@@ -3522,10 +3522,16 @@ async fn test_debug_account_transaction_quota_rejects_a_bad_address() {
 
 // ========== eth_gasPrice ==========
 
-struct FixedGasPrice(u64);
+/// A tracker's answer, and whether its fee market is working. The second
+/// field is the gate `eth_gasPrice` applies; a tracker always has a price.
+struct FixedGasPrice(u64, bool);
 impl crate::server::GasPriceSource for FixedGasPrice {
     fn gas_price(&self) -> U256 {
         U256::from(self.0)
+    }
+
+    fn is_fee_market_working(&self) -> bool {
+        self.1
     }
 }
 
@@ -3537,21 +3543,42 @@ impl crate::server::GasPriceSource for FixedGasPrice {
 #[tokio::test]
 async fn test_eth_gas_price_uses_the_tracker() {
     let (mut state, _tmp) = setup_state();
-    // The head's minimum is 59,240,000 (see `test_header`); the tracker's
-    // answer must win.
-    state.gas_price = Some(Arc::new(FixedGasPrice(123_456_789)));
+    // The head's minimum is 59,240,000 (see `test_header`); with the fee
+    // market working the tracker's answer must win.
+    state.gas_price = Some(Arc::new(FixedGasPrice(123_456_789, true)));
 
     let r = dispatch_for_test(&state, make_request("eth_gasPrice", json!([]))).await;
     assert_eq!(r.result.unwrap(), json!("0x75bcd15"));
 }
 
-/// Without a tracker -- a node built without sync -- the head's minimum is the
-/// documented fallback rather than an error.
+/// The gate, and the reason it exists.
+///
+/// rskj answers with the tracker **only** when the last 50 blocks averaged
+/// 90% full. Without that check a tracker primed from a busy chain keeps
+/// quoting its prices onto a quiet one long after the minimum has walked
+/// down underneath them -- 26,065,600 wei against a minimum of 587 on the
+/// run that found this, 44,000x, which is over RSKIP252's 100x cap and so
+/// cannot be mined at all.
+#[tokio::test]
+async fn test_eth_gas_price_ignores_the_tracker_without_a_fee_market() {
+    let (mut state, _tmp) = setup_state();
+    state.gas_price = Some(Arc::new(FixedGasPrice(123_456_789, false)));
+
+    let r = dispatch_for_test(&state, make_request("eth_gasPrice", json!([]))).await;
+    assert_eq!(
+        r.result.unwrap(),
+        json!("0x3e252e0"),
+        "the head's 59,240,000 times 1.1, not the tracker's 123,456,789"
+    );
+}
+
+/// Without a tracker -- a node built without sync -- the same branch answers,
+/// which is rskj's: the head's minimum times 1.1, not the bare minimum.
 #[tokio::test]
 async fn test_eth_gas_price_falls_back_to_the_block_minimum() {
     let (state, _tmp) = setup_state();
     let r = dispatch_for_test(&state, make_request("eth_gasPrice", json!([]))).await;
-    assert_eq!(r.result.unwrap(), json!("0x387ee40"), "59,240,000");
+    assert_eq!(r.result.unwrap(), json!("0x3e252e0"), "59,240,000 x 1.1");
 }
 
 // ========== trace_* namespace ==========

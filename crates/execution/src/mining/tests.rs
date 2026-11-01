@@ -1288,6 +1288,16 @@ mod partitioned_templates {
         fixture_with_forks(senders, RskHardforkConfig::all_active_parallel(33))
     }
 
+    /// The same fixture, for the RSKIP-252 tests next door. They need the
+    /// funded senders and the short chain; what they vary is the head's
+    /// minimum gas price, which they rewrite themselves.
+    #[allow(clippy::type_complexity)]
+    pub(super) fn fixture_for_cap_test(
+        senders: u8,
+    ) -> (BlockTemplateBuilder, Header, Vec<SigningKey>, Arc<dyn TrieStore>, Arc<BlockStore>) {
+        fixture_with_forks(senders, RskHardforkConfig::all_active_parallel(33))
+    }
+
     #[allow(clippy::type_complexity)]
     fn fixture_with_forks(
         senders: u8,
@@ -1490,5 +1500,174 @@ mod partitioned_templates {
         processor
             .process_block(&template.block, &parent_state, trie_store)
             .expect("the block validates");
+    }
+}
+
+// ── RSKIP-252: the miner's own price ceiling ──────────────────────────
+
+/// The cap the miner has to apply to itself.
+///
+/// `BlockTxsMaxGasPriceRule` rejects any block whose transactions pay more
+/// than 100x its `minimumGasPrice`, and until this was fixed the miner only
+/// applied the *floor*. The result is the worst shape a miner bug takes: the
+/// node seals a block, spends the work, and every validator on the network
+/// refuses it. A run that primed `eth_gasPrice` from a mainnet export and
+/// then mined on a quiet chain produced 138 such blocks.
+///
+/// The import-side rule is the assertion here, not a hand-written
+/// expectation: whatever the miner selects has to satisfy the same validator
+/// a peer would run.
+mod rskip252_cap {
+    use super::*;
+    use crate::mining::template::{PendingTransaction, PendingTransactionSource};
+    use k256::ecdsa::SigningKey;
+    use rustock_core::Transaction;
+    use rustock_core::validation::BlockValidator;
+    use rustock_core::validation::block_rules::BlockTxsMaxGasPriceRule;
+    use sha3::Digest;
+
+    struct Pool(Vec<PendingTransaction>);
+    impl PendingTransactionSource for Pool {
+        fn pending(&self) -> Vec<PendingTransaction> {
+            self.0.clone()
+        }
+    }
+
+    fn address_of(key: &SigningKey) -> Address {
+        let pubkey = key.verifying_key().to_encoded_point(false);
+        let hash: [u8; 32] = sha3::Keccak256::digest(&pubkey.as_bytes()[1..]).into();
+        Address::from_slice(&hash[12..])
+    }
+
+    fn sign(tx: &mut Transaction, key: &SigningKey, chain_id: u64) {
+        let hash = tx.signing_hash_eip155(chain_id);
+        let (signature, recid): (k256::ecdsa::Signature, k256::ecdsa::RecoveryId) =
+            key.sign_prehash_recoverable(hash.as_slice()).unwrap();
+        let sig_bytes = signature.to_bytes();
+        tx.r = U256::from_be_slice(&sig_bytes[..32]);
+        tx.s = U256::from_be_slice(&sig_bytes[32..]);
+        tx.v = chain_id * 2 + 35 + recid.to_byte() as u64;
+        tx.cached_rlp = None;
+    }
+
+    /// A signed transfer at an explicit gas price, which is the whole point.
+    fn transfer_at(from: &SigningKey, to: Address, gas_price: u64) -> PendingTransaction {
+        let mut tx = Transaction {
+            nonce: 0,
+            gas_price: U256::from(gas_price),
+            gas_limit: U256::from(21_000),
+            to: Bytes::copy_from_slice(to.as_slice()),
+            value: U256::from(1_000),
+            input: Bytes::new(),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
+        };
+        sign(&mut tx, from, 33);
+        let sender = address_of(from);
+        let hash = B256::from_slice(&sha3::Keccak256::digest(tx.rlp_for_trie()));
+        PendingTransaction { tx, sender, hash }
+    }
+
+    /// The partitioning fixture leaves every header at a zero minimum gas
+    /// price, and `TxGasPriceCap` short-circuits on zero -- so a fixture that
+    /// did not set one would pass whatever the miner did. Rewrite the head
+    /// with `minimum`, keeping the store consistent with it.
+    fn fixture_with_minimum(
+        senders: u8,
+        minimum: u64,
+    ) -> (BlockTemplateBuilder, Header, Vec<SigningKey>, Arc<dyn TrieStore>, Arc<BlockStore>) {
+        let (builder, parent, keys, trie_store, store) =
+            super::partitioned_templates::fixture_for_cap_test(senders);
+        let mut head = parent.clone();
+        head.minimum_gas_price = U256::from(minimum);
+        head.cached_hash = None;
+        head.cached_hash_for_merged_mining = None;
+        let hash = head.hash();
+        store.put_header_with_hash(hash, &head).unwrap();
+        store.put_canonical_hash(head.number, hash).unwrap();
+        store.put_total_difficulty(hash, U256::from(head.number + 1)).unwrap();
+        store.set_head(hash).unwrap();
+        store.set_exec_head(hash, head.state_root).unwrap();
+        (builder, head, keys, trie_store, store)
+    }
+
+    #[test]
+    fn transactions_over_the_cap_are_not_mined() {
+        const MINIMUM: u64 = 1_000;
+        const CAP: u64 = MINIMUM * BlockTxsMaxGasPriceRule::FOR_BLOCK_MULTIPLIER;
+
+        let (builder, parent, keys, trie_store, store) = fixture_with_minimum(3, MINIMUM);
+
+        // One comfortably inside the range, one exactly at the ceiling --
+        // the rule rejects `>` the cap, so this one is legal and a miner
+        // that dropped it would be leaving money on the table -- and one a
+        // single wei over, which no validator will accept.
+        let under = transfer_at(&keys[0], Address::repeat_byte(0xA1), MINIMUM * 50);
+        let at_cap = transfer_at(&keys[1], Address::repeat_byte(0xA2), CAP);
+        let over = transfer_at(&keys[2], Address::repeat_byte(0xA3), CAP + 1);
+        let over_hash = over.hash;
+        let pool = Pool(vec![under.clone(), at_cap.clone(), over]);
+
+        let template = builder
+            .build(std::slice::from_ref(&parent), Vec::new(), &pool)
+            .expect("the template builds");
+
+        let mined: Vec<U256> =
+            template.block.transactions.iter().map(|t| t.gas_price).collect();
+        assert!(
+            mined.contains(&U256::from(MINIMUM * 50)),
+            "a transaction well inside the range is mined: {mined:?}"
+        );
+        assert!(
+            mined.contains(&U256::from(CAP)),
+            "so is one exactly at the cap -- the rule rejects only what exceeds it: {mined:?}"
+        );
+        assert!(
+            !mined.contains(&U256::from(CAP + 1)),
+            "the one a wei over the cap is not: {mined:?}"
+        );
+        assert!(
+            !template.block.transactions.iter().any(|t| {
+                B256::from_slice(&sha3::Keccak256::digest(t.rlp_for_trie())) == over_hash
+            }),
+            "and it is gone by identity, not merely by price"
+        );
+
+        // The assertion that matters: the block the miner produced is one the
+        // import path accepts. This is the rule that rejected the 138 blocks.
+        BlockTxsMaxGasPriceRule { rskip252_height: 0 }
+            .validate_block(&template.block)
+            .expect("a block this miner seals must be one the network accepts");
+
+        let processor = BlockProcessor::new(RskHardforkConfig::all_active_parallel(33), store);
+        let parent_state = builder.load_state_root(parent.state_root).unwrap();
+        processor
+            .process_block(&template.block, &parent_state, trie_store)
+            .expect("and one it can execute");
+    }
+
+    /// `TxGasPriceCap.isSurpassed` short-circuits on a zero minimum, so a
+    /// chain without a fee market has no ceiling. Regtest runs this way, and
+    /// a cap derived from zero would drop every transaction in the pool.
+    #[test]
+    fn a_zero_minimum_imposes_no_ceiling() {
+        let (builder, parent, keys, _trie_store, _store) = fixture_with_minimum(1, 0);
+        assert!(parent.minimum_gas_price.is_zero(), "the premise");
+
+        let rich = transfer_at(&keys[0], Address::repeat_byte(0xB1), 26_065_600);
+        let pool = Pool(vec![rich]);
+
+        let template = builder
+            .build(std::slice::from_ref(&parent), Vec::new(), &pool)
+            .expect("the template builds");
+
+        let mined: Vec<U256> =
+            template.block.transactions.iter().map(|t| t.gas_price).collect();
+        assert!(
+            mined.contains(&U256::from(26_065_600u64)),
+            "with no minimum there is nothing to be 100x of: {mined:?}"
+        );
     }
 }

@@ -32,6 +32,16 @@ pub trait TxSubmitter: Send + Sync {
 pub trait GasPriceSource: Send + Sync {
     /// rskj `GasPriceTracker.getGasPrice()`.
     fn gas_price(&self) -> alloy_primitives::U256;
+
+    /// rskj `GasPriceTracker.isFeeMarketWorking()`: the last 50 blocks at
+    /// least 90% full on average.
+    ///
+    /// `gas_price` is only an answer when this is true. The tracker computes
+    /// its percentile either way, and on a chain with spare capacity that
+    /// percentile describes a market that is not setting the price -- see
+    /// [`crate::eth::eth_gas_price`] for what goes wrong when it is used
+    /// anyway.
+    fn is_fee_market_working(&self) -> bool;
 }
 
 /// Trait for reading from the transaction pool without depending on the sync crate.

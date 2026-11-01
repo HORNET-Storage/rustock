@@ -62,6 +62,10 @@ impl rustock_rpc::server::GasPriceSource for GasPriceAdapter {
     fn gas_price(&self) -> alloy_primitives::U256 {
         self.0.gas_price()
     }
+
+    fn is_fee_market_working(&self) -> bool {
+        self.0.is_fee_market_working()
+    }
 }
 
 impl rustock_rpc::server::TxPoolReader for PoolAdapter {

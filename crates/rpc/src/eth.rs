@@ -76,20 +76,67 @@ pub async fn eth_syncing(
 /// *valid*. During congestion the two diverge, and a wallet trusting the floor
 /// underpays and waits.
 ///
-/// rskj answers with `GasPriceTracker.getGasPrice()`: the 25th percentile of
-/// the last 512 transactions' gas prices, floored at the best block's minimum
-/// times 1.1. Until the node has seen 512 transactions the tracker has no
-/// percentile and falls back to the last block's minimum -- the old answer,
-/// now as a documented fallback rather than the whole implementation.
+/// rskj (`EthereumImpl.getGasPrice`) answers in two branches, and the gate
+/// between them matters as much as the percentile does:
+///
+/// * **Fee market working** -- the last 50 blocks at least 90% full on
+///   average -- `GasPriceTracker.getGasPrice()`: the 25th percentile of the
+///   last 512 transactions' gas prices, floored at the best block's minimum
+///   times 1.1.
+/// * **Otherwise** the head's `minimumGasPrice` times 1.1. The percentile is
+///   still computed; it is simply not an answer, because on a chain with
+///   spare capacity nobody is bidding and the window describes whatever the
+///   last 512 transactions happened to pay.
+///
+/// **Answering with the percentile unconditionally is not a smaller
+/// difference than it looks.** The window is 512 transactions deep with no
+/// age limit, so it long outlives the conditions that filled it. A node
+/// seeded from a mainnet export and then run on a quiet chain keeps quoting
+/// mainnet's prices while the minimum walks down underneath it: measured at
+/// 26,065,600 wei against a minimum of 587, a factor of 44,000. Wallets that
+/// trust it do not merely overpay -- they price themselves over RSKIP252's
+/// 100x cap, and the transactions they produce cannot legally be mined.
 pub fn eth_gas_price(id: Value, state: &crate::server::RpcState) -> JsonRpcResponse {
     if let Some(tracker) = &state.gas_price {
-        return JsonRpcResponse::success(id, json!(to_hex_u256(&alloy_primitives::U256::from(tracker.gas_price()))));
+        if tracker.is_fee_market_working() {
+            return JsonRpcResponse::success(
+                id,
+                json!(to_hex_u256(&alloy_primitives::U256::from(tracker.gas_price()))),
+            );
+        }
     }
     let price = head_header(&state.store)
-        .map(|h| to_hex_u256(&h.minimum_gas_price))
+        .map(|h| to_hex_u256(&head_minimum_times_multiplier(&h.minimum_gas_price)))
         .unwrap_or_else(|| "0x0".to_string());
     JsonRpcResponse::success(id, json!(price))
 }
+
+/// The head's `minimumGasPrice` times 1.1, which is what rskj answers when the
+/// fee market is not working.
+fn head_minimum_times_multiplier(minimum: &alloy_primitives::U256) -> alloy_primitives::U256 {
+    minimum.saturating_mul(alloy_primitives::U256::from(GAS_PRICE_MULTIPLIER_NUM))
+        / alloy_primitives::U256::from(GAS_PRICE_MULTIPLIER_DEN)
+}
+
+/// 1.1 as an exact ratio, so `x * 11 / 10` with truncation rather than a
+/// float.
+///
+/// Two constants in rskj hold this value and both are 1.1, which is why one
+/// pair serves here. They are not the same setting:
+///
+/// * `GasPriceTracker.DEFAULT_GAS_PRICE_MULTIPLIER` floors the percentile.
+/// * `EthereumImpl.minGasPriceMultiplier` scales the head's minimum on the
+///   branch below. It comes from the `gasPriceMultiplier` config key, whose
+///   default in `reference.conf` is 1.1 -- so an rskj operator can retune it
+///   and this node cannot. A divergence only reachable by changing that
+///   setting, and recorded here rather than discovered later.
+///
+/// Duplicated from `rustock_sync::gas_price`, which has the same pair, and
+/// deliberately: `rpc` does not depend on `sync` -- that is what
+/// `GasPriceSource` exists to avoid -- so sharing them would mean adding the
+/// dependency this trait was written to prevent.
+const GAS_PRICE_MULTIPLIER_NUM: u64 = 11;
+const GAS_PRICE_MULTIPLIER_DEN: u64 = 10;
 
 pub fn eth_mining(id: Value) -> JsonRpcResponse {
     JsonRpcResponse::success(id, json!(false))

@@ -10,6 +10,7 @@
 use alloy_primitives::{Address, B256, Bloom, Bytes, U256};
 use rustock_core::config::ChainConfig;
 use rustock_core::validation::DifficultyRule;
+use rustock_core::validation::block_rules::BlockTxsMaxGasPriceRule;
 use rustock_core::{Block, Header, Transaction, ordered_tx_trie_root};
 use rustock_trie::{AccountState, TrieKeySlice, TrieNode, TrieStore, account_key};
 use std::collections::HashMap;
@@ -188,6 +189,7 @@ impl BlockTemplateBuilder {
         let mut transactions = self.select_transactions(
             pending,
             &state_root,
+            number,
             minimum_gas_price,
             gas_limit,
         );
@@ -403,15 +405,41 @@ impl BlockTemplateBuilder {
 
     /// Pick transactions to include: best price first, each sender's
     /// transactions in nonce order and starting from the nonce the state
-    /// expects, skipping anything underpriced or that no longer fits.
+    /// expects, skipping anything underpriced, *overpriced*, or that no
+    /// longer fits.
+    ///
+    /// **Both ends of the price range are consensus rules, not policy.** The
+    /// floor is `TxsMinGasPriceRule` and the ceiling is
+    /// [`BlockTxsMaxGasPriceRule`] -- RSKIP252, 100x the block's
+    /// `minimumGasPrice`. A miner that applies only the floor seals blocks
+    /// that every validator on the network rejects, which is worse than
+    /// mining nothing: the work is spent and the block is refused. rskj drops
+    /// both in `MinerUtils.filterTransactions` (`isHighGasPriced`), and this
+    /// is the same filter on the same rule the import path already enforces.
+    ///
+    /// REMASC needs no exemption here even though the rule grants it one: it
+    /// is never in the pool, and `build` appends it after this returns.
     fn select_transactions(
         &self,
         pending: &dyn PendingTransactionSource,
         state_root: &TrieNode,
+        number: u64,
         minimum_gas_price: U256,
         block_gas_limit: U256,
     ) -> Vec<Transaction> {
         let ordered = order_by_price_sender_and_nonce(pending.pending());
+
+        // `TxGasPriceCap.isSurpassed` short-circuits on a zero minimum, so a
+        // chain whose minimum is zero -- regtest, and mainnet before the fee
+        // market moved -- has no ceiling at all. Matching that is what keeps
+        // this filter from dropping everything on such a chain.
+        let max_gas_price = (number >= self.chain_config.activation_heights.fingerroot500
+            && !minimum_gas_price.is_zero())
+        .then(|| {
+            minimum_gas_price.saturating_mul(U256::from(
+                BlockTxsMaxGasPriceRule::FOR_BLOCK_MULTIPLIER,
+            ))
+        });
 
         let mut next_nonce: HashMap<Address, u64> = HashMap::new();
         let mut gas_committed = U256::ZERO;
@@ -419,6 +447,9 @@ impl BlockTemplateBuilder {
 
         for candidate in ordered {
             if candidate.tx.gas_price < minimum_gas_price {
+                continue;
+            }
+            if max_gas_price.is_some_and(|cap| candidate.tx.gas_price > cap) {
                 continue;
             }
 
