@@ -82,6 +82,30 @@ pub enum Alert {
         peer_count: usize,
         for_secs: u64,
     },
+    /// A value transfer above the configured threshold with a smart contract
+    /// on at least one side of it.
+    ///
+    /// Found by re-executing the block with the call tracer, so this covers
+    /// internal transfers -- a contract paying out -- and not only what a
+    /// transaction declares. See [`crate::value`].
+    LargeContractTransfer {
+        block: u64,
+        tx_hash: [u8; 32],
+        /// `0x`-prefixed, already rendered: the alert carries text because
+        /// its only consumers are a log line and an email.
+        from: String,
+        to: String,
+        /// Which side is the contract, as [`crate::value::Direction`] reads it.
+        direction: &'static str,
+        /// `transaction`, `call`, `create` or `selfdestruct`.
+        kind: &'static str,
+        /// Position in the call tree: empty for the transaction's own
+        /// transfer, `0.1.3` for a nested frame.
+        path: String,
+        amount_wei: String,
+        amount_rbtc: String,
+        threshold_rbtc: String,
+    },
 }
 
 impl Alert {
@@ -117,6 +141,9 @@ impl Alert {
             Alert::InTransitAboveThreshold { total_sats, block, .. } => format!(
                 "Peg-outs in transit: {} BTC at block #{block}",
                 sats_to_btc_string(*total_sats)
+            ),
+            Alert::LargeContractTransfer { amount_rbtc, direction, block, .. } => format!(
+                "Large transfer {direction}: {amount_rbtc} RBTC at block #{block}"
             ),
         }
     }
@@ -281,6 +308,36 @@ handed to the signers.",
                     sats_to_btc_string(*total_sats),
                     sats_to_btc_string(*threshold_sats))
             }
+            Alert::LargeContractTransfer {
+                block, tx_hash, from, to, direction, kind, path, amount_wei, amount_rbtc,
+                threshold_rbtc,
+            } => {
+                let where_ = if path.is_empty() {
+                    "the transaction's own value transfer".to_string()
+                } else {
+                    format!("an internal transfer, at call-tree position {path}")
+                };
+                format!(
+"A value transfer {direction} is above the configured threshold.
+
+  RSK block      #{block}
+  transaction    0x{}
+  from           {from}
+  to             {to}
+  amount         {amount_rbtc} RBTC
+  threshold      {threshold_rbtc} RBTC
+  exact amount   {amount_wei} wei
+  moved by       {kind}
+
+This is {where_}.
+
+The transfer succeeded: frames that reverted, and everything beneath them, are
+excluded, so this is value that actually moved. To see it in context:
+
+  trace_transaction(\"0x{}\")",
+                    hex::encode(tx_hash),
+                    hex::encode(tx_hash))
+            }
         }
     }
 
@@ -312,6 +369,12 @@ handed to the signers.",
             Alert::SupplyNotConserved { block, .. } => format!("supply:{block}"),
             // One per Bitcoin transaction: registering it twice is the same event.
             Alert::LegacyMultisigPegin { btc_txid, .. } => format!("multisig-pegin:{btc_txid}"),
+            // The transaction and the position within its call tree identify
+            // the transfer exactly. Two transfers of the same size between the
+            // same pair in one transaction are different frames and different
+            // news, so the path has to be in the key.
+            Alert::LargeContractTransfer { tx_hash, path, .. } =>
+                format!("contract-transfer:{}:{path}", hex::encode(tx_hash)),
         }
     }
 }

@@ -2931,9 +2931,14 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
     }
 
     if let Some(path) = &args.alerts_config {
-        match start_pegout_alerts(path, store.clone(), trie_store_for_pool.clone()) {
+        match start_pegout_alerts(
+            path,
+            store.clone(),
+            trie_store_for_pool.clone(),
+            hardfork_cfg.clone(),
+        ) {
             Ok(Some(handle)) => {
-                info!("Peg-out alert watcher started from {path}");
+                info!("Alert watcher started from {path}");
                 // Detached deliberately: dropping a tokio JoinHandle does not
                 // cancel the task, and the watcher must outlive this scope.
                 drop(handle);
@@ -3761,13 +3766,18 @@ fn start_pegout_alerts(
     path: &str,
     store: Arc<BlockStore>,
     trie: Arc<dyn rustock_trie::TrieStore>,
+    hardfork_cfg: rustock_execution::RskHardforkConfig,
 ) -> anyhow::Result<Option<tokio::task::JoinHandle<()>>> {
     use rustock_alerts::{AlertSink, Config, LogSink, Watcher};
 
     let config = Config::load(path)?;
     let email = config.alerts.email;
     let cfg = config.alerts.pegout;
-    if !cfg.enabled {
+    let contract = config.alerts.contract_value;
+    // One watcher serves both: they sweep the same blocks in the same order,
+    // and two tasks walking the chain in parallel would read everything twice
+    // to no end. Either section alone is enough to start it.
+    if !cfg.enabled && !contract.enabled {
         return Ok(None);
     }
 
@@ -3829,9 +3839,43 @@ fn start_pegout_alerts(
         tracing::warn!("multisig-sender observer not installed: {e}");
     }
 
-    let watcher = Watcher::new(store, trie, cfg, sinks, change_scripts)?
+    let chain_id = hardfork_cfg.chain_id;
+    let mut watcher = Watcher::new(store.clone(), trie, cfg, sinks, change_scripts)?
         .reloading_from(path)
         .with_inbox(rx);
+    if contract.enabled {
+        // Its own processor, not the node's. This one re-executes committed
+        // blocks for reading only, so it must not share the mutable wiring
+        // -- the BTC block cache, the sender cache -- that block processing
+        // depends on being in a known state.
+        let processor =
+            Arc::new(rustock_execution::BlockProcessor::new(hardfork_cfg, store));
+
+        // The filter that keeps the re-execution off almost every block.
+        // Block processing already walks every account a block wrote, for
+        // the supply check; this takes the largest of those deltas off the
+        // end of that walk. The closure runs on the thread executing blocks,
+        // so it does one lock and one insert and nothing else.
+        let movements = Arc::new(rustock_alerts::movement::MovementLog::default());
+        let sink = movements.clone();
+        match rustock_execution::supply::set_movement_observer(move |m| {
+            sink.record(m.block_hash, m.max_movement);
+        }) {
+            Ok(()) => info!(
+                "Contract value watch will re-execute a block only when an account moved \
+                 more than {} RBTC",
+                contract.replay_filter_btc
+            ),
+            // Without it every block is re-executed: correct, and about 24 ms
+            // a block more expensive. Worth saying out loud rather than
+            // leaving as an unexplained load.
+            Err(e) => warn!(
+                "movement observer not installed ({e}); the contract value watch will \
+                 re-execute every block"
+            ),
+        }
+        watcher = watcher.with_contract_value(contract, processor, chain_id, movements);
+    }
     Ok(Some(tokio::spawn(watcher.run())))
 }
 

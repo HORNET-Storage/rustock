@@ -19,6 +19,20 @@
 //! two mail configurations is how one of them goes stale. See [`health`] and
 //! `docs/alerts-node-health.md`.
 //!
+//! # The one watch that is not a read
+//!
+//! [`value`] alerts on large transfers in or out of a smart contract, and it
+//! is the exception to the paragraph above. A value transfer emits no log and
+//! writes nothing to the receipt, so a contract paying out cannot be seen from
+//! stored data at all; the block has to be **re-executed** with the call
+//! tracer attached. That is still an observer -- the replay is handed a trie
+//! node, writes nothing, and runs on the watcher's own thread, so it cannot
+//! change what the node computes -- but it costs a second execution of the
+//! block, which is why it is off by default and why [`movement`] filters
+//! first: the supply check already records every account's balance delta for
+//! every block, and a block in which nothing moved needs no second look. See
+//! `docs/alerts-contract-value.md`.
+//!
 //! # A note on names
 //!
 //! The crate is `rustock-alerts`; it was `rustock-pegout-alerts` until the
@@ -32,12 +46,14 @@
 pub mod alert;
 pub mod config;
 pub mod health;
+pub mod movement;
 pub mod service;
 pub mod sink;
+pub mod value;
 pub mod watch;
 
 pub use alert::Alert;
-pub use config::{Config, NodeHealth, PegoutAlerts};
+pub use config::{Config, ContractValueAlerts, NodeHealth, PegoutAlerts};
 pub use service::Watcher;
 pub use sink::{AlertSink, LogSink};
 #[cfg(feature = "smtp")]

@@ -18,7 +18,7 @@
 //! block touching a dozen accounts pays a dozen lookups on top of the writes it
 //! was doing anyway.
 
-use alloy_primitives::{Address, U256};
+use alloy_primitives::{Address, B256, U256};
 use revm::state::{AccountStatus, EvmState};
 use rustock_trie::{account_key, AccountState, TrieKeySlice, TrieNode, TrieStore};
 
@@ -212,6 +212,60 @@ where
     OBSERVER.set(Box::new(f)).map_err(|_| "supply observer already installed")
 }
 
+/// The largest balance movement one block made, for a watcher deciding
+/// whether that block is worth looking at more closely.
+///
+/// This is **not** a supply finding. The supply check exists to catch rBTC
+/// appearing from nothing; this reuses the per-account deltas it already
+/// computes, because they are the cheapest honest answer to "did anything
+/// large happen here" that exists anywhere in the node. Nothing is judged
+/// here -- the magnitude is reported and the consumer decides -- so the
+/// policy stays in the crate that has the configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockMovement {
+    pub block: u64,
+    /// Keyed by hash, not number. A block that was executed and then orphaned
+    /// shares its number with the canonical one, and a consumer keyed by
+    /// number could answer for the wrong block.
+    pub block_hash: B256,
+    /// The largest `|after - before|` over every account the block wrote.
+    pub max_movement: U256,
+}
+
+type MovementObserver = Box<dyn Fn(&BlockMovement) + Send + Sync>;
+static MOVEMENT_OBSERVER: std::sync::OnceLock<MovementObserver> = std::sync::OnceLock::new();
+
+/// Install the process-wide movement observer, once.
+pub fn set_movement_observer<F>(f: F) -> Result<(), &'static str>
+where
+    F: Fn(&BlockMovement) + Send + Sync + 'static,
+{
+    MOVEMENT_OBSERVER.set(Box::new(f)).map_err(|_| "movement observer already installed")
+}
+
+/// Whether anyone is listening.
+///
+/// Checked before the block hash is computed: hashing a header is cheap but
+/// not free, and a node with no watcher should not pay for it on every block.
+pub fn movement_observer_installed() -> bool {
+    MOVEMENT_OBSERVER.get().is_some()
+}
+
+/// The largest movement in a report, or zero if nothing moved.
+pub fn largest_movement(report: &SupplyReport) -> U256 {
+    report.deltas.iter().map(|d| d.magnitude()).max().unwrap_or(U256::ZERO)
+}
+
+/// Hand one block's largest movement to the observer, if one is installed.
+///
+/// Silent: this is not a finding and logging one line per block would drown
+/// the log in nothing happening.
+pub fn report_movement(movement: &BlockMovement) {
+    if let Some(observer) = MOVEMENT_OBSERVER.get() {
+        observer(movement);
+    }
+}
+
 /// Log an imbalance and hand it to the observer, if one is installed.
 ///
 /// Logging happens either way, so the record exists whether or not the node was
@@ -336,6 +390,50 @@ pub fn report_transaction(block: u64, index: usize, report: &SupplyReport) {
     };
     if let Some(obs) = OBSERVER.get() {
         obs(&violation);
+    }
+}
+
+#[cfg(test)]
+mod movement_tests {
+    use super::*;
+
+    #[test]
+    fn the_largest_movement_of_an_empty_report_is_zero() {
+        assert_eq!(largest_movement(&SupplyReport::default()), U256::ZERO);
+    }
+
+    /// The trap this guards. With the per-block check disabled the caller
+    /// holds a `SupplyReport::default()`, whose largest movement is zero --
+    /// and a consumer told "zero" reads it as "nothing moved" when the truth
+    /// is "nobody looked". `BlockProcessor` must therefore not report a
+    /// movement unless `per_block_enabled()`, and this pins the reason.
+    #[test]
+    fn a_disabled_check_is_indistinguishable_from_a_quiet_block() {
+        let quiet = SupplyReport::default();
+        let not_checked = SupplyReport::default();
+        assert_eq!(largest_movement(&quiet), largest_movement(&not_checked));
+    }
+
+    #[test]
+    fn the_largest_movement_is_the_largest_magnitude_either_way() {
+        let report = SupplyReport {
+            deltas: vec![
+                AccountDelta {
+                    address: Address::repeat_byte(1),
+                    before: U256::from(10),
+                    after: U256::from(40),
+                },
+                // A decrease of 100: bigger than the increase of 30, and the
+                // sign must not hide it.
+                AccountDelta {
+                    address: Address::repeat_byte(2),
+                    before: U256::from(100),
+                    after: U256::ZERO,
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(largest_movement(&report), U256::from(100));
     }
 }
 

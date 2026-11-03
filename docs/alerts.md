@@ -18,6 +18,12 @@ commented file.
 | A single output of a peg-out transaction awaiting signature | > 100 BTC | `pegoutsWaitingForSignatures` |
 | Total value in transit | > 200 BTC | `pegoutsWaitingForConfirmations` |
 
+Two other watches share this file and this mail transport:
+[node health](alerts-node-health.md), and
+[large transfers in and out of smart contracts](alerts-contract-value.md).
+The second is the only one here that is not a read — it re-executes the block,
+because a value transfer leaves nothing behind to read.
+
 Every peg-out event is logged regardless of threshold —
 `release_request_received`, `release_requested`, `release_btc`,
 `pegout_confirmed`, `pegout_transaction_created` — at `info` on target

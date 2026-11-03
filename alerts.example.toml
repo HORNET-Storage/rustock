@@ -100,6 +100,68 @@ federation_change_scripts = [
   # "a914...87",
 ]
 
+# ── Large transfers in and out of smart contracts ─────────────────────────
+#
+# Alert when rBTC above a threshold moves with a smart contract on either
+# side of it: an account paying a contract, or a contract paying anyone.
+#
+# Unlike everything else here this watch cannot be answered by reading what
+# the node already stored. A value transfer emits no log and writes nothing
+# to the receipt, so a contract paying out is invisible from the outside.
+# Finding one means **re-executing the block** with the call tracer, the way
+# `trace_block` does, and reading the call tree.
+#
+# That is the cost, and it is why this is off by default. It still cannot
+# affect consensus -- the replay writes nothing and runs on the watcher's own
+# thread -- but it is not free the way reading a receipt is: about 24 ms a
+# block at the median, measured on mainnet.
+#
+# Which is why it does not run on every block. The node already walks every
+# account a block wrote, for the supply check, and so already knows the
+# largest balance change in each block. `replay_filter_btc` below uses that
+# to skip blocks in which nothing happened -- which, measured over 300
+# consecutive mainnet blocks, is almost all of them.
+#
+# What it catches that a naive check would miss:
+#
+#   - internal transfers, which is most of the point: a contract forwarding
+#     funds does not appear in any transaction's `to` or `value`
+#   - CREATE endowments and SELFDESTRUCT payouts
+#   - and it correctly ignores DELEGATECALL and CALLCODE, which carry a
+#     `value` but move no balance, and anything under a reverted frame
+
+[alerts.contract_value]
+enabled = false
+
+# Alert above this many RBTC, per transfer. Independent of the peg-out
+# thresholds above on purpose: a peg-out is the federation moving bitcoin,
+# and a contract payment is a different event at a different scale.
+transfer_alert_btc = 50.0
+
+# Do not re-execute a block unless some account's balance moved more than
+# this. Free, because the supply check computed those deltas already.
+#
+# Deliberately far below transfer_alert_btc, and it must stay below it --
+# a value at or above it is refused. A balance delta is a NET figure, so a
+# transfer hides from this filter only if the value came back to where it
+# started inside the same block. A contract passing funds through is NOT
+# that case and is not missed: the originator and the final recipient still
+# show the movement. What is given up is a closed cycle -- realistically a
+# flash loan, where a pool lends and is repaid in one transaction. At 0.1
+# RBTC such a cycle has to leave every account within 0.1 RBTC of where it
+# started, which is to say nobody profited.
+#
+# 0 re-executes every block: the behaviour before this filter existed, kept
+# reachable as the control for measuring what the filter saves.
+replay_filter_btc = 0.1
+
+# How far behind the executed head this watch will still re-execute. A node
+# that was stopped for a day comes back with thousands of blocks to sweep,
+# and re-executing all of them would turn a backlog into an outage. Blocks
+# further back than this are still swept for peg-outs, which is cheap, and
+# the skipped range is logged -- a gap in this watch is never silent.
+max_catchup_blocks = 128
+
 [alerts.node_health]
 enabled = false
 

@@ -17,6 +17,7 @@ anyhow = { workspace = true }
 async-trait = { workspace = true }
 bitcoin = { workspace = true }
 hex = { workspace = true }
+lru = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true }
 toml = "0.8.19"
@@ -34,3 +35,9 @@ smtp = ["dep:lettre"]
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# For `tests/contract_value.rs`, which signs a transaction and executes a real
+# block: this watch is the one that re-executes, so a fixture that stops at a
+# hand-built call tree would not test the part most likely to be wrong.
+k256 = { workspace = true }
+sha3 = { workspace = true }
+alloy-rlp = { workspace = true }

@@ -11,6 +11,10 @@ use std::path::Path;
 /// One BTC in satoshis. Thresholds are given in BTC in the file because that is
 /// how people think about peg-outs; everything internal is satoshis.
 pub const SATOSHIS_PER_BTC: u64 = 100_000_000;
+/// RBTC is quoted in wei (18 decimals) and BTC in satoshis (8), so one
+/// satoshi of RBTC is 10^10 wei. Used to carry a BTC-denominated threshold
+/// into the wei-denominated world of the EVM.
+pub const WEI_PER_SATOSHI: u64 = 10_000_000_000;
 
 fn default_true() -> bool { true }
 fn default_poll_secs() -> u64 { 5 }
@@ -21,6 +25,9 @@ fn default_in_transit_report_secs() -> u64 { 600 }
 fn default_confirmations() -> u64 { 4_000 }
 fn default_smtp_port() -> u16 { 587 }
 fn default_queue() -> usize { 256 }
+fn default_contract_transfer_btc() -> f64 { 50.0 }
+fn default_max_catchup_blocks() -> u64 { 128 }
+fn default_replay_filter_btc() -> f64 { 0.1 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -47,6 +54,9 @@ pub struct Alerts {
     /// Stalled, behind the network, or ahead of every peer.
     #[serde(default)]
     pub node_health: NodeHealth,
+    /// Large value transfers in or out of a smart contract.
+    #[serde(default)]
+    pub contract_value: ContractValueAlerts,
 }
 
 fn default_health_gap() -> u64 { 10 }
@@ -276,6 +286,179 @@ pub enum TlsMode {
     Implicit,
 }
 
+/// Large value transfers in or out of a smart contract.
+///
+/// Unlike every other watch in this crate, this one cannot be answered from
+/// what the node stored: a value transfer emits no log and writes nothing to
+/// the receipt, so the block is re-executed with the call tracer attached.
+/// That costs real CPU — see [`crate::value`] — which is why it is off by
+/// default and why `max_catchup_blocks` exists.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContractValueAlerts {
+    /// Off unless asked for.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Alert when a single transfer with a contract on either side exceeds
+    /// this many RBTC.
+    ///
+    /// Deliberately its own setting rather than reusing the peg-out
+    /// threshold: a peg-out is the federation moving bitcoin, and a contract
+    /// payment is not the same event at the same scale.
+    #[serde(default = "default_contract_transfer_btc")]
+    pub transfer_alert_btc: f64,
+    /// How far behind the executed head this watch will still re-execute.
+    ///
+    /// A node that was stopped for a day, or that is still syncing, comes
+    /// back with thousands of blocks to sweep. Re-executing all of them would
+    /// turn a backlog into an outage, so blocks further back than this are
+    /// swept for peg-outs — which is cheap — and not traced. The skipped
+    /// range is logged, so a gap in this watch is never silent.
+    #[serde(default = "default_max_catchup_blocks")]
+    pub max_catchup_blocks: u64,
+    /// Do not re-execute a block unless some account's balance moved more
+    /// than this many RBTC.
+    ///
+    /// The node already computes every account's balance delta for every
+    /// block, as part of the supply check, so this filter is free and skips
+    /// essentially every block: over 300 consecutive mainnet blocks in
+    /// November 2026 the largest single transfer in a block was 2.0 RBTC and
+    /// the median was zero.
+    ///
+    /// **Deliberately far below `transfer_alert_btc`, and it must stay
+    /// below it.** A delta is a net figure, so a transfer hides from this
+    /// filter only if the value came back inside the same block -- a closed
+    /// cycle, most realistically a flash loan. At 0.1 RBTC such a cycle has
+    /// to leave every account within 0.1 RBTC of where it started, which is
+    /// to say nobody profited. Raising it towards the alert threshold widens
+    /// that hole for no measurable saving, which is why a value at or above
+    /// `transfer_alert_btc` is refused.
+    ///
+    /// Zero re-executes every block, which is the behaviour before this
+    /// filter existed. Kept reachable as the control.
+    #[serde(default = "default_replay_filter_btc")]
+    pub replay_filter_btc: f64,
+}
+
+impl Default for ContractValueAlerts {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            transfer_alert_btc: default_contract_transfer_btc(),
+            max_catchup_blocks: default_max_catchup_blocks(),
+            replay_filter_btc: default_replay_filter_btc(),
+        }
+    }
+}
+
+impl ContractValueAlerts {
+    /// The threshold in wei.
+    ///
+    /// Routed through satoshis rather than multiplying the float by 1e18
+    /// directly: `f64` has 53 bits of mantissa and cannot represent most
+    /// wei-scale integers, so `50.0 * 1e18` is not 50 RBTC. A threshold is
+    /// wanted to satoshi precision at most, and this way the rounding is the
+    /// same one `pegout_alert_btc` already gets.
+    pub fn transfer_alert_wei(&self) -> alloy_primitives::U256 {
+        alloy_primitives::U256::from(btc_to_sats(self.transfer_alert_btc))
+            * alloy_primitives::U256::from(WEI_PER_SATOSHI)
+    }
+
+    /// The re-execution filter in wei, by the same route.
+    pub fn replay_filter_wei(&self) -> alloy_primitives::U256 {
+        alloy_primitives::U256::from(btc_to_sats(self.replay_filter_btc))
+            * alloy_primitives::U256::from(WEI_PER_SATOSHI)
+    }
+
+    /// What a running watcher can adopt, and what needs a restart.
+    pub fn describe_changes(&self, new: &ContractValueAlerts) -> (Vec<String>, Vec<String>) {
+        let mut live = Vec::new();
+        let mut restart = Vec::new();
+        if self.transfer_alert_btc != new.transfer_alert_btc {
+            live.push(format!(
+                "contract_value.transfer_alert_btc: {} -> {}",
+                self.transfer_alert_btc, new.transfer_alert_btc
+            ));
+        }
+        if self.max_catchup_blocks != new.max_catchup_blocks {
+            live.push(format!(
+                "contract_value.max_catchup_blocks: {} -> {}",
+                self.max_catchup_blocks, new.max_catchup_blocks
+            ));
+        }
+        if self.replay_filter_btc != new.replay_filter_btc {
+            live.push(format!(
+                "contract_value.replay_filter_btc: {} -> {}",
+                self.replay_filter_btc, new.replay_filter_btc
+            ));
+        }
+        // Whether this watch runs at all decides whether the watcher built a
+        // block processor, which happens once at startup.
+        if self.enabled != new.enabled {
+            restart.push(format!(
+                "contract_value.enabled: {} -> {}",
+                self.enabled, new.enabled
+            ));
+        }
+        (live, restart)
+    }
+
+    pub fn adopt_live(&mut self, new: &ContractValueAlerts) {
+        self.transfer_alert_btc = new.transfer_alert_btc;
+        self.max_catchup_blocks = new.max_catchup_blocks;
+        self.replay_filter_btc = new.replay_filter_btc;
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if !(self.transfer_alert_btc.is_finite() && self.transfer_alert_btc >= 0.0) {
+            anyhow::bail!(
+                "alerts.contract_value.transfer_alert_btc must be a non-negative number, got {}",
+                self.transfer_alert_btc
+            );
+        }
+        // Zero would alert on every transfer a contract makes, which on a
+        // busy block is thousands of mails. Refuse it rather than discover it
+        // at three in the morning.
+        if self.transfer_alert_wei().is_zero() {
+            anyhow::bail!(
+                "alerts.contract_value.transfer_alert_btc is {} RBTC, which rounds to zero and \
+                 would alert on every transfer; set a real threshold",
+                self.transfer_alert_btc
+            );
+        }
+        if self.max_catchup_blocks == 0 {
+            anyhow::bail!(
+                "alerts.contract_value.max_catchup_blocks must be greater than zero, or this \
+                 watch would never run"
+            );
+        }
+        if !(self.replay_filter_btc.is_finite() && self.replay_filter_btc >= 0.0) {
+            anyhow::bail!(
+                "alerts.contract_value.replay_filter_btc must be a non-negative number, got {}",
+                self.replay_filter_btc
+            );
+        }
+        // A filter at or above the alert threshold can skip a block holding a
+        // transfer that would have alerted and did not net out at all, which
+        // makes the filter -- not `transfer_alert_btc` -- the real threshold.
+        // Refuse rather than let the configuration mean something other than
+        // what it says.
+        if self.replay_filter_wei() >= self.transfer_alert_wei() {
+            anyhow::bail!(
+                "alerts.contract_value.replay_filter_btc ({}) must be below \
+                 transfer_alert_btc ({}), or blocks holding a reportable transfer could be \
+                 skipped before anything looks at them",
+                self.replay_filter_btc,
+                self.transfer_alert_btc
+            );
+        }
+        Ok(())
+    }
+}
+
 impl PegoutAlerts {
     pub fn pegout_alert_sats(&self) -> u64 { btc_to_sats(self.pegout_alert_btc) }
     pub fn output_alert_sats(&self) -> u64 { btc_to_sats(self.output_alert_btc) }
@@ -358,6 +541,21 @@ pub fn sats_to_btc_string(sats: u64) -> String {
     format!("{}.{:08}", sats / SATOSHIS_PER_BTC, sats % SATOSHIS_PER_BTC)
 }
 
+/// Wei to an RBTC string, to satoshi precision, for humans reading an alert.
+///
+/// Eight decimals rather than eighteen on purpose: the extra ten digits are
+/// noise in a subject line, and every alert that uses this also prints the
+/// exact wei. The value is **truncated**, not rounded, so the printed figure
+/// is never larger than what moved.
+pub fn wei_to_rbtc_string(wei: alloy_primitives::U256) -> String {
+    let per_sat = alloy_primitives::U256::from(WEI_PER_SATOSHI);
+    let sats = wei / per_sat;
+    // A transfer cannot exceed the 21M-RBTC supply, so this conversion cannot
+    // hide a real value; it only avoids a panic on absurd input.
+    let sats: u64 = sats.try_into().unwrap_or(u64::MAX);
+    sats_to_btc_string(sats)
+}
+
 impl Config {
     pub fn load(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let path = path.as_ref();
@@ -369,6 +567,7 @@ impl Config {
         cfg.alerts.validate_email()?;
         cfg.alerts.pegout.validate()?;
         cfg.alerts.node_health.validate()?;
+        cfg.alerts.contract_value.validate()?;
         Ok(cfg)
     }
 }
@@ -671,5 +870,176 @@ mod secret_tests {
         let f = env_file("SMTP_FROM=Alerts <alerts@example.com>\n", 0o600);
         let vars = read_env_file(f.path()).unwrap();
         assert_eq!(expand("${SMTP_FROM}", &vars).unwrap(), "Alerts <alerts@example.com>");
+    }
+}
+
+#[cfg(test)]
+mod contract_value_tests {
+    use super::*;
+    use alloy_primitives::U256;
+
+    #[test]
+    fn the_threshold_reaches_wei_without_going_through_a_float() {
+        let c = ContractValueAlerts { transfer_alert_btc: 50.0, ..Default::default() };
+        // 50 RBTC exactly, to the wei. `50.0 * 1e18` as an f64 is not this
+        // number, which is the whole reason the conversion goes via satoshis.
+        assert_eq!(
+            c.transfer_alert_wei(),
+            U256::from(50u64) * U256::from(10u64).pow(U256::from(18u64))
+        );
+    }
+
+    #[test]
+    fn a_fractional_threshold_survives_to_satoshi_precision() {
+        let c = ContractValueAlerts { transfer_alert_btc: 0.5, ..Default::default() };
+        assert_eq!(
+            c.transfer_alert_wei(),
+            U256::from(5u64) * U256::from(10u64).pow(U256::from(17u64))
+        );
+    }
+
+    /// Zero would mail on every transfer a contract makes. Catch it when the
+    /// file is read, not at three in the morning.
+    #[test]
+    fn a_threshold_that_rounds_to_zero_is_refused() {
+        let c = ContractValueAlerts {
+            enabled: true,
+            transfer_alert_btc: 0.0,
+            ..Default::default()
+        };
+        assert!(c.validate().is_err());
+        // Below one satoshi rounds to zero too, and is just as wrong.
+        let c = ContractValueAlerts {
+            enabled: true,
+            transfer_alert_btc: 1e-12,
+            ..Default::default()
+        };
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn a_disabled_section_is_not_validated() {
+        let c = ContractValueAlerts { enabled: false, transfer_alert_btc: 0.0, ..Default::default() };
+        assert!(c.validate().is_ok(), "a section that does nothing cannot be misconfigured");
+    }
+
+    #[test]
+    fn a_zero_catchup_window_is_refused() {
+        let c = ContractValueAlerts { enabled: true, max_catchup_blocks: 0, ..Default::default() };
+        assert!(c.validate().is_err(), "this watch would never run");
+    }
+
+    #[test]
+    fn the_threshold_is_live_but_enabling_it_needs_a_restart() {
+        let old = ContractValueAlerts::default();
+        let new = ContractValueAlerts {
+            enabled: true,
+            transfer_alert_btc: 10.0,
+            max_catchup_blocks: 256,
+            replay_filter_btc: 0.5,
+        };
+        let (live, restart) = old.describe_changes(&new);
+        assert_eq!(live.len(), 3, "threshold, window and filter are adoptable: {live:?}");
+        assert_eq!(restart.len(), 1, "enabling builds a processor: {restart:?}");
+        assert!(restart[0].contains("enabled"));
+    }
+
+    #[test]
+    fn adopting_live_changes_leaves_enabled_alone() {
+        let mut old = ContractValueAlerts::default();
+        let new = ContractValueAlerts {
+            enabled: true,
+            transfer_alert_btc: 10.0,
+            max_catchup_blocks: 256,
+            replay_filter_btc: 0.5,
+        };
+        old.adopt_live(&new);
+        assert_eq!(old.transfer_alert_btc, 10.0);
+        assert_eq!(old.max_catchup_blocks, 256);
+        assert_eq!(old.replay_filter_btc, 0.5);
+        assert!(!old.enabled, "a running watcher cannot grow a processor");
+    }
+
+    /// The section is new, so every deployed configuration file lacks it.
+    /// Those files must keep loading, with the watch off.
+    #[test]
+    fn a_configuration_without_the_section_still_loads_with_it_off() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [alerts.pegout]
+            enabled = true
+            "#,
+        )
+        .expect("an older file must still parse");
+        assert!(!cfg.alerts.contract_value.enabled);
+        assert_eq!(cfg.alerts.contract_value.transfer_alert_btc, 50.0);
+    }
+
+    #[test]
+    fn the_section_parses_from_toml() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [alerts.contract_value]
+            enabled = true
+            transfer_alert_btc = 25.5
+            max_catchup_blocks = 64
+            "#,
+        )
+        .unwrap();
+        let c = cfg.alerts.contract_value;
+        assert!(c.enabled);
+        assert_eq!(c.transfer_alert_btc, 25.5);
+        assert_eq!(c.max_catchup_blocks, 64);
+    }
+
+    /// A filter at or above the alert threshold makes the filter the real
+    /// threshold, because a block can be skipped before anything looks at the
+    /// transfer inside it.
+    #[test]
+    fn a_filter_at_or_above_the_alert_threshold_is_refused() {
+        let at = ContractValueAlerts {
+            enabled: true,
+            transfer_alert_btc: 50.0,
+            replay_filter_btc: 50.0,
+            ..Default::default()
+        };
+        assert!(at.validate().is_err(), "equal is already too high");
+        let above = ContractValueAlerts { replay_filter_btc: 60.0, ..at.clone() };
+        assert!(above.validate().is_err());
+        let below = ContractValueAlerts { replay_filter_btc: 49.9, ..at };
+        assert!(below.validate().is_ok());
+    }
+
+    /// Zero is the control an operator uses to measure what the filter saves,
+    /// so it has to stay reachable.
+    #[test]
+    fn a_zero_filter_is_allowed() {
+        let c = ContractValueAlerts {
+            enabled: true,
+            transfer_alert_btc: 50.0,
+            replay_filter_btc: 0.0,
+            ..Default::default()
+        };
+        assert!(c.validate().is_ok());
+        assert!(c.replay_filter_wei().is_zero());
+    }
+
+    #[test]
+    fn the_filter_defaults_well_below_the_alert_threshold() {
+        let c = ContractValueAlerts::default();
+        assert!(
+            c.replay_filter_wei() * alloy_primitives::U256::from(100u64)
+                <= c.transfer_alert_wei(),
+            "the default filter should be at least 100x below the default alert threshold"
+        );
+    }
+
+    #[test]
+    fn wei_renders_to_rbtc_truncated_not_rounded() {
+        let one = U256::from(10u64).pow(U256::from(18u64));
+        assert_eq!(wei_to_rbtc_string(one), "1.00000000");
+        // A shade under one satoshi more: it must not round up to .00000001.
+        assert_eq!(wei_to_rbtc_string(one + U256::from(9_999_999_999u64)), "1.00000000");
+        assert_eq!(wei_to_rbtc_string(one + U256::from(10_000_000_000u64)), "1.00000001");
     }
 }

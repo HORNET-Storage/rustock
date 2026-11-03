@@ -418,6 +418,20 @@ impl BlockProcessor {
         if !supply.is_balanced() {
             crate::supply::report(header.number, &supply);
         }
+        // The same deltas, reused. A watcher that wants to know whether this
+        // block is worth re-executing can read the largest movement here
+        // instead of executing it to find out, and the deltas were computed
+        // above whether or not anyone asks. Reported only when the per-block
+        // check actually ran: with it disabled the deltas are empty, and
+        // reporting a zero would tell a consumer "nothing moved" when the
+        // truth is "nobody looked".
+        if crate::supply::per_block_enabled() && crate::supply::movement_observer_installed() {
+            crate::supply::report_movement(&crate::supply::BlockMovement {
+                block: header.number,
+                block_hash: header.hash(),
+                max_movement: crate::supply::largest_movement(&supply),
+            });
+        }
         if supply.created_supply() {
             let (_, created) = supply.net();
             return Err(ProcessError::SupplyCreated { number: header.number, created });

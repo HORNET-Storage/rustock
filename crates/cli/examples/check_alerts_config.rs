@@ -26,6 +26,21 @@ fn main() -> anyhow::Result<()> {
         println!("    sustained for      {}s", health.for_secs);
         println!("    cooldown           {}s", health.cooldown_secs);
     }
+    let contract = &all.contract_value;
+    println!(
+        "\n  contract value       {}",
+        if contract.enabled { "enabled" } else { "disabled" }
+    );
+    if contract.enabled {
+        println!("    transfer threshold {} RBTC", contract.transfer_alert_btc);
+        println!("    threshold in wei   {}", contract.transfer_alert_wei());
+        println!("    replay filter      {} RBTC", contract.replay_filter_btc);
+        println!("    re-executes blocks up to {} behind the head", contract.max_catchup_blocks);
+        println!("    NOTE: a block is re-executed only when some account's balance moved");
+        println!("          more than the replay filter. On mainnet that is a very small");
+        println!("          fraction of blocks.");
+    }
+
     println!("\n  email                {}", if all.email.enabled { "enabled" } else { "disabled (log only)" });
     if all.email.enabled {
         println!("  smtp                 {}:{} ({:?})", all.email.smtp_host, all.email.smtp_port, all.email.tls);

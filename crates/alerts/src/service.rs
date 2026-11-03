@@ -6,12 +6,14 @@
 
 use crate::alert::Alert;
 use crate::config::PegoutAlerts;
+use crate::config::ContractValueAlerts;
 use crate::sink::AlertSink;
+use crate::value;
 use crate::watch;
-use alloy_primitives::B256;
+use alloy_primitives::{Address, B256, U256};
 use rustock_storage::BlockStore;
 use rustock_trie::{TrieNode, TrieStore};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -59,6 +61,24 @@ pub struct Watcher {
     config_seen_mtime: Option<SystemTime>,
     /// When the periodic in-transit report last fired.
     last_in_transit_report: std::time::Instant,
+    /// Large transfers in or out of a contract. Disabled unless a processor
+    /// was handed in: finding these means re-executing the block, and a
+    /// watcher with no processor has nothing to re-execute with.
+    contract: ContractValueAlerts,
+    processor: Option<Arc<rustock_execution::BlockProcessor>>,
+    chain_id: u64,
+    /// What the node's own execution saw each block move. Consulted before
+    /// re-executing anything; see [`crate::movement`].
+    movements: Option<Arc<crate::movement::MovementLog>>,
+    /// Counted per sweep, for the one line at the end of it.
+    replays: u64,
+    filtered: u64,
+    unrecorded: Option<(u64, u64)>,
+    /// Blocks this sweep declined to re-execute, and why. Summarised once per
+    /// sweep rather than logged per block, so a long catch-up reports a range
+    /// instead of thousands of lines -- but is never silent about the gap.
+    skipped_too_far: Option<(u64, u64)>,
+    skipped_no_state: Option<(u64, u64)>,
 }
 
 impl Watcher {
@@ -90,7 +110,37 @@ impl Watcher {
             config_seen_mtime: None,
             last_in_transit_report: std::time::Instant::now(),
             inbox: None,
+            contract: ContractValueAlerts::default(),
+            processor: None,
+            chain_id: 0,
+            movements: None,
+            replays: 0,
+            filtered: 0,
+            unrecorded: None,
+            skipped_too_far: None,
+            skipped_no_state: None,
         })
+    }
+
+    /// Watch for large value transfers involving a contract.
+    ///
+    /// The processor is what makes this possible and is the reason it is a
+    /// separate builder method rather than a field of the configuration: this
+    /// watch re-executes each block, so a caller that cannot supply a
+    /// processor cannot have it, and that should be a compile-time shape
+    /// rather than a runtime surprise.
+    pub fn with_contract_value(
+        mut self,
+        cfg: ContractValueAlerts,
+        processor: Arc<rustock_execution::BlockProcessor>,
+        chain_id: u64,
+        movements: Arc<crate::movement::MovementLog>,
+    ) -> Self {
+        self.contract = cfg;
+        self.processor = Some(processor);
+        self.chain_id = chain_id;
+        self.movements = Some(movements);
+        self
     }
 
     /// Accept alerts raised outside the watcher, such as a block that failed
@@ -132,8 +182,8 @@ impl Watcher {
         }
         self.config_seen_mtime = Some(mtime);
 
-        let new = match crate::config::Config::load(&path) {
-            Ok(c) => c.alerts.pegout,
+        let (new, new_contract) = match crate::config::Config::load(&path) {
+            Ok(c) => (c.alerts.pegout, c.alerts.contract_value),
             Err(e) => {
                 tracing::error!(
                     target: "rustock::alerts::pegout",
@@ -155,7 +205,10 @@ impl Watcher {
             }
         };
 
-        let (live, restart) = self.cfg.describe_changes(&new);
+        let (mut live, mut restart) = self.cfg.describe_changes(&new);
+        let (contract_live, contract_restart) = self.contract.describe_changes(&new_contract);
+        live.extend(contract_live);
+        restart.extend(contract_restart);
         if live.is_empty() && restart.is_empty() {
             tracing::info!(
                 target: "rustock::alerts::pegout",
@@ -172,6 +225,7 @@ impl Watcher {
         }
         if !live.is_empty() {
             self.cfg.adopt_live(&new);
+            self.contract.adopt_live(&new_contract);
             self.change_scripts = scripts;
             tracing::info!(
                 target: "rustock::alerts::pegout",
@@ -182,23 +236,78 @@ impl Watcher {
 
     /// Run until cancelled. Every error is logged and swallowed: a watcher that
     /// exits on a transient read failure is worse than one that retries.
+    ///
+    /// Each tick runs on a blocking thread rather than on a runtime worker.
+    /// A sweep reads the trie and, with the contract-value watch on,
+    /// re-executes blocks; both are CPU-bound work measured in tens of
+    /// milliseconds, and doing that on an async worker stalls every other
+    /// task sharing it -- the RPC server among them. The watcher is moved into
+    /// the blocking task and handed back, which is what keeps `&mut self`
+    /// usable without wrapping the whole thing in a lock.
     pub async fn run(mut self) {
-        tracing::info!(
-            target: "rustock::alerts::pegout",
-            "peg-out watcher started at #{}, thresholds: pegout {} BTC, output {} BTC, in transit {} BTC, {} confirmations",
-            self.next_block, self.cfg.pegout_alert_btc, self.cfg.output_alert_btc,
-            self.cfg.in_transit_alert_btc, self.cfg.confirmations
-        );
+        if self.cfg.enabled {
+            tracing::info!(
+                target: "rustock::alerts::pegout",
+                "peg-out watcher started at #{}, thresholds: pegout {} BTC, output {} BTC, in transit {} BTC, {} confirmations",
+                self.next_block, self.cfg.pegout_alert_btc, self.cfg.output_alert_btc,
+                self.cfg.in_transit_alert_btc, self.cfg.confirmations
+            );
+        }
+        if self.contract_value_active() {
+            tracing::info!(
+                target: "rustock::alerts::pegout",
+                "contract value watcher started at #{}, threshold {} RBTC, re-executing a block \
+                 only when some account moved more than {} RBTC, and only within {} blocks of \
+                 the executed head",
+                self.next_block,
+                self.contract.transfer_alert_btc,
+                self.contract.replay_filter_btc,
+                self.contract.max_catchup_blocks
+            );
+        }
         loop {
             // Read inside the loop so poll_interval_secs is itself reloadable.
             tokio::time::sleep(Duration::from_secs(self.cfg.poll_interval_secs)).await;
-            self.reload_config_if_changed();
-            self.drain_inbox();
-            if let Err(e) = self.sweep() {
-                tracing::warn!(target: "rustock::alerts::pegout", "sweep failed, will retry: {e:#}");
-            }
+            self = match tokio::task::spawn_blocking(move || {
+                self.tick();
+                self
+            })
+            .await
+            {
+                Ok(back) => back,
+                // The only way this returns Err is the tick panicking, which
+                // has already been reported by the panic hook. There is no
+                // watcher left to carry on with.
+                Err(e) => {
+                    tracing::error!(
+                        target: "rustock::alerts::pegout",
+                        "watcher task died and will not restart: {e}"
+                    );
+                    return;
+                }
+            };
+        }
+    }
+
+    /// One poll: re-read the configuration, deliver anything pushed in, sweep
+    /// the new blocks, and emit the periodic report. Synchronous on purpose --
+    /// see [`Watcher::run`].
+    fn tick(&mut self) {
+        self.reload_config_if_changed();
+        self.drain_inbox();
+        if let Err(e) = self.sweep() {
+            tracing::warn!(target: "rustock::alerts::pegout", "sweep failed, will retry: {e:#}");
+        }
+        // Reads Bridge state out of the trie, so it is worth nothing to a
+        // node running only the contract-value watch.
+        if self.cfg.enabled {
             self.report_in_transit_if_due();
         }
+    }
+
+    /// Whether the contract-value watch can actually run.
+    fn contract_value_active(&self) -> bool {
+        self.contract.enabled && self.processor.is_some()
     }
 
     /// Emit the in-transit line.
@@ -299,19 +408,76 @@ impl Watcher {
     /// Process every block executed since the last sweep.
     pub fn sweep(&mut self) -> anyhow::Result<()> {
         let head = self.head_number()?;
+        self.skipped_too_far = None;
+        self.skipped_no_state = None;
+        self.unrecorded = None;
+        self.replays = 0;
+        self.filtered = 0;
         while self.next_block <= head {
             let n = self.next_block;
-            if let Err(e) = self.process_block(n) {
+            if let Err(e) = self.process_block(n, head) {
                 // Do not advance past a block we failed to read: retry it.
                 tracing::warn!(target: "rustock::alerts::pegout", "block #{n}: {e:#}");
+                self.report_skipped();
                 return Ok(());
             }
             self.next_block = n + 1;
         }
+        self.report_skipped();
         Ok(())
     }
 
-    fn process_block(&mut self, number: u64) -> anyhow::Result<()> {
+    /// Say out loud which blocks the contract-value watch did not look at.
+    ///
+    /// A watch that quietly stops watching is worse than one that is off, so
+    /// the gap is always named. Once per sweep as a range, because a node
+    /// catching up from a day's downtime would otherwise emit thousands of
+    /// identical lines.
+    fn report_skipped(&mut self) {
+        if self.replays > 0 || self.filtered > 0 {
+            tracing::debug!(
+                target: "rustock::alerts::pegout",
+                replayed = self.replays,
+                filtered = self.filtered,
+                "contract value sweep"
+            );
+        }
+        if let Some((from, to)) = self.unrecorded.take() {
+            // Not an error -- a block this node imported rather than executed
+            // has no record and never will. Persistent, though, it means the
+            // movement hook is not installed and every block is being
+            // re-executed, which is the cost the filter exists to avoid.
+            tracing::info!(
+                target: "rustock::alerts::pegout",
+                "contract value watch re-executed #{from}..=#{to} without a movement record; \
+                 this node did not execute them, or the per-block supply check is off"
+            );
+        }
+        if let Some((from, to)) = self.skipped_too_far.take() {
+            tracing::warn!(
+                target: "rustock::alerts::pegout",
+                "contract value watch skipped #{from}..=#{to}: more than {} blocks behind the \
+                 executed head, so they were not re-executed. Peg-out checks still ran on them.",
+                self.contract.max_catchup_blocks
+            );
+        }
+        if let Some((from, to)) = self.skipped_no_state.take() {
+            tracing::warn!(
+                target: "rustock::alerts::pegout",
+                "contract value watch skipped #{from}..=#{to}: the parent state is no longer \
+                 held, so they cannot be re-executed"
+            );
+        }
+    }
+
+    fn note_skip(slot: &mut Option<(u64, u64)>, number: u64) {
+        match slot {
+            Some((_, to)) => *to = number,
+            None => *slot = Some((number, number)),
+        }
+    }
+
+    fn process_block(&mut self, number: u64, head: u64) -> anyhow::Result<()> {
         let Some(hash) = self.store.canonical_hash(number)? else {
             anyhow::bail!("no canonical hash");
         };
@@ -319,11 +485,36 @@ impl Watcher {
             anyhow::bail!("no header");
         };
         let receipts = self.store.receipts(hash)?.unwrap_or_default();
+
+        if self.cfg.enabled {
+            self.process_pegouts(number, &header, &receipts)?;
+        }
+        if self.contract_value_active() {
+            // Never fatal to the sweep: a block that cannot be re-executed is
+            // reported and the watcher moves on, because stopping here would
+            // also stop the peg-out watch that shares this loop.
+            if let Err(e) = self.process_contract_value(number, hash, &header, &receipts, head) {
+                tracing::warn!(
+                    target: "rustock::alerts::pegout",
+                    "contract value watch, block #{number}: {e:#}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Everything the peg-out watch does with one block.
+    fn process_pegouts(
+        &mut self,
+        number: u64,
+        header: &rustock_core::Header,
+        receipts: &[rustock_core::Receipt],
+    ) -> anyhow::Result<()> {
         let bridge = rustock_execution::precompiles::BRIDGE_ADDR;
 
         // 1. Log every peg-out event.
         let names = pegout_event_names();
-        for r in &receipts {
+        for r in receipts {
             for log in &r.logs {
                 if log.address != bridge {
                     continue;
@@ -346,7 +537,7 @@ impl Watcher {
         let mut alerts = Vec::new();
 
         // 2. Per-peg-out threshold, from release_requested.
-        let pegouts = watch::pegouts_in_receipts(&receipts, &bridge);
+        let pegouts = watch::pegouts_in_receipts(receipts, &bridge);
         for p in &pegouts {
             tracing::info!(
                 target: "rustock::alerts::pegout",
@@ -416,8 +607,221 @@ impl Watcher {
         Ok(())
     }
 
+    /// Large value transfers in or out of a contract, found by re-executing
+    /// the block with the call tracer attached.
+    ///
+    /// This is the only watch here that is not a read. A value transfer emits
+    /// no log and leaves nothing in the receipt, so the only way to see a
+    /// contract paying out is to run the block again and read the call tree.
+    /// The replay is still an observer -- it is handed a trie node, writes
+    /// nothing and runs on the watcher's own thread -- but it costs a second
+    /// execution of every block that has transactions in it.
+    fn process_contract_value(
+        &mut self,
+        number: u64,
+        hash: B256,
+        header: &rustock_core::Header,
+        receipts: &[rustock_core::Receipt],
+        head: u64,
+    ) -> anyhow::Result<()> {
+        let Some(processor) = self.processor.clone() else { return Ok(()) };
+
+        // A node catching up has thousands of blocks to sweep and would spend
+        // hours re-executing them. The peg-out watch still covers those; this
+        // one resumes once the backlog is inside the window.
+        if head.saturating_sub(number) > self.contract.max_catchup_blocks {
+            Self::note_skip(&mut self.skipped_too_far, number);
+            return Ok(());
+        }
+
+        // Did anything here move at all? Execution already computed every
+        // account's balance delta for this block as part of the supply
+        // check, so this answer is free and skips almost every block. See
+        // `crate::movement` for what a net figure gives up.
+        let recorded = self.movements.as_ref().and_then(|m| m.largest_movement(&hash));
+        match crate::movement::decide(recorded, self.contract.replay_filter_wei()) {
+            crate::movement::Replay::Skip => {
+                self.filtered += 1;
+                return Ok(());
+            }
+            crate::movement::Replay::NotRecorded => {
+                Self::note_skip(&mut self.unrecorded, number);
+                self.replays += 1;
+            }
+            crate::movement::Replay::Moved => self.replays += 1,
+        }
+
+        let Some((transactions, ommers)) = self.store.body(hash)? else {
+            anyhow::bail!("no body stored, so it cannot be re-executed");
+        };
+        // Free to dismiss, but rarer than it sounds: 300 consecutive mainnet
+        // blocks sampled in November 2026 all had transactions in them.
+        if transactions.is_empty() {
+            return Ok(());
+        }
+
+        let Some(parent) = self.store.header(header.parent_hash)? else {
+            anyhow::bail!("the parent header is missing, so there is no state to replay from");
+        };
+        let Some(parent_bytes) = self.trie.get(parent.state_root.as_slice()) else {
+            // Expected on a pruning node once a block ages out, and on the
+            // first blocks after a snapshot sync. Not an error.
+            Self::note_skip(&mut self.skipped_no_state, number);
+            return Ok(());
+        };
+        let parent_root = TrieNode::from_message(&parent_bytes, self.trie.as_ref());
+
+        let started = std::time::Instant::now();
+        let block = rustock_core::Block {
+            header: header.clone(),
+            transactions,
+            ommers,
+        };
+        let traces = processor
+            .trace_block_calls(&block, &parent_root, self.trie.clone())
+            .map_err(|e| anyhow::anyhow!("re-executing the block: {e}"))?;
+
+        // Whether an address is a contract is asked of the state **after**
+        // this block, not before it. A transaction that creates a contract and
+        // funds it in the same breath is exactly the case this watch is for,
+        // and the created account only has code in the post-state. The cost of
+        // that choice is a contract which self-destructs in the same block,
+        // whose outgoing transfer is still caught -- a SELFDESTRUCT frame
+        // names a contract by construction -- but whose incoming one is not.
+        let post_root = self
+            .trie
+            .get(header.state_root.as_slice())
+            .map(|b| TrieNode::from_message(&b, self.trie.as_ref()))
+            .unwrap_or_else(|| {
+                tracing::debug!(
+                    target: "rustock::alerts::pegout",
+                    "block #{number}: no post-state, classifying accounts against the parent"
+                );
+                parent_root.clone()
+            });
+
+        let threshold = self.contract.transfer_alert_wei();
+        let threshold_rbtc = crate::config::wei_to_rbtc_string(threshold);
+        let trie = self.trie.clone();
+        let chain_id = self.chain_id;
+        let mut code_memo: HashMap<Address, bool> = HashMap::new();
+        let mut found: Vec<Alert> = Vec::new();
+
+        for (index, tx) in block.transactions.iter().enumerate() {
+            let Some(trace) = traces.get(index) else { continue };
+            // A failed transaction moved nothing. `value::transfers_in_transaction`
+            // enforces this too; checking here saves the work.
+            if !receipts.get(index).map(|r| r.status).unwrap_or(false) {
+                continue;
+            }
+
+            // Recovering the sender costs an ECDSA recovery, so it is done
+            // only when the transaction's own transfer could breach. Passing
+            // a zero value below suppresses the top-level entry, which is
+            // correct: a transfer that cannot reach the threshold is not one
+            // this watch reports. Internal transfers need no sender.
+            let (sender, destination, top_value) = if tx.value > threshold {
+                match tx.recover_sender(chain_id) {
+                    Ok(s) => {
+                        let to = if tx.to.len() == 20 {
+                            Address::from_slice(tx.to.as_ref())
+                        } else {
+                            s.create(tx.nonce)
+                        };
+                        (s, to, tx.value)
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "rustock::alerts::pegout",
+                            "block #{number} tx {index}: sender not recoverable, its own \
+                             transfer cannot be checked: {e}"
+                        );
+                        (Address::ZERO, Address::ZERO, U256::ZERO)
+                    }
+                }
+            } else {
+                (Address::ZERO, Address::ZERO, U256::ZERO)
+            };
+
+            let transfers =
+                value::transfers_in_transaction(sender, destination, top_value, true, trace);
+            if transfers.is_empty() {
+                continue;
+            }
+
+            let tx_hash = tx.tx_hash().0;
+            let breaches = value::breaches(&transfers, threshold, |a| {
+                *code_memo.entry(*a).or_insert_with(|| {
+                    post_root
+                        .get(
+                            &rustock_trie::TrieKeySlice::from_key(&rustock_trie::code_key(a)),
+                            trie.as_ref(),
+                        )
+                        .is_some_and(|code| !code.is_empty())
+                })
+            });
+
+            for b in breaches {
+                tracing::warn!(
+                    target: "rustock::alerts::pegout",
+                    block = number,
+                    tx = %format!("0x{}", hex::encode(tx_hash)),
+                    from = %b.transfer.from,
+                    to = %b.transfer.to,
+                    amount_rbtc = %crate::config::wei_to_rbtc_string(b.transfer.value),
+                    amount_wei = %b.transfer.value,
+                    kind = b.transfer.kind.as_str(),
+                    "large transfer {}", b.direction.as_str()
+                );
+                found.push(Alert::LargeContractTransfer {
+                    block: number,
+                    tx_hash,
+                    from: format!("{}", b.transfer.from),
+                    to: format!("{}", b.transfer.to),
+                    direction: b.direction.as_str(),
+                    kind: b.transfer.kind.as_str(),
+                    path: b.transfer.path.clone(),
+                    amount_wei: b.transfer.value.to_string(),
+                    amount_rbtc: crate::config::wei_to_rbtc_string(b.transfer.value),
+                    threshold_rbtc: threshold_rbtc.clone(),
+                });
+            }
+        }
+
+        tracing::debug!(
+            target: "rustock::alerts::pegout",
+            block = number,
+            transactions = block.transactions.len(),
+            took_ms = started.elapsed().as_millis() as u64,
+            alerts = found.len(),
+            "contract value replay"
+        );
+
+        for alert in found {
+            self.deliver(alert);
+        }
+        Ok(())
+    }
+
+    /// Alerts remembered for deduplication before the set is dropped and
+    /// rebuilt. Peg-out alerts arrive a few a day and would never reach this;
+    /// the contract-value watch can, if someone sets a threshold low enough
+    /// to match ordinary traffic. Forgetting is better than growing without
+    /// bound, and saying so is better than forgetting quietly.
+    const MAX_REMEMBERED_ALERTS: usize = 50_000;
+
     /// Deduplicate and hand one alert to every sink.
     fn deliver(&mut self, alert: Alert) {
+        if self.seen.len() >= Self::MAX_REMEMBERED_ALERTS {
+            tracing::warn!(
+                target: "rustock::alerts::pegout",
+                "{} alerts remembered for deduplication; forgetting them. Repeats of older \
+                 alerts may be delivered again. A threshold low enough to reach this is \
+                 probably mis-set.",
+                self.seen.len()
+            );
+            self.seen.clear();
+        }
         if !self.seen.insert(alert.dedup_key()) {
             return;
         }
