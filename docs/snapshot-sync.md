@@ -73,6 +73,23 @@ a free denial of service. Now the peer is charged, the session is abandoned,
 and another starts against a different peer — up to `MAX_SNAP_ATTEMPTS` (5),
 carrying forward the list of peers already found unhelpful.
 
+### Nor can five failures
+
+When the attempts are spent, a node that has executed something hands over to
+ordinary sync, which can execute the blocks it is missing. A node that has
+executed nothing cannot: all it holds are the headers the sessions wrote, and
+nothing to execute them from. On mainnet on 6 November 2026 a light node handed
+over anyway, and ordinary sync tried three times to execute #9,372,260 on top
+of genesis, said "this node holds headers it has no way to execute", and
+stopped until someone restarted it.
+
+So such a node stays out of ordinary sync and tries snapshot sync again, after
+30 minutes, then after twice as long each time up to a day, one attempt per
+wait, and with every peer asked again: one set aside may have been set aside
+through no fault of its own (those five attempts failed on a bug in this
+client), and it may be the only one serving snapshots. A failure that keeps
+repeating costs one state download a day.
+
 ### The header walk runs in parallel
 
 For a node that starts with nothing, step 2 covers the whole mainnet chain:

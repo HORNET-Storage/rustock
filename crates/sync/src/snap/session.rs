@@ -311,6 +311,12 @@ impl SnapSession {
         Vec::new()
     }
 
+    /// End the session as a failure, for tests of what follows one.
+    #[cfg(test)]
+    pub(crate) fn fail_for_test(&mut self, why: SnapFailure) {
+        self.fail(why);
+    }
+
     /// What to do now. Safe to call as often as the caller likes: it returns
     /// only work that is not already outstanding.
     /// Tell this session how many of its requests are still outstanding.

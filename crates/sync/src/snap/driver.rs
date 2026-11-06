@@ -275,6 +275,12 @@ impl SnapDriver {
         &self.session
     }
 
+    /// End the session as a failure, for tests of what follows one.
+    #[cfg(test)]
+    pub(crate) fn fail_for_test(&mut self, why: super::session::SnapFailure) {
+        self.session.fail_for_test(why);
+    }
+
     pub fn is_finished(&self) -> bool {
         matches!(self.session.phase(), Phase::Done | Phase::Failed)
     }

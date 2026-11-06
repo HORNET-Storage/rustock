@@ -5570,6 +5570,155 @@ async fn the_ordinary_sync_resumes_when_the_snapshot_session_gives_up() {
     );
 }
 
+/// A node with genesis and nothing executed, a snapshot sync started on it.
+fn snapshot_syncing_node() -> (SyncService, Arc<BlockStore>, tempfile::TempDir) {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+    let mut service = make_service(store.clone()).with_trie_store_for_test(Arc::new(
+        rustock_trie::MemoryTrieStore::new(),
+    ));
+    service.start_snap_sync(
+        crate::snap::SnapConfig { client_enabled: true, ..Default::default() },
+        Arc::new(HeaderVerifier::new()),
+    );
+    assert!(service.snap_phase().is_some(), "precondition: a session is running");
+    (service, store, dir)
+}
+
+/// What failed every attempt on mainnet on 6 November 2026.
+fn state_not_whole() -> crate::snap::session::SnapFailure {
+    crate::snap::session::SnapFailure::IncompleteState("trie node 0x751b is not in the store".into())
+}
+
+/// Fail sessions until no further one opens, and say how many that took.
+async fn fail_until_spent(service: &mut SyncService) -> u32 {
+    let mut failed = 0;
+    while service.snap_phase().is_some() {
+        assert!(failed <= crate::service::MAX_SNAP_ATTEMPTS, "sessions kept opening");
+        service.fail_snap_session_for_test(state_not_whole()).await;
+        failed += 1;
+    }
+    failed
+}
+
+/// Make the waiting try due now.
+fn make_the_next_try_due(service: &mut SyncService) {
+    let (at, _) = service.snap_retry_for_test();
+    assert!(at.is_some(), "no try is waiting");
+    *at = Some(Instant::now());
+}
+
+/// A node that has executed nothing waits and tries snapshot sync again when
+/// its attempts are spent, rather than handing over to an ordinary sync that
+/// has nothing to execute from.
+///
+/// Mainnet, 6 November 2026: after five failed attempts a light node handed
+/// over, ordinary sync tried three times to execute #9,372,260 on genesis,
+/// said "this node holds headers it has no way to execute", and stopped for
+/// good: nothing more would happen until someone restarted it.
+#[tokio::test]
+async fn a_node_that_executed_nothing_tries_snapshot_sync_again_rather_than_halting() {
+    use crate::service::{MAX_SNAP_ATTEMPTS, SNAP_RETRY_FIRST};
+    use crate::snap::session::Phase;
+
+    let (mut service, _store, _dir) = snapshot_syncing_node();
+    let gate = service.prune_gate();
+
+    assert_eq!(fail_until_spent(&mut service).await, MAX_SNAP_ATTEMPTS);
+
+    // Spent: no session, still standing aside, and another try set.
+    assert!(
+        service.is_suspended_for_snap_for_test(),
+        "handed over to an ordinary sync with nothing to execute from"
+    );
+    assert!(
+        !gate.load(std::sync::atomic::Ordering::Relaxed),
+        "pruning was released while the node still waits on a snapshot"
+    );
+    let (at, next_wait) = service.snap_retry_for_test();
+    assert!(at.is_some(), "no further try was set");
+    assert_eq!(next_wait, SNAP_RETRY_FIRST * 2, "the wait after this one doubles");
+
+    // A tick before it is due changes nothing. In particular the guard for a
+    // node suspended with no session must not take the wait for one.
+    service.on_tick().await;
+    assert_eq!(service.snap_phase(), None);
+    assert!(service.is_suspended_for_snap_for_test(), "the wait was taken for a lost session");
+
+    // Once due, a session opens, and it is a single attempt.
+    make_the_next_try_due(&mut service);
+    service.on_tick().await;
+    assert_eq!(service.snap_phase(), Some(Phase::AwaitingStatus), "the try that was set did not happen");
+    assert_eq!(fail_until_spent(&mut service).await, 1, "a later round is one attempt");
+    let (at, next_wait) = service.snap_retry_for_test();
+    assert!(at.is_some(), "no try was set after the second round");
+    assert_eq!(next_wait, SNAP_RETRY_FIRST * 4);
+    assert!(service.is_suspended_for_snap_for_test());
+}
+
+/// The wait between tries stops growing at a day, so a node keeps trying.
+#[tokio::test]
+async fn the_wait_between_snapshot_tries_stops_growing_at_a_day() {
+    let (mut service, _store, _dir) = snapshot_syncing_node();
+    fail_until_spent(&mut service).await;
+    for _ in 0..12 {
+        make_the_next_try_due(&mut service);
+        service.on_tick().await;
+        fail_until_spent(&mut service).await;
+    }
+    let (at, next_wait) = service.snap_retry_for_test();
+    assert!(at.is_some(), "the node stopped trying");
+    assert_eq!(next_wait, crate::service::SNAP_RETRY_MAX);
+}
+
+/// A new try asks every peer again: one set aside may have been set aside
+/// through no fault of its own -- the attempts on mainnet failed on a bug in
+/// this client -- and it may be the only one serving snapshots.
+#[tokio::test]
+async fn a_new_snapshot_try_asks_every_peer_again() {
+    let (mut service, _store, _dir) = snapshot_syncing_node();
+    fail_until_spent(&mut service).await;
+    service.snap_avoid_for_test().insert(B512::repeat_byte(7));
+
+    make_the_next_try_due(&mut service);
+    service.on_tick().await;
+
+    assert!(service.snap_phase().is_some(), "precondition: the try happened");
+    assert!(service.snap_avoid_for_test().is_empty(), "a peer is still set aside");
+}
+
+/// A node that has executed something hands over to ordinary sync as before:
+/// executing the blocks it is missing is its way forward.
+#[tokio::test]
+async fn a_node_that_has_executed_still_hands_over_to_ordinary_sync() {
+    let (mut service, store, _dir) = snapshot_syncing_node();
+    // Execution recorded beyond genesis, as though it had happened meanwhile.
+    let one = dummy_header(1, store.head().unwrap().unwrap(), U256::from(1));
+    store.update_head(&one, U256::from(2)).unwrap();
+    store.set_exec_head(one.hash(), one.state_root).unwrap();
+
+    assert_eq!(fail_until_spent(&mut service).await, crate::service::MAX_SNAP_ATTEMPTS);
+
+    assert!(!service.is_suspended_for_snap_for_test(), "the peer set was not handed back");
+    assert!(service.snap_retry_for_test().0.is_none(), "a try was set for a node with a way forward");
+}
+
+/// Execution recorded at genesis is execution of nothing, as `start_snap_sync`
+/// already reads it: such a node waits and tries again too.
+#[tokio::test]
+async fn a_node_executed_only_to_genesis_tries_snapshot_sync_again_too() {
+    let (mut service, store, _dir) = snapshot_syncing_node();
+    let genesis = store.head().unwrap().unwrap();
+    store.set_exec_head(genesis, B256::ZERO).unwrap();
+
+    fail_until_spent(&mut service).await;
+
+    assert!(service.is_suspended_for_snap_for_test(), "handed over with nothing to execute from");
+    assert!(service.snap_retry_for_test().0.is_some(), "no further try was set");
+}
+
 // ── serving headers: the canonical fast path (#185) ──────────────────────────
 
 /// **The fast path must return exactly what the walk returns.** It is an

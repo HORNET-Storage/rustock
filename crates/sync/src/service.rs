@@ -60,7 +60,20 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// reason to abandon the feature -- but trying forever against a hostile
 /// network is not better. Each attempt costs a status round trip and whatever
 /// of the header walk it got through.
-const MAX_SNAP_ATTEMPTS: u32 = 5;
+///
+/// Concluding it will not work *now*, for a node that has executed nothing:
+/// such a node has no other way forward, so it waits [`SNAP_RETRY_FIRST`] and
+/// tries again, one attempt per wait (see `finish_snap_sync`).
+pub(crate) const MAX_SNAP_ATTEMPTS: u32 = 5;
+
+/// The first wait before a node that has executed nothing tries snapshot sync
+/// again, after its attempts are spent. Each wait doubles, to
+/// [`SNAP_RETRY_MAX`].
+pub(crate) const SNAP_RETRY_FIRST: Duration = Duration::from_secs(30 * 60);
+
+/// The longest wait between attempts, so a failure that keeps repeating costs
+/// a day one state download, not five an hour.
+pub(crate) const SNAP_RETRY_MAX: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// How long a coherence violation must persist before it is worth reporting.
 ///
@@ -491,6 +504,12 @@ pub struct SyncService {
     snap_attempts: u32,
     /// Peers not worth asking, carried between sessions.
     snap_avoid: std::collections::HashSet<B512>,
+    /// When a node that has executed nothing tries snapshot sync again, its
+    /// attempts spent. Ordinary sync stays suspended until then: it has
+    /// nothing to execute from.
+    snap_retry_at: Option<Instant>,
+    /// How long the next such wait will be.
+    snap_retry_wait: Duration,
     block_processor: Option<Arc<BlockProcessor>>,
     trie_store: Option<Arc<dyn TrieStore>>,
     pub(crate) current_state_root: Option<TrieNode>,
@@ -689,6 +708,8 @@ impl SyncService {
             snap_restart: None,
             snap_attempts: 0,
             snap_avoid: std::collections::HashSet::new(),
+            snap_retry_at: None,
+            snap_retry_wait: SNAP_RETRY_FIRST,
             trie_store: None,
             current_state_root: None,
             executing: None,
@@ -1202,6 +1223,32 @@ impl SyncService {
         self.snap_restart = None;
     }
 
+    /// End the running session as a failure, through the handover a real
+    /// failure takes.
+    #[cfg(test)]
+    pub(crate) async fn fail_snap_session_for_test(
+        &mut self,
+        why: crate::snap::session::SnapFailure,
+    ) {
+        if let Some(driver) = self.snap.as_mut() {
+            driver.fail_for_test(why);
+        }
+        self.finish_snap_sync().await;
+    }
+
+    /// When snapshot sync is next tried, if a node is waiting to try it again,
+    /// and how long the wait after that will be.
+    #[cfg(test)]
+    pub(crate) fn snap_retry_for_test(&mut self) -> (&mut Option<Instant>, Duration) {
+        (&mut self.snap_retry_at, self.snap_retry_wait)
+    }
+
+    /// Peers snapshot sessions are not asking, carried between them.
+    #[cfg(test)]
+    pub(crate) fn snap_avoid_for_test(&mut self) -> &mut std::collections::HashSet<B512> {
+        &mut self.snap_avoid
+    }
+
     /// Sessions started so far.
     #[cfg(test)]
     pub(crate) fn snap_attempts_for_test(&self) -> u32 {
@@ -1346,6 +1393,32 @@ impl SyncService {
         }
     }
 
+    /// Whether this node has executed nothing past genesis: the only node
+    /// `start_snap_sync` starts a session for, and one ordinary sync can do
+    /// nothing for once a session has written its window of headers.
+    fn executed_nothing(&self) -> bool {
+        self.recorded_execution().is_none_or(|executed| executed.number == 0)
+    }
+
+    /// Try snapshot sync again, after the wait `finish_snap_sync` set.
+    ///
+    /// Every peer gets another chance: one set aside may have been set aside
+    /// through no fault of its own, and it may be the only one that serves
+    /// snapshots. The round is a single attempt, so a failure that repeats
+    /// costs one attempt per wait rather than a round of them.
+    fn retry_snap_sync(&mut self) {
+        let (Some((config, verifier)), Some(trie_store)) =
+            (self.snap_restart.clone(), self.trie_store.clone())
+        else {
+            self.resume_ordinary_sync();
+            return;
+        };
+        info!(target: "rustock::snap", "trying snapshot sync again");
+        self.snap_avoid.clear();
+        self.snap_attempts = MAX_SNAP_ATTEMPTS - 1;
+        self.open_snap_session(config, verifier, trie_store);
+    }
+
     /// Hand a completed snapshot over to ordinary sync, or report the failure.
     async fn finish_snap_sync(&mut self) {
         let Some(driver) = self.snap.take() else { return };
@@ -1395,6 +1468,26 @@ impl SyncService {
                     return;
                 };
                 if self.snap_attempts >= MAX_SNAP_ATTEMPTS {
+                    // A node that has executed nothing has no other way
+                    // forward: ordinary sync has no state to execute from,
+                    // only the headers the sessions wrote. Handing over left
+                    // a mainnet light node halted for good on 6 November
+                    // 2026 ("this node holds headers it has no way to
+                    // execute"). So it waits, and tries again.
+                    if self.executed_nothing() && self.trie_store.is_some() {
+                        let wait = self.snap_retry_wait;
+                        self.snap_retry_wait = (wait * 2).min(SNAP_RETRY_MAX);
+                        self.snap_retry_at = Some(Instant::now() + wait);
+                        warn!(
+                            target: "rustock::snap",
+                            "snapshot sync gave up after {} attempt(s): {why}. This node has \
+                             executed nothing, so ordinary sync has nothing to start from; \
+                             trying again in {} min",
+                            self.snap_attempts,
+                            wait.as_secs() / 60
+                        );
+                        return;
+                    }
                     warn!(
                         target: "rustock::snap",
                         "snapshot sync gave up after {} attempts: {why}", self.snap_attempts
@@ -1448,6 +1541,11 @@ impl SyncService {
             self.refresh_status_to_peers().await;
         }
 
+        if self.snap.is_none() && self.snap_retry_at.is_some_and(|at| Instant::now() >= at) {
+            self.snap_retry_at = None;
+            self.retry_snap_sync();
+        }
+
         if self.snap.is_some() {
             let now = Instant::now();
             if let Some(driver) = self.snap.as_mut() {
@@ -1459,8 +1557,9 @@ impl SyncService {
         // Suspended with no session to wait for is a bug, and the shape of the
         // bug is a node that never syncs again -- the worst failure available
         // here, and a silent one. `finish_snap_sync` resumes on every path it
-        // owns; this catches a path it does not, complains, and recovers.
-        if self.suspended_for_snap && self.snap.is_none() {
+        // owns; this catches a path it does not, complains, and recovers. A
+        // node waiting to try snapshot sync again has a session to wait for.
+        if self.suspended_for_snap && self.snap.is_none() && self.snap_retry_at.is_none() {
             warn!(
                 target: "rustock::snap",
                 "ordinary sync was suspended with no snapshot session running; resuming"
