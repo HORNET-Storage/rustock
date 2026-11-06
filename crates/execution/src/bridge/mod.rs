@@ -1108,15 +1108,18 @@ mod tests {
     /// the failure it exists to catch.
     #[test]
     fn bridge_method_table_is_fully_dispatched() {
-        const SOURCE: &str = include_str!("mod.rs");
-        let start = SOURCE
+        // Read as LF whatever the checkout wrote: on a Windows checkout with
+        // CRLF endings the search below found nothing, and the test failed
+        // on a source that was fine.
+        let source = include_str!("mod.rs").replace("\r\n", "\n");
+        let start = source
             .find("    match method_name {\n        // Phase 2: BTC header chain")
             .expect("dispatch match not found -- did its shape change?");
-        let end = SOURCE[start..]
+        let end = source[start..]
             .find("        _ => unimplemented_method(method_name),")
             .expect("dispatch default arm not found")
             + start;
-        let dispatch = &SOURCE[start..end];
+        let dispatch = &source[start..end];
 
         /// Every method in the table is implemented as of issue #97. The list
         /// stays as the place to name one that is not, so that "unimplemented"
