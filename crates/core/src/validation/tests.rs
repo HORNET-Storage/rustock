@@ -704,6 +704,67 @@ fn fork_detection_starts_above_block_449() {
     );
 }
 
+/// A view of the chain that holds these headers, newest first.
+struct Held(Vec<Header>);
+
+impl fork_detection::MainchainView for Held {
+    fn headers_from(&self, _from: B256, count: u64) -> Vec<Header> {
+        self.0.iter().take(count as usize).cloned().collect()
+    }
+}
+
+/// rskj sums the uncle counts of the 32 headers below a block in Java `int`
+/// arithmetic (`IntStream.sum`) and caps the sum at 255. A sum that wraps
+/// below zero makes `new Uint8` throw, which `tryToConnect` turns into
+/// `INVALID_BLOCK`, so the block is refused whatever data it carries; one
+/// that wraps on past zero counts what it came to.
+#[test]
+fn the_uncle_counts_sum_as_a_java_int() {
+    let chain = |counts: &[u64]| -> Vec<Header> {
+        (0..fork_detection::REQUIRED_BLOCKS)
+            .map(|i| {
+                let mut header = create_dummy_header(10_000 - i, 1000, B256::ZERO);
+                header.uncle_count = counts.get(i as usize).copied().unwrap_or(0);
+                header.bitcoin_merged_mining_header = Some(Bytes::from(vec![0u8; 80]));
+                header
+            })
+            .collect()
+    };
+    let sum = |counts: &[u64]| fork_detection::uncle_sum(&chain(counts));
+    let max = i32::MAX as u64;
+    let below_zero = || ValidationError::UncleCountsSumBelowZero { sum: i32::MIN };
+
+    assert_eq!(sum(&[1, 2, 3]), Ok(6));
+    assert_eq!(sum(&[200, 56]), Ok(255));
+    let mut beyond = vec![0; 33];
+    beyond[32] = 5;
+    assert_eq!(sum(&beyond), Ok(0), "only the 32 newest count");
+    assert_eq!(sum(&[max, 1]), Err(below_zero()));
+    // 2 * (2^31 - 1) + 9 = 2^32 + 7.
+    assert_eq!(sum(&[max, max, 9]), Ok(7));
+
+    let block = create_dummy_header(10_001, 1000, B256::ZERO);
+    let wrapped = Held(chain(&[max, max, 9]));
+    let data = fork_detection::calculate(&wrapped.0).unwrap();
+    assert_eq!(data[7], 7);
+    assert_eq!(
+        fork_detection::validate(&block, Some(data), &wrapped, 0),
+        Ok(())
+    );
+    // Below zero, no data passes: not the 255 a saturating sum gives, nor the
+    // 0 a clamp gives, nor any other count with the right vector and height.
+    let refused = Held(chain(&[max, 1]));
+    for count in 0..=u8::MAX {
+        let mut carried = data;
+        carried[7] = count;
+        assert_eq!(
+            fork_detection::validate(&block, Some(carried), &refused, 0),
+            Err(below_zero()),
+            "carrying {count}"
+        );
+    }
+}
+
 /// Merge-mine `header` the way a miner does: commit to it in a coinbase, and
 /// roll the Bitcoin header's nonce until its hash meets the RSK difficulty.
 fn seal(header: &mut Header, btc_time: u64) {

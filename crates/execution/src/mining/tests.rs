@@ -10,7 +10,7 @@ use alloy_primitives::{Address, B256, Bytes, U256, address, b256};
 use bitcoin::hashes::Hash as _;
 use rustock_core::config::{ActivationHeights, ChainConfig};
 use rustock_core::validation::merged_mining::{compress_coinbase, compute_coinbase_hash};
-use rustock_core::validation::{HeaderValidator, MergedMiningRule};
+use rustock_core::validation::{HeaderValidator, MergedMiningRule, ValidationError};
 use rustock_core::Header;
 use rustock_storage::BlockStore;
 use rustock_trie::{MemoryTrieStore, TrieNode, TrieStore};
@@ -404,7 +404,7 @@ fn fork_detection_data_is_empty_on_a_short_chain() {
     let chain: Vec<Header> = (0..448)
         .map(|i| header_at(448 - i, B256::ZERO, B256::ZERO))
         .collect();
-    assert!(fork_detection::calculate(&chain).is_empty());
+    assert!(fork_detection::calculate(&chain).unwrap().is_empty());
 }
 
 #[test]
@@ -418,7 +418,7 @@ fn fork_detection_data_commits_to_height_and_uncles() {
     }
     chain[32].uncle_count = 99;
 
-    let data = fork_detection::calculate(&chain);
+    let data = fork_detection::calculate(&chain).unwrap();
     assert_eq!(data.len(), fork_detection::FORK_DETECTION_DATA_LENGTH);
     assert_eq!(data[7], 32, "uncles outside the 32-block window must not count");
     assert_eq!(&data[8..12], &5_001u32.to_be_bytes(), "the height being mined");
@@ -436,7 +436,62 @@ fn fork_detection_uncle_count_saturates() {
             h
         })
         .collect();
-    assert_eq!(fork_detection::calculate(&chain)[7], 255);
+    assert_eq!(fork_detection::calculate(&chain).unwrap()[7], 255);
+}
+
+/// The miner sums the uncle counts as the validator does, in rskj's Java
+/// `int`: counts that wrap the sum below zero leave no block to build, as
+/// rskj's `BlockToMineBuilder` throws, and counts that wrap it on past zero
+/// give what it came to, not a saturated 255.
+#[test]
+fn fork_detection_uncle_count_wraps_as_a_java_int() {
+    let chain = |counts: &[u64]| -> Vec<Header> {
+        (0..fork_detection::REQUIRED_MAINCHAIN_BLOCKS)
+            .map(|i| {
+                let mut h = header_at(5_000 - i as u64, B256::ZERO, B256::ZERO);
+                h.uncle_count = counts.get(i).copied().unwrap_or(0);
+                h
+            })
+            .collect()
+    };
+    let max = i32::MAX as u64;
+    assert_eq!(
+        fork_detection::calculate(&chain(&[max, 1])),
+        Err(ValidationError::UncleCountsSumBelowZero { sum: i32::MIN })
+    );
+    // 2 * (2^31 - 1) + 9 = 2^32 + 7.
+    assert_eq!(
+        fork_detection::calculate(&chain(&[max, max, 9])).unwrap()[7],
+        7
+    );
+}
+
+/// And no template either, as rskj's `BlockToMineBuilder` throws before it
+/// executes anything; the same chain without those counts builds.
+#[test]
+fn no_template_on_a_chain_whose_uncle_counts_sum_below_zero() {
+    let fx = fixture(20);
+    let chain = |counts: [u64; 2]| -> Vec<Header> {
+        let mut chain = vec![fx.parent.clone()];
+        chain.extend((1..fork_detection::REQUIRED_MAINCHAIN_BLOCKS).map(|i| {
+            let mut h = header_at(5_000 - i as u64, B256::ZERO, B256::ZERO);
+            h.uncle_count = counts.get(i - 1).copied().unwrap_or(0);
+            h
+        }));
+        chain
+    };
+    let build = |mainchain: &[Header]| {
+        fx.server
+            .builder_for_test()
+            .build(mainchain, Vec::new(), &NoPendingTransactions)
+    };
+    assert!(build(&chain([0, 0])).is_ok());
+    assert!(matches!(
+        build(&chain([i32::MAX as u64, 1])),
+        Err(TemplateError::ForkDetection(
+            ValidationError::UncleCountsSumBelowZero { sum: i32::MIN }
+        ))
+    ));
 }
 
 /// The overlay replaces the last 12 bytes and nothing else: the first 20 are

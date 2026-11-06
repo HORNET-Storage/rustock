@@ -8,14 +8,15 @@
 //!
 //! Ported from rskj `co.rsk.mine.ForkDetectionDataCalculator`.
 
+use rustock_core::validation::fork_detection::uncle_sum;
+use rustock_core::validation::ValidationError;
 use rustock_core::Header;
 
 /// Bytes of commit-to-parents vector in the fork-detection data.
 const CPV_SIZE: usize = 7;
 /// Spacing, in blocks, between the ancestors the CPV commits to.
 const CPV_JUMP_FACTOR: u64 = 64;
-/// How many recent blocks' uncle counts are summed.
-const NUMBER_OF_UNCLES: usize = 32;
+
 /// Total length of the fork-detection data.
 pub const FORK_DETECTION_DATA_LENGTH: usize = 12;
 
@@ -32,17 +33,21 @@ pub const REQUIRED_MAINCHAIN_BLOCKS: usize = CPV_SIZE * CPV_JUMP_FACTOR as usize
 /// the block being built, index 1 its parent, and so on. Returns an empty
 /// vector when the chain is too short, which is what rskj does and what the
 /// header then carries -- early blocks legitimately have none.
-pub fn calculate(mainchain: &[Header]) -> Vec<u8> {
+///
+/// The uncle count is the validator's own sum, so the two can't drift, and
+/// its error is rskj's `BlockToMineBuilder` throwing: no block on top of
+/// `mainchain[0]` would be valid.
+pub fn calculate(mainchain: &[Header]) -> Result<Vec<u8>, ValidationError> {
     if mainchain.len() < REQUIRED_MAINCHAIN_BLOCKS {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     let mut data = Vec::with_capacity(FORK_DETECTION_DATA_LENGTH);
     data.extend_from_slice(&commit_to_parents_vector(mainchain));
-    data.push(uncle_sum(mainchain));
+    data.push(uncle_sum(mainchain)?);
     data.extend_from_slice(&((mainchain[0].number + 1) as u32).to_be_bytes());
     debug_assert_eq!(data.len(), FORK_DETECTION_DATA_LENGTH);
-    data
+    Ok(data)
 }
 
 /// One byte per committed ancestor, each the least significant byte of that
@@ -64,7 +69,9 @@ fn commit_to_parents_vector(mainchain: &[Header]) -> [u8; CPV_SIZE] {
 /// The last byte of the Bitcoin block hash in its conventional (reversed,
 /// as-displayed) order -- which is the *first* byte of the consensus
 /// little-endian encoding. A header without a decodable Bitcoin block
-/// contributes zero, matching what rskj gets from a hash it cannot compute.
+/// contributes zero, so chains built without merged mining, as the tests and
+/// the load generator build them, still get data. rskj's miner throws there
+/// instead, and the validator refuses a block above such a header.
 fn bitcoin_hash_least_significant_byte(header: &Header) -> u8 {
     use bitcoin::block::Header as BtcHeader;
     use bitcoin::consensus::Decodable;
@@ -78,15 +85,6 @@ fn bitcoin_hash_least_significant_byte(header: &Header) -> u8 {
         Ok(btc) => btc.block_hash().to_byte_array()[0],
         Err(_) => 0,
     }
-}
-
-/// Uncles included by the last 32 mainchain blocks, saturating at a byte.
-fn uncle_sum(mainchain: &[Header]) -> u8 {
-    let sum: u64 = mainchain[..NUMBER_OF_UNCLES]
-        .iter()
-        .map(|h| h.uncle_count)
-        .sum();
-    sum.min(u8::MAX as u64) as u8
 }
 
 /// Overlay fork-detection data onto a merged-mining hash, producing the 32

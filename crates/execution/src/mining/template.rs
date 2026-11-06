@@ -103,6 +103,10 @@ pub enum TemplateError {
     /// alternative is a chain of blocks nobody else accepts.
     #[error("the assembled block fails a block rule: {0}")]
     SelfCheck(ValidationError),
+    /// rskj's `BlockToMineBuilder` throws here too: no block on this parent
+    /// can carry fork-detection data the validator takes.
+    #[error("no block on this parent can be valid: {0}")]
+    ForkDetection(ValidationError),
 }
 
 /// A transaction waiting to be mined, with its sender already recovered.
@@ -190,6 +194,11 @@ impl BlockTemplateBuilder {
         pending: &dyn PendingTransactionSource,
     ) -> Result<BlockTemplate, TemplateError> {
         let parent = &mainchain[0];
+        // First, as rskj's `BlockToMineBuilder` works it out before executing
+        // anything: on a chain whose uncle counts sum below zero, no block is
+        // valid, and there is no template to build.
+        let fork_data =
+            fork_detection::calculate(mainchain).map_err(TemplateError::ForkDetection)?;
         let parent_state_root = parent.state_root;
         let state_root = self.load_state_root(parent_state_root)?;
 
@@ -334,7 +343,6 @@ impl BlockTemplateBuilder {
         header.gas_used = executed.gas_used;
         header.paid_fees = executed.paid_fees;
 
-        let fork_data = fork_detection::calculate(mainchain);
         let hash_for_merged_mining =
             fork_detection::apply_to_hash(header.hash_for_merged_mining(), &fork_data);
 

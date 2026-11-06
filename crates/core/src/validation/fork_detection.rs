@@ -37,10 +37,13 @@ pub trait MainchainView {
 /// rskj `ForkDetectionDataCalculator.calculateWithBlockHeaders`.
 ///
 /// `headers[0]` is the best block (the parent of the block being mined).
-/// Returns `None` when the view is too short, matching the Java's empty array.
-pub fn calculate(headers: &[Header]) -> Option<[u8; 12]> {
+/// [`ValidationError::ForkDetectionDataUnreadable`] when the view is too short,
+/// which rskj's rule refuses before it calculates, or when a Bitcoin header it
+/// reads is missing or doesn't decode, where the Java throws; and
+/// [`uncle_sum`]'s error where rskj's throws.
+pub fn calculate(headers: &[Header]) -> Result<[u8; 12], ValidationError> {
     if (headers.len() as u64) < REQUIRED_BLOCKS {
-        return None;
+        return Err(ValidationError::ForkDetectionDataUnreadable);
     }
     let mut data = [0u8; 12];
 
@@ -50,25 +53,43 @@ pub fn calculate(headers: &[Header]) -> Option<[u8; 12]> {
     let cpv_start = (best_height / CPV_JUMP_FACTOR) * CPV_JUMP_FACTOR;
     for (i, slot) in data.iter_mut().enumerate().take(CPV_SIZE) {
         let index = best_height - cpv_start + i as u64 * CPV_JUMP_FACTOR;
-        let header = headers.get(index as usize)?;
-        *slot = btc_hash_least_significant_byte(header)?;
+        *slot = headers
+            .get(index as usize)
+            .and_then(btc_hash_least_significant_byte)
+            .ok_or(ValidationError::ForkDetectionDataUnreadable)?;
     }
 
-    // getNumberOfUncles: the uncle count over the 32 newest blocks, saturating
-    // at 255 (`Uint8.MAX_VALUE`).
-    let uncle_sum: u64 = headers
-        .iter()
-        .take(NUMBER_OF_UNCLES)
-        .map(|h| h.uncle_count)
-        .sum();
-    data[7] = uncle_sum.min(u8::MAX as u64) as u8;
+    data[7] = uncle_sum(headers)?;
 
     // getBlockBeingMinedHeight: the parent's height plus one, as a big-endian
     // 32-bit integer (Java `(int)` truncation).
     let height_being_mined = best_height.wrapping_add(1) as u32;
     data[8..12].copy_from_slice(&height_being_mined.to_be_bytes());
 
-    Some(data)
+    Ok(data)
+}
+
+/// rskj `getNumberOfUncles`: the uncle counts of the 32 newest headers,
+/// summed in Java `int` arithmetic and capped at 255 (`Uint8.MAX_VALUE`).
+///
+/// Nothing ties a header's uncle count to the uncles it carries, so the
+/// counts are the miners' to choose, and `IntStream.sum` wraps. A sum that
+/// wraps below zero makes `new Uint8(sum)` throw, which rskj's
+/// `BlockChainImpl.tryToConnect` turns into `INVALID_BLOCK`, so no child of
+/// such a chain is valid, and its `BlockToMineBuilder` can't build one. A sum
+/// that wraps on past zero counts what it came to. rskj decodes each count
+/// with `intValueExact`, so none is over `i32::MAX`.
+pub fn uncle_sum(headers: &[Header]) -> Result<u8, ValidationError> {
+    let sum = headers
+        .iter()
+        .take(NUMBER_OF_UNCLES)
+        .fold(0i32, |sum, header| {
+            sum.wrapping_add(header.uncle_count as i32)
+        });
+    if sum < 0 {
+        return Err(ValidationError::UncleCountsSumBelowZero { sum });
+    }
+    Ok(u8::try_from(sum).unwrap_or(u8::MAX))
 }
 
 /// The last byte of the BTC block hash in bitcoinj's `getBytes()` order.
@@ -119,7 +140,7 @@ pub fn validate<V: MainchainView + ?Sized>(
 
     // hasEnoughBlocksToCalculateForkDetectionData: a short view is a rejection,
     // not a skip.
-    let expected = calculate(&headers).ok_or(ValidationError::ForkDetectionDataUnreadable)?;
+    let expected = calculate(&headers)?;
 
     if expected != got {
         return Err(ValidationError::ForkDetectionDataMismatch { expected, got });
