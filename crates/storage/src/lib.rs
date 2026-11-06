@@ -1361,6 +1361,31 @@ impl BlockStore {
         }
     }
 
+    /// The uncle headers of a stored block body, read without decoding its
+    /// transactions: all that the uncle rule and total difficulty need, for a
+    /// fraction of [`Self::body`]'s work on a busy block.
+    pub fn uncles(&self, hash: B256) -> Result<Option<Vec<Header>>> {
+        let Some(bytes) = self
+            .db
+            .get_cf(self.cf(CF_BODIES)?, hash.as_slice())
+            .context("Failed to read block body")?
+        else {
+            return Ok(None);
+        };
+        let mut buf = bytes.as_slice();
+        let outer = RlpHeader::decode(&mut buf)?;
+        let mut body = &buf[..outer.payload_length];
+        let transactions = RlpHeader::decode(&mut body)?;
+        body = &body[transactions.payload_length..];
+        let ommers_h = RlpHeader::decode(&mut body)?;
+        let mut ommers_buf = &body[..ommers_h.payload_length];
+        let mut ommers = Vec::new();
+        while !ommers_buf.is_empty() {
+            ommers.push(Header::decode(&mut ommers_buf)?);
+        }
+        Ok(Some(ommers))
+    }
+
 
     /// Returns a full block (header + body) by hash.
     /// If only the header is stored (no body), returns a header-only block
@@ -2839,6 +2864,24 @@ mod tests {
         for (i, uncle) in ret_ommers.iter().enumerate() {
             assert_eq!(uncle.number, (100 + i) as u64, "uncle {i} number mismatch");
         }
+    }
+
+    #[test]
+    fn uncles_reads_the_uncles_of_a_body_past_its_transactions() {
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+        let hash = B256::repeat_byte(0xCC);
+        assert_eq!(store.uncles(hash).unwrap(), None, "no body, no answer");
+
+        let txs: Vec<Transaction> = (0..10).map(dummy_tx).collect();
+        let ommers: Vec<Header> = (100..103).map(dummy_header).collect();
+        store.put_body(hash, &txs, &ommers).unwrap();
+        let (_, from_body) = store.body(hash).unwrap().unwrap();
+        assert_eq!(store.uncles(hash).unwrap(), Some(from_body));
+
+        // A body that names none answers none, which is not the same as no body.
+        store.put_body(hash, &txs, &[]).unwrap();
+        assert_eq!(store.uncles(hash).unwrap(), Some(Vec::new()));
     }
 
     #[test]

@@ -167,6 +167,62 @@ impl SyncManager {
         true
     }
 
+    /// What a block adds to the chain's work from what this node holds: with
+    /// its uncles in hand, its own difficulty and theirs once they pass the
+    /// whole uncle rule; without, its own difficulty alone, the lower bound a
+    /// bare header gives.
+    fn held_contribution(&self, hash: B256, header: &Header) -> U256 {
+        let Some(uncles) = crate::total_difficulty::held_uncles(&self.store, hash, header) else {
+            return header.difficulty;
+        };
+        match crate::total_difficulty::credited_uncles(&self.store, &self.verifier, header, &uncles) {
+            Ok(credited) => header.difficulty.saturating_add(credited),
+            Err(why) => {
+                debug!(
+                    target: "rustock::sync",
+                    "Block #{}: its uncles are not credited with their difficulty: {why}",
+                    header.number
+                );
+                header.difficulty
+            }
+        }
+    }
+
+    /// Settle the total difficulty of each of `blocks`, oldest first, now that
+    /// their bodies are held. See [`crate::total_difficulty`].
+    ///
+    /// Stops at the first it cannot settle, a block without its body or whose
+    /// parent has no total, because every total above it would start from a
+    /// bound. Returns how many it settled.
+    pub(crate) fn settle_total_difficulties(&self, blocks: &[(B256, Header)]) -> usize {
+        for (settled, (hash, header)) in blocks.iter().enumerate() {
+            let Ok(Some(uncles)) = self.store.uncles(*hash) else {
+                return settled;
+            };
+            if !self.settle_total_difficulty(*hash, header, &uncles) {
+                return settled;
+            }
+        }
+        blocks.len()
+    }
+
+    /// Settle one block's total difficulty from the uncles its body names.
+    /// `false` when it cannot be settled: its parent has no total, or the
+    /// store failed.
+    pub(crate) fn settle_total_difficulty(&self, hash: B256, header: &Header, uncles: &[Header]) -> bool {
+        match crate::total_difficulty::settle(&self.store, &self.verifier, hash, header, uncles) {
+            Ok(settled) => settled.is_some(),
+            Err(e) => {
+                warn!(
+                    target: "rustock::sync",
+                    "Could not settle the total difficulty of #{} ({:?}): {e}",
+                    header.number, hash
+                );
+                false
+            }
+        }
+    }
+
     /// The body of [`Self::handle_headers_response`], with the peer optional so
     /// that paths without an attributable sender can still store headers. A
     /// header with no parent from such a path is dropped and charged to nobody,
@@ -233,6 +289,17 @@ impl SyncManager {
 
             let already_stored = self.store.header(hash)?.is_some();
 
+            // What this block adds to the chain's work: its own difficulty and
+            // its uncles', and uncle headers travel only in the body. In order
+            // of what can be proved: the uncles this peer sent with the header;
+            // then the uncles of a body this node holds, once they pass the
+            // whole uncle rule; otherwise -- plain header-first sync from an
+            // `rsk/62` peer, which is every rskj node -- the header difficulty
+            // alone. That is a lower bound, and `crate::total_difficulty`
+            // settles it once the body is in.
+            let proven = self.proven.lock().unwrap().get(&hash).copied();
+            let contribution = proven.unwrap_or_else(|| self.held_contribution(hash, header));
+
             // The parent is the block named by `parent_hash`, and nothing else.
             // Take it from the chunk when the previous entry *is* that block,
             // otherwise from the store.
@@ -258,13 +325,17 @@ impl SyncManager {
                         // Held already, so it was verified when it was first
                         // stored. Carry its committed total difficulty rather
                         // than recomputing one from a parent of zero, which
-                        // would rewrite a real chain's weight downward.
+                        // would rewrite a real chain's weight downward. What
+                        // the block adds is taken off here and added back
+                        // below, so the total stays as stored; taking off its
+                        // own difficulty alone would count its uncles twice
+                        // once its total holds them.
                         parent_ref = None;
                         parent_td = self
                             .store
                             .total_difficulty(hash)?
                             .unwrap_or_default()
-                            .saturating_sub(header.difficulty);
+                            .saturating_sub(contribution);
                     } else {
                         // The named parent is not held, so there is nothing to
                         // verify this header against. Storing it anyway is how
@@ -294,26 +365,6 @@ impl SyncManager {
                 }
             }
 
-            // Total difficulty counts the uncle difficulties too, and those
-            // live only in the body -- a header records `uncle_count` and
-            // nothing more. During header-first sync the body has usually not
-            // arrived, so this is the header difficulty alone: a lower bound,
-            // corrected once the body lands. A block that declares no uncles
-            // needs no body, and `cumulative_difficulty` says so without a read.
-            // Total difficulty counts uncle difficulty too, and uncle headers
-            // live only in the body. In order of what can actually be proved:
-            // the uncles this peer sent with the header, then a body this node
-            // already holds, then -- during plain header-first sync, where
-            // neither exists -- the header difficulty alone, which is a lower
-            // bound and the reason `rsk/63` carries the uncles at all.
-            let contribution = self
-                .proven
-                .lock()
-                .unwrap()
-                .get(&hash)
-                .copied()
-                .or_else(|| self.store.cumulative_difficulty(hash, header).ok().flatten())
-                .unwrap_or(header.difficulty);
             let new_td = parent_td + contribution;
 
             // For NEW headers with a known parent, run full verification.

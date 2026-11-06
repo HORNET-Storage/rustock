@@ -4271,6 +4271,13 @@ impl SyncService {
     /// blocking thread (freeing the event loop to download N+1) or — if a
     /// previous batch is still executing — park this batch until it completes.
     pub(crate) async fn finish_batch(&mut self, pending: &[(B256, Header)], peer_best: u64) {
+        // The batch's bodies are all held, so the totals that header-first
+        // sync could only bound are settled now, oldest first, each with its
+        // block's uncles once they pass the uncle rule. Without this a node
+        // that caught up this way carries every uncle it skipped in every
+        // total above it. See `crate::total_difficulty`.
+        self.manager.settle_total_difficulties(pending);
+
         // The download succeeded: advance the download cursor so the next
         // skeleton round queues the blocks that follow this batch. Execution
         // (the exec_head cursor) advances independently when the spawned job
@@ -5165,6 +5172,11 @@ impl SyncService {
             }
             self.follow_gap_since = None;
             let (hash, header, txs, uncles) = self.follow_buffer.remove(&next_num).unwrap();
+            // The body is in hand and the parent is the executed head, whose
+            // total is settled already, so this block's total can be settled
+            // too, rather than wait for a fork announcement to bring its
+            // header round again. See `crate::total_difficulty`.
+            self.manager.settle_total_difficulty(hash, &header, &uncles);
             if !self.process_single_block(hash, &header, txs, uncles).await {
                 // Real divergence: head didn't advance, so looping would spin.
                 return;

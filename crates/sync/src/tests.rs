@@ -6886,6 +6886,299 @@ async fn a_committed_uncle_without_proof_of_work_proves_nothing() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Total difficulty once the body is held. Header-first sync can only bound a
+// block's total, because its uncles travel in the body; `total_difficulty`
+// settles it once the body is in, crediting the uncles only once they pass
+// the whole uncle rule.
+// ---------------------------------------------------------------------------
+
+/// A header naming `uncles`: its uncle count and its uncles hash commit to
+/// them, as the body check on receipt requires.
+fn naming_uncles(mut header: Header, uncles: &[Header]) -> Header {
+    header.uncle_count = uncles.len() as u64;
+    header.ommers_hash = rustock_execution::processor::compute_ommers_hash(uncles);
+    header.cached_hash = None;
+    header
+}
+
+/// Fails the header whose difficulty is 999, standing in for an uncle whose
+/// merged-mining proof of work does not hold.
+struct NoWorkAt999;
+
+impl rustock_core::validation::HeaderValidator for NoWorkAt999 {
+    fn validate(&self, h: &Header) -> Result<(), rustock_core::validation::ValidationError> {
+        if h.difficulty == U256::from(999u64) {
+            return Err(rustock_core::validation::ValidationError::BitcoinPowInvalid {
+                hash: h.hash(),
+                target: U256::ZERO,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Genesis held whole with a total of 1; #1 on it, worth 10; and two siblings
+/// of #1 for a later block to name as uncles, worth `first` and `second`.
+fn genesis_and_siblings(store: &BlockStore, first: u64, second: u64) -> (Header, Vec<Header>) {
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+    store.put_body(genesis.hash(), &[], &[]).unwrap();
+    let b1 = dummy_header(1, genesis.hash(), U256::from(10));
+    let uncles = vec![
+        dummy_header(1, genesis.hash(), U256::from(first)),
+        dummy_header(1, genesis.hash(), U256::from(second)),
+    ];
+    (b1, uncles)
+}
+
+/// Answer each body request the service makes until it makes no more, with no
+/// transactions and the uncles `uncles_of` gives the block asked for.
+async fn answer_body_requests(service: &mut SyncService, uncles_of: impl Fn(B256) -> Vec<Header>) {
+    for _ in 0..16 {
+        let asked: Vec<(u64, B256, B512)> = match &service.state {
+            SyncState::DownloadingBodies { pending_headers, id_index, .. } => id_index
+                .iter()
+                .map(|(id, (i, peer))| (*id, pending_headers[*i].0, *peer))
+                .collect(),
+            _ => return,
+        };
+        for (id, hash, peer) in asked {
+            service.on_body_response(peer, id, vec![], uncles_of(hash)).await;
+        }
+    }
+    panic!("the service kept asking for bodies: {:?}", service.state);
+}
+
+/// Catch up #1 to #3 header-first, from a peer that cannot send uncles, then
+/// download their bodies, #2's naming `uncles`. Returns the three headers.
+async fn caught_up(
+    store: &Arc<BlockStore>,
+    verifier: HeaderVerifier,
+    b1: Header,
+    uncles: &[Header],
+) -> [Header; 3] {
+    let b2 = naming_uncles(dummy_header(2, b1.hash(), U256::from(10)), uncles);
+    let b3 = dummy_header(3, b2.hash(), U256::from(10));
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let (tx, _rx) = mpsc::channel(rustock_networking::peers::PEER_CHANNEL_CAPACITY);
+    peer_store.add_peer(B512::repeat_byte(0x01), tx).await;
+    let manager = Arc::new(SyncManager::new(store.clone(), Arc::new(verifier), peer_store.clone()));
+    manager
+        .handle_headers_response(vec![b3.clone(), b2.clone(), b1.clone()], test_peer())
+        .unwrap();
+    assert_eq!(
+        store.total_difficulty(b3.hash()).unwrap(),
+        Some(U256::from(31)),
+        "each total is a bound until the bodies come"
+    );
+
+    let (_event_tx, event_rx) = mpsc::unbounded_channel();
+    let mut service = SyncService::new(manager, peer_store, event_rx);
+    service.start_body_downloads(3).await;
+    let named = b2.hash();
+    answer_body_requests(&mut service, |hash| {
+        if hash == named { uncles.to_vec() } else { Vec::new() }
+    })
+    .await;
+    assert!(matches!(service.state, SyncState::Following), "{:?}", service.state);
+    [b1, b2, b3]
+}
+
+/// Once a caught-up batch's bodies are in, each total is made exact, oldest
+/// first, and every total above an uncle carries it, as rskj's do. A node that
+/// never did this ran 6.9 x 10^25 short of rskj after 8,000 mainnet blocks.
+#[tokio::test]
+async fn a_caught_up_batch_counts_the_uncles_its_bodies_bring() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let (b1, uncles) = genesis_and_siblings(&store, 7, 5);
+    let [b1, b2, b3] = caught_up(&store, HeaderVerifier::new(), b1, &uncles).await;
+
+    // 1 + 10; then + 10 + 7 + 5; then + 10.
+    assert_eq!(store.total_difficulty(b1.hash()).unwrap(), Some(U256::from(11)));
+    assert_eq!(store.total_difficulty(b2.hash()).unwrap(), Some(U256::from(33)));
+    assert_eq!(store.total_difficulty(b3.hash()).unwrap(), Some(U256::from(43)));
+}
+
+/// A body's uncles count only once they pass the whole uncle rule, proof of
+/// work included. The body check on receipt shows only that the block's miner
+/// chose them, and an uncle that never did its work would otherwise add what
+/// it claims to every total above it.
+#[tokio::test]
+async fn a_caught_up_body_whose_uncle_did_no_work_adds_no_uncle() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let (b1, uncles) = genesis_and_siblings(&store, 7, 999);
+    let verifier = HeaderVerifier::new().with_static_rule(NoWorkAt999);
+    let [_, b2, b3] = caught_up(&store, verifier, b1, &uncles).await;
+
+    // Neither uncle: rskj refuses the whole block over one.
+    assert_eq!(store.total_difficulty(b2.hash()).unwrap(), Some(U256::from(21)));
+    assert_eq!(store.total_difficulty(b3.hash()).unwrap(), Some(U256::from(31)));
+}
+
+/// In follow mode a block's total is settled from the executed head's when its
+/// body comes, rather than when a fork announcement next brings its header
+/// round again.
+#[tokio::test]
+async fn a_followed_block_counts_its_uncles_when_its_body_comes() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let (b1, uncles) = genesis_and_siblings(&store, 7, 5);
+    let b2 = naming_uncles(dummy_header(2, b1.hash(), U256::from(10)), &uncles);
+
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let verifier = Arc::new(HeaderVerifier::new());
+    let manager = Arc::new(SyncManager::new(store.clone(), verifier, peer_store.clone()));
+    manager.handle_headers_response(vec![b1.clone()], test_peer()).unwrap();
+    store.put_body(b1.hash(), &[], &[]).unwrap();
+    store.set_exec_head(b1.hash(), B256::ZERO).unwrap();
+    manager.handle_headers_response(vec![b2.clone()], test_peer()).unwrap();
+    assert_eq!(
+        store.total_difficulty(b2.hash()).unwrap(),
+        Some(U256::from(21)),
+        "a bound until the body comes"
+    );
+
+    let (_event_tx, event_rx) = mpsc::unbounded_channel();
+    let mut service = SyncService::new(manager, peer_store, event_rx);
+    service.state = SyncState::Following;
+    let peer = B512::repeat_byte(9);
+    service
+        .pending_follow_bodies
+        .insert(7, (b2.hash(), b2.clone(), std::time::Instant::now(), peer));
+    service.on_body_response(peer, 7, vec![], uncles).await;
+
+    assert_eq!(store.total_difficulty(b2.hash()).unwrap(), Some(U256::from(33)));
+}
+
+/// A header ingested again with its body held, as a fork announcement does to
+/// the last few hundred, is credited the body's uncles only once they pass the
+/// whole uncle rule, as settling does.
+#[tokio::test]
+async fn a_header_ingested_again_credits_only_uncles_that_did_their_work() {
+    for (second, total) in [(5u64, 33u64), (999, 21)] {
+        let dir = tempdir().unwrap();
+        let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+        let (b1, uncles) = genesis_and_siblings(&store, 7, second);
+        let b2 = naming_uncles(dummy_header(2, b1.hash(), U256::from(10)), &uncles);
+        let verifier = Arc::new(HeaderVerifier::new().with_static_rule(NoWorkAt999));
+        let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+        let manager = SyncManager::new(store.clone(), verifier, peer_store);
+        manager.handle_headers_response(vec![b2.clone(), b1.clone()], test_peer()).unwrap();
+        store.put_body(b1.hash(), &[], &[]).unwrap();
+        store.put_body(b2.hash(), &[], &uncles).unwrap();
+
+        manager.handle_headers_response(vec![b2.clone(), b1.clone()], test_peer()).unwrap();
+        assert_eq!(
+            store.total_difficulty(b2.hash()).unwrap(),
+            Some(U256::from(total)),
+            "uncles worth 7 and {second}"
+        );
+    }
+}
+
+/// A held header whose parent is not held keeps the total it has. What the
+/// block adds is taken off and added back, so taking off its own difficulty
+/// alone counted its uncles twice once its total held them.
+#[tokio::test]
+async fn a_held_header_without_its_parent_keeps_its_total() {
+    use rustock_networking::protocol::HeaderWithUncles;
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let (b1, uncles) = genesis_and_siblings(&store, 7, 5);
+    let b2 = naming_uncles(dummy_header(2, b1.hash(), U256::from(10)), &uncles);
+    // #2 held with the total that counts its uncles; #1 not held at all.
+    store.put_header(&b2).unwrap();
+    store.put_total_difficulty(b2.hash(), U256::from(33)).unwrap();
+
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = SyncManager::new(store.clone(), Arc::new(HeaderVerifier::new()), peer_store);
+    // A peer at `rsk/63` proves what #2 adds, its uncles with it.
+    let entries = vec![
+        HeaderWithUncles { header: b1, uncles: Vec::new() },
+        HeaderWithUncles { header: b2.clone(), uncles },
+    ];
+    assert!(entries.iter().all(HeaderWithUncles::commitment_matches));
+    manager.note_proven_difficulties(entries);
+
+    manager.handle_headers_response(vec![b2.clone()], test_peer()).unwrap();
+    assert_eq!(store.total_difficulty(b2.hash()).unwrap(), Some(U256::from(33)));
+}
+
+/// An uncle is judged against the uncles its block's ancestors named, so it is
+/// not credited while an ancestor's are not held: the rule would read that
+/// ancestor as naming none, and pass an uncle it had named already.
+#[tokio::test]
+async fn an_uncle_is_not_credited_while_an_ancestors_uncles_are_not_held() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let (b1, uncles) = genesis_and_siblings(&store, 7, 5);
+    let reused = &uncles[..1];
+    // #2 names the uncle and #3 names it again, which the rule refuses -- but
+    // only a node holding #2's uncles can see it.
+    let b2 = naming_uncles(dummy_header(2, b1.hash(), U256::from(10)), reused);
+    let b3 = naming_uncles(dummy_header(3, b2.hash(), U256::from(10)), reused);
+    for (header, total) in [(&b1, 11u64), (&b2, 28)] {
+        store.put_header(header).unwrap();
+        store.put_total_difficulty(header.hash(), U256::from(total)).unwrap();
+    }
+    store.put_body(b1.hash(), &[], &[]).unwrap();
+    store.put_header(&b3).unwrap();
+
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = SyncManager::new(store.clone(), Arc::new(HeaderVerifier::new()), peer_store);
+    assert!(manager.settle_total_difficulty(b3.hash(), &b3, reused));
+    assert_eq!(
+        store.total_difficulty(b3.hash()).unwrap(),
+        Some(U256::from(38)),
+        "#2's uncles are not held, so #3's are not credited"
+    );
+
+    // With #2's uncles held, the rule sees the reuse and refuses it.
+    store.put_body(b2.hash(), &[], reused).unwrap();
+    assert!(manager.settle_total_difficulty(b3.hash(), &b3, reused));
+    assert_eq!(store.total_difficulty(b3.hash()).unwrap(), Some(U256::from(38)));
+
+    // And an uncle that no ancestor named is credited: 28 + 10 + 5.
+    let fresh = &uncles[1..];
+    let b3 = naming_uncles(dummy_header(3, b2.hash(), U256::from(10)), fresh);
+    store.put_header(&b3).unwrap();
+    assert!(manager.settle_total_difficulty(b3.hash(), &b3, fresh));
+    assert_eq!(store.total_difficulty(b3.hash()).unwrap(), Some(U256::from(43)));
+}
+
+/// The oldest ancestor the rule walks, seven generations back or genesis, must
+/// have its uncles held as much as the nearest.
+#[tokio::test]
+async fn the_oldest_ancestor_the_uncle_rule_walks_must_be_held_too() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+    let b1 = dummy_header(1, genesis.hash(), U256::from(10));
+    store.put_header(&b1).unwrap();
+    store.put_total_difficulty(b1.hash(), U256::from(11)).unwrap();
+    store.put_body(b1.hash(), &[], &[]).unwrap();
+    let uncles = vec![dummy_header(1, genesis.hash(), U256::from(7))];
+    let b2 = naming_uncles(dummy_header(2, b1.hash(), U256::from(10)), &uncles);
+    store.put_header(&b2).unwrap();
+
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = SyncManager::new(store.clone(), Arc::new(HeaderVerifier::new()), peer_store);
+    assert!(manager.settle_total_difficulty(b2.hash(), &b2, &uncles));
+    assert_eq!(
+        store.total_difficulty(b2.hash()).unwrap(),
+        Some(U256::from(21)),
+        "genesis is within the rule's reach and its uncles are not held"
+    );
+
+    store.put_body(genesis.hash(), &[], &[]).unwrap();
+    assert!(manager.settle_total_difficulty(b2.hash(), &b2, &uncles));
+    assert_eq!(store.total_difficulty(b2.hash()).unwrap(), Some(U256::from(28)));
+}
+
 /// One real uncle may not be counted twice.
 ///
 /// After #268 a peer cannot fabricate uncles: the list is bound to the trunk

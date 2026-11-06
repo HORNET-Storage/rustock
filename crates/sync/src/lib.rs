@@ -10,6 +10,7 @@ mod manager;
 mod progress;
 mod service;
 mod state;
+mod total_difficulty;
 mod tracker;
 pub mod chain_activity;
 pub mod gas_price;
