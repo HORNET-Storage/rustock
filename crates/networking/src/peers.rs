@@ -127,6 +127,20 @@ impl PeerStore {
             .collect()
     }
 
+    /// Peers that can be asked for headers with their uncles.
+    ///
+    /// The snapshot ascent asks only these: it needs each header's uncles, and
+    /// only a peer at `rsk/63` sends them. The descending walk asks anyone.
+    pub async fn peers_sending_header_uncles(&self) -> Vec<B512> {
+        self.connected_peers
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, p)| p.caps.understands_header_uncles())
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
     /// Whether this peer can serve a block at `number`.
     ///
     /// A peer that never stated a range serves everything: that is what every
@@ -543,5 +557,24 @@ mod snap_capability_tests {
             store.peers_serving_snapshots().await.is_empty(),
             "rsk/63 does not imply snap"
         );
+    }
+
+    /// Headers with their uncles come only from `rsk/63` peers, and `snap`
+    /// says nothing about it either way.
+    #[tokio::test]
+    async fn header_uncles_are_asked_only_of_rsk63_peers() {
+        let store = PeerStore::new();
+        let (tx, _rx) = mpsc::channel(4);
+        let rsk63 = B512::repeat_byte(1);
+        let rsk62_snap = B512::repeat_byte(2);
+        store
+            .add_peer_with(rsk63, tx.clone(), PeerCapabilities { rsk_version: 63, snap: false })
+            .await;
+        store
+            .add_peer_with(rsk62_snap, tx, PeerCapabilities { rsk_version: 62, snap: true })
+            .await;
+
+        assert_eq!(store.peers_sending_header_uncles().await, vec![rsk63]);
+        assert_eq!(store.peers_serving_snapshots().await, vec![rsk62_snap]);
     }
 }

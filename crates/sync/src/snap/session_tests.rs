@@ -638,7 +638,7 @@ fn a_body_that_does_not_match_its_header_is_refused() {
 // ------------------------------------------------------- blaming the peer
 
 use alloy_primitives::B512;
-use crate::snap::driver::{Blame, SnapDriver};
+use crate::snap::driver::{Blame, Peers, SnapDriver};
 use rustock_networking::protocol::{P2pMessage, RskSubMessage};
 use rustock_networking::protocol::snap::Refusal;
 use rustock_networking::scoring::EventType;
@@ -897,6 +897,152 @@ fn a_timed_out_request_is_charged() {
     assert_eq!(blame[0].event, EventType::TimeoutMessage);
 }
 
+// ------------------------------------------------ who is asked for what
+
+/// The header walk asks ordinary peers. Its header and skeleton requests are
+/// messages every peer serves, and with only the `snap` peers to ask, the walk
+/// stalled for good on mainnet when the one peer that had offered the
+/// checkpoint stopped answering, with fifteen other peers connected.
+#[test]
+fn the_header_walk_asks_peers_without_snap() {
+    let f = fixture(20);
+    let genesis = f.with_genesis();
+    let (blocks, tds) = chain(1, 3, genesis, 100, f.state_root);
+    let server = B512::repeat_byte(1);
+    let plain = B512::repeat_byte(2);
+    let mut driver = SnapDriver::new(f.session(HeaderVerifier::new()));
+
+    let out = driver.poll(Peers { snap: &[server], uncles: &[], any: &[server, plain] });
+    let (status_id, kind) = asked(&out[0]);
+    assert_eq!(kind, "status");
+    assert_eq!(out[0].peer, server, "a status request goes only to a snap peer");
+
+    // Only an ordinary peer is left to ask, as when the server stops answering.
+    let only_plain = Peers { snap: &[], uncles: &[], any: &[plain] };
+    let out = driver.on_status(status_id, server, &blocks, &tds, 5_000, 0, only_plain);
+    assert!(!out.is_empty(), "the walk stalled with an ordinary peer to ask");
+    for request in &out {
+        let (_, kind) = asked(request);
+        assert!(matches!(kind, "headers" | "skeleton"), "asked an ordinary peer for a {kind}");
+        assert_eq!(request.peer, plain);
+    }
+}
+
+/// A snapshot message never goes to a peer that did not announce `snap`: rskj
+/// closes the connection on a message id it does not know, so asking the wrong
+/// peer would lose it.
+#[test]
+fn snapshot_requests_go_only_to_snap_peers() {
+    let f = fixture(20);
+    let server = B512::repeat_byte(1);
+    let plain = B512::repeat_byte(2);
+    let mut driver = SnapDriver::new(f.session(HeaderVerifier::new()));
+
+    let out = driver.poll(Peers { snap: &[], uncles: &[plain], any: &[plain] });
+    assert!(out.is_empty(), "asked a peer without snap for a snapshot message");
+    assert!(driver.outstanding_ids().is_empty());
+
+    let out = driver.poll(Peers { snap: &[server], uncles: &[], any: &[server, plain] });
+    let (_, kind) = asked(&out[0]);
+    assert_eq!(kind, "status");
+    assert_eq!(out[0].peer, server);
+}
+
+/// A request that nobody connected can take is handed back, not lost: once a
+/// peer that can take it is there, it is asked.
+#[test]
+fn a_request_nobody_can_take_is_asked_once_somebody_can() {
+    let f = fixture(20);
+    let genesis = f.with_genesis();
+    let (blocks, tds) = chain(1, 3, genesis, 100, f.state_root);
+    let server = B512::repeat_byte(1);
+    let mut driver = SnapDriver::new(f.session(HeaderVerifier::new()));
+
+    let out = driver.poll(&[server]);
+    let (status_id, _) = asked(&out[0]);
+    let nobody_for_headers = Peers { snap: &[server], uncles: &[], any: &[] };
+    let out = driver.on_status(status_id, server, &blocks, &tds, 5_000, 0, nobody_for_headers);
+    assert!(out.is_empty());
+    assert!(
+        driver.outstanding_ids().is_empty(),
+        "a request that was never sent still counts against the budget"
+    );
+
+    let plain = B512::repeat_byte(2);
+    let out = driver.poll(Peers { snap: &[], uncles: &[], any: &[plain] });
+    assert!(!out.is_empty(), "the walk's requests were lost");
+    assert!(out.iter().all(|request| request.peer == plain));
+}
+
+/// An empty answer hands its range back, to be asked of somebody else.
+///
+/// Left marked as asked, it never was again. When the range was the walk's
+/// frontier, as here, nothing could move the walk past it.
+#[test]
+fn an_empty_header_answer_is_asked_again() {
+    let f = fixture(20);
+    let genesis = f.with_genesis();
+    let (blocks, tds) = chain(1, 4, genesis, 100, f.state_root);
+    let mut session = f.session(HeaderVerifier::new());
+
+    let first = session.on_status(&blocks, &tds, 8_000, 0);
+    assert_eq!(session.phase(), Phase::VerifyingHeaders);
+    let asked = first
+        .iter()
+        .find(|a| matches!(a, Action::RequestHeaders { .. }))
+        .cloned()
+        .expect("the walk asks for headers");
+    let Action::RequestHeaders { point, .. } = asked else { unreachable!() };
+
+    let again = session.on_headers(point, &[]);
+    assert!(again.contains(&asked), "the range was not asked for again: {again:?}");
+}
+
+/// A peer that left a request unanswered sits out while somebody else can be
+/// asked. On mainnet about half the peers never answered a header request,
+/// and each one's turn in the rotation cost the walk thirty seconds.
+#[test]
+fn a_peer_that_left_a_request_unanswered_sits_out() {
+    let f = fixture(20);
+    let genesis = f.with_genesis();
+    let (blocks, tds) = chain(1, 3, genesis, 100, f.state_root);
+    let server = B512::repeat_byte(1);
+    let silent = B512::repeat_byte(2);
+    let mut driver = SnapDriver::new(f.session(HeaderVerifier::new()));
+
+    let out = driver.poll(&[server]);
+    let (status_id, _) = asked(&out[0]);
+    // At first only `silent` can be asked for headers, and it answers nothing.
+    let only_silent = Peers { snap: &[server], uncles: &[], any: &[silent] };
+    let out = driver.on_status(status_id, server, &blocks, &tds, 5_000, 0, only_silent);
+    assert!(!out.is_empty() && out.iter().all(|request| request.peer == silent));
+    let later = std::time::Instant::now() + std::time::Duration::from_secs(31);
+    assert_eq!(driver.expire(later), out.len());
+
+    let out = driver.poll(Peers { snap: &[server], uncles: &[], any: &[server, silent] });
+    assert!(!out.is_empty(), "the walk's requests were not asked again");
+    assert!(
+        out.iter().all(|request| request.peer == server),
+        "a peer that answered nothing was asked again with another peer to ask"
+    );
+}
+
+/// But a peer sitting out is still asked when nobody else can be: a slow peer
+/// beats none, and a sync left with only such peers must still finish.
+#[test]
+fn a_peer_sitting_out_is_asked_when_nobody_else_can_be() {
+    let f = fixture(20);
+    let peers = vec![B512::repeat_byte(1)];
+    let mut driver = SnapDriver::new(f.session(HeaderVerifier::new()));
+    driver.poll(&peers);
+    let later = std::time::Instant::now() + std::time::Duration::from_secs(31);
+    assert_eq!(driver.expire(later), 1);
+
+    let out = driver.poll(&peers);
+    assert_eq!(out.len(), 1, "the request was not asked again");
+    assert_eq!(out[0].peer, peers[0]);
+}
+
 /// Serves a real chunk for `from` out of the fixture's trie.
 fn served_chunk(f: &Fixture, from: u64) -> ChunkPayload {
     let root_message = f.trie.get(f.state_root.as_slice()).expect("root");
@@ -1092,7 +1238,9 @@ fn outstanding_snap_requests_never_exceed_the_budget() {
     assert_eq!(kind, "status");
     driver.on_status(status_id, peers[0], &blocks, &tds, 8_000, 0, &peers);
 
-    let budget = 2usize; // `Fixture::session` sets max_in_flight: 2
+    // The walk's budget: two for each peer it can ask, never less than
+    // `max_in_flight` (which `Fixture::session` sets to 2).
+    let budget = 2usize.max(2 * peers.len());
     // Poll *and* feed responses back, so the response handlers are exercised
     // too -- capping only `poll` left those five paths issuing a fresh
     // budget's worth each.
@@ -1109,6 +1257,48 @@ fn outstanding_snap_requests_never_exceed_the_budget() {
             driver.outstanding_ids().len()
         );
     }
+}
+
+/// The header walk's budget is per peer, since every peer serves headers.
+/// Held to the eight a state download is allowed, forty peers sat mostly
+/// idle on mainnet through a walk of hours.
+#[test]
+fn the_header_walk_asks_more_of_more_peers() {
+    let f = fixture(64);
+    let genesis = f.with_genesis();
+    let (blocks, tds) = chain(1, 4_000, genesis, 100, f.state_root);
+    let peers: Vec<B512> = (1..=10).map(B512::repeat_byte).collect();
+    let mut driver = SnapDriver::new(f.session(HeaderVerifier::new()));
+
+    let out = driver.poll(&peers);
+    let (status_id, _) = asked(&out[0]);
+    let mut out = driver.on_status(status_id, peers[0], &blocks, &tds, 8_000, 0, &peers);
+
+    // Answer the skeletons honestly, so the walk knows more points than any
+    // budget allows, and leave the header requests outstanding.
+    for _ in 0..10 {
+        let mut next = Vec::new();
+        for request in &out {
+            let P2pMessage::RskMessage(m) = &request.message else { continue };
+            let RskSubMessage::SkeletonRequest(r) = &m.sub_message else { continue };
+            let ids: Vec<rustock_networking::protocol::BlockIdentifier> = blocks
+                .iter()
+                .map(|b| &b.header)
+                .filter(|h| h.number % 192 == 0)
+                .filter(|h| h.number >= r.start_number && h.number <= r.start_number + 3_840)
+                .map(|h| rustock_networking::protocol::BlockIdentifier { number: h.number, hash: h.hash() })
+                .collect();
+            next.extend(driver.on_skeleton(r.id, request.peer, &ids, &peers));
+        }
+        if next.is_empty() {
+            break;
+        }
+        out = next;
+    }
+
+    let outstanding = driver.outstanding_ids().len();
+    assert!(outstanding > 2, "held to a state download's budget: {outstanding} outstanding");
+    assert!(outstanding <= 2 * peers.len(), "{outstanding} outstanding, more than two per peer");
 }
 
 /// With a checkpoint configured, a session bounds the peer's claim before it

@@ -182,9 +182,14 @@ impl HeaderWalk {
             skeleton_todo.push(start);
             start += span;
         }
-        // Asked for from the top down: the walk finishes at the bottom, but it
-        // is the top that unblocks it.
-        skeleton_todo.reverse();
+        // Popped from the back, so the highest start is asked for first: the
+        // walk finishes at the bottom, but it is the top that unblocks it.
+        //
+        // Left ascending for that reason. The ascent reverses its queue
+        // because it wants the low end first; reversed here as well, the walk
+        // asked from genesis up, and its frontier sat at the checkpoint until
+        // all nine million mainnet headers had arrived -- 0.0% for the whole
+        // two hours, with nothing to tell that from a hang.
 
         // A walk feeds the freezer only when there is nothing to lose by
         // doing so: an empty freezer, on a node syncing from scratch. On a
@@ -277,51 +282,57 @@ impl HeaderWalk {
     /// Up to `budget` things to ask for, none of them already outstanding.
     pub fn wants(&mut self, budget: usize) -> Vec<Want> {
         let mut out = Vec::new();
-        if self.done {
+        if self.done || budget == 0 || self.need_number == 0 {
             return out;
         }
+        let need = self.need_number;
 
-        // Headers first: a skeleton is only useful once its points are being
-        // turned into headers, and the queue below is what finishes the walk.
-        let points: Vec<u64> = self
+        // The frontier first, asked for from the hash the linked chain names
+        // for it. That hash is this node's own finding, not a peer's claim,
+        // so the request needs no skeleton: it is the serial walk, running
+        // beneath the parallel one. It is also the only way back to the
+        // frontier once its point is gone -- a run there that does not link
+        // takes the point with it, and a short answer leaves the need between
+        // grid points, where no point sits -- and either used to stop the
+        // walk for good.
+        //
+        // It reaches down to the grid point below, so that the run under it
+        // can link: all 192 from a point on the grid, the remainder from the
+        // checkpoint or from wherever a short answer stopped.
+        if !self.headers_sent.contains(&need) && !self.runs.contains_key(&need) {
+            let floor = ((need - 1) / HEADER_CHUNK) * HEADER_CHUNK;
+            self.headers_sent.insert(need);
+            out.push(Want::Headers { from: self.need_hash, count: (need - floor) as u32, point: need });
+            if out.len() >= budget {
+                return out;
+            }
+        }
+
+        // Then the points below the frontier, highest first: a skeleton is
+        // only useful once its points are being turned into headers. Only
+        // below, because a point at or above the frontier is linked already,
+        // and asking for it again would fetch that stretch twice.
+        let points: Vec<(u64, B256)> = self
             .points
-            .keys()
+            .range(..need)
             .rev()
-            .copied()
-            .filter(|p| !self.headers_sent.contains(p) && !self.runs.contains_key(p))
-            .take(budget)
+            .filter(|(p, _)| !self.headers_sent.contains(*p) && !self.runs.contains_key(*p))
+            .take(budget - out.len())
+            .map(|(p, hash)| (*p, *hash))
             .collect();
-        for point in points {
-            let Some(hash) = self.points.get(&point).copied() else { continue };
+        for (point, hash) in points {
             self.headers_sent.insert(point);
             out.push(Want::Headers { from: hash, count: HEADER_CHUNK as u32, point });
-            if out.len() >= budget {
-                return out;
-            }
         }
 
-        // The stretch above the grid, which no skeleton point covers. It stops
-        // one *above* the grid top rather than at it: the grid's own run ends
-        // at its point, so a bespoke run reaching that far would overlap it and
-        // the two would not link.
-        let grid_top = (self.top.number / HEADER_CHUNK) * HEADER_CHUNK;
-        if self.top.number > grid_top
-            && !self.headers_sent.contains(&self.top.number)
-            && !self.runs.contains_key(&self.top.number)
-        {
-            self.headers_sent.insert(self.top.number);
-            out.push(Want::Headers {
-                from: self.top.hash(),
-                count: (self.top.number - grid_top) as u32,
-                point: self.top.number,
-            });
-            if out.len() >= budget {
-                return out;
-            }
-        }
-
+        // Skeletons with whatever is left, the highest first. One that starts
+        // at or above the frontier could name only linked points, and the
+        // frontier never rises, so it is dropped rather than asked.
         while out.len() < budget {
             let Some(start) = self.skeleton_todo.pop() else { break };
+            if start >= need {
+                continue;
+            }
             if self.skeleton_sent.insert(start) {
                 out.push(Want::Skeleton { start });
             }
@@ -346,7 +357,11 @@ impl HeaderWalk {
     /// Skeleton identifiers: where to ask, and nothing more.
     pub fn on_skeleton(&mut self, identifiers: &[BlockIdentifier]) {
         for id in identifiers {
-            if id.number == 0 || id.number > self.top.number {
+            // Only a grid point below the frontier can lead anywhere. Above
+            // it the chain is linked already. Off the grid no run can link,
+            // and one identifier usually is: rskj ends every skeleton with
+            // its best block, wherever that sits.
+            if id.number == 0 || id.number >= self.need_number || id.number % HEADER_CHUNK != 0 {
                 continue;
             }
             // A point already answered for is not replaced: the run that
@@ -547,6 +562,7 @@ impl HeaderWalk {
             }
 
             self.runs.remove(&self.need_number);
+            self.points.remove(&self.need_number);
             // The run covered down to its oldest header, so what is needed
             // next is that header's parent: one lower, and named by it.
             self.need_number = run.oldest_number.saturating_sub(1);

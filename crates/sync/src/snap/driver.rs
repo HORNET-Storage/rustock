@@ -25,10 +25,18 @@ use rustock_networking::protocol::{
 };
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
-use tracing::{debug, warn};
+use tracing::{debug, trace, warn};
 
 /// How long to wait on a snap request before offering the work elsewhere.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long a peer that left a request unanswered sits out, doubling for each
+/// further one it leaves in a row, up to [`BENCH_MAX`].
+const BENCH: Duration = Duration::from_secs(60);
+const BENCH_MAX: Duration = Duration::from_secs(16 * 60);
+/// Benched peers held before those whose time is up are swept out, so the
+/// record stays bounded however many peers come and go.
+const BENCH_SWEEP: usize = 1024;
 
 /// rskj reads request ids through Java's signed long, so an id above 2^63
 /// comes back sign-mangled.
@@ -60,6 +68,58 @@ struct InFlight {
 pub struct Outbound {
     pub peer: B512,
     pub message: P2pMessage,
+}
+
+/// Who can be sent what.
+///
+/// The six snapshot messages go only to peers that announced `snap`: rskj
+/// resolves an incoming id through `MessageType.valueOfType`, which throws on an
+/// unknown one, and closes the connection, so sending one to anyone else loses
+/// the peer. The header walk's requests are the ordinary header and skeleton
+/// messages, which every peer serves, so they go to anyone -- except during the
+/// ascent, which asks for headers with their uncles and so needs `rsk/63`.
+///
+/// Every request used to go to the `snap` peers alone. On mainnet those are
+/// few, and when the one that offered the checkpoint stopped answering, the
+/// walk stalled for good forty headers in, nine million short of genesis,
+/// with fifteen ordinary peers connected that could have served it.
+#[derive(Debug, Clone, Copy)]
+pub struct Peers<'a> {
+    /// Peers that announced `snap`.
+    pub snap: &'a [B512],
+    /// Peers that can be asked for headers with their uncles (`rsk/63`).
+    pub uncles: &'a [B512],
+    /// Every connected peer.
+    pub any: &'a [B512],
+}
+
+impl<'a> Peers<'a> {
+    /// One set of peers for every kind of request.
+    pub fn all(peers: &'a [B512]) -> Self {
+        Self { snap: peers, uncles: peers, any: peers }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.snap.is_empty() && self.uncles.is_empty() && self.any.is_empty()
+    }
+}
+
+impl<'a> From<&'a [B512]> for Peers<'a> {
+    fn from(peers: &'a [B512]) -> Self {
+        Self::all(peers)
+    }
+}
+
+impl<'a> From<&'a Vec<B512>> for Peers<'a> {
+    fn from(peers: &'a Vec<B512>) -> Self {
+        Self::all(peers)
+    }
+}
+
+impl<'a, const N: usize> From<&'a [B512; N]> for Peers<'a> {
+    fn from(peers: &'a [B512; N]) -> Self {
+        Self::all(peers)
+    }
 }
 
 /// Something a peer did that it should be charged for.
@@ -112,6 +172,15 @@ pub struct SnapDriver {
     /// keep declining. Not an accusation -- just a note to stop wasting
     /// requests on them.
     unhelpful: std::collections::HashSet<B512>,
+    /// Peers that left a request unanswered: how many in a row, and until
+    /// when they sit out.
+    ///
+    /// On mainnet about half the peers connected never answered a header
+    /// request at all. The rotation gave each its turn regardless, and every
+    /// turn cost thirty seconds of a request the walk was waiting on. A
+    /// peer's time out ends, so one that was only slow for a while is asked
+    /// again; and any answer clears it.
+    benched: HashMap<B512, (u32, Instant)>,
 }
 
 impl SnapDriver {
@@ -122,6 +191,7 @@ impl SnapDriver {
             next_peer: 0,
             blame: Vec::new(),
             unhelpful: std::collections::HashSet::new(),
+            benched: HashMap::new(),
         }
     }
 
@@ -238,9 +308,36 @@ impl SnapDriver {
                 let peer = request.peer;
                 self.release(request.what);
                 self.charge(peer, EventType::TimeoutMessage, "snap request timed out");
+                self.bench(peer, now);
             }
         }
         stale.len()
+    }
+
+    /// Sit `peer` out after a request it left unanswered.
+    fn bench(&mut self, peer: B512, now: Instant) {
+        if self.benched.len() >= BENCH_SWEEP {
+            self.benched.retain(|_, (_, until)| *until > now);
+        }
+        let (strikes, until) = self.benched.entry(peer).or_insert((0, now));
+        *strikes = strikes.saturating_add(1);
+        *until = now + BENCH.saturating_mul(1 << (*strikes - 1).min(4)).min(BENCH_MAX);
+    }
+
+    /// Of `peers`, those not sitting out -- or all of them, if every one is.
+    /// Asking a peer that was slow beats asking nobody, and a sync left with
+    /// only such peers must still finish.
+    fn available(&self, peers: &[B512], now: Instant) -> Vec<B512> {
+        let ready: Vec<B512> = peers
+            .iter()
+            .copied()
+            .filter(|p| self.benched.get(p).is_none_or(|(_, until)| now >= *until))
+            .collect();
+        if ready.is_empty() {
+            peers.to_vec()
+        } else {
+            ready
+        }
     }
 
     fn release(&mut self, what: Pending) {
@@ -271,29 +368,40 @@ impl SnapDriver {
     }
 
     /// Ask for whatever the session wants next, spreading the requests over
-    /// the peers given.
-    pub fn poll(&mut self, peers: &[B512]) -> Vec<Outbound> {
+    /// the peers that can take each kind.
+    pub fn poll<'p>(&mut self, peers: impl Into<Peers<'p>>) -> Vec<Outbound> {
+        let peers = peers.into();
         if peers.is_empty() || self.is_finished() {
             return Vec::new();
         }
-        let actions = self.ask();
+        let actions = self.ask(peers);
         self.dispatch(actions, peers)
     }
 
     /// Ask the session for work, having first told it how much is already
     /// outstanding.
     ///
-    /// Every path that can produce requests goes through here. Capping only
-    /// `poll` left the five response handlers issuing a fresh budget's worth
-    /// each, which is how ~1,100 requests ended up outstanding against a
-    /// budget of 8. See #185.
-    fn ask(&mut self) -> Vec<Action> {
-        self.session.note_in_flight(self.in_flight.len());
+    /// Every path that can produce requests goes through here or through
+    /// [`Self::note`]. Capping only `poll` left the five response handlers
+    /// issuing a fresh budget's worth each, which is how ~1,100 requests
+    /// ended up outstanding against a budget of 8. See #185.
+    fn ask(&mut self, peers: Peers<'_>) -> Vec<Action> {
+        self.note(peers);
         self.session.poll()
     }
 
-    /// The peers worth asking, which is all of them minus the ones that have
-    /// already said they cannot help.
+    /// Tell the session, before it decides what to ask for, what is already
+    /// outstanding and how many peers its header requests can go to.
+    fn note(&mut self, peers: Peers<'_>) {
+        self.session.note_in_flight(self.in_flight.len());
+        let now = Instant::now();
+        let headers = self.available(peers.any, now).len();
+        let uncles = self.available(peers.uncles, now).len();
+        self.session.note_header_peers(headers, uncles);
+    }
+
+    /// The snapshot peers worth asking for state, which is all of them minus
+    /// the ones that have already said they cannot serve it.
     fn worth_asking(&self, peers: &[B512]) -> Vec<B512> {
         let willing: Vec<B512> =
             peers.iter().copied().filter(|p| !self.unhelpful.contains(p)).collect();
@@ -307,19 +415,21 @@ impl SnapDriver {
         }
     }
 
-    fn dispatch(&mut self, actions: Vec<Action>, peers: &[B512]) -> Vec<Outbound> {
+    fn dispatch(&mut self, actions: Vec<Action>, peers: Peers<'_>) -> Vec<Outbound> {
         let mut out = Vec::new();
         if actions.is_empty() {
             return out;
         }
-        let peers = self.worth_asking(peers);
-        if peers.is_empty() {
-            return out;
-        }
+        // The ascent asks for headers with their uncles, which only `rsk/63`
+        // peers understand. The descending walk and the sampling gate ask for
+        // plain headers, which every peer serves.
+        let now = Instant::now();
+        let header_peers = self.available(
+            if self.session.phase() == Phase::AscendingHeaders { peers.uncles } else { peers.any },
+            now,
+        );
+        let snap_peers = self.available(&self.worth_asking(peers.snap), now);
         for action in actions {
-            let peer = peers[self.next_peer % peers.len()];
-            self.next_peer = self.next_peer.wrapping_add(1);
-
             let id = fresh_id();
             let (what, sub) = match action {
                 Action::RequestStatus => (
@@ -355,6 +465,20 @@ impl SnapDriver {
                 ),
             };
 
+            let candidates: &[B512] = match what {
+                Pending::Headers { .. } | Pending::Skeleton { .. } => &header_peers,
+                Pending::Status | Pending::Chunk { .. } | Pending::Blocks => &snap_peers,
+            };
+            if candidates.is_empty() {
+                // Nobody connected can be sent this one. Hand it back, so it is
+                // asked again once somebody can take it, rather than lose it.
+                self.release(what);
+                continue;
+            }
+            let peer = candidates[self.next_peer % candidates.len()];
+            self.next_peer = self.next_peer.wrapping_add(1);
+
+            trace!(target: "rustock::snap", "asking {:?} for {what:?} (request {id})", &peer.0[..4]);
             self.in_flight.insert(id, InFlight { what, peer, sent: Instant::now() });
             out.push(Outbound {
                 peer,
@@ -370,7 +494,7 @@ impl SnapDriver {
         self.session.set_peer_serves_uncles(yes);
     }
 
-    pub fn on_status(
+    pub fn on_status<'p>(
         &mut self,
         id: u64,
         sender: B512,
@@ -378,23 +502,24 @@ impl SnapDriver {
         difficulties: &[U256],
         trie_size: u64,
         grid: u64,
-        peers: &[B512],
+        peers: impl Into<Peers<'p>>,
     ) -> Vec<Outbound> {
         if !self.answers(id, sender, |p| matches!(p, Pending::Status)) {
             return Vec::new();
         }
-        self.session.note_in_flight(self.in_flight.len());
+        let peers = peers.into();
+        self.note(peers);
         let actions = self.session.on_status(blocks, difficulties, trie_size, grid);
         self.charge_for_failure(sender);
         self.dispatch(actions, peers)
     }
 
-    pub fn on_headers(
+    pub fn on_headers<'p>(
         &mut self,
         id: u64,
         sender: B512,
         headers: &[Header],
-        peers: &[B512],
+        peers: impl Into<Peers<'p>>,
     ) -> Vec<Outbound> {
         let Some(point) = self.in_flight.get(&id).and_then(|r| match r.what {
             Pending::Headers { point, .. } if r.peer == sender => Some(point),
@@ -403,8 +528,16 @@ impl SnapDriver {
             return Vec::new();
         };
         self.in_flight.remove(&id);
+        self.benched.remove(&sender);
+        trace!(
+            target: "rustock::snap",
+            "{} header(s) from {:?} for #{point} (request {id})",
+            headers.len(),
+            &sender.0[..4]
+        );
 
-        self.session.note_in_flight(self.in_flight.len());
+        let peers = peers.into();
+        self.note(peers);
         let actions = self.session.on_headers(point, headers);
         self.charge_for_failure(sender);
         self.dispatch(actions, peers)
@@ -416,12 +549,12 @@ impl SnapDriver {
     /// checkpoint, and in RSK that work includes every uncle the chain
     /// absorbed. Fed bare headers the walk can only compute a lower bound; fed
     /// these it computes the figure rskj computes.
-    pub fn on_headers_with_uncles(
+    pub fn on_headers_with_uncles<'p>(
         &mut self,
         id: u64,
         sender: B512,
         entries: &[rustock_networking::protocol::HeaderWithUncles],
-        peers: &[B512],
+        peers: impl Into<Peers<'p>>,
     ) -> Vec<Outbound> {
         let Some(point) = self.in_flight.get(&id).and_then(|r| match r.what {
             Pending::Headers { point, .. } if r.peer == sender => Some(point),
@@ -430,25 +563,36 @@ impl SnapDriver {
             return Vec::new();
         };
         self.in_flight.remove(&id);
+        self.benched.remove(&sender);
 
-        self.session.note_in_flight(self.in_flight.len());
+        let peers = peers.into();
+        self.note(peers);
         let actions = self.session.on_headers_with_uncles(point, entries);
         self.charge_for_failure(sender);
         self.dispatch(actions, peers)
     }
 
     /// Block identifiers: where to ask, nothing more.
-    pub fn on_skeleton(
+    pub fn on_skeleton<'p>(
         &mut self,
         id: u64,
         sender: B512,
         identifiers: &[BlockIdentifier],
-        peers: &[B512],
+        peers: impl Into<Peers<'p>>,
     ) -> Vec<Outbound> {
         if !self.answers(id, sender, |p| matches!(p, Pending::Skeleton { .. })) {
             return Vec::new();
         }
-        self.session.note_in_flight(self.in_flight.len());
+        trace!(
+            target: "rustock::snap",
+            "skeleton of {} point(s) from {:?}, #{:?}..#{:?} (request {id})",
+            identifiers.len(),
+            &sender.0[..4],
+            identifiers.first().map(|i| i.number),
+            identifiers.last().map(|i| i.number)
+        );
+        let peers = peers.into();
+        self.note(peers);
         let actions = self.session.on_skeleton(identifiers);
         self.charge_for_failure(sender);
         self.dispatch(actions, peers)
@@ -458,13 +602,13 @@ impl SnapDriver {
     ///
     /// The offset comes from this node's record of the request, never from
     /// the response.
-    pub fn on_chunk(
+    pub fn on_chunk<'p>(
         &mut self,
         id: u64,
         sender: B512,
         payload: &ChunkPayload,
         refusal: Refusal,
-        peers: &[B512],
+        peers: impl Into<Peers<'p>>,
     ) -> Vec<Outbound> {
         if self.in_flight.get(&id).is_some_and(|r| r.peer != sender) {
             debug!(
@@ -477,6 +621,7 @@ impl SnapDriver {
             debug!(target: "rustock::snap", "chunk answer to unknown request {id}");
             return Vec::new();
         };
+        self.benched.remove(&sender);
         let Pending::Chunk { from } = request.what else {
             warn!(target: "rustock::snap", "request {id} was not a chunk request");
             self.release(request.what);
@@ -487,7 +632,8 @@ impl SnapDriver {
         // before it is used, so a stray one cannot corrupt the download --
         // but accepting it would still let an unasked peer consume the
         // request and leave the genuine answer to be dropped as unknown.
-        self.session.note_in_flight(self.in_flight.len());
+        let peers = peers.into();
+        self.note(peers);
 
         // The chunk that completes the download also verifies it, and that
         // walk takes about ten minutes on a mainnet state: single-threaded,
@@ -508,18 +654,19 @@ impl SnapDriver {
         self.dispatch(actions, peers)
     }
 
-    pub fn on_blocks(
+    pub fn on_blocks<'p>(
         &mut self,
         id: u64,
         sender: B512,
         blocks: &[Block],
         difficulties: &[U256],
-        peers: &[B512],
+        peers: impl Into<Peers<'p>>,
     ) -> Vec<Outbound> {
         if !self.answers(id, sender, |p| matches!(p, Pending::Blocks)) {
             return Vec::new();
         }
-        self.session.note_in_flight(self.in_flight.len());
+        let peers = peers.into();
+        self.note(peers);
         let actions = self.session.on_blocks(blocks, difficulties);
         self.charge_for_failure(sender);
         self.dispatch(actions, peers)
@@ -546,6 +693,7 @@ impl SnapDriver {
             }
             Some(request) if want(request.what) => {
                 self.in_flight.remove(&id);
+                self.benched.remove(&sender);
                 true
             }
             Some(_) => {

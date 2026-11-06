@@ -1215,28 +1215,32 @@ impl SyncService {
     where
         F: FnOnce(
             &mut crate::snap::driver::SnapDriver,
-            &[B512],
+            crate::snap::driver::Peers<'_>,
         ) -> Vec<crate::snap::driver::Outbound>,
     {
-        // Only peers that announced `snap`. Sending one of the six snapshot
-        // messages to a peer that did not is not a wasted request -- rskj
-        // throws out of `MessageType.valueOfType` on an unknown id and closes
-        // the connection, so an unfiltered round robin sheds every
-        // non-snap-capable peer, which on mainnet is most of them.
-        let peers: Vec<B512> = self.peer_store.peers_serving_snapshots().await;
-        if peers.is_empty() {
-            // Say so rather than falling back to every peer: a snapshot sync
-            // with nobody to ask should stall visibly and let the ordinary
-            // sync take over, not quietly disconnect the peer set.
-            debug!(
-                target: "rustock::snap",
-                "no peer has announced the snap capability; nothing to drive"
-            );
-            return;
+        // Who can be sent what; `Peers` says why. The six snapshot messages go
+        // only to peers that announced `snap`: rskj throws out of
+        // `MessageType.valueOfType` on an unknown id and closes the connection,
+        // so an unfiltered round robin would shed every non-snap-capable peer,
+        // which on mainnet is most of them. The header walk's requests are
+        // ordinary messages that every peer serves, so they go to anyone, and
+        // the walk no longer waits on the few peers that serve snapshots.
+        let snap: Vec<B512> = self.peer_store.peers_serving_snapshots().await;
+        let uncles: Vec<B512> = self.peer_store.peers_sending_header_uncles().await;
+        let any: Vec<B512> = self.peer_store.peers().await;
+        if any.is_empty() {
+            // Say so rather than stall silently. The step still runs, so an
+            // answer that arrived just before its peer left is not thrown away;
+            // whatever the session asks next is handed back until a peer can
+            // take it.
+            debug!(target: "rustock::snap", "no peer connected; nothing can be asked");
         }
         let Some(driver) = self.snap.as_mut() else { return };
 
-        let outbound = step(driver, &peers);
+        let outbound = step(
+            driver,
+            crate::snap::driver::Peers { snap: &snap, uncles: &uncles, any: &any },
+        );
 
         // Charge whatever the step turned up before anything else: a peer that
         // misbehaved should pay for it even if the session went on to finish

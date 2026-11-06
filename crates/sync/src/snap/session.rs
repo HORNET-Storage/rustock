@@ -45,6 +45,19 @@ use tracing::{debug, info, warn};
 /// concludes the chain does not connect to ours.
 const EMPTY_HEADER_REPLIES_ALLOWED: u32 = 5;
 
+/// Header requests the walk may have outstanding for each peer that can take
+/// them.
+///
+/// Header and skeleton requests are messages every peer serves, so their
+/// budget grows with the peers there are, where a state download is held to
+/// `SnapConfig::max_in_flight` by the few peers that serve state. On mainnet
+/// that budget of eight left forty peers mostly idle through a walk of
+/// hours. Two keeps a peer busy while its last answer is on the way, without
+/// queueing work behind a slow one.
+const HEADER_REQUESTS_PER_PEER: usize = 2;
+/// And never more than this in all, however many peers there are.
+const MAX_HEADER_REQUESTS: usize = 64;
+
 /// Chunk answers in a row that add nothing before the session gives up.
 ///
 /// A peer declining to serve is ordinary -- it may be pruned, or on another
@@ -168,6 +181,11 @@ pub struct SnapSession {
     /// Requests this session has outstanding, as last reported by the driver.
     /// See [`Self::note_in_flight`].
     in_flight: usize,
+    /// Peers that can take header requests, and those that can take them
+    /// with uncles, as last counted by the driver. See
+    /// [`Self::note_header_peers`].
+    header_peers: usize,
+    uncle_peers: usize,
     /// The block whose state is being downloaded, once one has been offered.
     checkpoint: Option<Header>,
     /// Its cumulative difficulty, as offered and then vouched for by the
@@ -230,6 +248,8 @@ impl SnapSession {
             phase: Phase::AwaitingStatus,
             failure: None,
             in_flight: 0,
+            header_peers: 0,
+            uncle_peers: 0,
             checkpoint: None,
             checkpoint_td: U256::ZERO,
             offered: Vec::new(),
@@ -305,6 +325,27 @@ impl SnapSession {
     /// outstanding against a budget of 8. See #185.
     pub fn note_in_flight(&mut self, n: usize) {
         self.in_flight = n;
+    }
+
+    /// Tell this session how many peers can take its header requests, and how
+    /// many of those can send uncles with them, which sets the header phases'
+    /// budget. See [`HEADER_REQUESTS_PER_PEER`].
+    pub fn note_header_peers(&mut self, headers: usize, uncles: usize) {
+        self.header_peers = headers;
+        self.uncle_peers = uncles;
+    }
+
+    /// What may be outstanding at once in the current phase.
+    fn budget(&self) -> usize {
+        let per_peer = |peers: usize| {
+            peers.saturating_mul(HEADER_REQUESTS_PER_PEER).min(MAX_HEADER_REQUESTS)
+        };
+        let cap = match self.phase {
+            Phase::VerifyingHeaders => per_peer(self.header_peers),
+            Phase::AscendingHeaders => per_peer(self.uncle_peers),
+            _ => 0,
+        };
+        cap.max(self.config.max_in_flight).max(1)
     }
 
     /// Moves to a new phase, restarting the clock the progress lines report
@@ -418,7 +459,7 @@ impl SnapSession {
         // that let the budget be exceeded by one on *every* call, which is
         // unbounded growth wearing a smaller number. When the queue is full
         // the right answer is to ask for nothing and wait for an answer.
-        let budget = self.config.max_in_flight.max(1).saturating_sub(self.in_flight);
+        let budget = self.budget().saturating_sub(self.in_flight);
         if budget == 0 {
             return Vec::new();
         }
@@ -920,6 +961,11 @@ impl SnapSession {
         if headers.is_empty() {
             // That peer cannot fill this range; another might. Give up only
             // once several in a row have come back empty.
+            //
+            // The range is handed back first, which is all the walk does with
+            // an empty run. Left marked as asked, it was never asked again,
+            // and when it was the frontier nothing could move the walk past it.
+            let _ = walk.on_headers(point, headers, proven);
             self.empty_header_replies += 1;
             if self.empty_header_replies >= EMPTY_HEADER_REPLIES_ALLOWED {
                 return self.fail(SnapFailure::NoCommonAncestor);
