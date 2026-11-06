@@ -3401,6 +3401,42 @@ impl SyncService {
             }
         }
 
+        // While a snapshot session holds the peer set, chain data it did not
+        // ask for is kept from the ordinary sync, which is standing down for
+        // it. `suspended_for_snap` already stops that sync's rounds; this stops
+        // what arrives without one.
+        //
+        // The ordinary handlers write what they are given -- headers with their
+        // total difficulties, the canonical index, the head -- and the likeliest
+        // such answer is a late one to the session's own request, arriving after
+        // it timed out: a stretch of the very chain the session is walking.
+        // Taken by the ordinary path, one wrote canonical pointers a thousand
+        // blocks deep into the middle of a mainnet walk, which the walk then
+        // took for ground this node already held, and stopped there.
+        if self.suspended_for_snap {
+            let ours = |driver: Option<&crate::snap::driver::SnapDriver>, id: u64, headers: bool| {
+                driver.is_some_and(|d| if headers { d.awaits_headers(id) } else { d.awaits_skeleton(id) })
+            };
+            let claimed = match &event {
+                SyncEvent::SkeletonResponse { id, .. } => ours(self.snap.as_ref(), *id, false),
+                SyncEvent::HeadersResponse { id, .. }
+                | SyncEvent::HeadersWithUnclesResponse { id, .. } => ours(self.snap.as_ref(), *id, true),
+                SyncEvent::SnapStatusResponse { .. }
+                | SyncEvent::SnapChunkResponse { .. }
+                | SyncEvent::SnapBlocksResponse { .. } => true,
+                SyncEvent::BodyResponse { .. }
+                | SyncEvent::BlockHashResponse { .. }
+                | SyncEvent::NewBlockHashes { .. } => false,
+            };
+            if !claimed {
+                trace!(
+                    target: "rustock::snap",
+                    "chain data the snapshot session did not ask for; kept from the ordinary sync"
+                );
+                return;
+            }
+        }
+
         match event {
             SyncEvent::BlockHashResponse { hash, .. } => {
                 self.on_block_hash_response(hash).await;

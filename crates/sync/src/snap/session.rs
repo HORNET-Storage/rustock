@@ -1075,6 +1075,45 @@ impl SnapSession {
     fn start_state_download(&mut self) -> Vec<Action> {
         let checkpoint = self.checkpoint.clone();
 
+        // The claim is judged before anything is written. Everything after this
+        // makes the checkpoint this node's own -- its total difficulty, the
+        // canonical index under it, the head -- and the next session's walk
+        // stops at the first block it finds there. Written first and refused
+        // after, a claim turned down here was taken on the next attempt without
+        // a walk: on mainnet the second session "verified" the chain in four
+        // seconds, on the strength of the first one's refused total.
+        //
+        // The walk has read every header from the checkpoint down to a block
+        // this node already trusted, so the work of that chain is known. The
+        // claimed cumulative difficulty may exceed it only by the checkpoint
+        // block's own contribution -- the one header the walk never visits as
+        // a candidate.
+        //
+        // That contribution includes the checkpoint's uncles, whose headers
+        // are not in hand here: only `uncle_count` is. An uncle is a sibling,
+        // computed from the same parent, so its difficulty is close to the
+        // block's own; `difficulty * (1 + uncle_count)` is therefore a sound
+        // upper bound without pretending to a precision the data does not
+        // support. Bounding it low instead would reject every honest peer
+        // whose totals are right, which is what the header-only bound did.
+        //
+        // The claim is written as this node's own total difficulty at the
+        // checkpoint, so it is worth establishing rather than accepting.
+        if let Some(established) = self.walk.as_ref().and_then(|w| w.established_difficulty()) {
+            let ceiling = established.saturating_add(
+                checkpoint.as_ref().map_or(U256::ZERO, |h| {
+                    h.difficulty
+                        .saturating_mul(U256::from(1u64).saturating_add(U256::from(h.uncle_count)))
+                }),
+            );
+            if self.checkpoint_td > ceiling {
+                return self.fail(SnapFailure::OverstatedDifficulty {
+                    claimed: self.checkpoint_td,
+                    ceiling,
+                });
+            }
+        }
+
         // The walk reached a block this node already had, so everything above
         // it is anchored to work this node had already accepted. Only now do
         // the headers become part of this chain.
@@ -1110,37 +1149,6 @@ impl SnapSession {
                 ),
             }
             let _ = self.store.set_head(hash);
-        }
-
-        // The walk has read every header from the checkpoint down to a block
-        // this node already trusted, so the work of that chain is known. The
-        // claimed cumulative difficulty may exceed it only by the checkpoint
-        // block's own contribution -- the one header the walk never visits as
-        // a candidate.
-        //
-        // That contribution includes the checkpoint's uncles, whose headers
-        // are not in hand here: only `uncle_count` is. An uncle is a sibling,
-        // computed from the same parent, so its difficulty is close to the
-        // block's own; `difficulty * (1 + uncle_count)` is therefore a sound
-        // upper bound without pretending to a precision the data does not
-        // support. Bounding it low instead would reject every honest peer
-        // whose totals are right, which is what the header-only bound did.
-        //
-        // The claim is written as this node's own total difficulty at the
-        // checkpoint, so it is worth establishing rather than accepting.
-        if let Some(established) = self.walk.as_ref().and_then(|w| w.established_difficulty()) {
-            let ceiling = established.saturating_add(
-                checkpoint.as_ref().map_or(U256::ZERO, |h| {
-                    h.difficulty
-                        .saturating_mul(U256::from(1u64).saturating_add(U256::from(h.uncle_count)))
-                }),
-            );
-            if self.checkpoint_td > ceiling {
-                return self.fail(SnapFailure::OverstatedDifficulty {
-                    claimed: self.checkpoint_td,
-                    ceiling,
-                });
-            }
         }
 
         info!(

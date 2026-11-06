@@ -1301,6 +1301,107 @@ fn the_header_walk_asks_more_of_more_peers() {
     assert!(outstanding <= 2 * peers.len(), "{outstanding} outstanding, more than two per peer");
 }
 
+/// **A refused claim leaves nothing behind.** Making the checkpoint this
+/// node's own -- its total difficulty, the canonical index under it, the head
+/// -- waits until the work the walk established bounds the claim. Written
+/// first and refused after, the next session's walk found the checkpoint
+/// already canonical, stopped there at once, and took the claim that had just
+/// been refused: on mainnet a second attempt "verified" the chain in four
+/// seconds.
+#[test]
+fn a_refused_claim_leaves_nothing_behind() {
+    let f = fixture(20);
+    let genesis = f.with_genesis();
+    // A chain that links, with totals that agree with each other, all raised
+    // by the same million: more work than the chain carries.
+    let (blocks, tds) = chain(1, 4, genesis, 1_000_000, f.state_root);
+    let checkpoint = blocks.last().unwrap().header.clone();
+
+    let mut session = f.session(HeaderVerifier::new());
+    let actions = session.on_status(&blocks, &tds, 8_000, 0);
+    assert_eq!(session.phase(), Phase::VerifyingHeaders);
+    let Some(Action::RequestHeaders { point, count, .. }) =
+        actions.into_iter().find(|a| matches!(a, Action::RequestHeaders { .. }))
+    else {
+        panic!("the walk asks for headers");
+    };
+    session.on_headers(point, &headers_for(&blocks, point, count));
+    assert!(
+        matches!(session.failure(), Some(SnapFailure::OverstatedDifficulty { .. })),
+        "{:?}",
+        session.failure()
+    );
+
+    assert_eq!(
+        f.store.canonical_hash(checkpoint.number).unwrap(),
+        None,
+        "the refused checkpoint was indexed as canonical"
+    );
+    assert_ne!(f.store.head().unwrap(), Some(checkpoint.hash()), "it became the head");
+    assert_eq!(
+        f.store.total_difficulty(checkpoint.hash()).unwrap(),
+        None,
+        "the refused claim was recorded as this node's own"
+    );
+}
+
+/// **While a session holds the peer set, the ordinary sync takes no chain
+/// data.** A late answer to one of the session's own header requests, after
+/// it timed out, is a stretch of the very chain being walked. Handed to the
+/// ordinary sync, which writes what it is given, one put canonical pointers a
+/// thousand blocks deep into a mainnet walk, and the walk took them for
+/// ground this node already held.
+#[tokio::test]
+async fn the_ordinary_sync_takes_no_headers_during_a_snapshot_session() {
+    use crate::events::SyncEvent;
+    use crate::manager::SyncManager;
+    use crate::SyncService;
+    use rustock_networking::peers::PeerStore;
+
+    let f = fixture(20);
+    let genesis = f.with_genesis();
+    f.store.put_total_difficulty(genesis, U256::from(100u64)).expect("td");
+    f.store.set_head(genesis).expect("head");
+    let (blocks, _) = chain(1, 3, genesis, 100, f.state_root);
+
+    let peers = Arc::new(PeerStore::new());
+    let peer = B512::repeat_byte(9);
+    let (tx, _rx) = tokio::sync::mpsc::channel(8);
+    peers
+        .add_peer_with(
+            peer,
+            tx,
+            rustock_networking::handshake::PeerCapabilities { rsk_version: 62, snap: true },
+        )
+        .await;
+    let manager = Arc::new(SyncManager::new(
+        f.store.clone(),
+        Arc::new(HeaderVerifier::new()),
+        peers.clone(),
+    ));
+    let (_event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut service = SyncService::new(manager, peers, event_rx)
+        .with_trie_store_for_test(f.trie.clone() as Arc<dyn TrieStore>);
+    service.start_snap_sync(SnapConfig::default(), Arc::new(HeaderVerifier::new()));
+    service.on_tick().await;
+
+    // Headers that link to this node's genesis, under an id nobody awaits.
+    service
+        .handle_event(SyncEvent::HeadersResponse {
+            peer,
+            id: 0x5eed,
+            headers: blocks.iter().map(|b| b.header.clone()).collect(),
+        })
+        .await;
+
+    assert_eq!(f.store.head().unwrap(), Some(genesis), "the ordinary sync moved the head");
+    assert_eq!(
+        f.store.canonical_hash(1).unwrap(),
+        None,
+        "the ordinary sync wrote the canonical index"
+    );
+}
+
 /// With a checkpoint configured, a session bounds the peer's claim before it
 /// commits to the header walk.
 ///
