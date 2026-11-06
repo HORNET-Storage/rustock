@@ -5687,6 +5687,232 @@ mod tests {
         let _ = b256_to_bitcoin_hash;
     }
 
+    /// rskj compares a `getBtcTransactionConfirmations` branch in display
+    /// order: with the header's merkle root as bitcoinj reads it, and with the
+    /// witness merkle root as `registerBtcCoinbaseTransaction` stored it, its
+    /// ABI argument untouched. rustock climbed the branch in wire order, so a
+    /// transaction proved through the witness tree got -5 where rskj counts
+    /// its confirmations. And two branch nodes that read as a 64-byte
+    /// transaction make rskj's `combineLeftRight` throw, so the call answers
+    /// nothing: a top-level Bridge call that throws is rskj's invisible
+    /// exception, a successful receipt with no return data.
+    ///
+    /// On regtest: one block of two transactions, a coinbase and one more,
+    /// whose roots are no palindromes, so the order shows.
+    #[test]
+    fn test_btc_transaction_confirmations_compare_in_display_order() {
+        use bitcoin::absolute::LockTime;
+        use bitcoin::block::Version;
+        use bitcoin::consensus::serialize as btc_serialize;
+        use bitcoin::hashes::{sha256d, Hash as _};
+        use bitcoin::{
+            Amount, CompactTarget, OutPoint, ScriptBuf, Sequence, TxIn, TxMerkleNode, TxOut,
+            Witness,
+        };
+        use rustock_core::validation::merged_mining::combine_left_right;
+
+        const BLOCK: u64 = 7_000_000; // every relevant RSKIP active
+        let reversed = |mut hash: [u8; 32]| {
+            hash.reverse();
+            hash
+        };
+
+        // The witness tree: the coinbase's wtxid, zero by definition, then one
+        // more. Its root, in display order, is the ABI argument, and the
+        // coinbase commits to it in wire order.
+        let other_wtxid: [u8; 32] = std::array::from_fn(|i| 0x40 + i as u8);
+        let witness_root = combine_left_right(&[0; 32], &other_wtxid);
+        let reserved = [0u8; 32];
+        let commitment =
+            sha256d::Hash::hash(&[reversed(witness_root), reserved].concat()).to_byte_array();
+        let mut commitment_script = vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
+        commitment_script.extend_from_slice(&commitment);
+        let coinbase = bitcoin::Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::from_bytes(vec![0x01, 0x01]),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![
+                TxOut {
+                    value: Amount::from_sat(5_000_000_000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                },
+                TxOut {
+                    value: Amount::ZERO,
+                    script_pubkey: ScriptBuf::from_bytes(commitment_script),
+                },
+            ],
+        };
+        // Without its witness, so that its hash is its txid.
+        let coinbase_bytes = btc_serialize(&coinbase);
+
+        // The block's tree, in wire order.
+        let coinbase_txid = sha256d::Hash::hash(&coinbase_bytes).to_byte_array();
+        let other_txid: [u8; 32] = std::array::from_fn(|i| 0x80 + i as u8);
+        let block_root = sha256d::Hash::hash(&[coinbase_txid, other_txid].concat()).to_byte_array();
+        let genesis = bitcoin::constants::genesis_block(bitcoin::Network::Regtest)
+            .header
+            .block_hash();
+        let header = (0u32..10_000)
+            .map(|nonce| bitcoin::block::Header {
+                version: Version::from_consensus(1),
+                prev_blockhash: genesis,
+                merkle_root: TxMerkleNode::from_byte_array(block_root),
+                time: 1_700_000_000,
+                bits: CompactTarget::from_consensus(0x207f_ffff),
+                nonce,
+            })
+            .find(crate::bridge::btc_store::check_proof_of_work)
+            .expect("regtest PoW is trivial");
+        let block_hash = crate::bridge::btc_chain::bitcoin_hash_to_b256(&header.block_hash()).0;
+
+        // The tree that proves the coinbase: two transactions, the first
+        // matched, flags 1 (the root), 1 (the coinbase), 0 (the other).
+        let mut pmt = 2u32.to_le_bytes().to_vec();
+        pmt.push(2);
+        pmt.extend_from_slice(&coinbase_txid);
+        pmt.extend_from_slice(&other_txid);
+        pmt.extend_from_slice(&[1, 0b011]);
+
+        let word = |n: usize| U256::from(n).to_be_bytes::<32>();
+        let padded = |bytes: &[u8]| {
+            let mut out = word(bytes.len()).to_vec();
+            out.extend_from_slice(bytes);
+            out.resize(32 + bytes.len().div_ceil(32) * 32, 0);
+            out
+        };
+        let mut receive_header = crate::bridge::compute_selector("receiveHeader(bytes)").to_vec();
+        receive_header.extend_from_slice(&word(32));
+        receive_header.extend_from_slice(&padded(&btc_serialize(&header)));
+        let mut register = crate::bridge::compute_selector(
+            "registerBtcCoinbaseTransaction(bytes,bytes32,bytes,bytes32,bytes32)",
+        )
+        .to_vec();
+        let tx_part = padded(&coinbase_bytes);
+        register.extend_from_slice(&word(160));
+        register.extend_from_slice(&block_hash);
+        register.extend_from_slice(&word(160 + tx_part.len()));
+        register.extend_from_slice(&witness_root);
+        register.extend_from_slice(&reserved);
+        register.extend_from_slice(&tx_part);
+        register.extend_from_slice(&padded(&pmt));
+
+        let bridge_tx = |nonce: u64, input: Vec<u8>| rustock_core::Transaction {
+            nonce,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(2_000_000),
+            to: Bytes::copy_from_slice(crate::precompiles::BRIDGE_ADDR.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::from(input),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
+        };
+        let store = Arc::new(MemoryTrieStore::new());
+        let sender = Address::repeat_byte(0xC1);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&TrieNode::empty(), store.as_ref(), &sender, 0, one_rbtc);
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store)
+            .with_bridge_constants(crate::bridge::constants::BridgeConstants::regtest());
+        let txs = [
+            (bridge_tx(0, receive_header), sender),
+            (bridge_tx(1, register), sender),
+        ];
+        let built = executor
+            .execute_block(&dummy_header(BLOCK), &txs, &root, store.clone())
+            .expect("header and coinbase block");
+        assert!(built.tx_results.iter().all(|r| r.success));
+        let root = crate::state::apply_state_changes(
+            &root,
+            store.as_ref(),
+            &built.state_changes,
+            &built.markers,
+        );
+
+        // The confirmations, or None where the call throws.
+        let confirmations = |tx_hash: [u8; 32], path: usize, branch: &[[u8; 32]]| {
+            let mut input = crate::bridge::compute_selector(
+                "getBtcTransactionConfirmations(bytes32,bytes32,uint256,bytes32[])",
+            )
+            .to_vec();
+            input.extend_from_slice(&tx_hash);
+            input.extend_from_slice(&block_hash);
+            input.extend_from_slice(&word(path));
+            input.extend_from_slice(&word(128));
+            input.extend_from_slice(&word(branch.len()));
+            branch.iter().for_each(|hash| input.extend_from_slice(hash));
+            let built = executor
+                .execute_block(
+                    &dummy_header(BLOCK),
+                    &[(bridge_tx(2, input), sender)],
+                    &root,
+                    store.clone(),
+                )
+                .expect("query block");
+            let result = &built.tx_results[0];
+            assert!(
+                result.success,
+                "a top-level Bridge call's receipt succeeds even when it throws"
+            );
+            let answer: Option<[u8; 32]> = result.output.as_slice().try_into().ok();
+            assert!(answer.is_some() || result.output.is_empty());
+            answer.map(alloy_primitives::I256::from_be_bytes::<32>)
+        };
+        let code = |n: i64| Some(alloy_primitives::I256::try_from(n).unwrap());
+
+        // The second transaction, by the block's tree.
+        assert_eq!(
+            confirmations(reversed(other_txid), 1, &[reversed(coinbase_txid)]),
+            code(1)
+        );
+        assert_eq!(
+            confirmations(other_txid, 1, &[coinbase_txid]),
+            code(-5),
+            "wire order proves nothing"
+        );
+        // By the witness tree, where rustock got -5.
+        assert_eq!(confirmations(other_wtxid, 1, &[[0; 32]]), code(1));
+        assert_eq!(
+            confirmations(reversed(other_wtxid), 1, &[[0; 32]]),
+            code(-5)
+        );
+
+        // Nodes that read, left then right, as a 64-byte transaction: one
+        // input, an output index of 0, scripts of two bytes each, one output
+        // of one satoshi.
+        let transaction = [
+            &[1u8, 0, 0, 0][..],
+            &[1],
+            &[0x11; 32],
+            &[0; 4],
+            &[2, 0xaa, 0xbb],
+            &[0xff; 4],
+            &[1],
+            &1i64.to_le_bytes(),
+            &[2, 0xcc, 0xdd],
+            &[0; 4],
+        ]
+        .concat();
+        let left: [u8; 32] = transaction[..32].try_into().unwrap();
+        let right: [u8; 32] = transaction[32..].try_into().unwrap();
+        assert_eq!(
+            confirmations(left, 0, &[right]),
+            None,
+            "rskj's combineLeftRight throws"
+        );
+        assert_eq!(
+            confirmations(right, 0, &[left]),
+            code(-5),
+            "the other way round they are no transaction"
+        );
+    }
+
     /// Audit findings FRCR-78 and FRCR-678.
     ///
     /// `getEstimatedFeesForNextPegOutEvent` is **transaction-callable** — rskj

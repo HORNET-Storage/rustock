@@ -1,31 +1,27 @@
-//! Partial Merkle Tree (PMT) implementation for BTC transaction inclusion proofs.
+//! The Bridge's proofs that a Bitcoin transaction is in a Bitcoin block.
 //!
-//! Implements BIP37 merkleblock encoding, matching bitcoinj-thin's
-//! `PartialMerkleTree` used by rskj. The PMT proves that a set of
-//! transactions are included in a BTC block's merkle tree.
+//! A partial Merkle tree is read and walked by `rustock_core`'s port of
+//! bitcoinj-thin's `PartialMerkleTree`, the one rskj's Bridge shares with its
+//! check of merged mining below RSKIP92. The Bridge compares in wire order,
+//! the bytes a Bitcoin block hashes, so the tree's results, which bitcoinj
+//! gives in display order, are turned round here.
 //!
-//! ## Wire format
-//!
-//! ```text
-//! [tx_count: u32 LE][nHashes: varint][hashes: 32*nHashes bytes]
-//! [nFlagBytes: varint][flag_bits: nFlagBytes bytes]
-//! ```
-//!
-//! Hashes are in depth-first traversal order. Flag bits (LSB first per byte)
-//! indicate whether each node is a "parent of match" (recurse deeper) or a
-//! leaf/hash boundary.
+//! A Merkle branch is rskj's `MerkleBranch`, for
+//! `getBtcTransactionConfirmations`. It works in display order, as rskj's
+//! does, since that is the order two of its nodes are tested in for a
+//! 64-byte transaction.
 
-use bitcoin::hashes::{sha256d, Hash};
+use rustock_core::partial_merkle_tree as bitcoinj;
+use rustock_core::validation::merged_mining::{
+    combine_left_right, parses_as_a_64_byte_transaction,
+};
 
-/// A parsed Partial Merkle Tree.
+/// A partial Merkle tree, as bitcoinj reads one.
 #[derive(Debug)]
-pub struct PartialMerkleTree {
-    pub tx_count: u32,
-    hashes: Vec<[u8; 32]>,
-    flag_bits: Vec<bool>,
-}
+pub struct PartialMerkleTree(bitcoinj::PartialMerkleTree);
 
-/// Result of PMT verification: merkle root + list of matched tx hashes.
+/// What a tree walks to: the root and the transactions it matches, in wire
+/// order.
 #[derive(Debug)]
 pub struct PmtResult {
     pub merkle_root: [u8; 32],
@@ -33,348 +29,110 @@ pub struct PmtResult {
 }
 
 impl PartialMerkleTree {
-    /// Parse a PMT from its serialized form.
+    /// `new PartialMerkleTree(params, data, 0)`; `None` where bitcoinj throws.
     pub fn parse(data: &[u8]) -> Option<Self> {
-        if data.len() < 4 {
-            return None;
-        }
-
-        // tx_count: u32 LE
-        let tx_count = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-        let mut offset = 4;
-
-        // nHashes: varint
-        let (n_hashes, varint_len) = read_varint(&data[offset..])?;
-        offset += varint_len;
-
-        // hashes: 32 * nHashes bytes
-        let n_hashes = n_hashes as usize;
-        let mut hashes = Vec::with_capacity(n_hashes);
-        for _ in 0..n_hashes {
-            if offset + 32 > data.len() {
-                return None;
-            }
-            let mut hash = [0u8; 32];
-            hash.copy_from_slice(&data[offset..offset + 32]);
-            hashes.push(hash);
-            offset += 32;
-        }
-
-        // nFlagBytes: varint
-        let (n_flag_bytes, varint_len) = read_varint(&data[offset..])?;
-        offset += varint_len;
-
-        // flag_bits: nFlagBytes bytes
-        let n_flag_bytes = n_flag_bytes as usize;
-        if offset + n_flag_bytes > data.len() {
-            return None;
-        }
-
-        let mut flag_bits = Vec::with_capacity(n_flag_bytes * 8);
-        for i in 0..n_flag_bytes {
-            let byte = data[offset + i];
-            for bit in 0..8 {
-                flag_bits.push((byte >> bit) & 1 == 1);
-            }
-        }
-
-        Some(Self {
-            tx_count,
-            hashes,
-            flag_bits,
-        })
+        bitcoinj::PartialMerkleTree::parse(data).ok().map(Self)
     }
 
-    /// Validate the expected size of PMT serialized data.
+    /// rskj `PartialMerkleTreeFormatUtils.hasExpectedSize`.
     pub fn has_expected_size(data: &[u8]) -> bool {
-        if data.len() < 4 {
-            return false;
-        }
-        let mut offset = 4;
-
-        let (n_hashes, varint_len) = match read_varint(&data[offset..]) {
-            Some(v) => v,
-            None => return false,
-        };
-        offset += varint_len;
-        let hash_bytes = (n_hashes as usize).checked_mul(32);
-        offset = match hash_bytes.and_then(|hb| offset.checked_add(hb)) {
-            Some(o) => o,
-            None => return false,
-        };
-
-        if offset > data.len() {
-            return false;
-        }
-
-        let (n_flag_bytes, varint_len) = match read_varint(&data[offset..]) {
-            Some(v) => v,
-            None => return false,
-        };
-        offset = match offset.checked_add(varint_len).and_then(|o| o.checked_add(n_flag_bytes as usize)) {
-            Some(o) => o,
-            None => return false,
-        };
-
-        offset == data.len()
+        bitcoinj::has_expected_size(data)
     }
 
-    /// Extract matched transaction hashes and compute the merkle root.
-    ///
-    /// Returns `None` if the tree is invalid (malformed bits/hashes, or
-    /// the structure doesn't match tx_count).
+    /// The block's transaction count, as the Java `int` bitcoinj reads it into.
+    pub fn transaction_count(&self) -> i32 {
+        self.0.transaction_count()
+    }
+
+    /// `getTxnHashAndMerkleRoot`, in wire order; `None` where bitcoinj throws
+    /// a `VerificationException`.
     pub fn extract_matches(&self) -> Option<PmtResult> {
-        if self.tx_count == 0 {
-            return None;
-        }
-        if self.hashes.len() > self.tx_count as usize {
-            return None;
-        }
-
-        let height = tree_height(self.tx_count);
-
-        let mut bits_used = 0usize;
-        let mut hashes_used = 0usize;
-        let mut matched = Vec::new();
-
-        let root = self.recursive_extract(
-            height,
-            0,
-            &mut bits_used,
-            &mut hashes_used,
-            &mut matched,
-        )?;
-
-        // Verify all hashes and bits were consumed
-        if hashes_used != self.hashes.len() {
-            return None;
-        }
-        // Allow unused padding bits in the last byte
-        let used_bytes = bits_used.div_ceil(8);
-        let total_bytes = self.flag_bits.len().div_ceil(8);
-        if used_bytes != total_bytes {
-            return None;
-        }
-
+        let (matched, root) = self.0.txn_hashes_and_merkle_root().ok()?;
         Some(PmtResult {
-            merkle_root: root,
-            matched_hashes: matched,
+            merkle_root: reversed(root),
+            matched_hashes: matched.into_iter().map(reversed).collect(),
         })
     }
-
-    fn recursive_extract(
-        &self,
-        height: u32,
-        pos: u32,
-        bits_used: &mut usize,
-        hashes_used: &mut usize,
-        matched: &mut Vec<[u8; 32]>,
-    ) -> Option<[u8; 32]> {
-        if *bits_used >= self.flag_bits.len() {
-            return None;
-        }
-        let parent_of_match = self.flag_bits[*bits_used];
-        *bits_used += 1;
-
-        if height == 0 || !parent_of_match {
-            // Leaf or non-matching subtree: consume one hash
-            if *hashes_used >= self.hashes.len() {
-                return None;
-            }
-            let hash = self.hashes[*hashes_used];
-            *hashes_used += 1;
-
-            if height == 0 && parent_of_match {
-                matched.push(hash);
-            }
-
-            return Some(hash);
-        }
-
-        // Internal node that is parent of a match: recurse
-        let left = self.recursive_extract(height - 1, pos * 2, bits_used, hashes_used, matched)?;
-
-        let right = if pos * 2 + 1 < tree_width(self.tx_count, height - 1) {
-            let r = self.recursive_extract(
-                height - 1,
-                pos * 2 + 1,
-                bits_used,
-                hashes_used,
-                matched,
-            )?;
-            // Left and right must differ (protection against 64-byte tx attack)
-            if left == r {
-                return None;
-            }
-            r
-        } else {
-            left
-        };
-
-        Some(combine_hashes(&left, &right))
-    }
 }
 
-/// Combine two 32-byte hashes for the Bitcoin merkle tree.
-///
-/// Our hashes stay in wire ("internal", little-endian) order from parse
-/// through extraction, so the combination is a plain double-SHA256 of the
-/// concatenation — equivalent to rskj's `MerkleTreeUtils.combineLeftRight`,
-/// which operates on display-order `Sha256Hash` values and therefore
-/// reverses on the way in and out.
-fn combine_hashes(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
-    let mut combined = [0u8; 64];
-    combined[..32].copy_from_slice(left);
-    combined[32..].copy_from_slice(right);
-    *sha256d::Hash::hash(&combined).as_byte_array()
-}
-
-/// Compute tree height from transaction count.
-fn tree_height(tx_count: u32) -> u32 {
-    let mut height = 0u32;
-    let mut size = tx_count;
-    while size > 1 {
-        height += 1;
-        size = size.div_ceil(2);
-    }
-    height
-}
-
-/// Compute tree width at a given height.
-fn tree_width(tx_count: u32, height: u32) -> u32 {
-    (tx_count + (1 << height) - 1) >> height
-}
-
-/// Read a Bitcoin varint from a byte slice.
-/// Returns (value, bytes_consumed).
-fn read_varint(data: &[u8]) -> Option<(u64, usize)> {
-    if data.is_empty() {
-        return None;
-    }
-    match data[0] {
-        0..=0xFC => Some((data[0] as u64, 1)),
-        0xFD => {
-            if data.len() < 3 {
-                return None;
-            }
-            let val = u16::from_le_bytes([data[1], data[2]]);
-            Some((val as u64, 3))
-        }
-        0xFE => {
-            if data.len() < 5 {
-                return None;
-            }
-            let val = u32::from_le_bytes([data[1], data[2], data[3], data[4]]);
-            Some((val as u64, 5))
-        }
-        0xFF => {
-            if data.len() < 9 {
-                return None;
-            }
-            let val = u64::from_le_bytes([
-                data[1], data[2], data[3], data[4], data[5], data[6], data[7], data[8],
-            ]);
-            Some((val, 9))
-        }
-    }
+fn reversed(mut hash: [u8; 32]) -> [u8; 32] {
+    hash.reverse();
+    hash
 }
 
 // ---------------------------------------------------------------------------
 // Merkle Branch (for getBtcTransactionConfirmations)
 // ---------------------------------------------------------------------------
 
-/// A Merkle branch proof: list of sibling hashes + path bits.
-///
-/// Matches rskj's `MerkleBranch`. The `path` integer encodes which side
-/// the target hash is on at each level (bit i: 0 = left, 1 = right).
+/// rskj `MerkleBranch`: the hashes beside a transaction's on its way up the
+/// tree, and its path, whose bit `i` is set where, `i` levels up, the
+/// transaction's side is the right one. The hashes are in display order, as
+/// rskj wraps the ones it is given.
 #[derive(Debug)]
 pub struct MerkleBranch {
-    pub hashes: Vec<[u8; 32]>,
-    pub path: u32,
+    hashes: Vec<[u8; 32]>,
+    path: i32,
 }
 
 impl MerkleBranch {
+    /// rskj's constructor: no more than 32 hashes, and no more significant
+    /// bits in the path than there are hashes. rskj's `significantBitCount`
+    /// counts none in a path below zero. Where rskj throws, `None`.
+    pub fn new(hashes: Vec<[u8; 32]>, path: i32) -> Option<Self> {
+        let significant = if path > 0 {
+            32 - path.leading_zeros() as usize
+        } else {
+            0
+        };
+        (hashes.len() <= 32 && significant <= hashes.len()).then_some(Self { hashes, path })
+    }
+
     /// Parse from ABI-encoded arguments:
-    /// `(bytes32 btcTxHash, bytes32 btcBlockHash, uint256 merkleBranchPath, bytes32[] merkleBranchHashes)`
-    ///
-    /// The path and hashes are at offsets 64..96 and 96+, respectively.
+    /// `(bytes32 btcTxHash, bytes32 btcBlockHash, uint256 merkleBranchPath, bytes32[] merkleBranchHashes)`.
+    /// The transaction and block hashes come back as given, in display order,
+    /// and the path as rskj's `BigInteger.intValue` reads it, its low 32 bits.
     pub fn from_abi_args(args: &[u8]) -> Option<(Self, [u8; 32], [u8; 32])> {
         if args.len() < 128 {
             return None;
         }
+        let tx_hash: [u8; 32] = args[0..32].try_into().ok()?;
+        let block_hash: [u8; 32] = args[32..64].try_into().ok()?;
+        let path = i32::from_be_bytes(args[92..96].try_into().ok()?);
 
-        let mut tx_hash = [0u8; 32];
-        tx_hash.copy_from_slice(&args[0..32]);
-
-        let mut block_hash = [0u8; 32];
-        block_hash.copy_from_slice(&args[32..64]);
-
-        let path = {
-            let mut buf = [0u8; 32];
-            buf.copy_from_slice(&args[64..96]);
-            u32::from_be_bytes([buf[28], buf[29], buf[30], buf[31]])
+        // The array's offset and, there, its length, each in its word's low
+        // four bytes.
+        let word = |at: usize| -> Option<usize> {
+            Some(u32::from_be_bytes(args.get(at + 28..at + 32)?.try_into().ok()?) as usize)
         };
-
-        // Dynamic array offset
-        let array_offset = {
-            let mut buf = [0u8; 32];
-            buf.copy_from_slice(&args[96..128]);
-            u32::from_be_bytes([buf[28], buf[29], buf[30], buf[31]]) as usize
-        };
-
-        if array_offset + 32 > args.len() {
-            return None;
-        }
-
-        let count = {
-            let mut buf = [0u8; 32];
-            buf.copy_from_slice(&args[array_offset..array_offset + 32]);
-            u32::from_be_bytes([buf[28], buf[29], buf[30], buf[31]]) as usize
-        };
-
-        let mut hashes = Vec::with_capacity(count);
+        let array_offset = word(96)?;
+        let count = word(array_offset)?;
         let data_start = array_offset + 32;
+        let mut hashes = Vec::new();
         for i in 0..count {
-            let offset = data_start + i * 32;
-            if offset + 32 > args.len() {
-                return None;
-            }
-            let mut h = [0u8; 32];
-            h.copy_from_slice(&args[offset..offset + 32]);
-            hashes.push(h);
+            let at = data_start + i * 32;
+            hashes.push(args.get(at..at + 32)?.try_into().ok()?);
         }
-
-        // ABI callers supply display-order hashes (rskj Sha256Hash.wrap of
-        // the bytes32 args); our merkle arithmetic uses wire (internal)
-        // order throughout.
-        #[allow(clippy::redundant_locals)] // rebind to mutate the caller's copy
-        let mut tx_hash = tx_hash;
-        tx_hash.reverse();
-        let hashes = hashes
-            .into_iter()
-            .map(|mut h| {
-                h.reverse();
-                h
-            })
-            .collect();
-        let branch = MerkleBranch { hashes, path };
-        Some((branch, tx_hash, block_hash))
+        Some((MerkleBranch::new(hashes, path)?, tx_hash, block_hash))
     }
 
-    /// Reduce the branch from a given tx hash to compute the merkle root.
-    pub fn reduce_from(&self, tx_hash: &[u8; 32]) -> [u8; 32] {
+    /// `reduceFrom`: the root the branch climbs to from `tx_hash`, in display
+    /// order. `None` where two of the nodes form a 64-byte transaction, where
+    /// rskj's `MerkleTreeUtils.combineLeftRight` throws.
+    pub fn reduce_from(&self, tx_hash: &[u8; 32]) -> Option<[u8; 32]> {
         let mut current = *tx_hash;
-
-        for (i, sibling) in self.hashes.iter().enumerate() {
-            let is_right = (self.path >> i) & 1 == 1;
-            if is_right {
-                current = combine_hashes(sibling, &current);
+        for (index, sibling) in self.hashes.iter().enumerate() {
+            // `(path >> index) & 1`, the constructor holding `index` below 32.
+            let (left, right) = if (self.path >> index) & 1 == 1 {
+                (*sibling, current)
             } else {
-                current = combine_hashes(&current, sibling);
+                (current, *sibling)
+            };
+            if parses_as_a_64_byte_transaction(&left, &right) {
+                return None;
             }
+            current = combine_left_right(&left, &right);
         }
-
-        current
+        Some(current)
     }
 }
 
@@ -386,55 +144,12 @@ impl MerkleBranch {
 mod tests {
     use super::*;
 
-    #[test]
-    fn tree_height_one_tx() {
-        assert_eq!(tree_height(1), 0);
+    fn hex_to_bytes(hex: &str) -> Vec<u8> {
+        alloy_primitives::hex::decode(hex.replace(char::is_whitespace, "")).unwrap()
     }
 
-    #[test]
-    fn tree_height_two_tx() {
-        assert_eq!(tree_height(2), 1);
-    }
-
-    #[test]
-    fn tree_height_three_tx() {
-        assert_eq!(tree_height(3), 2);
-    }
-
-    #[test]
-    fn tree_height_four_tx() {
-        assert_eq!(tree_height(4), 2);
-    }
-
-    #[test]
-    fn tree_width_single() {
-        assert_eq!(tree_width(1, 0), 1);
-    }
-
-    #[test]
-    fn tree_width_two_at_level_zero() {
-        assert_eq!(tree_width(2, 0), 2);
-        assert_eq!(tree_width(2, 1), 1);
-    }
-
-    #[test]
-    fn tree_width_three() {
-        assert_eq!(tree_width(3, 0), 3);
-        assert_eq!(tree_width(3, 1), 2);
-        assert_eq!(tree_width(3, 2), 1);
-    }
-
-    #[test]
-    fn varint_single_byte() {
-        assert_eq!(read_varint(&[0x00]), Some((0, 1)));
-        assert_eq!(read_varint(&[0x01]), Some((1, 1)));
-        assert_eq!(read_varint(&[0xFC]), Some((252, 1)));
-    }
-
-    #[test]
-    fn varint_two_bytes() {
-        assert_eq!(read_varint(&[0xFD, 0xFD, 0x00]), Some((253, 3)));
-        assert_eq!(read_varint(&[0xFD, 0xFF, 0xFF]), Some((65535, 3)));
+    fn hex_to_32(hex: &str) -> [u8; 32] {
+        hex_to_bytes(hex).try_into().unwrap()
     }
 
     #[test]
@@ -443,248 +158,208 @@ mod tests {
         assert!(!PartialMerkleTree::has_expected_size(&[0, 0, 0]));
     }
 
+    /// A block of one transaction, matched: the tree is its hash alone, and
+    /// so is the root.
     #[test]
     fn simple_pmt_single_tx() {
-        // PMT for a block with 1 transaction (the tx itself is matched)
-        // tx_count=1, nHashes=1, hash=all-zeros, nFlagBytes=1, flags=0x01
-        let mut data = Vec::new();
-        data.extend_from_slice(&1u32.to_le_bytes()); // tx_count
-        data.push(1); // nHashes (varint)
-        data.extend_from_slice(&[0xAA; 32]); // hash
-        data.push(1); // nFlagBytes (varint)
-        data.push(0x01); // flag bits: bit 0 = 1 (matched)
+        let mut data = 1u32.to_le_bytes().to_vec();
+        data.push(1);
+        data.extend_from_slice(&[0xAA; 32]);
+        data.push(1);
+        data.push(0x01);
 
         assert!(PartialMerkleTree::has_expected_size(&data));
-
         let pmt = PartialMerkleTree::parse(&data).unwrap();
-        assert_eq!(pmt.tx_count, 1);
-
+        assert_eq!(pmt.transaction_count(), 1);
         let result = pmt.extract_matches().unwrap();
-        assert_eq!(result.matched_hashes.len(), 1);
-        assert_eq!(result.matched_hashes[0], [0xAA; 32]);
+        assert_eq!(result.matched_hashes, [[0xAA; 32]]);
         assert_eq!(result.merkle_root, [0xAA; 32]);
     }
 
+    /// Ported from rskj PartialMerkleTreeFormatUtilsTest: the canonical blob
+    /// has its expected size, with a byte gone it has not, and with a hash
+    /// count that overflows no size can be worked out.
     #[test]
-    fn combine_hashes_deterministic() {
-        let a = [0x01; 32];
-        let b = [0x02; 32];
-        let result = combine_hashes(&a, &b);
-        // Same inputs should always produce same output
-        assert_eq!(result, combine_hashes(&a, &b));
-        // Different order should produce different result
-        assert_ne!(result, combine_hashes(&b, &a));
-    }
-
-    #[test]
-    fn merkle_branch_reduce_single() {
-        let tx_hash = [0x42; 32];
-        let sibling = [0x43; 32];
-        let branch = MerkleBranch {
-            hashes: vec![rev(sibling)],
-            path: 0, // tx is on the left
-        };
-        let root = branch.reduce_from(&rev(tx_hash));
-        assert_eq!(root, combine_hashes(&tx_hash, &sibling));
-    }
-
-    #[test]
-    fn merkle_branch_reduce_right_side() {
-        let tx_hash = [0x42; 32];
-        let sibling = [0x43; 32];
-        let branch = MerkleBranch {
-            hashes: vec![rev(sibling)],
-            path: 1, // tx is on the right
-        };
-        let root = branch.reduce_from(&rev(tx_hash));
-        assert_eq!(root, combine_hashes(&sibling, &tx_hash));
-    }
-
-    // -----------------------------------------------------------------------
-    // Tests ported from rskj
-    // -----------------------------------------------------------------------
-
-    /// Ported from rskj PartialMerkleTreeFormatUtilsTest.getHashesCount
-    /// and getFlagBitsCount — canonical PMT blob from rskj test suite.
-    #[test]
-    fn rskj_pmt_canonical_blob_parse() {
-        let data = hex_to_bytes(
-            "030000000279e7c0da739df8a00f12c0bff55e5438f530aa5859ff98\
-             74258cd7bad3fe709746aff897e6a851faa80120d6ae99db30883699\
-             ac0428fc7192d6c3fec0ca6409010d"
-        );
-
-        // rskj expects: 2 hashes, 1 flag byte, valid size
+    fn rskj_pmt_format_vectors() {
+        let canonical = "030000000279e7c0da739df8a00f12c0bff55e5438f530aa5859ff98\
+                         74258cd7bad3fe709746aff897e6a851faa80120d6ae99db30883699\
+                         ac0428fc7192d6c3fec0ca6409010d";
+        let data = hex_to_bytes(canonical);
         assert!(PartialMerkleTree::has_expected_size(&data));
-
-        let pmt = PartialMerkleTree::parse(&data).unwrap();
-        assert_eq!(pmt.tx_count, 3); // LE 03000000 = 3
-        assert_eq!(pmt.hashes.len(), 2);
-        assert_eq!(pmt.flag_bits.len(), 8); // 1 flag byte = 8 bits
-    }
-
-    /// Ported from rskj PartialMerkleTreeFormatUtilsTest.doesntHaveExpectedSize
-    #[test]
-    fn rskj_pmt_invalid_size_rejected() {
-        // Truncated/wrong tail (from rskj: ending in "64010d")
-        let data = hex_to_bytes(
-            "030000000279e7c0da739df8a00f12c0bff55e5438f530aa5859ff98\
-             74258cd7bad3fe709746aff897e6a851faa80120d6ae99db30883699\
-             ac0428fc7192d6c3fec0ca64010d"
+        assert_eq!(
+            PartialMerkleTree::parse(&data).unwrap().transaction_count(),
+            3
         );
-        assert!(!PartialMerkleTree::has_expected_size(&data));
+
+        let short = canonical.replace("ca6409010d", "ca64010d");
+        assert!(!PartialMerkleTree::has_expected_size(&hex_to_bytes(&short)));
+        let overflow = canonical.replacen("0300000002", "0300ffffff", 1);
+        assert!(!PartialMerkleTree::has_expected_size(&hex_to_bytes(
+            &overflow
+        )));
     }
 
-    /// rskj branch vectors are display-order hashes; reverse for our wire
-    /// order convention.
-    fn rev(mut h: [u8; 32]) -> [u8; 32] {
-        h.reverse();
-        h
-    }
-
-    /// Ported from rskj MerkleBranchTest.oneHashBranch
-    /// assertBranchCorrectlyProves(hashes, path, txHash, expectedMerkleRoot)
+    /// rskj's MerkleBranchTest vectors, display order as rskj gives them: one,
+    /// two and three hashes climb to their roots, and a wrong path does not.
     #[test]
-    fn rskj_merkle_branch_one_hash() {
-        let h1 = hex_to_32("3709934297f8bfd8a1cfcf82514bbfdcc910cf4d934e0eabd58b6eb955954b45");
-        let tx_hash = hex_to_32("444f6714a6010b452d705531fb9ed850f2578ef28c364676d7e9f3f436c25554");
-        let expected_root = hex_to_32("71306e0f38f1f606d7a4eadf22814432321b2a6d6f40c94fdc8e7dd2bbcef47f");
+    fn rskj_merkle_branch_vectors() {
+        let cases: [(&[&str], i32, &str, &str); 4] = [
+            (
+                &["3709934297f8bfd8a1cfcf82514bbfdcc910cf4d934e0eabd58b6eb955954b45"],
+                1,
+                "444f6714a6010b452d705531fb9ed850f2578ef28c364676d7e9f3f436c25554",
+                "71306e0f38f1f606d7a4eadf22814432321b2a6d6f40c94fdc8e7dd2bbcef47f",
+            ),
+            (
+                &[
+                    "bfc0770be0c8bc9d06714b00c89cc769286968c28632aa7768f9525a0287d5e6",
+                    "ad13c3242a67436e8958c0b1a76ff017d1e0c36ab7b38b98d7fb3df9ebea2bff",
+                ],
+                3,
+                "9f4c1131e3dfab1b0413f97d53cab183f48f4ed0003387e7cbadea0c1f4ce365",
+                "14fd0a443ebba0fe62e323b5250fb13042e7840701058fb025032f1527f8f6f5",
+            ),
+            (
+                &[
+                    "81aa2c77c201daab3868da9a4c2e29bc1e42bdc804c7c8a4d84c5e7f3866fb3f",
+                    "bed5ecce0c0ffa58236271d4ca49767c968fb6aba6aa3c10abe31170ca826404",
+                    "f733ca23def34db37b79af4c65d5929be741b79a1d74006153892b87487d1137",
+                ],
+                5,
+                "807d74e37d9c39a315eb74955889c9be83ba33eaaf9735a9617211870cde22b2",
+                "f7f0eb7ba33dd6f37ad11153d1bc803cd6f932051d72fa73343bff59d270e9ef",
+            ),
+            (
+                &[
+                    "807d74e37d9c39a315eb74955889c9be83ba33eaaf9735a9617211870cde22b2",
+                    "bed5ecce0c0ffa58236271d4ca49767c968fb6aba6aa3c10abe31170ca826404",
+                    "f733ca23def34db37b79af4c65d5929be741b79a1d74006153892b87487d1137",
+                ],
+                4,
+                "81aa2c77c201daab3868da9a4c2e29bc1e42bdc804c7c8a4d84c5e7f3866fb3f",
+                "f7f0eb7ba33dd6f37ad11153d1bc803cd6f932051d72fa73343bff59d270e9ef",
+            ),
+        ];
+        for (hashes, path, tx, root) in cases {
+            let hashes: Vec<_> = hashes.iter().map(|h| hex_to_32(h)).collect();
+            let branch = MerkleBranch::new(hashes.clone(), path).unwrap();
+            assert_eq!(
+                branch.reduce_from(&hex_to_32(tx)),
+                Some(hex_to_32(root)),
+                "path {path}"
+            );
+            if path == 4 {
+                let wrong = MerkleBranch::new(hashes, 3).unwrap();
+                assert_ne!(wrong.reduce_from(&hex_to_32(tx)), Some(hex_to_32(root)));
+            }
+        }
+    }
 
-        let branch = MerkleBranch {
-            hashes: vec![rev(h1)],
-            path: 1,
+    /// rskj's MerkleBranch takes at most 32 hashes and a path with no more
+    /// significant bits than hashes, counting none in a negative path.
+    #[test]
+    fn a_merkle_branch_is_held_to_rskjs_constructor() {
+        let hashes = |n: usize| vec![[0x5a; 32]; n];
+        assert!(MerkleBranch::new(hashes(32), 0).is_some());
+        assert!(MerkleBranch::new(hashes(33), 0).is_none());
+        assert!(MerkleBranch::new(hashes(3), 0b111).is_some());
+        assert!(MerkleBranch::new(hashes(3), 0b1000).is_none());
+        assert!(MerkleBranch::new(hashes(0), 0).is_some());
+        assert!(MerkleBranch::new(hashes(0), 1).is_none());
+        assert!(MerkleBranch::new(hashes(1), i32::MIN).is_some());
+        assert!(MerkleBranch::new(hashes(31), i32::MAX).is_some());
+        assert!(MerkleBranch::new(hashes(30), i32::MAX).is_none());
+    }
+
+    /// Two nodes that read, in display order, as a 64-byte Bitcoin
+    /// transaction stop the climb, on whichever side the transaction sits.
+    #[test]
+    fn a_merkle_branch_through_a_transaction_shaped_pair_fails() {
+        let transaction = [
+            &[1u8, 0, 0, 0][..],
+            &[1],
+            &[0x11; 32],
+            &[0, 0, 0, 0],
+            &[2, 0xaa, 0xbb],
+            &[0xff; 4],
+            &[1],
+            &1i64.to_le_bytes(),
+            &[2, 0xcc, 0xdd],
+            &[0; 4],
+        ]
+        .concat();
+        let left: [u8; 32] = transaction[..32].try_into().unwrap();
+        let right: [u8; 32] = transaction[32..].try_into().unwrap();
+        let on_the_left = MerkleBranch::new(vec![right], 0).unwrap();
+        assert_eq!(on_the_left.reduce_from(&left), None);
+        let on_the_right = MerkleBranch::new(vec![left], 1).unwrap();
+        assert_eq!(on_the_right.reduce_from(&right), None);
+        // The other way round they are no transaction.
+        assert!(MerkleBranch::new(vec![left], 0)
+            .unwrap()
+            .reduce_from(&right)
+            .is_some());
+    }
+
+    /// The ABI's path is read as rskj's `BigInteger.intValue` reads it, and the
+    /// branch is held to rskj's constructor.
+    #[test]
+    fn merkle_branch_abi_args() {
+        let args = |path: [u8; 32], count: usize| {
+            let mut args = [[0x01; 32], [0x02; 32], path].concat();
+            let mut offset = [0u8; 32];
+            offset[31] = 128;
+            args.extend(offset);
+            let mut length = [0u8; 32];
+            length[31] = count as u8;
+            args.extend(length);
+            for i in 0..count {
+                args.extend([i as u8; 32]);
+            }
+            args
         };
-        let root = branch.reduce_from(&rev(tx_hash));
-        assert_eq!(rev(root), expected_root, "rskj oneHashBranch root mismatch");
-    }
-
-    /// Ported from rskj MerkleBranchTest.twoHashesBranch
-    #[test]
-    fn rskj_merkle_branch_two_hashes() {
-        let h1 = hex_to_32("bfc0770be0c8bc9d06714b00c89cc769286968c28632aa7768f9525a0287d5e6");
-        let h2 = hex_to_32("ad13c3242a67436e8958c0b1a76ff017d1e0c36ab7b38b98d7fb3df9ebea2bff");
-        let tx_hash = hex_to_32("9f4c1131e3dfab1b0413f97d53cab183f48f4ed0003387e7cbadea0c1f4ce365");
-        let expected_root = hex_to_32("14fd0a443ebba0fe62e323b5250fb13042e7840701058fb025032f1527f8f6f5");
-
-        let branch = MerkleBranch {
-            hashes: vec![rev(h1), rev(h2)],
-            path: 3,
-        };
-        let root = branch.reduce_from(&rev(tx_hash));
-        assert_eq!(rev(root), expected_root, "rskj twoHashesBranch root mismatch");
-    }
-
-    /// Ported from rskj MerkleBranchTest.threeHashesBranch
-    #[test]
-    fn rskj_merkle_branch_three_hashes() {
-        let h1 = hex_to_32("81aa2c77c201daab3868da9a4c2e29bc1e42bdc804c7c8a4d84c5e7f3866fb3f");
-        let h2 = hex_to_32("bed5ecce0c0ffa58236271d4ca49767c968fb6aba6aa3c10abe31170ca826404");
-        let h3 = hex_to_32("f733ca23def34db37b79af4c65d5929be741b79a1d74006153892b87487d1137");
-        let tx_hash = hex_to_32("807d74e37d9c39a315eb74955889c9be83ba33eaaf9735a9617211870cde22b2");
-        let expected_root = hex_to_32("f7f0eb7ba33dd6f37ad11153d1bc803cd6f932051d72fa73343bff59d270e9ef");
-
-        let branch = MerkleBranch {
-            hashes: vec![rev(h1), rev(h2), rev(h3)],
-            path: 5,
-        };
-        let root = branch.reduce_from(&rev(tx_hash));
-        assert_eq!(rev(root), expected_root, "rskj threeHashesBranch root mismatch");
-    }
-
-    /// Ported from rskj MerkleBranchTest.threeHashesBranchBis (alternate leaf)
-    #[test]
-    fn rskj_merkle_branch_three_hashes_bis() {
-        let h1 = hex_to_32("807d74e37d9c39a315eb74955889c9be83ba33eaaf9735a9617211870cde22b2");
-        let h2 = hex_to_32("bed5ecce0c0ffa58236271d4ca49767c968fb6aba6aa3c10abe31170ca826404");
-        let h3 = hex_to_32("f733ca23def34db37b79af4c65d5929be741b79a1d74006153892b87487d1137");
-        let tx_hash = hex_to_32("81aa2c77c201daab3868da9a4c2e29bc1e42bdc804c7c8a4d84c5e7f3866fb3f");
-        let expected_root = hex_to_32("f7f0eb7ba33dd6f37ad11153d1bc803cd6f932051d72fa73343bff59d270e9ef");
-
-        let branch = MerkleBranch {
-            hashes: vec![rev(h1), rev(h2), rev(h3)],
-            path: 4,
-        };
-        let root = branch.reduce_from(&rev(tx_hash));
-        assert_eq!(rev(root), expected_root, "rskj threeHashesBranchBis root mismatch");
-    }
-
-    /// Ported from rskj MerkleBranchTest.threeHashesBranchFailsIfPathIsWrong
-    #[test]
-    fn rskj_merkle_branch_wrong_path() {
-        let h1 = hex_to_32("807d74e37d9c39a315eb74955889c9be83ba33eaaf9735a9617211870cde22b2");
-        let h2 = hex_to_32("bed5ecce0c0ffa58236271d4ca49767c968fb6aba6aa3c10abe31170ca826404");
-        let h3 = hex_to_32("f733ca23def34db37b79af4c65d5929be741b79a1d74006153892b87487d1137");
-        let tx_hash = hex_to_32("81aa2c77c201daab3868da9a4c2e29bc1e42bdc804c7c8a4d84c5e7f3866fb3f");
-        let expected_root = hex_to_32("f7f0eb7ba33dd6f37ad11153d1bc803cd6f932051d72fa73343bff59d270e9ef");
-
-        let branch = MerkleBranch {
-            hashes: vec![rev(h1), rev(h2), rev(h3)],
-            path: 3, // wrong path
-        };
-        let root = branch.reduce_from(&rev(tx_hash));
-        assert_ne!(root, expected_root, "Wrong path should produce different root");
-    }
-
-    /// rskj vectors are display-order `Sha256Hash` values; our convention is
-    /// wire (internal) order, so they are reversed on the way in and out.
-    fn combine_display(left: &str, right: &str) -> [u8; 32] {
-        let mut l = hex_to_32(left);
-        l.reverse();
-        let mut r = hex_to_32(right);
-        r.reverse();
-        let mut out = combine_hashes(&l, &r);
-        out.reverse();
-        out
-    }
-
-    /// Ported from rskj MerkleTreeUtilsTest.combineLeftRight — 3 vectors from
-    /// bitcoind regtest (two-transaction blocks).
-    #[test]
-    fn rskj_combine_left_right_vector_1() {
-        let expected = hex_to_32("ceea4835dd23fae1978a3f6f3f0aa0171e018360272dd5b98d37550fbc978d01");
-        assert_eq!(combine_display("b945b008fbc3f357db745909958b570773fc14575a36af8bbc195b484e21f366", "9880f57b6735152a8c6d4c7e1b3bc6434ee75e459511a642bbb8cb71d3a6b6d8"), expected, "rskj combineLeftRight vector 1");
-    }
-
-    #[test]
-    fn rskj_combine_left_right_vector_2() {
-        let expected = hex_to_32("107857d7233c41d4c37ecaa9ad9d9ab15371f643074866cd23d657e6e99676be");
-        assert_eq!(combine_display("083eafdf670bb1bbc83b63262887e3cf519c3e252fac29adfb92c1e857b37f91", "5740915e973a211c71655d10e4c672301c27c287843dcfa97b7aafc04992ec5e"), expected, "rskj combineLeftRight vector 2");
-    }
-
-    #[test]
-    fn rskj_combine_left_right_vector_3() {
-        let expected = hex_to_32("71a12c9bd54735864dd6e12640e6d00d60a42a2e92e4cd0bde3f9f268b7d4345");
-        assert_eq!(combine_display("c960ed36a67318cd562d384bfbf41499db1312835e2bfe86805d9465afe9736f", "120196be3b0ca6ba07d3cfee53f8dc883781e82afdfba11181184f41a67b9898"), expected, "rskj combineLeftRight vector 3");
-    }
-
-    /// Ported from rskj PartialMerkleTreeFormatUtilsTest.overflowSize
-    #[test]
-    fn rskj_pmt_overflow_size() {
-        let data = hex_to_bytes(
-            "0300ffffff79e7c0da739df8a00f12c0bff55e5438f530aa5859ff98\
-             74258cd7bad3fe709746aff897e6a851faa80120d6ae99db30883699\
-             ac0428fc7192d6c3fec0ca6409010d"
+        let mut path = [0u8; 32];
+        path[31] = 0b10;
+        let (branch, tx, block) = MerkleBranch::from_abi_args(&args(path, 2)).unwrap();
+        assert_eq!(
+            (branch.path, branch.hashes.len(), tx, block),
+            (2, 2, [0x01; 32], [0x02; 32])
         );
-        // In rskj this throws ArithmeticException due to overflow in hash count.
-        // Our parser should either reject it or fail to parse.
-        assert!(!PartialMerkleTree::has_expected_size(&data) || PartialMerkleTree::parse(&data).is_none());
+        // Only the low 32 bits count: this path is -1, of no significant bits.
+        let high = [0xff; 32];
+        assert_eq!(
+            MerkleBranch::from_abi_args(&args(high, 1)).unwrap().0.path,
+            -1
+        );
+        path[31] = 0b100;
+        assert!(MerkleBranch::from_abi_args(&args(path, 2)).is_none());
+        assert!(MerkleBranch::from_abi_args(&args([0; 32], 33)).is_none());
     }
 
-    // Test helpers
-    fn hex_to_bytes(hex: &str) -> Vec<u8> {
-        let hex = hex.replace(|c: char| c.is_whitespace(), "");
-        (0..hex.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
-            .collect()
-    }
-
-    fn hex_to_32(hex: &str) -> [u8; 32] {
-        let bytes = hex_to_bytes(hex);
-        assert_eq!(bytes.len(), 32);
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(&bytes);
-        arr
+    /// Ported from rskj MerkleTreeUtilsTest.combineLeftRight: three vectors
+    /// from bitcoind regtest, display order.
+    #[test]
+    fn rskj_combine_left_right_vectors() {
+        for (left, right, expected) in [
+            (
+                "b945b008fbc3f357db745909958b570773fc14575a36af8bbc195b484e21f366",
+                "9880f57b6735152a8c6d4c7e1b3bc6434ee75e459511a642bbb8cb71d3a6b6d8",
+                "ceea4835dd23fae1978a3f6f3f0aa0171e018360272dd5b98d37550fbc978d01",
+            ),
+            (
+                "083eafdf670bb1bbc83b63262887e3cf519c3e252fac29adfb92c1e857b37f91",
+                "5740915e973a211c71655d10e4c672301c27c287843dcfa97b7aafc04992ec5e",
+                "107857d7233c41d4c37ecaa9ad9d9ab15371f643074866cd23d657e6e99676be",
+            ),
+            (
+                "c960ed36a67318cd562d384bfbf41499db1312835e2bfe86805d9465afe9736f",
+                "120196be3b0ca6ba07d3cfee53f8dc883781e82afdfba11181184f41a67b9898",
+                "71a12c9bd54735864dd6e12640e6d00d60a42a2e92e4cd0bde3f9f268b7d4345",
+            ),
+        ] {
+            let combined = combine_left_right(&hex_to_32(left), &hex_to_32(right));
+            assert_eq!(combined, hex_to_32(expected));
+        }
     }
 
     /// Groundtruth: the PMT from the first mainnet peg-in (RSK #6916,
@@ -702,12 +377,16 @@ mod tests {
 
         // Internal (little-endian) byte order, as stored in BTC headers.
         let mut expected_root = alloy_primitives::hex::decode(
-            "794bc781118b3bbe2c6a3a6ae21128bb50756e2dabe36e8225aacc133375835d").unwrap();
+            "794bc781118b3bbe2c6a3a6ae21128bb50756e2dabe36e8225aacc133375835d",
+        )
+        .unwrap();
         expected_root.reverse();
         assert_eq!(result.merkle_root.to_vec(), expected_root, "merkle root");
 
         let mut expected_txid = alloy_primitives::hex::decode(
-            "b4b31c7c486d1e2594f8fb96962d023a7b1eadf322862eed098deee0464394b5").unwrap();
+            "b4b31c7c486d1e2594f8fb96962d023a7b1eadf322862eed098deee0464394b5",
+        )
+        .unwrap();
         expected_txid.reverse();
         let contains = result
             .matched_hashes

@@ -254,8 +254,9 @@ pub fn register_btc_coinbase_transaction<CTX: crate::RskContextTr>(
     // Validate the witness commitment (rskj `validateWitnessInformation`,
     // BridgeSupport l.2568-2587). The commitment embedded in the coinbase tx
     // must equal SHA256d(witnessMerkleRoot.getReversedBytes() || witnessReservedValue).
-    // The ABI arg is the witness merkle root in INTERNAL byte order (bitcoinj
-    // `Sha256Hash.wrap`), so it must be reversed to display order before hashing.
+    // The ABI arg is the witness merkle root in display order (bitcoinj
+    // `Sha256Hash.wrap` keeps the bytes as given), and the commitment hashes it
+    // in wire order, so it is reversed here. It is stored as given.
     let mut commitment_data = [0u8; 64];
     commitment_data[..32].copy_from_slice(&witness_merkle_root);
     commitment_data[..32].reverse();
@@ -401,21 +402,27 @@ pub fn get_btc_transaction_confirmations<CTX: crate::RskContextTr>(
         }
     }
 
-    // 4. Merkle branch must reduce to the block's merkle root (or, from
-    //    RSKIP143, to the registered witness merkle root).
-    let computed_root = branch.reduce_from(&tx_hash);
+    // 4. The branch must climb to the block's merkle root or, from RSKIP143,
+    //    to the witness merkle root registered for the block (rskj
+    //    `isBlockMerkleRootValid`). rskj holds all of them in display order:
+    //    the branch and the transaction as the ABI gives them, the header's
+    //    root as bitcoinj reads it, and the witness root as
+    //    `registerBtcCoinbaseTransaction` stored it. Two branch nodes that
+    //    form a 64-byte transaction make rskj's `combineLeftRight` throw,
+    //    which fails the call.
+    let computed_root = branch.reduce_from(&tx_hash).ok_or_else(|| {
+        PrecompileError::other(
+            "getBtcTransactionConfirmations: two branch nodes form a transaction",
+        )
+    })?;
     let block_merkle_root = {
-        let raw = block.header.merkle_root.to_raw_hash();
-        *raw.as_byte_array()
+        let mut root = *block.header.merkle_root.to_raw_hash().as_byte_array();
+        root.reverse();
+        root
     };
-    let root_valid = if computed_root == block_merkle_root {
-        true
-    } else {
-        match get_coinbase_information(ctx, &block_hash_bytes) {
-            Some(witness_root) => computed_root == witness_root,
-            None => false,
-        }
-    };
+    let root_valid = computed_root == block_merkle_root
+        || get_coinbase_information(ctx, &block_hash_bytes)
+            .is_some_and(|witness_root| witness_root == computed_root);
     if !root_valid {
         return Ok(encode_int_output(
             gas_cost,
@@ -639,7 +646,7 @@ mod tests {
             "feb3b9170ae765cc6586edd67229eaa8bc19f9674d64cb10ee8a205f4ccf0bc6"
         );
 
-        // witnessMerkleRoot ABI arg (INTERNAL byte order, bitcoinj Sha256Hash.wrap):
+        // witnessMerkleRoot ABI arg, display order (bitcoinj Sha256Hash.wrap):
         // = MerkleTreeUtils.combineLeftRight(ZERO_HASH, secondHashTx) from the rskj test.
         let witness_merkle_root: [u8; 32] =
             hex::decode("613cb22535df8d9443fe94b66d807cd60312f982e305e25e825b00e6f429799f")
