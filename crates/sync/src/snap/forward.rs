@@ -482,7 +482,9 @@ impl ForwardSync {
             }
             for uncle in &entry.uncles {
                 let hash = uncle.hash();
-                self.verifier.verify(uncle, None).map_err(|e| {
+                // An uncle's own rules, which are not a trunk header's; its
+                // parent is not held here, so only the rules that need none.
+                self.verifier.verify_uncle(uncle).map_err(|e| {
                     AscentError::UncleProofOfWork {
                         number: entry.header.number,
                         hash,

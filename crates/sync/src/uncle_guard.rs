@@ -133,10 +133,11 @@ impl UncleGuard {
 
     /// Whether this block's uncles may be credited with their difficulty.
     ///
-    /// Runs rskj's whole `BlockUnclesValidationRule`: the list limit, the
-    /// generation limit, no repeats, no ancestor, nothing already used by an
-    /// ancestor, a parent that is itself an ancestor, and every per-header and
-    /// parent-relative rule a trunk header faces -- proof of work included.
+    /// Runs rskj's `BlockUnclesValidationRule`: the list limit, the generation
+    /// limit, no repeats, no ancestor, nothing already used by an ancestor, a
+    /// parent that is itself an ancestor, and the rules rskj gives it for each
+    /// uncle -- proof of work, timestamps, difficulty and gas limit against its
+    /// own parent. Not fork detection, which reads 449 headers per uncle.
     ///
     /// Returns the reason when it refuses, for the caller to log.
     pub fn uncles_are_admissible(
@@ -167,8 +168,8 @@ impl UncleGuard {
             store: &source,
             uncle_list_limit: UNCLE_LIST_LIMIT,
             uncle_generation_limit: UNCLE_GENERATION_LIMIT,
-            header_rules: verifier.static_rules(),
-            parent_rules: verifier.parent_rules(),
+            header_rules: verifier.uncle_rules(),
+            parent_rules: verifier.uncle_parent_rules(),
             fork_detection: None,
         };
         let block = rustock_core::types::block::Block {

@@ -896,3 +896,27 @@ fn the_uncle_rule_runs_fork_detection_when_asked() {
     );
     assert_eq!(judge(&ancestry, &block, uncle, None), Ok(()));
 }
+
+/// The verifier every sync path holds judges uncles by rskj's uncle rules,
+/// not by a trunk header's: no extra-data cap or gas-limit bounds. The
+/// timestamp rule, RSKIP179 included, holds for both.
+#[test]
+fn default_rsk_holds_uncles_to_rskjs_uncle_rules() {
+    let verifier = HeaderVerifier::default_rsk(uncle_config());
+    let (_, parent, _) = uncle_chain(0);
+
+    let mut chatty = uncle_of(&parent, 1010);
+    chatty.extra_data = Bytes::from(vec![0xab; 40]);
+    chatty.gas_limit = U256::from(20_000_000);
+    seal(&mut chatty, 1010);
+    assert_eq!(verifier.verify_uncle(&chatty), Ok(()));
+    assert!(verifier.verify(&chatty, None).is_err(), "a trunk header may not carry either");
+
+    let mut adrift = uncle_of(&parent, 1010);
+    seal(&mut adrift, 1010 + 300);
+    for verdict in [verifier.verify_uncle(&adrift), verifier.verify(&adrift, None)] {
+        assert!(matches!(verdict, Err(ValidationError::BitcoinTimestampTooFar { .. })));
+    }
+
+    assert_eq!(verifier.uncle_parent_rules().len(), 5, "rskj's five, in its order");
+}

@@ -10,12 +10,13 @@
 //! makes a block's total exact once its body is held, in the order the chain
 //! runs, so that each block starts from a parent whose total is exact already.
 //!
-//! An uncle is credited only once it passes rskj's whole uncle rule against the
-//! ancestry this node holds, with every rule a trunk header faces, proof of work
-//! included: the standard [`crate::uncle_guard`] holds uncles from the wire to.
-//! The body check on receipt proves only that the list is the one the block's
-//! header commits to, that its miner chose those uncles, not that each did the
-//! work it claims. An uncle that fails is not credited, which leaves the total
+//! An uncle is credited only once it passes rskj's uncle rule against the
+//! ancestry this node holds, with the rules rskj gives that rule for each
+//! uncle: proof of work, timestamps, difficulty and gas limit against its own
+//! parent. Not fork detection, which reads 449 headers per uncle. The body
+//! check on receipt proves only that the list is the one the block's header
+//! commits to, that its miner chose those uncles, not that each did the work
+//! it claims. An uncle that fails is not credited, which leaves the total
 //! understated, the safe direction, rather than overstated.
 
 use alloy_primitives::{B256, U256};
@@ -110,8 +111,8 @@ pub(crate) fn credited_uncles(
         store: &held,
         uncle_list_limit: UNCLE_LIST_LIMIT,
         uncle_generation_limit: UNCLE_GENERATION_LIMIT,
-        header_rules: verifier.static_rules(),
-        parent_rules: verifier.parent_rules(),
+        header_rules: verifier.uncle_rules(),
+        parent_rules: verifier.uncle_parent_rules(),
         fork_detection: None,
     }
     .validate(&block)

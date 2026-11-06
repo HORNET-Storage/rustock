@@ -168,6 +168,10 @@ impl BlockVerifier {
 pub struct HeaderVerifier {
     static_rules: Vec<Box<dyn HeaderValidator>>,
     parent_rules: Vec<Box<dyn ParentHeaderValidator>>,
+    /// The rules an uncle passes, which are not a trunk header's: rskj gives
+    /// its uncle rule lists of its own.
+    uncle_rules: Vec<Box<dyn HeaderValidator>>,
+    uncle_parent_rules: Vec<Box<dyn ParentHeaderValidator>>,
 }
 
 impl Default for HeaderVerifier {
@@ -181,10 +185,14 @@ impl HeaderVerifier {
         Self {
             static_rules: Vec::new(),
             parent_rules: Vec::new(),
+            uncle_rules: Vec::new(),
+            uncle_parent_rules: Vec::new(),
         }
     }
 
-    /// Creates a standard RSK verifier with all consensus rules.
+    /// Creates a standard RSK verifier with all consensus rules, and rskj's
+    /// rules for uncles, [`uncles::rsk_header_rules`] and
+    /// [`uncles::rsk_parent_rules`].
     ///
     /// Note: `ParentHashRule` is intentionally **not** included here because
     /// the sync pipeline looks up the parent by `header.parent_hash`, so
@@ -193,7 +201,7 @@ impl HeaderVerifier {
     /// from Java's non-canonical RLP encoding (leading zeros in difficulty)
     /// and cannot be reproduced by our standard `Header::hash()`.
     pub fn default_rsk(config: std::sync::Arc<crate::config::ChainConfig>) -> Self {
-        Self::new()
+        let mut verifier = Self::new()
             .with_static_rule(GasUsedRule)
             .with_static_rule(GasLimitBoundsRule { 
                 min_gas_limit: config.min_gas_limit, 
@@ -207,25 +215,57 @@ impl HeaderVerifier {
             .with_parent_rule(TimestampRule::new(config.max_future_block_time))
             .with_parent_rule(BlockParentGasLimitRule { config: config.clone() })
             .with_parent_rule(block_rules::PrevMinGasPriceRule)
-            .with_parent_rule(DifficultyRule { config })
+            .with_parent_rule(DifficultyRule { config: config.clone() });
+        verifier.uncle_rules = uncles::rsk_header_rules(config.clone());
+        verifier.uncle_parent_rules = uncles::rsk_parent_rules(config);
+        verifier
     }
 
-    /// The rules that judge a header on its own, proof of work among them.
-    ///
-    /// Exposed so an uncle can be put through exactly the same rules as a
-    /// trunk header. An uncle that is not checked as hard as a trunk block is
-    /// a way to credit work nobody did.
+    /// The rules that judge a trunk header on its own, proof of work among
+    /// them.
     pub fn static_rules(&self) -> &[Box<dyn HeaderValidator>] {
         &self.static_rules
     }
 
-    /// The rules that judge a header against its parent.
+    /// The rules that judge a trunk header against its parent.
     pub fn parent_rules(&self) -> &[Box<dyn ParentHeaderValidator>] {
         &self.parent_rules
     }
 
+    /// The rules that judge an uncle on its own: rskj's, which are not a
+    /// trunk header's. An uncle checked less hard than rskj checks it is work
+    /// credited that nobody did; one checked harder is work rskj counts and
+    /// this node does not.
+    pub fn uncle_rules(&self) -> &[Box<dyn HeaderValidator>] {
+        &self.uncle_rules
+    }
+
+    /// The rules that judge an uncle against its own parent.
+    pub fn uncle_parent_rules(&self) -> &[Box<dyn ParentHeaderValidator>] {
+        &self.uncle_parent_rules
+    }
+
+    /// Runs the rules an uncle faces on its own, for a caller that does not
+    /// hold its parent.
+    pub fn verify_uncle(&self, uncle: &Header) -> Result<(), ValidationError> {
+        for rule in &self.uncle_rules {
+            rule.validate(uncle)?;
+        }
+        Ok(())
+    }
+
     pub fn with_static_rule(mut self, rule: impl HeaderValidator + 'static) -> Self {
         self.static_rules.push(Box::new(rule));
+        self
+    }
+
+    pub fn with_uncle_rule(mut self, rule: impl HeaderValidator + 'static) -> Self {
+        self.uncle_rules.push(Box::new(rule));
+        self
+    }
+
+    pub fn with_uncle_parent_rule(mut self, rule: impl ParentHeaderValidator + 'static) -> Self {
+        self.uncle_parent_rules.push(Box::new(rule));
         self
     }
 

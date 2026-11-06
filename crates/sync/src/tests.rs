@@ -6824,7 +6824,8 @@ async fn forged_uncles_do_not_prove_a_difficulty() {
     );
 }
 
-/// An uncle the header *does* commit to still has to have done the work.
+/// An uncle the header *does* commit to still has to have done the work, and
+/// to follow its parent as rskj's uncle rule requires.
 ///
 /// A matching commitment only proves the block's miner chose this list. The
 /// uncle's own merged-mining proof of work is what makes the difficulty it
@@ -6833,57 +6834,57 @@ async fn forged_uncles_do_not_prove_a_difficulty() {
 #[tokio::test]
 async fn a_committed_uncle_without_proof_of_work_proves_nothing() {
     use rustock_networking::protocol::HeaderWithUncles;
-    let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
-    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
-    let genesis_hash = genesis.hash();
-    store.update_head(&genesis, U256::from(1)).unwrap();
 
-    /// Rejects the marked header, standing in for a failed merged-mining check.
-    struct RejectMarked;
-    impl rustock_core::validation::HeaderValidator for RejectMarked {
-        fn validate(
-            &self,
-            h: &rustock_core::Header,
-        ) -> Result<(), rustock_core::validation::ValidationError> {
-            if h.difficulty == U256::from(999u64) {
-                return Err(rustock_core::validation::ValidationError::BitcoinPowInvalid {
-                    hash: h.hash(),
-                    target: U256::ZERO,
-                });
-            }
-            Ok(())
-        }
-    }
-
-    let verifier = Arc::new(
-        HeaderVerifier::new()
-            .with_static_rule(RejectMarked)
+    let verifiers = [
+        (HeaderVerifier::new(), 1_020u64),
+        (HeaderVerifier::new().with_uncle_rule(NoWorkAt999), 21),
+        (HeaderVerifier::new().with_uncle_parent_rule(OffItsParentAt999), 21),
+    ];
+    for (verifier, total) in verifiers {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+        let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+        let genesis_hash = genesis.hash();
+        store.update_head(&genesis, U256::from(1)).unwrap();
+        let verifier = verifier
             .with_parent_rule(rustock_core::validation::BlockNumberRule)
-            .with_parent_rule(rustock_core::validation::ParentHashRule),
-    );
-    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
-    let manager = SyncManager::new(store.clone(), verifier, peer_store);
+            .with_parent_rule(rustock_core::validation::ParentHashRule);
+        let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+        let manager = SyncManager::new(store.clone(), Arc::new(verifier), peer_store);
 
-    let uncle = dummy_header(0, B256::ZERO, U256::from(999));
-    let mut b1 = dummy_header(1, genesis_hash, U256::from(10));
-    b1.uncle_count = 1;
-    let entry = HeaderWithUncles { header: b1, uncles: vec![uncle] };
-    let mut header = entry.header.clone();
-    header.ommers_hash = alloy_primitives::keccak256(entry.encoded_uncles());
-    header.cached_hash = None;
-    let entry = HeaderWithUncles { header, uncles: entry.uncles };
-    assert!(entry.commitment_matches(), "the commitment is honest; the work is not");
+        // #1 on the trunk, then #2 naming a genuine sibling of #1 worth 999:
+        // its parent is an ancestor, so with no rule against it, it counts.
+        let commit = |h: &Header, us: &[Header]| -> Header {
+            let mut h = h.clone();
+            h.uncle_count = us.len() as u64;
+            h.ommers_hash = alloy_primitives::keccak256(
+                HeaderWithUncles { header: h.clone(), uncles: us.to_vec() }.encoded_uncles(),
+            );
+            h.cached_hash = None;
+            h
+        };
+        let b1 = commit(&dummy_header(1, genesis_hash, U256::from(10)), &[]);
+        let mut uncle = dummy_header(1, genesis_hash, U256::from(999));
+        uncle.gas_used = 1;
+        uncle.cached_hash = None;
+        let b2 =
+            commit(&dummy_header(2, b1.hash(), U256::from(10)), std::slice::from_ref(&uncle));
+        let hash = b2.hash();
+        let entry = HeaderWithUncles { header: b2, uncles: vec![uncle] };
+        assert!(entry.commitment_matches(), "the commitment is honest; the work is not");
 
-    let hash = entry.header.hash();
-    let headers = manager.note_proven_difficulties(vec![entry]);
-    manager.handle_headers_response(headers, test_peer()).unwrap();
+        let headers = manager.note_proven_difficulties(vec![
+            HeaderWithUncles { header: b1, uncles: Vec::new() },
+            entry,
+        ]);
+        manager.handle_headers_response(headers, test_peer()).unwrap();
 
-    assert_eq!(
-        store.total_difficulty(hash).unwrap(),
-        Some(U256::from(11)),
-        "a committed uncle with no proof of work must not be credited"
-    );
+        assert_eq!(
+            store.total_difficulty(hash).unwrap(),
+            Some(U256::from(total)),
+            "an uncle is credited exactly when it passes the uncle rules"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -6912,6 +6913,26 @@ impl rustock_core::validation::HeaderValidator for NoWorkAt999 {
             return Err(rustock_core::validation::ValidationError::BitcoinPowInvalid {
                 hash: h.hash(),
                 target: U256::ZERO,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Fails the header whose difficulty is 999 against its parent, standing in
+/// for an uncle whose difficulty is not the one its parent calls for.
+struct OffItsParentAt999;
+
+impl rustock_core::validation::ParentHeaderValidator for OffItsParentAt999 {
+    fn validate_with_parent(
+        &self,
+        h: &Header,
+        _parent: &Header,
+    ) -> Result<(), rustock_core::validation::ValidationError> {
+        if h.difficulty == U256::from(999u64) {
+            return Err(rustock_core::validation::ValidationError::DifficultyMismatch {
+                expected: U256::from(10u64),
+                got: h.difficulty,
             });
         }
         Ok(())
@@ -7001,21 +7022,27 @@ async fn a_caught_up_batch_counts_the_uncles_its_bodies_bring() {
     assert_eq!(store.total_difficulty(b3.hash()).unwrap(), Some(U256::from(43)));
 }
 
-/// A body's uncles count only once they pass the whole uncle rule, proof of
-/// work included. The body check on receipt shows only that the block's miner
-/// chose them, and an uncle that never did its work would otherwise add what
-/// it claims to every total above it.
+/// A body's uncles count only once they pass the whole uncle rule: the rules
+/// an uncle faces on its own, proof of work among them, and those it faces
+/// against its parent. The body check on receipt shows only that the block's
+/// miner chose them, and an uncle that never did its work would otherwise add
+/// what it claims to every total above it.
 #[tokio::test]
 async fn a_caught_up_body_whose_uncle_did_no_work_adds_no_uncle() {
-    let dir = tempdir().unwrap();
-    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
-    let (b1, uncles) = genesis_and_siblings(&store, 7, 999);
-    let verifier = HeaderVerifier::new().with_static_rule(NoWorkAt999);
-    let [_, b2, b3] = caught_up(&store, verifier, b1, &uncles).await;
+    let verifiers = [
+        HeaderVerifier::new().with_uncle_rule(NoWorkAt999),
+        HeaderVerifier::new().with_uncle_parent_rule(OffItsParentAt999),
+    ];
+    for verifier in verifiers {
+        let dir = tempdir().unwrap();
+        let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+        let (b1, uncles) = genesis_and_siblings(&store, 7, 999);
+        let [_, b2, b3] = caught_up(&store, verifier, b1, &uncles).await;
 
-    // Neither uncle: rskj refuses the whole block over one.
-    assert_eq!(store.total_difficulty(b2.hash()).unwrap(), Some(U256::from(21)));
-    assert_eq!(store.total_difficulty(b3.hash()).unwrap(), Some(U256::from(31)));
+        // Neither uncle: rskj refuses the whole block over one.
+        assert_eq!(store.total_difficulty(b2.hash()).unwrap(), Some(U256::from(21)));
+        assert_eq!(store.total_difficulty(b3.hash()).unwrap(), Some(U256::from(31)));
+    }
 }
 
 /// In follow mode a block's total is settled from the executed head's when its
@@ -7063,7 +7090,7 @@ async fn a_header_ingested_again_credits_only_uncles_that_did_their_work() {
         let store = Arc::new(BlockStore::open(dir.path()).unwrap());
         let (b1, uncles) = genesis_and_siblings(&store, 7, second);
         let b2 = naming_uncles(dummy_header(2, b1.hash(), U256::from(10)), &uncles);
-        let verifier = Arc::new(HeaderVerifier::new().with_static_rule(NoWorkAt999));
+        let verifier = Arc::new(HeaderVerifier::new().with_uncle_rule(NoWorkAt999));
         let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
         let manager = SyncManager::new(store.clone(), verifier, peer_store);
         manager.handle_headers_response(vec![b2.clone(), b1.clone()], test_peer()).unwrap();

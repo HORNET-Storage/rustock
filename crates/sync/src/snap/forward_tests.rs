@@ -157,7 +157,7 @@ impl HeaderValidator for RejectMarked {
 #[test]
 fn an_uncle_without_proof_of_work_is_refused() {
     let anchor = header(0, B256::ZERO, 100);
-    let (mut s, _d) = sync(&anchor, 2, HeaderVerifier::new().with_static_rule(RejectMarked));
+    let (mut s, _d) = sync(&anchor, 2, HeaderVerifier::new().with_uncle_rule(RejectMarked));
 
     let entries = run_of(1, 2, anchor.hash(), 100, |n| {
         if n == 1 { vec![header(0, B256::repeat_byte(5), 666)] } else { Vec::new() }
