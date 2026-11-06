@@ -5426,7 +5426,7 @@ pub(crate) fn identify_chunk_by_content(
 /// missing); the sync must not advance past it (rskj treats such a block as
 /// invalid and stops there). The returned state root and flush counter are
 /// carried back into the service for the next batch.
-fn process_downloaded_blocks(
+pub(crate) fn process_downloaded_blocks(
     processor: &BlockProcessor,
     trie_store: Arc<dyn TrieStore>,
     state_root: TrieNode,
@@ -5507,13 +5507,17 @@ fn process_downloaded_blocks(
             ommers,
         };
 
-        // Same consensus gate as the single-block path above.
+        // Same consensus gate as the single-block path above, and a failure
+        // here is a failure of the batch like any other below: reported clean,
+        // it let the sync resume past an invalid block until the next batch's
+        // lineage check tripped over the gap it left.
         if let Err(e) = processor.validate_block(&block) {
             warn!(
                 target: "rustock::sync",
                 "Block #{} ({:?}) failed consensus validation: {e}",
                 block.header.number, hash
             );
+            all_ok = false;
             break;
         }
 

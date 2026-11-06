@@ -7179,6 +7179,57 @@ async fn the_oldest_ancestor_the_uncle_rule_walks_must_be_held_too() {
     assert_eq!(store.total_difficulty(b2.hash()).unwrap(), Some(U256::from(28)));
 }
 
+/// A batch stopped by a block that fails consensus validation is not clean,
+/// any more than one stopped by a block that fails to execute: rskj treats the
+/// block as invalid and stops there.
+#[test]
+fn a_batch_stopped_by_a_block_that_fails_validation_is_not_clean() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let trie = Arc::new(rustock_trie::MemoryTrieStore::new()) as Arc<dyn rustock_trie::TrieStore>;
+    let empty = rustock_trie::TrieNode::empty();
+    let root = empty.compute_hash(trie.as_ref());
+    trie.put(root.as_slice(), &empty.to_message(trie.as_ref()));
+
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+    store.set_exec_head(genesis.hash(), root).unwrap();
+    // A block with no REMASC transaction, which every block but genesis needs.
+    let b1 = dummy_header(1, genesis.hash(), U256::from(1));
+    store.put_header(&b1).unwrap();
+    store.put_body(b1.hash(), &[], &[]).unwrap();
+
+    let processor = rustock_execution::BlockProcessor::new(
+        rustock_execution::RskHardforkConfig::mainnet(),
+        store.clone(),
+    );
+    let block = rustock_core::types::block::Block {
+        header: b1.clone(),
+        transactions: Vec::new(),
+        ommers: Vec::new(),
+    };
+    assert!(processor.validate_block(&block).is_err(), "the block must fail validation");
+
+    let outcome = crate::service::process_downloaded_blocks(
+        &processor,
+        trie,
+        empty,
+        &store,
+        None,
+        0,
+        1,
+        &[(b1.hash(), b1)],
+        &crate::chain_activity::ChainActivity::new(),
+        &crate::gas_price::GasPriceTracker::default(),
+    );
+    assert!(!outcome.all_ok, "a batch stopped by an invalid block reported itself clean");
+    assert_eq!(
+        store.exec_head().unwrap().map(|(hash, _)| hash),
+        Some(genesis.hash()),
+        "and nothing past the invalid block's parent executed"
+    );
+}
+
 /// One real uncle may not be counted twice.
 ///
 /// After #268 a peer cannot fabricate uncles: the list is bound to the trunk
