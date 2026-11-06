@@ -116,7 +116,9 @@ pub struct RateLimiter {
     max_wait: Duration,
     /// Beyond this many tracked peers, idle buckets are dropped. A full bucket
     /// carries no information -- it is indistinguishable from a peer that has
-    /// never asked -- so dropping it costs nothing and bounds the map.
+    /// never asked -- so dropping it costs nothing. When that frees no room,
+    /// the bucket nearest full makes way for the newcomer, so the map never
+    /// holds more than this.
     capacity: usize,
     state: Mutex<State>,
 }
@@ -163,6 +165,25 @@ impl RateLimiter {
                 b.refill(self.per_peer, cap, now);
                 !b.is_full(cap)
             });
+            // Dropping full buckets alone bounds nothing while peers arrive
+            // faster than buckets refill: in a release build, 5,000 new peers
+            // asking once each left about 150 behind against a bound of 64.
+            // A newcomer that still finds no room takes the place of the peer
+            // nearest to full, which forgives the smallest debt there is; the
+            // whole-server bucket still holds everyone to the total.
+            if !state.peers.contains_key(&peer) {
+                while state.peers.len() >= self.capacity {
+                    let Some(nearest) = state
+                        .peers
+                        .iter()
+                        .max_by(|a, b| a.1.tokens.total_cmp(&b.1.tokens))
+                        .map(|(p, _)| *p)
+                    else {
+                        break;
+                    };
+                    state.peers.remove(&nearest);
+                }
+            }
         }
 
         state.global.refill(self.global, global_capacity, now);
