@@ -856,6 +856,140 @@ fn an_rskj_chunk_that_does_not_rebuild_is_charged() {
     assert_eq!(blame[0].event, EventType::InvalidMessage);
 }
 
+/// An rskj chunk of the fixture's state, as an rskj server answers `from`.
+fn rskj_chunk(f: &Fixture, from: u64, cell: u64) -> ChunkPayload {
+    use rustock_trie::snapshot_legacy::{encode_blob, legacy_chunk};
+    let root: [u8; 32] = f.state_root.into();
+    let chunk = legacy_chunk(&root, from, from + cell, f.trie.as_ref()).expect("a chunk");
+    ChunkPayload::Legacy(encode_blob(&chunk).into())
+}
+
+/// An honest rskj chunk is kept, moves the download as far as it reached,
+/// and costs its sender nothing.
+#[test]
+fn an_honest_rskj_chunk_is_kept_and_not_charged() {
+    let f = fixture(250);
+    let genesis = f.with_genesis();
+    let (blocks, tds) = chain(1, 3, genesis, 100, f.state_root);
+    let peers = vec![B512::repeat_byte(1), B512::repeat_byte(2)];
+
+    let (mut driver, id, from, server) = driver_awaiting_a_chunk(&f, &blocks, &tds, &peers);
+    driver.take_blame();
+
+    driver.on_chunk(id, server, &rskj_chunk(&f, from, 4_000), Refusal::None, &peers);
+
+    assert!(driver.take_blame().is_empty(), "an honest rskj peer was charged");
+    let (covered, total) = driver.state_progress();
+    assert!(covered > 0, "the chunk moved nothing");
+    assert_eq!(
+        total,
+        Some(rustock_trie::snapshot::total_size(&f.trie_root, f.trie.as_ref())),
+        "the size of the trie comes from the rebuilt root, not the peer's hint"
+    );
+}
+
+/// An rskj chunk that answers another offset is charged: its nodes are
+/// genuine, but it is not an answer to the question, any more than a proved
+/// chunk for the wrong offset is.
+#[test]
+fn an_rskj_chunk_for_another_offset_is_charged() {
+    let f = fixture(250);
+    let genesis = f.with_genesis();
+    let (blocks, tds) = chain(1, 3, genesis, 100, f.state_root);
+    let peers = vec![B512::repeat_byte(1), B512::repeat_byte(2)];
+
+    let (mut driver, id, from, server) = driver_awaiting_a_chunk(&f, &blocks, &tds, &peers);
+    driver.take_blame();
+
+    let total = rustock_trie::snapshot::total_size(&f.trie_root, f.trie.as_ref());
+    let elsewhere = rskj_chunk(&f, from + total / 2, 1_000);
+    driver.on_chunk(id, server, &elsewhere, Refusal::None, &peers);
+
+    let blame = driver.take_blame();
+    assert_eq!(blame.len(), 1, "got {blame:?}");
+    assert_eq!(blame[0].peer, server);
+    assert_eq!(blame[0].event, EventType::InvalidMessage);
+    assert_eq!(driver.state_progress().0, 0, "a chunk for another offset moved the download");
+}
+
+/// An rskj chunk with nothing of its own -- what rskj answers when the node at
+/// the offset outruns its cell, or the offset is past the end -- is not held
+/// against the peer. It is about the offset, and the range is asked again.
+#[test]
+fn an_rskj_chunk_with_nothing_of_its_own_is_not_charged() {
+    let f = fixture(250);
+    let genesis = f.with_genesis();
+    let (blocks, tds) = chain(1, 3, genesis, 100, f.state_root);
+    let peers = vec![B512::repeat_byte(1), B512::repeat_byte(2)];
+
+    let (mut driver, id, from, server) = driver_awaiting_a_chunk(&f, &blocks, &tds, &peers);
+    driver.take_blame();
+
+    // A one-byte cell: no node fits, so the chunk carries only the path to it.
+    let nothing = rskj_chunk(&f, from, 1);
+    let ChunkPayload::Legacy(blob) = &nothing else { unreachable!() };
+    let chunk = rustock_trie::snapshot_legacy::decode_blob(blob).expect("decodes");
+    assert!(chunk.nodes.is_empty() && !chunk.post_root.is_empty(), "not the chunk this test is about");
+
+    driver.on_chunk(id, server, &nothing, Refusal::None, &peers);
+    assert!(driver.take_blame().is_empty(), "charged a peer for the offset it was asked");
+    assert!(!driver.unhelpful().contains(&server), "stopped asking a peer that can serve");
+    assert_eq!(driver.state_progress().0, 0);
+}
+
+/// The chunk requests among a batch of outbound messages: id, offset, peer.
+fn chunk_requests(out: &[super::driver::Outbound]) -> Vec<(u64, u64, B512)> {
+    out.iter()
+        .filter_map(|o| {
+            let P2pMessage::RskMessage(m) = &o.message else { return None };
+            let RskSubMessage::SnapChunkRequest(req) = &m.sub_message else { return None };
+            Some((req.id, req.from, o.peer))
+        })
+        .collect()
+}
+
+/// After an rskj chunk the session asks for exactly where it stopped, which
+/// only an rskj server takes; a server that refuses the offset as off its
+/// grid gets the cell next, not the same offset again.
+#[test]
+fn an_offset_refused_as_off_the_grid_is_asked_on_the_grid_next() {
+    let f = fixture(250);
+    let genesis = f.with_genesis();
+    let (blocks, tds) = chain(1, 3, genesis, 100, f.state_root);
+    let peers = vec![B512::repeat_byte(1), B512::repeat_byte(2)];
+
+    let (mut driver, id, from, server) = driver_awaiting_a_chunk(&f, &blocks, &tds, &peers);
+    driver.on_chunk(id, server, &rskj_chunk(&f, from, 2_000), Refusal::None, &peers);
+    let (cursor, _) = driver.state_progress();
+    assert!(cursor > 0, "the chunk moved nothing");
+    // Let whatever else the setup left outstanding time out, so the budget
+    // has room for the request this is about. Timing out is charged; that is
+    // not what this test is about.
+    driver.expire(std::time::Instant::now() + std::time::Duration::from_secs(60));
+    driver.take_blame();
+    let out = driver.poll(&peers);
+
+    let exact = chunk_requests(&out);
+    let &(id, asked, peer) = exact
+        .iter()
+        .find(|(_, asked, _)| *asked == cursor)
+        .unwrap_or_else(|| panic!("nothing asked at the cursor {cursor}: {exact:?}"));
+    assert_ne!(asked % 100_000, 0, "the exact offset happens to be on the grid; the test proves nothing");
+
+    let refused = ChunkPayload::Proved { entries: Vec::new(), witness: Vec::new() };
+    let out = driver.on_chunk(id, peer, &refused, Refusal::OffsetNotOnGrid, &peers);
+    assert!(driver.take_blame().is_empty(), "a refusal about the offset was charged");
+    let next = chunk_requests(&out);
+    assert!(
+        next.iter().any(|(_, asked, _)| *asked == cursor / 100_000 * 100_000),
+        "the refused offset was not replaced by its cell: {next:?}"
+    );
+    assert!(
+        next.iter().all(|(_, asked, _)| *asked != cursor),
+        "the refused offset was asked again: {next:?}"
+    );
+}
+
 /// A peer that offers a chain which does not link is charged for the status,/// A peer that offers a chain which does not link is charged for the status,
 /// not merely ignored.
 #[test]

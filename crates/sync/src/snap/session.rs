@@ -1192,12 +1192,18 @@ impl SnapSession {
         // much: it costs it nothing to lie, but the lie only wastes our
         // requests, and the alternative is guessing from an empty payload.
         if refusal != Refusal::None {
-            self.chunk_fault = Some(if refusal.worth_asking_again() {
+            let realign = refusal.worth_asking_again();
+            self.chunk_fault = Some(if realign {
                 ChunkFault::Realign
             } else {
                 ChunkFault::Declined
             });
             debug!(target: "rustock::snap", "peer refused offset {from}: {refusal:?}");
+            if realign {
+                if let Some(download) = self.download.as_mut() {
+                    download.realign(from);
+                }
+            }
             return self.fruitless(from);
         }
 
@@ -1219,16 +1225,30 @@ impl SnapSession {
 
         // An rskj chunk proves itself by rebuilding to the root, which has
         // already happened -- there is no way to inspect one without
-        // reconstructing it. What is left is to keep the nodes.
+        // reconstructing it. The rebuild placed it too, so what is left is to
+        // check it answers what was asked, and keep the nodes.
         let proof = match arrived {
             super::client::Arrived::Rebuilt(rebuilt) => {
                 let Some(download) = self.download.as_mut() else { return Vec::new() };
-                let progress = download.accept_rebuilt(from, &rebuilt);
-                self.fruitless_chunks = 0;
-                return if progress.complete {
-                    self.finish_state_download()
-                } else {
-                    self.poll()
+                return match download.accept_rebuilt(from, &rebuilt) {
+                    Ok(progress) => {
+                        self.fruitless_chunks = 0;
+                        if progress.complete {
+                            self.finish_state_download()
+                        } else {
+                            self.poll()
+                        }
+                    }
+                    Err(e) => {
+                        debug!(target: "rustock::snap", "rskj chunk from offset {from} refused: {e}");
+                        self.chunk_fault = Some(match e {
+                            // Nothing of its own: past the end, as rskj answers
+                            // an offset there. About the offset, not the peer.
+                            ChunkError::Empty => ChunkFault::Realign,
+                            other => ChunkFault::Misbehaved(other),
+                        });
+                        self.fruitless(from)
+                    }
                 };
             }
             super::client::Arrived::Proved(proof) => proof,

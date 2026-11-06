@@ -74,6 +74,10 @@ struct Slice {
     /// its responses below the grid size will do that -- because asking for
     /// the same cell again would produce the same answer forever. Costs a
     /// cache miss at that server, which is strictly better than a stall.
+    ///
+    /// Set after every rskj chunk too. An rskj server answers any offset,
+    /// starting with the node that ends there, so asking for the cursor picks
+    /// up exactly where the last chunk stopped, whatever size it serves.
     exact: bool,
 }
 
@@ -122,6 +126,11 @@ const OVERSIZE_FACTOR: u64 = 4;
 pub struct RebuiltChunk {
     pub nodes: Vec<(B256, Vec<u8>)>,
     pub long_values: Vec<Vec<u8>>,
+    /// The size of the whole trie, which the rebuilt root commits to.
+    pub total: u64,
+    /// Where the chunk's own nodes begin and end in the traversal, as the
+    /// rebuild placed them. `None` when it carried none.
+    pub span: Option<(u64, u64)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -134,6 +143,10 @@ pub enum ChunkError {
     LegacyRebuild(String),
     #[error("the answer is {got} bytes against a {asked} byte request")]
     Oversized { asked: u64, got: u64 },
+    #[error("the chunk begins at offset {starts}, after the offset {asked} it answers")]
+    Misplaced { asked: u64, starts: u64 },
+    #[error("the chunk carried no nodes of its own")]
+    Empty,
 }
 
 /// Downloading one state trie.
@@ -242,11 +255,22 @@ impl StateDownload {
     /// undo. Called on a timeout, a disconnect, or a chunk that failed to
     /// verify.
     pub fn release(&mut self, from: u64) {
-        let grid = self.grid;
         if let Some(i) = self.slice_for(from) {
             self.slices[i].in_flight = false;
         }
-        let _ = grid;
+    }
+
+    /// Give back a request whose offset did not suit the server -- not on its
+    /// grid, or past an end the hint had wrong -- and ask on the grid next.
+    ///
+    /// An exact offset is what an rskj server needs and what a rustock server
+    /// refuses, and either may be asked next; the grid is the request every
+    /// server takes.
+    pub fn realign(&mut self, from: u64) {
+        if let Some(i) = self.slice_for(from) {
+            self.slices[i].in_flight = false;
+            self.slices[i].exact = false;
+        }
     }
 
     /// The slice an answer for `from` belongs to.
@@ -349,14 +373,53 @@ impl StateDownload {
     /// Keep a chunk that arrived in rskj's format.
     ///
     /// It has already proved itself: the only way to read one is to rebuild
-    /// it, and the rebuild is checked against the state root. So there is
-    /// nothing left to verify here, only nodes to store and a cursor to move.
+    /// it, and the rebuild is checked against the state root. The rebuild
+    /// also placed it -- from the sizes the rebuilt tree commits to, where its
+    /// first node begins, where its last ends, and that nothing between them
+    /// was left out -- so the slice advances to where the chunk really
+    /// reached.
     ///
-    /// The offsets it covers are not stated anywhere -- rskj's format carries
-    /// no per-node offsets and the rebuild derives structure, not position --
-    /// so the slice advances by the cell it asked for rather than by where
-    /// the nodes turned out to sit.
-    pub fn accept_rebuilt(&mut self, from: u64, chunk: &RebuiltChunk) -> Progress {
+    /// It used to advance by the cell it asked for, on the reasoning that
+    /// rskj's format states no offsets. But an rskj server does not serve the
+    /// cell asked for: it serves `from` to `from + 50 * 1024`, a constant on
+    /// its side, whatever the request says. On rustock's 100,000-byte grid
+    /// the last 48,800 bytes of every cell were marked done and never
+    /// fetched. On mainnet that was 45.7% of the state, found only by the
+    /// check after an hour's download, five attempts running.
+    ///
+    /// The next request then names the cursor exactly: an rskj server
+    /// answers any offset, beginning with the node that ends there, so the
+    /// next chunk picks up where this one stopped.
+    pub fn accept_rebuilt(
+        &mut self,
+        from: u64,
+        chunk: &RebuiltChunk,
+    ) -> Result<Progress, ChunkError> {
+        if self.slice_for(from).is_none() {
+            return Err(ChunkError::Unsolicited(from));
+        }
+
+        // The rebuilt root commits to the size of the whole trie, as a proved
+        // chunk's does. Taken before anything else, so that a range a peer's
+        // overstated hint put past the end is trimmed away.
+        if self.total.is_none() {
+            self.adopt_total(chunk.total);
+        }
+
+        // Nothing of its own is what rskj sends for an offset past the end.
+        // Whatever was asked, the grid is the next thing to try.
+        let Some((starts, reached)) = chunk.span else {
+            self.realign(from);
+            return Err(ChunkError::Empty);
+        };
+        // An answer to `from` begins with the node that holds it. One that
+        // begins after it is not an answer to the question, and taking it
+        // would leave a gap behind the cursor.
+        if starts > from {
+            self.release(from);
+            return Err(ChunkError::Misplaced { asked: from, starts });
+        }
+
         for (hash, message) in &chunk.nodes {
             self.store.put(hash.as_slice(), message);
             self.stored_bytes += message.len() as u64;
@@ -367,24 +430,24 @@ impl StateDownload {
         }
         self.stored_nodes += chunk.nodes.len() as u64;
 
-        let reached = from.saturating_add(self.grid);
         let mut advanced = 0;
         if let Some(i) = self.slice_for(from) {
             let slice = &mut self.slices[i];
-            advanced = reached.saturating_sub(slice.cursor).min(slice.end - slice.cursor);
-            slice.exact = reached <= slice.cursor;
+            advanced = reached
+                .saturating_sub(slice.cursor)
+                .min(slice.end.saturating_sub(slice.cursor));
             slice.cursor = reached.max(slice.cursor);
+            slice.exact = true;
             slice.in_flight = false;
         }
 
-        // The size of the trie comes from the root, which a rebuilt chunk
-        // always reconstructs; without a parsed root here it stays whatever
-        // the peer advertised until a proved chunk settles it.
-        if self.total.is_none() {
-            self.adopt_total(self.hinted_total);
-        }
+        trace!(
+            target: "rustock::snap",
+            "accepted {} rskj-format nodes from offset {from}, covering {starts}..{reached}",
+            chunk.nodes.len()
+        );
 
-        Progress { nodes: chunk.nodes.len(), advanced, complete: self.is_complete() }
+        Ok(Progress { nodes: chunk.nodes.len(), advanced, complete: self.is_complete() })
     }
 
     /// Replace the hinted size with the one the root proves, and reshape the
@@ -580,6 +643,8 @@ pub fn chunk_from_payload(
             Ok(Arrived::Rebuilt(RebuiltChunk {
                 nodes: rebuilt.nodes,
                 long_values: rebuilt.long_values,
+                total: rebuilt.total,
+                span: rebuilt.span,
             }))
         }
     }
