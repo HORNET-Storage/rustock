@@ -70,8 +70,8 @@ fn header_at(number: u64, parent_hash: B256, state_root: B256) -> Header {
         receipts_root: B256::ZERO,
         logs_bloom: Default::default(),
         extension_data: None,
-        // Small enough that every Bitcoin hash clears the target, so the tests
-        // never have to search for a nonce.
+        // Small: rskj takes a difficulty of 2 or less as 3, a target of
+        // 2^256 / 3, so a nonce search clears it in a few tries.
         difficulty: U256::from(2),
         number,
         gas_limit: U256::from(6_800_000),
@@ -255,9 +255,10 @@ fn fixture_on(
 /// which is to say, actually mined.
 ///
 /// The search is the point: RSK compares the Bitcoin block hash, read
-/// little-endian, against `U256::MAX / difficulty`, so a block built with a
-/// fixed nonce clears the target only by luck. At these difficulties a handful
-/// of nonces suffice, which is what makes the round trip a unit test.
+/// little-endian, against the target rskj derives from the difficulty -- at
+/// best 2^256 / 3 -- so a block built with a fixed nonce clears the target
+/// only by luck. At these difficulties a handful of nonces suffice, which is
+/// what makes the round trip a unit test.
 fn solve(work: &MinerWork) -> bitcoin::Block {
     let coinbase = coinbase::build_coinbase(&work.block_hash_for_merged_mining, 0xDEAD_BEEF);
     for nonce in 0..100_000u32 {
@@ -1185,13 +1186,27 @@ fn a_solution_that_misses_the_target_is_refused() {
 }
 
 /// `mnr_getWork` hands out the target the Bitcoin hash is compared against,
-/// and it has to be the same number the verifier derives from the difficulty.
+/// and it has to be the same number the verifier derives from the difficulty:
+/// the validator's own function, not one the miner keeps beside it.
 #[test]
 fn the_advertised_target_matches_the_difficulty() {
+    use rustock_core::validation::merged_mining::difficulty_to_target as validators;
     let fx = fixture(20);
     let template = fx.build().unwrap();
-    assert_eq!(template.target, U256::MAX / template.block.header.difficulty);
-    assert_eq!(difficulty_to_target(U256::from(1)), U256::MAX);
+    assert_eq!(
+        template.target,
+        validators(template.block.header.difficulty)
+    );
+    // At rskj's corners too: 2^256 over 3 for a difficulty of 2 or less, never
+    // all of 2^256, and a power of two dividing 2^256 exactly.
+    for d in [0u64, 1, 2, 3, 4, 5, 1 << 20] {
+        let d = U256::from(d);
+        assert_eq!(difficulty_to_target(d), validators(d), "difficulty {d}");
+    }
+    assert_eq!(
+        difficulty_to_target(U256::from(1)),
+        U256::MAX / U256::from(3)
+    );
 }
 
 /// A mined block that loses the total-difficulty comparison is still stored --

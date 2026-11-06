@@ -68,7 +68,7 @@ pub struct BlockTemplate {
     /// the header's merged-mining hash, then RSKIP110 fork-detection data.
     /// This, not the block hash, is what a submission is looked up by.
     pub hash_for_merged_mining: B256,
-    /// `U256::MAX / difficulty`: the Bitcoin block hash, read little-endian,
+    /// [`difficulty_to_target`]: the Bitcoin block hash, read little-endian,
     /// must not exceed this.
     pub target: U256,
     /// Fees this block would pay its miner, for a pool deciding whether the
@@ -785,11 +785,6 @@ pub fn next_minimum_gas_price(parent_price: U256, target: Option<U256>) -> U256 
     target.clamp(lower, upper)
 }
 
-/// rskj `DifficultyUtils.difficultyToTarget`.
-pub fn difficulty_to_target(difficulty: U256) -> U256 {
-    if difficulty.is_zero() {
-        U256::MAX
-    } else {
-        U256::MAX / difficulty
-    }
-}
+/// rskj `DifficultyUtils.difficultyToTarget`, the validator's own, so that the
+/// target handed out is the one a submission is judged by.
+pub use rustock_core::validation::merged_mining::difficulty_to_target;

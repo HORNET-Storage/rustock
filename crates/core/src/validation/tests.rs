@@ -90,7 +90,7 @@ fn build_mm_proof(header: &Header, btc_bits: u32, rsk_tag_hash: Option<B256>) ->
     merkle_root_bytes.copy_from_slice(&txid_bytes);
     let merkle_root = bitcoin::TxMerkleNode::from_byte_array(merkle_root_bytes);
 
-    let btc_header = BtcHeader {
+    let mut btc_header = BtcHeader {
         version: bitcoin::block::Version::from_consensus(1),
         prev_blockhash: bitcoin::BlockHash::all_zeros(),
         merkle_root,
@@ -98,6 +98,7 @@ fn build_mm_proof(header: &Header, btc_bits: u32, rsk_tag_hash: Option<B256>) ->
         bits: bitcoin::CompactTarget::from_consensus(btc_bits),
         nonce: 0,
     };
+    mine(&mut btc_header, header.difficulty);
 
     let mut btc_header_bytes = Vec::new();
     btc_header.consensus_encode(&mut btc_header_bytes).unwrap();
@@ -106,6 +107,19 @@ fn build_mm_proof(header: &Header, btc_bits: u32, rsk_tag_hash: Option<B256>) ->
     let merkle_proof = Bytes::new();
 
     (Bytes::from(btc_header_bytes), Bytes::from(compressed), merkle_proof)
+}
+
+/// Roll `btc`'s nonce until its hash meets rskj's target for `difficulty`, as
+/// a miner does. At the difficulties tests use, a few nonces do it.
+fn mine(btc: &mut BtcHeader, difficulty: U256) {
+    let target = merged_mining::difficulty_to_target(difficulty);
+    for _ in 0..1_000_000 {
+        if U256::from_le_slice(btc.block_hash().as_byte_array()) <= target {
+            return;
+        }
+        btc.nonce += 1;
+    }
+    panic!("no nonce meets the target for difficulty {difficulty}");
 }
 
 #[test]
@@ -243,13 +257,17 @@ fn test_merged_mining_rule_invalid_pow() {
     let config = Arc::new(crate::config::ChainConfig::regtest());
     let rule = MergedMiningRule { config };
     let mut header = create_dummy_header(10, 1000, B256::ZERO);
-    header.difficulty = U256::MAX; 
-    
+    header.difficulty = U256::from(1);
+
     let (btc_h, btc_cb, btc_m) = build_mm_proof(&header, 0x207fffff, None);
     header.bitcoin_merged_mining_header = Some(btc_h);
     header.bitcoin_merged_mining_coinbase_transaction = Some(btc_cb);
     header.bitcoin_merged_mining_merkle_proof = Some(btc_m);
-    
+    assert_eq!(rule.validate(&header), Ok(()));
+
+    // The same Bitcoin header, held to the hardest target: proof of work is
+    // judged before the coinbase, whose tag the new difficulty also moves.
+    header.difficulty = U256::MAX;
     let res = rule.validate(&header);
     assert!(matches!(res, Err(ValidationError::BitcoinPowInvalid { .. })));
 }
@@ -298,6 +316,75 @@ fn test_merged_mining_rule_wrong_tag() {
     
     let res = rule.validate(&header);
     assert!(matches!(res, Err(ValidationError::BitcoinCoinbaseTagInvalid)));
+}
+
+/// rskj's target is 2^256 over the difficulty, in `BigInteger`, and over 3
+/// where the difficulty is 2 or less, so it never needs bit 255. In 256
+/// bits that is (2^256 - 1) / d, but one more where d divides 2^256.
+#[test]
+fn the_target_is_two_to_the_256_over_the_difficulty_and_never_over_less_than_3() {
+    use merged_mining::difficulty_to_target as target;
+    let one = U256::from(1);
+    // 2^256 = 3q + 1, so (2^256 - 1) / 3 is q itself.
+    let third = U256::MAX / U256::from(3);
+    for difficulty in [0u64, 1, 2, 3] {
+        assert_eq!(
+            target(U256::from(difficulty)),
+            third,
+            "difficulty {difficulty}"
+        );
+    }
+    assert_eq!(target(U256::from(4)), one << 254);
+    assert_eq!(target(U256::from(5)), U256::MAX / U256::from(5));
+    assert_eq!(target(one << 64), one << 192);
+    assert_eq!(target(one << 255), U256::from(2));
+    assert_eq!(target(U256::MAX), one);
+    let floor = U256::from(7_000_000_000_000_000u64);
+    assert_eq!(
+        target(floor),
+        U256::MAX / floor,
+        "mainnet's least difficulty"
+    );
+}
+
+/// The rule holds a Bitcoin hash to that target. At a difficulty of 2 or
+/// less it is 2^256 / 3, so two hashes in three fall short, where every one
+/// used to pass; and a difficulty of 0 is judged the same, not refused.
+#[test]
+fn proof_of_work_meets_rskjs_target_at_the_least_difficulties() {
+    let rule = regtest_merged_mining();
+    let third = U256::MAX / U256::from(3);
+    let hash_of = |btc: &BtcHeader| U256::from_le_slice(btc.block_hash().as_byte_array());
+    for difficulty in [0u64, 1, 2] {
+        let mut header = header_at(100);
+        header.difficulty = U256::from(difficulty);
+        let (btc, coinbase, proof) = build_mm_proof(&header, 0x207fffff, None);
+        header.bitcoin_merged_mining_coinbase_transaction = Some(coinbase);
+        header.bitcoin_merged_mining_merkle_proof = Some(proof);
+        let mut btc: BtcHeader = bitcoin::consensus::deserialize(&btc).unwrap();
+
+        assert!(hash_of(&btc) <= third);
+        header.bitcoin_merged_mining_header =
+            Some(Bytes::from(bitcoin::consensus::serialize(&btc)));
+        assert_eq!(
+            rule.validate(&header),
+            Ok(()),
+            "difficulty {difficulty}, under the target"
+        );
+
+        while hash_of(&btc) <= third {
+            btc.nonce += 1;
+        }
+        header.bitcoin_merged_mining_header =
+            Some(Bytes::from(bitcoin::consensus::serialize(&btc)));
+        assert!(
+            matches!(
+                rule.validate(&header),
+                Err(ValidationError::BitcoinPowInvalid { target, .. }) if target == third
+            ),
+            "difficulty {difficulty}, over the target"
+        );
+    }
 }
 
 // --- Difficulty rule tests (mainnet) ---
@@ -771,10 +858,7 @@ fn seal(header: &mut Header, btc_time: u64) {
     let (btc, coinbase, proof) = build_mm_proof(header, 0x207fffff, None);
     let mut btc: BtcHeader = bitcoin::consensus::deserialize(&btc).unwrap();
     btc.time = btc_time as u32;
-    let target = U256::MAX / header.difficulty;
-    while U256::from_le_slice(btc.block_hash().as_byte_array()) > target {
-        btc.nonce += 1;
-    }
+    mine(&mut btc, header.difficulty);
     header.bitcoin_merged_mining_header = Some(Bytes::from(bitcoin::consensus::serialize(&btc)));
     header.bitcoin_merged_mining_coinbase_transaction = Some(coinbase);
     header.bitcoin_merged_mining_merkle_proof = Some(proof);
@@ -1077,9 +1161,9 @@ fn a_block_no_later_than_its_parent_joins_the_trunk_but_is_no_uncle() {
 
 // --- the merged-mining proof, byte for byte as rskj's `ProofOfWorkRule`
 
-/// A regtest header at `number`, at difficulty 1, where any Bitcoin hash
-/// meets the target and only the coinbase and the merkle proof are in
-/// question.
+/// A regtest header at `number`, at difficulty 1, where a Bitcoin hash meets
+/// rskj's target, 2^256 / 3, one time in three: the helpers mine for one
+/// that does, so only the coinbase and the merkle proof are in question.
 fn header_at(number: u64) -> Header {
     let mut header = create_dummy_header(number, 1000, B256::ZERO);
     header.difficulty = U256::from(1);
@@ -1109,8 +1193,13 @@ fn tail_committing_to(committed: &[u8], before: usize, after: usize) -> Vec<u8> 
 
 /// `header` merge-mined through `coinbase` and `proof`, by a Bitcoin header
 /// holding `wire_root` as its merkle root.
-fn mined_through(mut header: Header, coinbase: Vec<u8>, proof: Vec<u8>, wire_root: [u8; 32]) -> Header {
-    let btc = BtcHeader {
+fn mined_through(
+    mut header: Header,
+    coinbase: Vec<u8>,
+    proof: Vec<u8>,
+    wire_root: [u8; 32],
+) -> Header {
+    let mut btc = BtcHeader {
         version: bitcoin::block::Version::from_consensus(1),
         prev_blockhash: bitcoin::BlockHash::all_zeros(),
         merkle_root: bitcoin::TxMerkleNode::from_byte_array(wire_root),
@@ -1118,6 +1207,7 @@ fn mined_through(mut header: Header, coinbase: Vec<u8>, proof: Vec<u8>, wire_roo
         bits: bitcoin::CompactTarget::from_consensus(0x207fffff),
         nonce: 0,
     };
+    mine(&mut btc, header.difficulty);
     header.bitcoin_merged_mining_header = Some(Bytes::from(bitcoin::consensus::serialize(&btc)));
     header.bitcoin_merged_mining_coinbase_transaction = Some(Bytes::from(coinbase));
     header.bitcoin_merged_mining_merkle_proof = Some(Bytes::from(proof));

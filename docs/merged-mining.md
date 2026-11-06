@@ -62,8 +62,9 @@ breaks them: `feesPaidToMiner` is a **decimal** string, and
    last 12 are replaced with RSKIP110 fork-detection data (§4).
 3. A miner puts `RSKBLOCK:` followed by those 32 bytes in a Bitcoin coinbase
    and searches for a Bitcoin block whose hash, read little-endian, is at most
-   `U256::MAX / difficulty`. That is **RSK's** difficulty, not Bitcoin's, so a
-   solution is usually not a valid Bitcoin block.
+   rskj's target: 2^256 / difficulty, or 2^256 / 3 where the difficulty is 2 or
+   less (`difficulty_to_target`). That is **RSK's** difficulty, not Bitcoin's,
+   so a solution is usually not a valid Bitcoin block.
 4. The solution comes back and fills in the three `bitcoin_merged_mining_*`
    header fields: the 80-byte Bitcoin header, the compressed coinbase, and the
    merkle proof linking the coinbase to the Bitcoin merkle root.
@@ -433,8 +434,8 @@ runs on blocks arriving from peers. The search is not decorative: before it
 existed the tests used a fixed nonce, cleared the target only by luck, and that
 is how the `get_work` notify bug surfaced.
 
-The difficulty is 2, so the target is `2^255 - 1` and a nonce is found in a few
-tries. Two heights are used deliberately:
+The difficulty is 2, which rskj takes as 3, so the target is 2^256 / 3 and a
+nonce is found in a few tries. Two heights are used deliberately:
 
 - Most tests mine #21, which is fast but **does not exercise REMASC**:
   `RskExecutor::new` hardcodes `RemascConfig::mainnet()` whatever the chain id,

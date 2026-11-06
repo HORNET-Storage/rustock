@@ -34,9 +34,6 @@ pub enum ValidationError {
     #[error("Difficulty mismatch: expected {expected}, got {got}")]
     DifficultyMismatch { expected: U256, got: U256 },
 
-    #[error("Difficulty is zero")]
-    DifficultyZero,
-
     #[error("Failed to decode Bitcoin block header")]
     BitcoinHeaderDecodeError,
 

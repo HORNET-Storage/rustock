@@ -2879,15 +2879,21 @@ mod tests {
 
     /// Merge-mine `header` as a miner would, committing to `fork_data` after
     /// its merged-mining hash, beside a Bitcoin header of its own time. Its
-    /// difficulty must be 1, which any Bitcoin hash meets.
+    /// difficulty must be small: at 1, rskj's target is 2^256 / 3, which a
+    /// few nonces meet.
     fn seal(header: &mut Header, fork_data: &[u8]) {
         use crate::mining::{coinbase, fork_detection, merkle};
-        use rustock_core::validation::merged_mining::compress_coinbase;
+        use bitcoin::hashes::Hash as _;
+        use rustock_core::validation::merged_mining::{compress_coinbase, difficulty_to_target};
 
         let payload = fork_detection::apply_to_hash(header.hash_for_merged_mining(), fork_data);
         let cb = coinbase::build_coinbase(&payload, 0);
         let mut btc = coinbase::build_bitcoin_block(cb.clone(), 0);
         btc.header.time = header.timestamp as u32;
+        let target = difficulty_to_target(header.difficulty);
+        while U256::from_le_slice(btc.header.block_hash().as_byte_array()) > target {
+            btc.header.nonce += 1;
+        }
         let compressed = compress_coinbase(&coinbase::encode_transaction(&cb), true).unwrap();
         let proof = merkle::proof_from_txids(&coinbase::txids_display_order(&btc)).unwrap();
         header.bitcoin_merged_mining_header = Some(coinbase::encode_header(&btc.header).into());

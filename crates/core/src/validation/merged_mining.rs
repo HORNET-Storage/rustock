@@ -107,6 +107,25 @@ impl HeaderValidator for BitcoinTimestampRule {
     }
 }
 
+/// rskj `DifficultyUtils.difficultyToTarget`: 2^256 over the difficulty, or
+/// over 3 where the difficulty is 2 or less, so that the target never needs
+/// bit 255. A merge-mining Bitcoin header's hash, read as a number, must not
+/// exceed it.
+///
+/// 2^256 is past a `U256`. floor(2^256 / d) is floor((2^256 - 1) / d) except
+/// where d divides 2^256, a power of two, where it is one more.
+pub fn difficulty_to_target(difficulty: alloy_primitives::U256) -> alloy_primitives::U256 {
+    use alloy_primitives::U256;
+    let divisor = difficulty.max(U256::from(3));
+    let below = U256::MAX / divisor;
+    if divisor.is_power_of_two() {
+        below + U256::from(1)
+    } else {
+        below
+
+    }
+}
+
 impl HeaderValidator for MergedMiningRule {
     fn validate(&self, header: &Header) -> Result<(), ValidationError> {
         use bitcoin::consensus::Decodable;
@@ -136,15 +155,7 @@ impl HeaderValidator for MergedMiningRule {
             .map_err(|_| ValidationError::BitcoinHeaderDecodeError)?;
 
         // 1. Bitcoin PoW vs RSK difficulty
-        let difficulty = header.difficulty;
-        if difficulty.is_zero() {
-             return Err(ValidationError::DifficultyZero);
-        }
-        let target = if difficulty > U256::MAX {
-            U256::ZERO
-        } else {
-            U256::MAX / difficulty
-        };
+        let target = difficulty_to_target(header.difficulty);
         let btc_hash = btc_header.block_hash();
         let btc_hash_u256 = U256::from_le_slice(btc_hash.as_byte_array());
         if btc_hash_u256 > target {
