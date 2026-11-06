@@ -1053,8 +1053,13 @@ impl SnapSession {
         }
     }
 
-    /// Ask again for a skeleton nobody answered. See above: both phases.
+    /// Ask again for a skeleton nobody answered: in both header phases, and in
+    /// the sampling gate before them, which asks for skeletons too and waits
+    /// for every one of them before it judges.
     pub fn release_skeleton_request(&mut self, start: u64) {
+        if let Some(gate) = self.gate.as_mut() {
+            gate.release_skeleton(start);
+        }
         if let Some(walk) = self.walk.as_mut() {
             walk.release(&super::headers::Want::Skeleton { start });
         }

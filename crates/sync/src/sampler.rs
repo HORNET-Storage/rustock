@@ -677,6 +677,8 @@ pub struct SamplingGate {
     /// Next skeleton start not yet asked for.
     next_skeleton: u64,
     skeletons_outstanding: usize,
+    /// Skeleton starts handed back unanswered, asked again before new ones.
+    retry_skeletons: Vec<u64>,
     /// Whether the claimed work is bounded, which is what the sampling is
     /// for. With it off the gate asks only for the checkpoint block: there is
     /// a chain to establish but no ceiling to compute.
@@ -713,6 +715,7 @@ impl SamplingGate {
             skeleton_span: skeleton_span.max(1),
             next_skeleton: checkpoint_number,
             skeletons_outstanding: 0,
+            retry_skeletons: Vec::new(),
             learned: BTreeMap::new(),
             started: false,
             bound_work: defence.bound_work,
@@ -750,7 +753,14 @@ impl SamplingGate {
             out.push(GateAction::RequestHeader { number: req.number, hash: req.hash });
         }
 
-        // And keep the skeleton walk moving until the window is covered.
+        // And keep the skeleton walk moving until the window is covered,
+        // starting with any skeleton nobody answered: until it is in, the
+        // window is not covered, and nothing else will ask for it again.
+        while self.skeletons_outstanding < 4 {
+            let Some(start) = self.retry_skeletons.pop() else { break };
+            out.push(GateAction::RequestSkeleton { start });
+            self.skeletons_outstanding += 1;
+        }
         while self.next_skeleton < self.head && self.skeletons_outstanding < 4 {
             out.push(GateAction::RequestSkeleton { start: self.next_skeleton });
             self.next_skeleton = self.next_skeleton.saturating_add(self.skeleton_span);
@@ -776,6 +786,20 @@ impl SamplingGate {
         self.sampler.give_up_on(number);
     }
 
+    /// A skeleton request nobody answered, handed back to be asked again.
+    ///
+    /// The window counts as covered only once every skeleton is in, and one
+    /// lost to a timeout used to stay counted as outstanding for ever: the gate
+    /// never reached a verdict, and the session never left it. On mainnet that
+    /// happened as soon as a fresh node's first skeleton went to one of the
+    /// peers that never answer.
+    pub fn release_skeleton(&mut self, start: u64) {
+        if start < self.next_skeleton && self.skeletons_outstanding > 0 {
+            self.skeletons_outstanding -= 1;
+            self.retry_skeletons.push(start);
+        }
+    }
+
     /// The verdict, if one can be reached yet.
     pub fn outcome(&self) -> GateOutcome {
         if self.sampler.too_many_missing() {
@@ -784,7 +808,9 @@ impl SamplingGate {
             });
         }
         // Judge as soon as the window is covered and every sample answered.
-        let covered = self.next_skeleton >= self.head && self.skeletons_outstanding == 0;
+        let covered = self.next_skeleton >= self.head
+            && self.skeletons_outstanding == 0
+            && self.retry_skeletons.is_empty();
         if !self.started || !covered || !self.sampler.is_complete() || !self.learned.is_empty() {
             return GateOutcome::Pending;
         }
@@ -923,6 +949,65 @@ mod gate_tests {
             GateOutcome::Rejected(GateRejection::Unsubstantiated { .. }) => {}
             other => panic!("a peer that answers nothing must be rejected: {other:?}"),
         }
+    }
+
+    /// Answers one request as an honest server would.
+    fn answer(gate: &mut SamplingGate, action: GateAction, head: u64, verifier: &HeaderVerifier) {
+        let cp = MAINNET_CHECKPOINT;
+        match action {
+            GateAction::RequestSkeleton { start } => {
+                let ids: Vec<(u64, B256)> = (0..20)
+                    .map(|i| start + (i + 1) * 192)
+                    .filter(|n| *n <= head)
+                    .map(|n| (n, header_at(n, cp.difficulty).hash()))
+                    .collect();
+                gate.on_skeleton(&ids);
+            }
+            GateAction::RequestHeader { number, .. } => {
+                gate.on_header(&header_at(number, cp.difficulty), verifier);
+            }
+        }
+    }
+
+    /// A skeleton request nobody answered is asked again, and does not hold
+    /// the verdict for ever. One lost to a timeout used to stay counted as
+    /// outstanding, so the window was never covered and the session never
+    /// left the gate.
+    #[test]
+    fn a_skeleton_nobody_answered_is_asked_again() {
+        let cp = MAINNET_CHECKPOINT;
+        let blocks = 20_000u64;
+        let head = cp.number + blocks;
+        let honest = cp.cumulative_difficulty + cp.difficulty * U256::from(blocks);
+        let mut gate = SamplingGate::new(cp, honest, head, DIV, MIN, SPAN, CheckpointDefence { verify_hash: false, bound_work: true });
+        let verifier = HeaderVerifier::new();
+
+        // The first skeleton goes unanswered and is handed back; the rest of
+        // the first round is answered.
+        let mut lost = None;
+        for action in gate.poll() {
+            match action {
+                GateAction::RequestSkeleton { start } if lost.is_none() => lost = Some(start),
+                other => answer(&mut gate, other, head, &verifier),
+            }
+        }
+        let lost = lost.expect("a skeleton is asked for");
+        gate.release_skeleton(lost);
+        assert_eq!(gate.outcome(), GateOutcome::Pending, "judged without the lost skeleton");
+
+        let mut asked_again = false;
+        for _ in 0..64 {
+            let actions = gate.poll();
+            if actions.is_empty() && gate.outcome() != GateOutcome::Pending {
+                break;
+            }
+            for action in actions {
+                asked_again |= action == GateAction::RequestSkeleton { start: lost };
+                answer(&mut gate, action, head, &verifier);
+            }
+        }
+        assert!(asked_again, "the lost skeleton was never asked again");
+        assert!(matches!(gate.outcome(), GateOutcome::Passed { .. }), "{:?}", gate.outcome());
     }
 
     /// The gate does not reach a verdict before the window is covered —
