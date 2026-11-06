@@ -67,6 +67,9 @@ pub enum ValidationError {
     #[error("Two nodes of the merged-mining merkle proof parse as a 64-byte Bitcoin transaction")]
     MerkleNodesFormTransaction,
 
+    #[error("Merged-mining partial merkle tree refused: {0}")]
+    PartialMerkleTreeInvalid(crate::partial_merkle_tree::PmtError),
+
     #[error("UMM root is {len} bytes, must be empty or 20")]
     UmmRootInvalid { len: usize },
 

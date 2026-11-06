@@ -24,19 +24,36 @@ during sync.
 
 | Hardfork | Block | Relevant RSKIPs |
 |----------|-------|-----------------|
-| Orchid | 729,000 | RSKIP92 (merged mining PoW), RSKIP97 (no 10-min reset), RSKIP98 (no fallback mining) |
+| Orchid | 729,000 | RSKIP92 (merged-mining merkle proof), RSKIP97 (no 10-min reset), RSKIP98 (no fallback mining; a Bitcoin header of exactly 80 bytes) |
 | Papyrus200 | 2,392,700 | RSKIP156 (difficulty divisor 50 → 400) |
 
 ### Merged mining (RSKIP92/98)
 
-Before Orchid, RSK allowed "fallback mining" without proper Bitcoin merged
-mining fields. The `MergedMiningRule` in `crates/core/src/validation/merged_mining.rs`
-skips validation for blocks below `activation_heights.orchid`.
+`MergedMiningRule` in `crates/core/src/validation/merged_mining.rs` follows
+rskj's `ProofOfWorkRule`, and checks every block, below orchid too.
 
-After Orchid, the rule validates:
-1. Bitcoin header PoW against RSK difficulty target
-2. Merkle proof linking coinbase to Bitcoin header
-3. RSK tag (`RSKBLOCK:` + hash) in coinbase outputs
+Below orchid a block may be fallback-mined: no coinbase, no merkle proof, a
+difficulty no greater than the network's fallback-mining difficulty, and in
+the Bitcoin-header field a signature of the block's merged-mining hash by
+rskj's fallback-mining key for an even or an odd height, checked as rskj's
+`validFallbackBlockSignature` checks it. RSKIP98 ended fallback mining.
+
+Every other block is merge-mined, and the rule checks:
+1. The Bitcoin header: from orchid exactly 80 bytes (`BtcHeaderSizeRule`).
+   Below orchid, and at block 0, any bytes bitcoinj-thin reads as a block,
+   whose header is their first 80 (`crates/core/src/btc_block.rs`).
+2. Its proof of work against the RSK target, 2^256 / max(difficulty, 3).
+3. The `RSKBLOCK:` tag and the block's merged-mining hash in the coinbase,
+   where rskj requires them, and a coinbase longer than 64 bytes.
+4. The merkle proof that puts the coinbase in the Bitcoin block. From orchid
+   (RSKIP92) it is the coinbase's branch of sibling hashes, at most 960 bytes
+   from iris300 (RSKIP180). Below orchid it is a bitcoinj-thin partial merkle
+   tree, of exactly the size its counts declare, that walks to the header's
+   merkle root and matches the coinbase (rskj's `GenesisMerkleProofValidator`;
+   `crates/core/src/partial_merkle_tree.rs`, shared with the Bridge).
+
+On mainnet all 728,999 blocks below orchid pass: 165,328 fallback-mined and
+563,671 merge-mined.
 
 ### Difficulty calculation
 
@@ -60,9 +77,9 @@ three hardfork-gated behaviors matching `rskj/.../core/DifficultyCalculator.java
 ### Rust implementation
 
 `ChainConfig` in `crates/core/src/config.rs` includes an `ActivationHeights`
-struct with `orchid` and `papyrus200` fields. Both `MergedMiningRule` and
-`DifficultyRule` check `header.number` against these heights before applying
-hardfork-specific logic.
+struct with the heights these rules read, `orchid`, `wasabi100`, `papyrus200`
+and `iris300` among them. Both `MergedMiningRule` and `DifficultyRule` check
+`header.number` against these heights before applying hardfork-specific logic.
 
 ---
 

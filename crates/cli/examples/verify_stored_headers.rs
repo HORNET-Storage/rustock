@@ -159,6 +159,9 @@ fn main() -> anyhow::Result<()> {
     // Headers below orchid that answer for their work with a fallback-mining
     // signature rather than a Bitcoin header.
     let fallback = AtomicU64::new(0);
+    // And those below orchid that answer for it with a Bitcoin header, whose
+    // coinbase a bitcoinj partial merkle tree proves.
+    let trees = AtomicU64::new(0);
     let started = Instant::now();
 
     std::thread::scope(|scope| -> anyhow::Result<()> {
@@ -174,7 +177,7 @@ fn main() -> anyhow::Result<()> {
             let (store, verifier, config, failures, checked, not_later, orphaned, missing) = (
                 &store, &verifier, &config, &failures, &checked, &not_later, &orphaned, &missing,
             );
-            let (fork_checked, fallback) = (&fork_checked, &fallback);
+            let (fork_checked, fallback, trees) = (&fork_checked, &fallback, &trees);
             workers.push(scope.spawn(move || -> anyhow::Result<()> {
                 // The highest block from `number` down to this range's bottom
                 // that the store holds, counting the numbers it does not.
@@ -204,6 +207,8 @@ fn main() -> anyhow::Result<()> {
                     let parent = store.header(header.parent_hash)?;
                     if merged_mining::is_fallback_mined(&header, config) {
                         fallback.fetch_add(1, Ordering::Relaxed);
+                    } else if header.number < config.activation_heights.orchid {
+                        trees.fetch_add(1, Ordering::Relaxed);
                     }
                     if let Err(e) = verifier.verify(&header, parent.as_ref()) {
                         record(failures, header.number, &e);
@@ -290,6 +295,10 @@ fn main() -> anyhow::Result<()> {
     println!(
         "  fallback-mined, their signatures checked: {}",
         fallback.into_inner()
+    );
+    println!(
+        "  merge-mined below orchid, their partial merkle trees checked: {}",
+        trees.into_inner()
     );
     let expected = highest - lowest + 1;
     anyhow::ensure!(

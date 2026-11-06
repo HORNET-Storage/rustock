@@ -588,6 +588,178 @@ fn a_fallback_signature_covers_its_header() {
     );
 }
 
+/// Mainnet #728,999, the last block below orchid, as rskj stores it. Below
+/// RSKIP92 a block's hash is Keccak-256 of the whole of it, so RSKj's hash of
+/// the block vouches for every byte.
+const MAINNET_728999: &str =
+    "f90484a092beb2d8b8dce8fa2ad47cdb50966185c78b31176cc9305b18e562e569b673fda010b55649b9283184efeed4\
+     ba62df75cc9cb0e7829c79ac4f4c36d76b91dcb09f9432dfc7a84f24b10a5dded1d8b24f48b96ab77373a0622343f407\
+     291f8eafc1e19bebeeb0c97e70a93ba6d96fe00dfe90fea8bc2055a0bb597f3ba349abf127973d075cfd1a8b70088da2\
+     3633c69c521ddada4f4d9f61a09d84e10a4187f8b1ff7d2f5bc3287b037056d70f7e032d7c822bee2835f1d766b90100\
+     000000000000000000000000000004080000000000000040000200000000000000100000000000000000000000000000\
+     0000000400000000200000000000800100000800000000100000200000080000a0000000000000000000020000000000\
+     40000000000000000000000000800000200020000800000000000000000000020000000000000001008a004000402000\
+     000010000000200008000020005000000000000100001000200a00002000000000002000000000000010000000000000\
+     000000010000000000008000000000000000200011000004002000001008000000040000000000000080040400000000\
+     008200000000000000000084000000008909e5a16d6b4451573d830b1fa78367c28080845b932beb8080840387ee4002\
+     b85000000020ec507847794a1088d577e8f664e3a566f42c6aea8f4723000000000000000000a0c9c1038cf9f5d980cc\
+     32408a6ff544638eacfac5dd68d352d7438364bb3878f12b935ba119281713ddc006b901aad20800000d737de9538e4c\
+     6d9668fea42548309ac66597dc7c727e0fe3fe4cf03c500b69415a62de517b3b39ae2b8ecbadb65f03c7898d17bdb29a\
+     75fcac327489509e4377c6e359c5f55d76b9040ee953afa09fbaa9f211501e01af40ea5064413faec66bb2d1f2e541a9\
+     55760b378aefe63a761151259b5bff356228e0300a3e72b70da8bf48b2ae696dae70321f7ccaf84e3c66882302c9f291\
+     7b8446ced622059c5a294842f441e78b33370cb385c6cbdb2862533f9a6b0dfe5d37282316bf5fce5650b1ef0cab4b16\
+     4f7b14a031b84ba25f57e74e924c070414f33276fa17226b110858a54ebb9c2bd8ad61c5fbd65f7be61d8392dcc2a24a\
+     48775f53ce6ab765ff2017bb571e1f5e840e2ac3be1a9df2c69c71b6dfd701670ea605b4de30209e39b39682bf26c376\
+     66e89853be6aa1dfd10b67f228a6598ddc23d4765d1f70f3d32f69a81560269a1d49883e6871d7a9b11f1f01c53503e6\
+     e1c00b20a07c5e9d819c00b1c9ad08297129669bae66881911c75c964e10d7119f9ba78b675d4c1a0f7403237186beab\
+     82f01c05454172e10af3448d9ce9213baa9c58c93634ab598ff704ff1f0000b8a600000000000000805998b42c25f5e9\
+     d5948bfdb8806ad419d3ae2203f69ab4c0c643ecd39f6161d97c154ed1dc59609e3d26abb2df2ea3d587cd8c4188ac00\
+     000000000000002c6a4c2952534b424c4f434b3ad3e5bd1cd73aece37e3be2c9ea36bcfd663f30599838fdeaff75e4bf\
+     54bf9d110000000000000000266a24aa21a9ed5c478fd38b405c680d17c3b281a98baa67e9191c16aac595bb7765aef4\
+     82513400000000";
+
+/// Mainnet #728,999, its hash checked against RSKj's.
+fn mainnet_728999() -> Header {
+    let rlp = hex::decode(MAINNET_728999).unwrap();
+    let rskj: B256 = "0x450f29ed02e088c1f7a37ed1d53ff1246857ab04e6f7032d0a299005a0c5e021"
+        .parse()
+        .unwrap();
+    assert_eq!(alloy_primitives::keccak256(&rlp), rskj);
+    let header = decoded(&rlp);
+    assert_eq!((header.number, header.hash()), (728_999, rskj));
+    header
+}
+
+/// rskj `GenesisMerkleProofValidator`: below orchid a merge-mined block's
+/// coinbase is proved by a bitcoinj partial merkle tree, of the size its
+/// counts declare, that walks to the Bitcoin header's root and matches the
+/// coinbase. Mainnet's last such block passes, and fails with its tree or
+/// its coinbase changed.
+#[test]
+fn below_orchid_a_partial_merkle_tree_proves_the_coinbase() {
+    use crate::config::{ActivationHeights, ChainConfig};
+    use crate::partial_merkle_tree::{PartialMerkleTree, PmtError};
+
+    let rule = MergedMiningRule {
+        config: Arc::new(ChainConfig::mainnet()),
+    };
+    let header = mainnet_728999();
+    assert_eq!(rule.validate(&header), Ok(()));
+
+    let proof = header
+        .bitcoin_merged_mining_merkle_proof
+        .clone()
+        .unwrap()
+        .to_vec();
+    // The tree's first hash is the coinbase's, and its only match.
+    let coinbase = header
+        .bitcoin_merged_mining_coinbase_transaction
+        .clone()
+        .unwrap();
+    let coinbase_hash = merged_mining::compute_coinbase_hash(&coinbase);
+    let tree = PartialMerkleTree::parse(&proof).unwrap();
+    assert_eq!(tree.hashes()[0], coinbase_hash);
+    assert_eq!(
+        tree.txn_hashes_and_merkle_root().unwrap().0,
+        [coinbase_hash]
+    );
+    let with_proof = |proof: &[u8]| {
+        let mut changed = header.clone();
+        changed.bitcoin_merged_mining_merkle_proof = Some(Bytes::copy_from_slice(proof));
+        rule.validate(&changed)
+    };
+    // A bit of the hash beside the coinbase's: the coinbase still matches,
+    // but the tree walks to another root.
+    let mut other = proof.clone();
+    other[5 + 32] ^= 1;
+    assert_eq!(
+        with_proof(&other),
+        Err(ValidationError::BitcoinMerkleProofInvalid)
+    );
+    // A byte more or fewer than its counts declare.
+    let longer = [&proof[..], &[0]].concat();
+    assert_eq!(
+        with_proof(&longer),
+        Err(ValidationError::BitcoinMerkleProofDecodeError)
+    );
+    let shorter = &proof[..proof.len() - 1];
+    assert_eq!(
+        with_proof(shorter),
+        Err(ValidationError::BitcoinMerkleProofDecodeError)
+    );
+    // No flag set: the first hash is the root, and the rest go unused.
+    let flags = tree.matched_child_bits().len();
+    let mut unflagged = proof.clone();
+    let at = unflagged.len() - flags;
+    unflagged[at..].fill(0);
+    assert_eq!(
+        with_proof(&unflagged),
+        Err(ValidationError::PartialMerkleTreeInvalid(
+            PmtError::UnusedData
+        ))
+    );
+
+    // A bit of the coinbase's midstate: it is no longer what the tree matches.
+    let mut coinbase = header
+        .bitcoin_merged_mining_coinbase_transaction
+        .clone()
+        .unwrap()
+        .to_vec();
+    coinbase[20] ^= 1;
+    let mut changed = header.clone();
+    changed.bitcoin_merged_mining_coinbase_transaction = Some(Bytes::from(coinbase));
+    assert_eq!(
+        rule.validate(&changed),
+        Err(ValidationError::BitcoinMerkleProofInvalid)
+    );
+
+    // From orchid the proof is RSKIP92's, a run of 32-byte hashes, which this
+    // tree is not.
+    let at_orchid = MergedMiningRule {
+        config: Arc::new(ChainConfig {
+            activation_heights: ActivationHeights {
+                orchid: 728_999,
+                ..ActivationHeights::mainnet()
+            },
+            ..ChainConfig::mainnet()
+        }),
+    };
+    assert_eq!(
+        at_orchid.validate(&header),
+        Err(ValidationError::BitcoinMerkleProofDecodeError)
+    );
+}
+
+/// Below RSKIP98 rskj makes a bitcoinj block of the Bitcoin-header field, so
+/// the block's transactions may follow the header; what bitcoinj cannot read
+/// refuses the block.
+#[test]
+fn below_orchid_the_bitcoin_header_may_carry_its_blocks_transactions() {
+    let rule = MergedMiningRule {
+        config: Arc::new(crate::config::ChainConfig::mainnet()),
+    };
+    let header = mainnet_728999();
+    let field = header
+        .bitcoin_merged_mining_header
+        .clone()
+        .unwrap()
+        .to_vec();
+    assert_eq!(field.len(), 80);
+    let with_field = |field: Vec<u8>| {
+        let mut changed = header.clone();
+        changed.bitcoin_merged_mining_header = Some(Bytes::from(field));
+        rule.validate(&changed)
+    };
+    let genesis = bitcoin::constants::genesis_block(bitcoin::Network::Bitcoin);
+    let coinbase = bitcoin::consensus::serialize(&genesis.txdata[0]);
+    assert_eq!(with_field([&field[..], &[1], &coinbase].concat()), Ok(()));
+    assert_eq!(with_field([&field[..], &[0]].concat()), Ok(()));
+    // One transaction promised, none there; and a header cut short.
+    let refused = Err(ValidationError::BitcoinHeaderDecodeError);
+    assert_eq!(with_field([&field[..], &[1]].concat()), refused);
+    assert_eq!(with_field(field[..79].to_vec()), refused);
+}
+
 /// rskj's `isFallbackMiningPossibleAndBlockSigned`: below orchid, with no
 /// coinbase and no proof, an empty one counting as none, at no more than the
 /// network's fallback-mining difficulty: 14 x 10^15 on mainnet and testnet,
@@ -1187,6 +1359,41 @@ fn merged_mining_wants_exactly_a_bitcoin_header() {
 
     header.bitcoin_merged_mining_header = Some(btc_h);
     assert_eq!(rule.validate(&header), Ok(()));
+}
+
+/// rskj `BtcHeaderSizeRule` passes block 0 at any size, RSKIP98 or not, and
+/// leaves its field to bitcoinj's `makeBlock`, as below orchid. On regtest,
+/// where orchid is at genesis, block 0's field may carry its block's
+/// transactions after the header and block 1's may not.
+#[test]
+fn merged_mining_reads_block_zero_as_below_orchid() {
+    let rule = MergedMiningRule {
+        config: Arc::new(crate::config::ChainConfig::regtest()),
+    };
+    for number in [0, 1] {
+        let mut header = create_dummy_header(number, 1000, B256::ZERO);
+        header.difficulty = U256::from(1);
+        let (btc_h, btc_cb, btc_m) = build_mm_proof(&header, 0x207fffff, None);
+        header.bitcoin_merged_mining_coinbase_transaction = Some(btc_cb);
+        header.bitcoin_merged_mining_merkle_proof = Some(btc_m);
+
+        // A count of no transactions: a block bitcoinj reads.
+        header.bitcoin_merged_mining_header = Some(Bytes::from([&btc_h[..], &[0]].concat()));
+        let size_rule = if number == 0 {
+            Ok(())
+        } else {
+            Err(ValidationError::BitcoinHeaderDecodeError)
+        };
+        assert_eq!(rule.validate(&header), size_rule, "block {number}");
+
+        // One transaction declared and none there: bitcoinj throws.
+        header.bitcoin_merged_mining_header = Some(Bytes::from([&btc_h[..], &[1]].concat()));
+        assert_eq!(
+            rule.validate(&header),
+            Err(ValidationError::BitcoinHeaderDecodeError),
+            "block {number}"
+        );
+    }
 }
 
 /// A view of the chain that holds nothing.

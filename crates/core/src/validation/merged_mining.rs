@@ -1,5 +1,7 @@
 use super::fork_detection::REQUIRED_BLOCKS;
 use super::{HeaderValidator, ValidationError};
+use crate::btc_block;
+use crate::partial_merkle_tree::{self, PartialMerkleTree};
 use crate::types::header::Header;
 use crate::config::ChainConfig;
 
@@ -27,7 +29,7 @@ pub const MAX_RSK_TAG_POSITION_IN_TAIL: usize = 64;
 pub const MAX_MERGED_MINING_MERKLE_PROOF_LENGTH: usize = 960;
 
 /// The length of a Bitcoin block header, and from RSKIP98 (orchid) the only
-/// length rskj accepts for the field that carries one: rskj
+/// length rskj accepts for the field that carries one, block 0 excepted: rskj
 /// `RskMiningConstants.BTC_HEADER_SIZE`, enforced by `BtcHeaderSizeRule`.
 pub const BTC_HEADER_SIZE: usize = 80;
 
@@ -253,23 +255,27 @@ impl HeaderValidator for MergedMiningRule {
                 number: header.number,
             });
         }
-        // Merged mining below RSKIP92, orchid too, proves its coinbase by a
-        // bitcoinj partial Merkle tree, which this does not check yet.
-        if header.number < self.config.activation_heights.orchid {
-            return Ok(());
-        }
         // rskj `ProofOfWorkRule` with `miner.server.skipPowValidation`: the
         // whole rule passes, merkle proof and coinbase included.
         if self.config.skip_pow_validation {
             return Ok(());
         }
+        // RSKIP92 and RSKIP98 arrive together, at orchid. Below them the
+        // Bitcoin-header field may carry its block's transactions after the
+        // header, and the merkle proof is a bitcoinj partial merkle tree.
+        let orchid = header.number >= self.config.activation_heights.orchid;
 
         let btc_header_bytes = header.bitcoin_merged_mining_header.as_ref()
             .ok_or(ValidationError::BitcoinHeaderDecodeError)?;
-        // rskj `BtcHeaderSizeRule`, from RSKIP98, which is orchid like the
-        // rest of this rule: exactly a Bitcoin header. The decoder below
-        // reads the first 80 bytes and would let anything after them ride.
-        if btc_header_bytes.len() != BTC_HEADER_SIZE {
+        // rskj `BtcHeaderSizeRule`: from RSKIP98, exactly a Bitcoin header,
+        // block 0 excepted. Otherwise any bytes bitcoinj makes a block of,
+        // whose header is their first 80. The decoder below reads those 80 alone.
+        let readable = if orchid && header.number != 0 {
+            btc_header_bytes.len() == BTC_HEADER_SIZE
+        } else {
+            btc_block::bitcoinj_reads(btc_header_bytes)
+        };
+        if !readable {
             return Err(ValidationError::BitcoinHeaderDecodeError);
         }
         let mut reader = &btc_header_bytes[..];
@@ -356,6 +362,9 @@ impl HeaderValidator for MergedMiningRule {
 
         let merkle_proof_bytes = header.bitcoin_merged_mining_merkle_proof.as_ref()
             .ok_or(ValidationError::BitcoinMerkleProofDecodeError)?;
+        if !orchid {
+            return genesis_merkle_proof(merkle_proof_bytes, &btc_header, &coinbase_hash);
+        }
 
         // RSKIP180 (iris300): rskj `Rskip92MerkleProofValidator` rejects a
         // merged-mining merkle proof longer than
@@ -387,6 +396,30 @@ impl HeaderValidator for MergedMiningRule {
 
         Ok(())
     }
+}
+
+/// rskj `GenesisMerkleProofValidator`, merged mining's proof below RSKIP92: a
+/// bitcoinj partial merkle tree of exactly the size its counts declare, which
+/// walks to the Bitcoin header's merkle root and matches the coinbase, both
+/// compared in bitcoinj's display order.
+fn genesis_merkle_proof(
+    proof: &[u8],
+    btc_header: &bitcoin::block::Header,
+    coinbase_hash: &[u8; 32],
+) -> Result<(), ValidationError> {
+    use bitcoin::hashes::Hash;
+    if !partial_merkle_tree::has_expected_size(proof) {
+        return Err(ValidationError::BitcoinMerkleProofDecodeError);
+    }
+    let (matched, root) = PartialMerkleTree::parse(proof)
+        .and_then(|tree| tree.txn_hashes_and_merkle_root())
+        .map_err(ValidationError::PartialMerkleTreeInvalid)?;
+    let mut header_root = btc_header.merkle_root.to_byte_array();
+    header_root.reverse();
+    if root != header_root || !matched.contains(coinbase_hash) {
+        return Err(ValidationError::BitcoinMerkleProofInvalid);
+    }
+    Ok(())
 }
 
 /// The 12 fork-detection bytes a header commits to, read out of its

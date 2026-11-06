@@ -62,7 +62,7 @@ rustock `crates/execution/src/bridge/` (~22,700 lines).
 | Peg-out queue and building | `ReleaseRequestQueue`, `PegoutsWaitingForConfirmations`, `ReleaseTransactionBuilder` | `bridge/release_tx.rs` |
 | Peg-in classification | `peg/pegin/*`, `PegUtils`, `btcLockSender/*` | `bridge/peg.rs`, `rskj_sender_compat.rs` |
 | Peg-in instructions (flyover) | `peg/pegininstructions/*` | `bridge/pegin_instructions.rs` |
-| Merkle proofs | `PartialMerkleTreeFormatUtils`, plus `co.rsk.bitcoinj.core.PartialMerkleTree` from the **bitcoinj-thin** dependency | `bridge/pmt.rs` |
+| Merkle proofs | `PartialMerkleTreeFormatUtils`, `MerkleBranch`, plus `co.rsk.bitcoinj.core.PartialMerkleTree` from the **bitcoinj-thin** dependency | `bridge/pmt.rs`, over `crates/core/src/partial_merkle_tree.rs` |
 | Whitelist / locking cap / fees | `peg/whitelist/*`, `peg/lockingcap/*`, `peg/feeperkb/*` | `bridge/governance.rs` |
 | Voting | `peg/vote/*` (`ABICallSpec`, `ABICallElection`) | `bridge/vote.rs` |
 | Local-call getters | `BridgeSupport` getters, `BridgeState` | `bridge/getters.rs` |
@@ -93,7 +93,7 @@ as functions.
 | Body rules | `BlockTxsValidationRule`, `BlockTxsMaxGasPriceRule`, `BlockRootValidationRule` | `crates/core/src/validation/block_rules.rs` |
 | Uncles | `BlockUnclesValidationRule`, `BlockUnclesHashValidationRule`, `FamilyUtils` | `crates/core/src/validation/uncles.rs` |
 | Difficulty | `co.rsk.core.DifficultyCalculator` | `crates/core/src/validation/difficulty.rs` |
-| Merged mining | `ProofOfWorkRule`, `BtcHeaderSizeRule` | `crates/core/src/validation/merged_mining.rs` |
+| Merged mining | `ProofOfWorkRule`, `BtcHeaderSizeRule`, `Rskip92MerkleProofValidator`, `GenesisMerkleProofValidator`, plus bitcoinj-thin's `BtcBlock` and `PartialMerkleTree` | `crates/core/src/validation/merged_mining.rs`, `crates/core/src/btc_block.rs`, `crates/core/src/partial_merkle_tree.rs` |
 | Fork detection | `ForkDetectionDataRule`, `ConsensusValidationMainchainView` | `crates/core/src/validation/fork_detection.rs` |
 
 ### Networking
