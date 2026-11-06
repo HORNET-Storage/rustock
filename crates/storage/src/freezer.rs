@@ -145,16 +145,7 @@ fn open_store(dir: &Path, prefix: &str, kind: &str) -> Result<Writable> {
     }
     let end_number = index_len / INDEX_ENTRY_BYTES;
 
-    // Find the newest data file on disk; the index does not record which one
-    // is being appended to, only where each block landed.
-    let mut file_number = 0u16;
-    for n in 0..=u16::MAX {
-        if dir.join(format!("{prefix}{kind}-{n:04}.cdat")).exists() {
-            file_number = n;
-        } else if n > 0 {
-            break;
-        }
-    }
+    let file_number = newest_data_file(dir, prefix, kind);
 
     let data_path = dir.join(format!("{prefix}{kind}-{file_number:04}.cdat"));
     let data = OpenOptions::new()
@@ -178,6 +169,49 @@ fn open_store(dir: &Path, prefix: &str, kind: &str) -> Result<Writable> {
         data_len: covered,
         end_number,
         pending_data: Vec::with_capacity(WRITE_BUFFER_BYTES),
+        pending_index: Vec::new(),
+    })
+}
+
+/// The newest data file on disk: the index does not record which one is
+/// being appended to, only where each block landed.
+fn newest_data_file(dir: &Path, prefix: &str, kind: &str) -> u16 {
+    let mut file_number = 0u16;
+    for n in 0..=u16::MAX {
+        if dir.join(format!("{prefix}{kind}-{n:04}.cdat")).exists() {
+            file_number = n;
+        } else if n > 0 {
+            break;
+        }
+    }
+    file_number
+}
+
+/// Opens one of the parallel stores to read only.
+///
+/// Nothing is created and nothing is repaired. In a freezer another process
+/// has open, data past the index's last entry is that writer's append in
+/// progress, and a ragged index tail its entry half-written: `open_store`
+/// would cut both away, so this leaves both alone and counts whole entries.
+fn open_store_read_only(dir: &Path, prefix: &str, kind: &str) -> Result<Writable> {
+    let index_path = dir.join(format!("{prefix}{kind}.cidx"));
+    let index =
+        File::open(&index_path).with_context(|| format!("opening {}", index_path.display()))?;
+    let end_number = index.metadata()?.len() / INDEX_ENTRY_BYTES;
+
+    let file_number = newest_data_file(dir, prefix, kind);
+    let data_path = dir.join(format!("{prefix}{kind}-{file_number:04}.cdat"));
+    let data =
+        File::open(&data_path).with_context(|| format!("opening {}", data_path.display()))?;
+    let data_len = u32::try_from(data.metadata()?.len()).unwrap_or(u32::MAX);
+
+    Ok(Writable {
+        index,
+        data,
+        file_number,
+        data_len,
+        end_number,
+        pending_data: Vec::new(),
         pending_index: Vec::new(),
     })
 }
@@ -250,6 +284,8 @@ pub struct Freezer {
     /// can neither recompute total difficulty nor prove the uncles its chain
     /// absorbed ever existed.
     uncles: Mutex<Writable>,
+    /// Opened by [`Freezer::open_read_only`]: every write is refused.
+    read_only: bool,
 }
 
 /// File-name stems for the two parallel stores.
@@ -267,6 +303,36 @@ impl Freezer {
     /// that can simply be redone.
     pub fn open(dir: impl AsRef<Path>) -> Result<Self> {
         Self::open_with_prefix(dir, "")
+    }
+
+    /// Opens the freezer in `dir` to read beside the node that writes it, as
+    /// a diagnostic does.
+    ///
+    /// Nothing is created, repaired or written: see `open_store_read_only`.
+    /// What it holds is the freezer as it stood when opened, and every write
+    /// is refused before it touches a file.
+    pub fn open_read_only(dir: impl AsRef<Path>) -> Result<Self> {
+        let dir = dir.as_ref().to_path_buf();
+        let headers = open_store_read_only(&dir, "", HEADERS)?;
+        let uncles = open_store_read_only(&dir, "", UNCLES)?;
+        Ok(Self {
+            dir,
+            prefix: String::new(),
+            write: Mutex::new(headers),
+            uncles: Mutex::new(uncles),
+            read_only: true,
+        })
+    }
+
+    /// Refuses a write to a freezer opened read-only. Rolling to a new data
+    /// file opens it to create and truncate, which in another process's
+    /// freezer is that writer's next file, so read-only handles alone would
+    /// not be enough.
+    fn writable(&self) -> Result<()> {
+        if self.read_only {
+            bail!("the freezer at {} is open read-only", self.dir.display());
+        }
+        Ok(())
     }
 
     /// Opens a staging freezer for a chain that is not yet trusted.
@@ -313,6 +379,7 @@ impl Freezer {
             prefix,
             write: Mutex::new(headers),
             uncles: Mutex::new(uncles),
+            read_only: false,
         })
     }
 
@@ -461,6 +528,7 @@ impl Freezer {
         number: u64,
         encoded: Vec<u8>,
     ) -> Result<()> {
+        self.writable()?;
         let mut w = store.lock().unwrap();
 
         // Roll before writing, never across: a header must be contiguous
@@ -681,6 +749,7 @@ impl Freezer {
     /// order there is no single offset above which everything belongs to the
     /// dropped blocks, and unreferenced bytes cost only space.
     pub fn truncate_head(&self, number: u64) -> Result<()> {
+        self.writable()?;
         // Both stores are addressed by block number, so a head that is rolled
         // back must drop the same range from each. Leaving uncles behind for a
         // header that no longer exists would make the uncle store answer for
@@ -962,6 +1031,55 @@ pub(crate) mod tests {
             "data past the last index entry must be discarded"
         );
         assert_eq!(f.header(19).unwrap().unwrap().number, 19);
+    }
+
+    /// A read-only open, beside a writer mid-append, reads what is frozen,
+    /// cuts away neither the writer's data nor its half-written index entry,
+    /// and refuses every write.
+    #[test]
+    fn a_read_only_open_reads_and_leaves_a_writers_append_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let f = Freezer::open(dir.path()).unwrap();
+            for n in 0..20 {
+                f.put(n, &header(n)).unwrap();
+            }
+            f.sync().unwrap();
+        }
+        let data_path = dir.path().join("headers-0000.cdat");
+        let index_path = dir.path().join("headers.cidx");
+        let append = |path: &Path, bytes: &[u8]| {
+            OpenOptions::new()
+                .append(true)
+                .open(path)
+                .unwrap()
+                .write_all(bytes)
+                .unwrap()
+        };
+        append(&data_path, &[0xAA; 512]);
+        append(&index_path, &[0x01; 4]);
+        let len = |path: &Path| std::fs::metadata(path).unwrap().len();
+        let (data_len, index_len) = (len(&data_path), len(&index_path));
+
+        let f = Freezer::open_read_only(dir.path()).unwrap();
+        assert_eq!(f.end_number(), 20, "whole index entries only");
+        assert_eq!(f.run(0, 20).unwrap().iter().flatten().count(), 20);
+        assert!(f.put(20, &header(20)).is_err());
+        assert!(f.put_uncles(20, &[]).is_err());
+        assert!(f.truncate_head(10).is_err());
+        assert_eq!(len(&data_path), data_len, "the writer's data is not cut");
+        assert_eq!(len(&index_path), index_len, "nor its index entry");
+        assert_eq!(f.header(15).unwrap().unwrap().number, 15);
+    }
+
+    /// Where there is no freezer, a read-only open fails and makes none.
+    #[test]
+    fn a_read_only_open_creates_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(Freezer::open_read_only(dir.path()).is_err());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        assert!(Freezer::open_read_only(dir.path().join("absent")).is_err());
+        assert!(!dir.path().join("absent").exists());
     }
 
     #[test]
