@@ -201,3 +201,108 @@ pub fn eth_get_proof(id: Value, params: &Value, state: &RpcState) -> JsonRpcResp
         }),
     )
 }
+
+/// `rsk_getStorageNodes(address, [slots], block)`: for each slot, whether the
+/// state holds it, its value, and the unitrie nodes from the slot's key up to
+/// the state root -- for a slot that is absent as much as for one that is not.
+///
+/// `eth_getProof` answers an absent key with an empty array, on purpose (see
+/// the module note), which leaves a caller no way to prove a slot empty. On
+/// Rootstock that is also the only way to prove a slot holds zero, because a
+/// slot set to zero is deleted from the trie (rskj
+/// `MutableRepository.addStorageBytes`). So this answers both cases with the
+/// path toward the key, and says which case it is, so that a path is never
+/// read as inclusion when it is not:
+///
+/// - `present: true`: the deepest node is the slot's own, and holds its value.
+/// - `present: false`: the deepest node is where the key leaves the trie: its
+///   shared path parts from the key's, or the key ends inside it, or the child
+///   the key would take is empty, or the key ends at it and it holds nothing.
+///
+/// A caller checks the nodes as `eth_getProof`'s are checked, walking the key
+/// down from the root, and must reach the same answer as `present`. The block
+/// is named in the answer, so the caller knows which header's state root the
+/// nodes hang from. A node the store cannot produce is an error, never an
+/// absence.
+pub fn rsk_get_storage_nodes(id: Value, params: &Value, state: &RpcState) -> JsonRpcResponse {
+    let Some(addr) = params
+        .get(0)
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<Address>().ok())
+    else {
+        return JsonRpcResponse::error(id, INVALID_PARAMS, "Missing or invalid address");
+    };
+    let Some(slot_values) = params.get(1).and_then(|v| v.as_array()) else {
+        return JsonRpcResponse::error(id, INVALID_PARAMS, "Missing storage key array");
+    };
+    let mut slots: Vec<(String, B256)> = Vec::with_capacity(slot_values.len());
+    for v in slot_values {
+        let Some(raw) = v.as_str() else {
+            return JsonRpcResponse::error(id, INVALID_PARAMS, "Storage key must be a string");
+        };
+        let Some(slot) = crate::helpers::parse_storage_slot(raw) else {
+            return JsonRpcResponse::error(
+                id,
+                INVALID_PARAMS,
+                format!("Invalid storage key: {raw}"),
+            );
+        };
+        slots.push((raw.to_string(), slot));
+    }
+
+    let block_param = params.get(2).and_then(|v| v.as_str()).unwrap_or("latest");
+    let Some((root, header)) = resolve_state_root(block_param, state) else {
+        return JsonRpcResponse::error(id, INTERNAL_ERROR, "Cannot resolve block");
+    };
+    let Some(trie_store) = state.trie_store.clone() else {
+        return JsonRpcResponse::error(id, INTERNAL_ERROR, "State not available");
+    };
+    let store = &*trie_store;
+
+    let mut storage: Vec<Value> = Vec::with_capacity(slots.len());
+    for (raw, slot) in &slots {
+        let key = TrieKeySlice::from_key(&storage_key(&addr, slot));
+        let incomplete = |missing: B256| {
+            JsonRpcResponse::error(
+                id.clone(),
+                INTERNAL_ERROR,
+                format!("The state is incomplete here: node {missing:#x} is missing"),
+            )
+        };
+        let nodes = match root.try_nodes_toward(&key, store) {
+            Ok(nodes) => nodes,
+            Err(missing) => return incomplete(missing),
+        };
+        let value = match root.try_get(&key, store) {
+            Ok(value) => value.filter(|v| !v.is_empty()),
+            Err(missing) => return incomplete(missing),
+        };
+        // Stored minimally, as `eth_getStorageAt` also finds.
+        let number = value.as_ref().map_or(U256::ZERO, |bytes| {
+            let mut padded = [0u8; 32];
+            let start = 32usize.saturating_sub(bytes.len());
+            padded[start..].copy_from_slice(&bytes[bytes.len().saturating_sub(32)..]);
+            U256::from_be_bytes(padded)
+        });
+        storage.push(json!({
+            "key": raw,
+            "present": value.is_some(),
+            "value": format!("{number:#x}"),
+            "nodes": nodes
+                .iter()
+                .map(|n| format!("0x{}", hex::encode(n.to_message(store))))
+                .collect::<Vec<_>>(),
+        }));
+    }
+
+    JsonRpcResponse::success(
+        id,
+        json!({
+            "address": format!("{addr:#x}"),
+            "blockNumber": format!("{:#x}", header.number),
+            "blockHash": format!("{:#x}", header.hash()),
+            "stateRoot": format!("{:#x}", header.state_root),
+            "storage": storage,
+        }),
+    )
+}

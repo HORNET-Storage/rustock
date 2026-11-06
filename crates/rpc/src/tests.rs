@@ -6028,3 +6028,69 @@ async fn get_proof_rejects_a_missing_slot_array() {
     .await;
     assert!(resp.error.is_some(), "the slot array is required, even when empty");
 }
+
+// ===== rsk_getStorageNodes =====
+
+/// The nodes a slot's answer carries hang from the block's state root, each
+/// a child of the one above it.
+fn assert_hangs_from(nodes: &Value, state_root: B256, trie_store: &dyn rustock_trie::TrieStore) {
+    use rustock_trie::TrieNode;
+
+    let parsed: Vec<TrieNode> = nodes
+        .as_array()
+        .expect("an array of nodes")
+        .iter()
+        .map(|n| hex::decode(n.as_str().unwrap().trim_start_matches("0x")).unwrap())
+        .map(|bytes| TrieNode::from_message(&bytes, trie_store))
+        .collect();
+    assert!(parsed.len() > 1, "the path should span more than one level");
+    assert_eq!(parsed.last().unwrap().compute_hash(trie_store), state_root, "not the block's state root");
+    for pair in parsed.windows(2) {
+        let (child, parent) = (&pair[0], &pair[1]);
+        let message = child.to_message(trie_store);
+        let linked = [&parent.left, &parent.right]
+            .iter()
+            .any(|r| r.resolve(trie_store).is_some_and(|c| c.to_message(trie_store) == message));
+        assert!(linked, "a node on the path is not a child of the one above it");
+    }
+}
+
+/// A slot the state holds: present, its value, and its path.
+#[tokio::test]
+async fn storage_nodes_prove_a_slot_that_is_there() {
+    let (state, _tmp, addr, state_root) = setup_proof_state();
+    let trie_store = state.trie_store.clone().unwrap();
+    let req = make_request("rsk_getStorageNodes", json!([format!("{addr:#x}"), ["0x1"], "latest"]));
+    let r = dispatch_for_test(&state, req).await.result.unwrap();
+
+    assert_eq!(r["blockNumber"], json!("0x2a"), "the block the nodes hang from is named");
+    assert_eq!(r["stateRoot"], json!(format!("{state_root:#x}")));
+    let slot = &r["storage"][0];
+    assert_eq!(slot["present"], json!(true));
+    assert_eq!(slot["value"], json!("0x2a"), "42");
+    assert_hangs_from(&slot["nodes"], state_root, &*trie_store);
+}
+
+/// **A slot the state does not hold is proved absent**, not answered with
+/// nothing: on Rootstock that is also how a slot holding zero is proved, since
+/// a slot set to zero is deleted. `eth_getProof` keeps its empty array.
+#[tokio::test]
+async fn storage_nodes_prove_a_slot_that_is_not() {
+    let (state, _tmp, addr, state_root) = setup_proof_state();
+    let trie_store = state.trie_store.clone().unwrap();
+    let req = make_request("rsk_getStorageNodes", json!([format!("{addr:#x}"), ["0x3"], "latest"]));
+    let r = dispatch_for_test(&state, req).await.result.unwrap();
+
+    let slot = &r["storage"][0];
+    assert_eq!(slot["present"], json!(false));
+    assert_eq!(slot["value"], json!("0x0"));
+    assert_hangs_from(&slot["nodes"], state_root, &*trie_store);
+
+    let req = make_request("eth_getProof", json!([format!("{addr:#x}"), ["0x3"], "latest"]));
+    let r = dispatch_for_test(&state, req).await.result.unwrap();
+    assert_eq!(
+        r["storageProof"][0]["proof"].as_array().unwrap().len(),
+        0,
+        "eth_getProof still answers an absent slot with an empty array"
+    );
+}

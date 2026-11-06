@@ -330,6 +330,7 @@ async fn dispatch(state: &RpcState, req: JsonRpcRequest) -> JsonRpcResponse {
         ),
         "rsk_storageStatus" => admin::rsk_storage_status(id, &state.store, &state.epoch_store),
         "rsk_getStorageBytesAt" => rsk::rsk_get_storage_bytes_at(id, params, state),
+        "rsk_getStorageNodes" => proof::rsk_get_storage_nodes(id, params, state),
         "rsk_getRawTransactionReceiptByHash" => {
             rsk::rsk_get_raw_transaction_receipt_by_hash(id, params, &state.store)
         }
