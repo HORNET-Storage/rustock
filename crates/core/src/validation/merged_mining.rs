@@ -126,6 +126,116 @@ pub fn difficulty_to_target(difficulty: alloy_primitives::U256) -> alloy_primiti
     }
 }
 
+/// rskj `Constants.FALLBACKMINING_PUBKEY_0` and `_1`, uncompressed: the key
+/// that signs a fallback-mined block at an even height, and the one at an
+/// odd height.
+pub const FALLBACK_MINING_PUBKEYS: [[u8; 65]; 2] = [
+    hex_literal::hex!(
+        "041e2b148c024770e19c4f31db2233cac791583df95b4d14a5e9fd4b38dc8254b3"
+        "048f937f169446b19d2eca40db1dd93fab34c0cd8a310afd6e6211f9a89e4bca"
+    ),
+    hex_literal::hex!(
+        "04b55031870df5de88bdb84f65bd1c6f8331c633e759caa5ac7cad3fa4f8a36791"
+        "e995804bba1558ddcf330a67ff5bfa253fa1d8789735f97a97e849686527976e"
+    ),
+];
+
+/// rskj `ProofOfWorkRule.isFallbackMiningPossibleAndBlockSigned`: below
+/// RSKIP98 (orchid), a block with no coinbase and no Merkle proof, of no
+/// greater difficulty than the network's fallback-mining difficulty,
+/// answers for its proof of work with a signature in the Bitcoin-header
+/// field instead. rskj reads an empty coinbase as none, and an empty proof
+/// counts as none.
+pub fn is_fallback_mined(header: &Header, config: &ChainConfig) -> bool {
+    use alloy_primitives::Bytes;
+    let none = |field: &Option<Bytes>| field.as_ref().is_none_or(|f| f.is_empty());
+    header.number < config.activation_heights.orchid
+        && none(&header.bitcoin_merged_mining_coinbase_transaction)
+        && none(&header.bitcoin_merged_mining_merkle_proof)
+        && header.difficulty <= config.fallback_mining_difficulty
+}
+
+/// rskj `ProofOfWorkRule.validFallbackBlockSignature`: the Bitcoin-header
+/// field holds the RLP list `[v, r, s]`, a signature of the header's
+/// merged-mining hash by `keys[0]` at an even height or `keys[1]` at an odd
+/// one.
+///
+/// Read as rskj reads it: by its lenient RLP, with `r` and `s` exactly as
+/// Java's `BigInteger.toByteArray` writes them, `v` from 27 to 30, `s` below
+/// half the curve order, and the key recovered by libsecp256k1, which is
+/// rskj's default `native` crypto library. Where rskj throws, as where it
+/// answers false, the signature does not stand.
+pub fn fallback_signature_is_valid(header: &Header, keys: &[[u8; 65]; 2]) -> bool {
+    use alloy_primitives::U256;
+    let key = &keys[(header.number % 2) as usize];
+    let field = header
+        .bitcoin_merged_mining_header
+        .as_ref()
+        .map_or(&[][..], |f| f.as_ref());
+    let Ok(elements) = crate::rskj_rlp::decode2(field) else {
+        return false;
+    };
+    let [signature] = elements.as_slice() else {
+        return false;
+    };
+    let Ok(parts) = signature.elements() else {
+        return false;
+    };
+    let [v, r, s] = parts.as_slice() else {
+        return false;
+    };
+    let (Some(v), Some(r), Some(s)) = (v.data(), r.data(), s.data()) else {
+        return false;
+    };
+    let &[v] = v else { return false };
+    if r != java_unsigned(r) || s != java_unsigned(s) {
+        return false;
+    }
+    // `getV` is a Java byte, negative from 0x80. From 31 the recovery id
+    // passes 3, where rskj's `check` throws.
+    let v = v as i8;
+    if !(27..=30).contains(&v) {
+        return false;
+    }
+    let (Some(r), Some(s)) = (magnitude(r), magnitude(s)) else {
+        return false;
+    };
+    if s >= U256::from_be_bytes(secp256k1::constants::CURVE_ORDER) >> 1 {
+        return false;
+    }
+    let mut compact = [0u8; 64];
+    compact[..32].copy_from_slice(&r.to_be_bytes::<32>());
+    compact[32..].copy_from_slice(&s.to_be_bytes::<32>());
+    // `validateComponentsWithoutV` holds r and s to 1 through n - 1, as
+    // libsecp256k1 does in parsing and recovering. The id is 0 to 3 here.
+    let id = secp256k1::ecdsa::RecoveryId::from_u8_masked((v - 27) as u8);
+    let Ok(signature) = secp256k1::ecdsa::RecoverableSignature::from_compact(&compact, id) else {
+        return false;
+    };
+    let message = secp256k1::Message::from_digest(header.hash_for_merged_mining().0);
+    crate::types::transaction::secp_context()
+        .recover_ecdsa(message, &signature)
+        .is_ok_and(|found| found.serialize_uncompressed() == *key)
+}
+
+/// `new BigInteger(1, bytes).toByteArray()`: the magnitude without leading
+/// zeros, with one zero byte back in front where its high bit is set, which
+/// also writes zero as a single zero byte.
+fn java_unsigned(bytes: &[u8]) -> Vec<u8> {
+    let start = bytes.iter().position(|b| *b != 0).unwrap_or(bytes.len());
+    let magnitude = &bytes[start..];
+    match magnitude.first() {
+        Some(b) if b & 0x80 == 0 => magnitude.to_vec(),
+        _ => [&[0u8][..], magnitude].concat(),
+    }
+}
+
+/// The unsigned number in `bytes`, if it fits 256 bits.
+fn magnitude(bytes: &[u8]) -> Option<alloy_primitives::U256> {
+    let start = bytes.iter().position(|b| *b != 0).unwrap_or(bytes.len());
+    (bytes.len() - start <= 32).then(|| alloy_primitives::U256::from_be_slice(&bytes[start..]))
+}
+
 impl HeaderValidator for MergedMiningRule {
     fn validate(&self, header: &Header) -> Result<(), ValidationError> {
         use bitcoin::consensus::Decodable;
@@ -133,6 +243,18 @@ impl HeaderValidator for MergedMiningRule {
         use bitcoin::hashes::Hash;
         use alloy_primitives::{B256, U256};
 
+        // rskj `ProofOfWorkRule.isValid` asks first whether the block was
+        // mined without Bitcoin, which RSKIP98 (orchid) ended.
+        if is_fallback_mined(header, &self.config) {
+            if fallback_signature_is_valid(header, &FALLBACK_MINING_PUBKEYS) {
+                return Ok(());
+            }
+            return Err(ValidationError::FallbackMiningSignatureInvalid {
+                number: header.number,
+            });
+        }
+        // Merged mining below RSKIP92, orchid too, proves its coinbase by a
+        // bitcoinj partial Merkle tree, which this does not check yet.
         if header.number < self.config.activation_heights.orchid {
             return Ok(());
         }

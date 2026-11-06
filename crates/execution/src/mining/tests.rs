@@ -32,6 +32,7 @@ fn test_chain_config() -> Arc<ChainConfig> {
         duration_limit: 10,
         difficulty_divisor: U256::from(2048),
         min_difficulty: U256::from(1),
+        fallback_mining_difficulty: U256::ZERO,
         max_future_block_time: 0,
         gas_limit_bound_divisor: 1024,
         min_gas_limit: 1,

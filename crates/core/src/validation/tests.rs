@@ -473,17 +473,441 @@ fn test_difficulty_equal_timestamps_increases() {
     assert!(rule.validate_with_parent(&header, &parent).is_ok());
 }
 
+/// Below orchid, a header with no coinbase and no proof, at no more than the
+/// fallback-mining difficulty, answers for its work with a fallback-mining
+/// signature. Without one it has no proof of work, and rskj refuses it.
 #[test]
-fn test_merged_mining_skipped_before_orchid() {
+fn below_orchid_a_header_without_bitcoin_needs_a_fallback_signature() {
     let config = Arc::new(crate::config::ChainConfig::mainnet());
     let rule = MergedMiningRule { config };
 
-    // Header at block 100 (before orchid=729,000) with NO bitcoin merged mining fields
     let mut header = create_dummy_header(100, 1000, B256::ZERO);
     header.difficulty = U256::from(7_000_000_000_000_000u64);
-    // bitcoin_merged_mining_* are None by default in create_dummy_header
 
-    assert!(rule.validate(&header).is_ok());
+    assert_eq!(
+        rule.validate(&header),
+        Err(ValidationError::FallbackMiningSignatureInvalid { number: 100 })
+    );
+}
+
+/// Mainnet #1 or #2 as rskj stores it. Both were fallback-mined at the
+/// least difficulty: no coinbase, no proof, and in the Bitcoin-header field
+/// the list `[v, r, s]`, signed by the key for the block's parity. The logs
+/// bloom between the two halves is 256 zero bytes.
+fn mainnet_rlp(number: u64) -> Vec<u8> {
+    let (before_bloom, after_bloom) = match number {
+        1 => (
+            "f90221\
+             a0f88529d4ab262c0f4d042e9d8d3f2472848eaafe1a9b7213f57617eb40a9f9e0\
+             a01dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347\
+             9414d3065c8eb89895f4df12450ec6b130049f8034\
+             a021e18f252c8579cee053a215b1f56b90f0b0d008716f5bfbf40009bd6c7d8c04\
+             a01b4008e6fba070d33fb937e369ddbea5c2b66e5bcb12cfc829f15e1f25e568d0\
+             a0a70fc9a7d692ac80a46b23dcf81d5928dbdebc8ac097cfdbce2c03301d9e9406\
+             b90100",
+            "8718de76816d8000018367a89080845a4ddaa32a80840acc6f5080\
+             b845f8431b\
+             a07c85e0cdfd3e8ae89755a8c82de0cc0b22539635b5f5aab084b390726d67c2cf\
+             a05cc475b9130d27193f405de48cdeca961f071e97ffb727299f8cf471a7906017\
+             8080",
+        ),
+        2 => (
+            "f90221\
+             a02422043c4210153a91b974edcd8091b7f40f1cc8ec082ce2a47bc9c613811256\
+             a01dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347\
+             9414d3065c8eb89895f4df12450ec6b130049f8034\
+             a08a9f2c7c75ba8e2dc20d94d94dc5b80a6099adb345eef3af04aa2e08a095490e\
+             a0c10441f2e687fd7032dbdef56cb65afafb0e9a6b54bbe5f081807988cdb7d92c\
+             a0a70fc9a7d692ac80a46b23dcf81d5928dbdebc8ac097cfdbce2c03301d9e9406\
+             b90100",
+            "8718de76816d80000283678ea680845a4ddab22a80840ab0ca5c80\
+             b845f8431c\
+             a02207f67db2d064b6348b7e67041f183274609f85dff748b95fadccbff9640ce2\
+             a0568cd574b87979cfedeaf7dc9c9f5079d0b5df28d90dcaa1b7656828c404b5dd\
+             8080",
+        ),
+        _ => unreachable!("only #1 and #2 are here"),
+    };
+    let mut rlp = hex::decode(before_bloom).unwrap();
+    rlp.extend([0u8; 256]);
+    rlp.extend(hex::decode(after_bloom).unwrap());
+    rlp
+}
+
+/// A header decoded as the node decodes one, the whole of `rlp`.
+fn decoded(rlp: &[u8]) -> Header {
+    let mut rest = rlp;
+    let header = Header::decode_with_hash(&mut rest).unwrap();
+    assert!(rest.is_empty(), "bytes after the header");
+    header
+}
+
+/// rskj takes mainnet's first fallback-mined blocks, and so must this: each
+/// carries the signature of the key for its parity, and of no other.
+#[test]
+fn mainnets_fallback_mined_blocks_carry_their_keys_signatures() {
+    use merged_mining::{fallback_signature_is_valid, is_fallback_mined, FALLBACK_MINING_PUBKEYS};
+
+    let config = Arc::new(crate::config::ChainConfig::mainnet());
+    let rule = MergedMiningRule {
+        config: config.clone(),
+    };
+    let first = decoded(&mainnet_rlp(1));
+    let second = decoded(&mainnet_rlp(2));
+    // Mainnet's: #1 follows genesis and #2 follows #1.
+    assert_eq!(Some(first.parent_hash), config.known_genesis_hash());
+    assert_eq!(second.parent_hash, first.hash());
+
+    let swapped = [FALLBACK_MINING_PUBKEYS[1], FALLBACK_MINING_PUBKEYS[0]];
+    for header in [&first, &second] {
+        assert!(is_fallback_mined(header, &config), "#{}", header.number);
+        assert_eq!(rule.validate(header), Ok(()), "#{}", header.number);
+        assert!(
+            !fallback_signature_is_valid(header, &swapped),
+            "#{}",
+            header.number
+        );
+    }
+}
+
+/// The signature covers the header: one byte of #1's timestamp changed and
+/// the key it recovers is no fallback-mining key.
+#[test]
+fn a_fallback_signature_covers_its_header() {
+    let rule = MergedMiningRule {
+        config: Arc::new(crate::config::ChainConfig::mainnet()),
+    };
+    let mut rlp = mainnet_rlp(1);
+    let timestamp = [0x84, 0x5a, 0x4d, 0xda, 0xa3];
+    let at = rlp.windows(5).position(|w| w == timestamp).unwrap() + 4;
+    rlp[at] ^= 1;
+
+    assert_eq!(
+        rule.validate(&decoded(&rlp)),
+        Err(ValidationError::FallbackMiningSignatureInvalid { number: 1 })
+    );
+}
+
+/// rskj's `isFallbackMiningPossibleAndBlockSigned`: below orchid, with no
+/// coinbase and no proof, an empty one counting as none, at no more than the
+/// network's fallback-mining difficulty: 14 x 10^15 on mainnet and testnet,
+/// zero on regtest.
+#[test]
+fn which_headers_are_fallback_mined() {
+    use crate::config::{ActivationHeights, ChainConfig};
+    use merged_mining::is_fallback_mined;
+
+    let at = |number: u64, difficulty: u64| {
+        let mut header = create_dummy_header(number, 1000, B256::ZERO);
+        header.difficulty = U256::from(difficulty);
+        header
+    };
+    let ceiling = 14_000_000_000_000_000u64;
+    let mainnet = ChainConfig::mainnet();
+    assert!(is_fallback_mined(&at(728_999, ceiling), &mainnet));
+    assert!(!is_fallback_mined(&at(728_999, ceiling + 1), &mainnet));
+    assert!(!is_fallback_mined(&at(729_000, ceiling / 2), &mainnet));
+
+    let mut empty = at(1, ceiling);
+    empty.bitcoin_merged_mining_coinbase_transaction = Some(Bytes::new());
+    empty.bitcoin_merged_mining_merkle_proof = Some(Bytes::new());
+    assert!(is_fallback_mined(&empty, &mainnet));
+    let mut coinbase = empty.clone();
+    coinbase.bitcoin_merged_mining_coinbase_transaction = Some(Bytes::from_static(&[0]));
+    assert!(!is_fallback_mined(&coinbase, &mainnet));
+    let mut proof = empty;
+    proof.bitcoin_merged_mining_merkle_proof = Some(Bytes::from_static(&[0]));
+    assert!(!is_fallback_mined(&proof, &mainnet));
+
+    // Testnet and regtest put orchid at genesis, so neither has any. With
+    // orchid later, each has its own ceiling.
+    assert!(!is_fallback_mined(&at(0, 0), &ChainConfig::testnet()));
+    assert!(!is_fallback_mined(&at(0, 0), &ChainConfig::regtest()));
+    let late = |config: ChainConfig| ChainConfig {
+        activation_heights: ActivationHeights {
+            orchid: 1_000,
+            ..config.activation_heights.clone()
+        },
+        ..config
+    };
+    let testnet = late(ChainConfig::testnet());
+    assert!(is_fallback_mined(&at(999, ceiling), &testnet));
+    assert!(!is_fallback_mined(&at(999, ceiling + 1), &testnet));
+    let regtest = late(ChainConfig::regtest());
+    assert!(is_fallback_mined(&at(999, 0), &regtest));
+    assert!(!is_fallback_mined(&at(999, 1), &regtest));
+}
+
+/// A key's public half as rskj's constants hold one: uncompressed.
+fn uncompressed(key: &k256::ecdsa::VerifyingKey) -> [u8; 65] {
+    key.to_encoded_point(false).as_bytes().try_into().unwrap()
+}
+
+/// A header below orchid that only a fallback signature can answer for.
+fn unsigned_fallback_header(number: u64) -> Header {
+    let mut header = create_dummy_header(number, 1000 + number, B256::ZERO);
+    header.difficulty = U256::from(7_000_000_000_000_000u64);
+    header
+}
+
+/// `key`'s signature of `header`'s merged-mining hash: `v` as rskj reads
+/// it, 27 plus the recovery id, then `r` and `s`, low-s as k256 makes it.
+fn fallback_sign(header: &Header, key: &k256::ecdsa::SigningKey) -> (u8, [u8; 32], [u8; 32]) {
+    let hash = header.hash_for_merged_mining();
+    let (signature, id) = key.sign_prehash_recoverable(hash.as_slice()).unwrap();
+    assert!(signature.normalize_s().is_none(), "k256 signs low-s");
+    let bytes = signature.to_bytes();
+    (
+        27 + id.to_byte(),
+        bytes[..32].try_into().unwrap(),
+        bytes[32..].try_into().unwrap(),
+    )
+}
+
+/// What Java's `BigInteger.toByteArray` writes for the unsigned `bytes`: no
+/// leading zeros, then a zero byte in front where the high bit is set.
+fn java_bytes(bytes: &[u8; 32]) -> Vec<u8> {
+    let trimmed = U256::from_be_bytes(*bytes).to_be_bytes_trimmed_vec();
+    match trimmed.first() {
+        None => vec![0],
+        Some(&b) if b >= 0x80 => [vec![0], trimmed].concat(),
+        Some(_) => trimmed,
+    }
+}
+
+/// An RLP list of `items`, each already encoded.
+fn rlp_list(items: &[Vec<u8>]) -> Vec<u8> {
+    let payload = items.concat();
+    let mut out = Vec::new();
+    alloy_rlp::Header {
+        list: true,
+        payload_length: payload.len(),
+    }
+    .encode(&mut out);
+    out.extend_from_slice(&payload);
+    out
+}
+
+/// `bytes` as a canonical RLP string.
+fn rlp_string(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    alloy_rlp::Encodable::encode(bytes, &mut out);
+    out
+}
+
+/// Whether `header` stands with `field` in its Bitcoin-header field.
+fn signed_by(header: &Header, field: Vec<u8>, keys: &[[u8; 65]; 2]) -> bool {
+    let mut header = header.clone();
+    header.bitcoin_merged_mining_header = Some(Bytes::from(field));
+    merged_mining::fallback_signature_is_valid(&header, keys)
+}
+
+/// rskj's `validFallbackBlockSignature`, on signatures made here by keys
+/// that stand in for mainnet's two: what it takes and what it refuses.
+#[test]
+fn a_fallback_signature_is_read_as_rskj_reads_it() {
+    use k256::ecdsa::SigningKey;
+
+    let even = SigningKey::from_slice(&[0x11; 32]).unwrap();
+    let odd = SigningKey::from_slice(&[0x22; 32]).unwrap();
+    let keys = [
+        uncompressed(even.verifying_key()),
+        uncompressed(odd.verifying_key()),
+    ];
+    let n = U256::from_be_bytes(secp256k1::constants::CURVE_ORDER);
+    // Whether an `r`, or an `s`, came that Java writes with a zero in front.
+    // An `r` has to, for the test below; a low `s` never can, its high bit
+    // being clear.
+    let mut zero_in_front = [false; 2];
+
+    for number in 1..=16u64 {
+        let header = unsigned_fallback_header(number);
+        let (signer, other) = if number % 2 == 0 {
+            (&even, &odd)
+        } else {
+            (&odd, &even)
+        };
+        let (v, r, s) = fallback_sign(&header, signer);
+        let (r_java, s_java) = (java_bytes(&r), java_bytes(&s));
+        let field =
+            |v: &[u8], r: &[u8], s: &[u8]| rlp_list(&[rlp_string(v), rlp_string(r), rlp_string(s)]);
+        let stands = |field: Vec<u8>| signed_by(&header, field, &keys);
+
+        assert!(stands(field(&[v], &r_java, &s_java)), "#{number}");
+
+        // Another key's signature, and this one with the wrong `v`.
+        let (v_other, r_other, s_other) = fallback_sign(&header, other);
+        assert!(!stands(field(
+            &[v_other],
+            &java_bytes(&r_other),
+            &java_bytes(&s_other)
+        )));
+        let flipped = if v == 27 { 28 } else { 27 };
+        assert!(!stands(field(&[flipped], &r_java, &s_java)), "#{number}");
+        // Four either way, or 128 more, keeps the recovery id's two bits, so
+        // only the range refuses these.
+        for v in [v - 4, v + 4, v | 0x80] {
+            assert!(!stands(field(&[v], &r_java, &s_java)), "#{number}, v {v}");
+        }
+        assert!(
+            !stands(field(&[0, v], &r_java, &s_java)),
+            "#{number}, v in two bytes"
+        );
+        assert!(!stands(field(&[], &r_java, &s_java)), "#{number}, no v");
+
+        // `r` and `s` exactly as Java writes them, and no other way.
+        for (i, java) in [&r_java, &s_java].into_iter().enumerate() {
+            let mut written = [r_java.clone(), s_java.clone()];
+            written[i] = [&[0u8][..], &java[..]].concat();
+            assert!(
+                !stands(field(&[v], &written[0], &written[1])),
+                "#{number}, extra zero"
+            );
+            if java[0] == 0 {
+                zero_in_front[i] = true;
+                written[i] = java[1..].to_vec();
+                assert!(
+                    !stands(field(&[v], &written[0], &written[1])),
+                    "#{number}, no zero"
+                );
+            }
+            written[i] = vec![];
+            assert!(
+                !stands(field(&[v], &written[0], &written[1])),
+                "#{number}, empty"
+            );
+        }
+
+        // The same signature with `s` high is good ECDSA, the key recovers
+        // from it, but rskj takes only the low `s`.
+        let high: [u8; 32] = (n - U256::from_be_bytes(s)).to_be_bytes();
+        let compact = [r, high].concat();
+        let id = secp256k1::ecdsa::RecoveryId::from_u8_masked(flipped - 27);
+        let recovered = secp256k1::Secp256k1::verification_only()
+            .recover_ecdsa(
+                secp256k1::Message::from_digest(header.hash_for_merged_mining().0),
+                &secp256k1::ecdsa::RecoverableSignature::from_compact(&compact, id).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            recovered.serialize_uncompressed(),
+            keys[(number % 2) as usize]
+        );
+        assert!(
+            !stands(field(&[flipped], &r_java, &java_bytes(&high))),
+            "#{number}, high s"
+        );
+
+        // Exactly one list of exactly three.
+        let good = field(&[v], &r_java, &s_java);
+        let parts = [rlp_string(&[v]), rlp_string(&r_java), rlp_string(&s_java)];
+        assert!(!stands(rlp_list(&parts[..2])), "#{number}, two");
+        let four = [parts.to_vec(), vec![vec![0x80]]].concat();
+        assert!(!stands(rlp_list(&four)), "#{number}, four");
+        assert!(
+            !stands([good.clone(), vec![0x80]].concat()),
+            "#{number}, after the list"
+        );
+        assert!(!stands(rlp_string(&parts.concat())), "#{number}, an item");
+        assert!(
+            !stands(good[..good.len() - 1].to_vec()),
+            "#{number}, cut short"
+        );
+        assert!(!stands(vec![]), "#{number}, empty");
+        let mut absent = header.clone();
+        absent.bitcoin_merged_mining_header = None;
+        assert!(!merged_mining::fallback_signature_is_valid(&absent, &keys));
+
+        // What rskj's lenient RLP takes, this takes: `v` as a one-byte
+        // string, `r` in a long-form prefix, and the list's length with a
+        // zero in front.
+        let long = |bytes: &[u8]| [vec![0xb8, bytes.len() as u8], bytes.to_vec()].concat();
+        let payload = [vec![0x81, v], long(&r_java), rlp_string(&s_java)].concat();
+        let lenient = [vec![0xf9, 0x00, payload.len() as u8], payload].concat();
+        assert!(stands(lenient), "#{number}, lenient");
+    }
+    assert_eq!(
+        zero_in_front,
+        [true, false],
+        "an r with a zero in front, and no s"
+    );
+}
+
+/// rskj refuses an `s` of half the curve order, rounded down, or more, and
+/// takes one less. The key is whatever k256 recovers from each signature,
+/// so only the bound decides.
+#[test]
+fn a_fallback_signatures_s_stops_below_half_the_curve_order() {
+    use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
+
+    let header = unsigned_fallback_header(7);
+    let hash = header.hash_for_merged_mining();
+    let half: U256 = U256::from_be_bytes(secp256k1::constants::CURVE_ORDER) >> 1;
+    // The generator's x, which is on the curve.
+    let r: [u8; 32] =
+        hex_literal::hex!("79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798");
+    for (s, taken) in [(half, false), (half - U256::from(1), true)] {
+        let s: [u8; 32] = s.to_be_bytes();
+        let signature = Signature::from_scalars(r, s).unwrap();
+        let id = RecoveryId::from_byte(0).unwrap();
+        let key = VerifyingKey::recover_from_prehash(hash.as_slice(), &signature, id).unwrap();
+        let key = uncompressed(&key);
+        let field = rlp_list(&[
+            rlp_string(&[27]),
+            rlp_string(&java_bytes(&r)),
+            rlp_string(&java_bytes(&s)),
+        ]);
+        let s = U256::from_be_bytes(s);
+        assert_eq!(signed_by(&header, field, &[key, key]), taken, "s = {s}");
+    }
+}
+
+/// rskj takes `v` up to 30: recovery ids 2 and 3 say `r` is a point's x less
+/// the curve order, and libsecp256k1, rskj's library, recovers from them.
+/// Four less keeps the id's two bits, and rskj refuses it all the same.
+#[test]
+fn a_fallback_signature_takes_each_recovery_id_rskj_takes() {
+    let header = unsigned_fallback_header(9);
+    let message = secp256k1::Message::from_digest(header.hash_for_merged_mining().0);
+    let n = U256::from_be_bytes(secp256k1::constants::CURVE_ORDER);
+    // The least `r` whose `r + n` is a point's x, as ids 2 and 3 need.
+    let r = (1u64..)
+        .map(U256::from)
+        .find(|r| {
+            let x: [u8; 32] = (*r + n).to_be_bytes();
+            secp256k1::PublicKey::from_slice(&[&[2u8][..], &x].concat()).is_ok()
+        })
+        .unwrap();
+    let s = U256::from(0x5eed);
+    let (r, s): ([u8; 32], [u8; 32]) = (r.to_be_bytes(), s.to_be_bytes());
+    let field = |v: u8| {
+        rlp_list(&[
+            rlp_string(&[v]),
+            rlp_string(&java_bytes(&r)),
+            rlp_string(&java_bytes(&s)),
+        ])
+    };
+    for id in [2u8, 3] {
+        let signature = secp256k1::ecdsa::RecoverableSignature::from_compact(
+            &[r, s].concat(),
+            secp256k1::ecdsa::RecoveryId::from_u8_masked(id),
+        )
+        .unwrap();
+        let key = secp256k1::Secp256k1::verification_only()
+            .recover_ecdsa(message, &signature)
+            .unwrap()
+            .serialize_uncompressed();
+        assert!(
+            signed_by(&header, field(27 + id), &[key, key]),
+            "v {}",
+            27 + id
+        );
+        assert!(
+            !signed_by(&header, field(23 + id), &[key, key]),
+            "v {}",
+            23 + id
+        );
+    }
 }
 
 #[test]

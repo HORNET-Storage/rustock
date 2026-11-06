@@ -49,6 +49,9 @@ pub enum ValidationError {
     #[error("Bitcoin Proof of Work invalid: hash {hash} exceeds target {target}")]
     BitcoinPowInvalid { hash: B256, target: U256 },
 
+    #[error("Fallback-mined block #{number} is not signed by its fallback-mining key")]
+    FallbackMiningSignatureInvalid { number: u64 },
+
     #[error("Bitcoin Merkle proof invalid")]
     BitcoinMerkleProofInvalid,
 

@@ -165,6 +165,11 @@ pub struct ChainConfig {
     pub duration_limit: u64,
     pub difficulty_divisor: U256,
     pub min_difficulty: U256,
+    /// The greatest difficulty at which a block below RSKIP98 (orchid) may
+    /// be signed by a fallback-mining key rather than merge-mined: rskj
+    /// `Constants.getFallbackMiningDifficulty()`. 14 x 10^15 on mainnet and
+    /// testnet, zero on regtest.
+    pub fallback_mining_difficulty: U256,
     /// rskj `Constants.newBlockMaxSecondsInTheFuture`: how far past the
     /// node's clock a header may be timestamped. 60 on mainnet, 540 on
     /// testnet, 0 on regtest, where zero turns the timestamp rule off
@@ -211,6 +216,7 @@ impl ChainConfig {
             duration_limit: 14,
             difficulty_divisor: U256::from(50),
             min_difficulty: U256::from(7_000_000_000_000_000u64), // 7e15, FALLBACK_MINING_DIFFICULTY / 2
+            fallback_mining_difficulty: U256::from(14_000_000_000_000_000u64),
             max_future_block_time: 60,
             gas_limit_bound_divisor: 1024,
             min_gas_limit: 3_000_000,
@@ -231,6 +237,7 @@ impl ChainConfig {
             duration_limit: 14,
             difficulty_divisor: U256::from(50),
             min_difficulty: U256::from(131072),
+            fallback_mining_difficulty: U256::from(14_000_000_000_000_000u64),
             max_future_block_time: 540,
             gas_limit_bound_divisor: 1024,
             min_gas_limit: 3_000_000,
@@ -251,6 +258,7 @@ impl ChainConfig {
             duration_limit: 10,
             difficulty_divisor: U256::from(2048),
             min_difficulty: U256::from(1),
+            fallback_mining_difficulty: U256::ZERO,
             max_future_block_time: 0,
             gas_limit_bound_divisor: 1024,
             min_gas_limit: 3_000_000,

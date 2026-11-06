@@ -199,7 +199,7 @@ fn take_rlp_item<'a>(buf: &mut &'a [u8]) -> Option<&'a [u8]> {
 /// more than a recovery does -- so a per-call context would spend the whole
 /// advantage of using this library and then some. Verification-only because
 /// nothing here signs: the signing half of the tables is not built.
-fn secp_context() -> &'static secp256k1::Secp256k1<secp256k1::VerifyOnly> {
+pub(crate) fn secp_context() -> &'static secp256k1::Secp256k1<secp256k1::VerifyOnly> {
     static CTX: std::sync::OnceLock<secp256k1::Secp256k1<secp256k1::VerifyOnly>> =
         std::sync::OnceLock::new();
     CTX.get_or_init(secp256k1::Secp256k1::verification_only)

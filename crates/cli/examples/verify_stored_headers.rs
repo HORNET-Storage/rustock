@@ -138,7 +138,7 @@ fn main() -> anyhow::Result<()> {
 
     let config = Arc::new(ChainConfig::mainnet());
     let wasabi100 = config.activation_heights.wasabi100;
-    let verifier = HeaderVerifier::default_rsk(config);
+    let verifier = HeaderVerifier::default_rsk(config.clone());
     let threads = std::thread::available_parallelism()
         .map(|n| n.get() as u64)
         .unwrap_or(4);
@@ -156,6 +156,9 @@ fn main() -> anyhow::Result<()> {
     let orphaned = AtomicU64::new(0);
     let missing = AtomicU64::new(0);
     let fork_checked = AtomicU64::new(0);
+    // Headers below orchid that answer for their work with a fallback-mining
+    // signature rather than a Bitcoin header.
+    let fallback = AtomicU64::new(0);
     let started = Instant::now();
 
     std::thread::scope(|scope| -> anyhow::Result<()> {
@@ -168,16 +171,10 @@ fn main() -> anyhow::Result<()> {
                 break;
             }
             let bottom = top.saturating_sub(span - 1).max(lowest);
-            let (store, verifier, failures, checked, not_later, orphaned, missing, fork_checked) = (
-                &store,
-                &verifier,
-                &failures,
-                &checked,
-                &not_later,
-                &orphaned,
-                &missing,
-                &fork_checked,
+            let (store, verifier, config, failures, checked, not_later, orphaned, missing) = (
+                &store, &verifier, &config, &failures, &checked, &not_later, &orphaned, &missing,
             );
+            let (fork_checked, fallback) = (&fork_checked, &fallback);
             workers.push(scope.spawn(move || -> anyhow::Result<()> {
                 // The highest block from `number` down to this range's bottom
                 // that the store holds, counting the numbers it does not.
@@ -205,6 +202,9 @@ fn main() -> anyhow::Result<()> {
                 let mut window: VecDeque<Header> = VecDeque::new();
                 let below = loop {
                     let parent = store.header(header.parent_hash)?;
+                    if merged_mining::is_fallback_mined(&header, config) {
+                        fallback.fetch_add(1, Ordering::Relaxed);
+                    }
                     if let Err(e) = verifier.verify(&header, parent.as_ref()) {
                         record(failures, header.number, &e);
                     }
@@ -287,6 +287,10 @@ fn main() -> anyhow::Result<()> {
         .max(fork_detection::REQUIRED_BLOCKS + 1);
     let fork_expected = (highest + 1).saturating_sub(fork_from);
     println!("  fork-detection data checked on {fork_checked} blocks, from #{fork_from}");
+    println!(
+        "  fallback-mined, their signatures checked: {}",
+        fallback.into_inner()
+    );
     let expected = highest - lowest + 1;
     anyhow::ensure!(
         checked + missing == expected,
