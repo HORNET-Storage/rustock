@@ -104,6 +104,32 @@ fn chain(
     (blocks, tds)
 }
 
+/// The same, each block with one uncle as heavy as itself, and totals that
+/// count it as rskj's do.
+fn chain_with_uncles(
+    first_number: u64,
+    n: usize,
+    from_parent: B256,
+    base_td: u64,
+    state_root: B256,
+) -> (Vec<Block>, Vec<U256>) {
+    let difficulty = 100u64;
+    let (mut blocks, mut tds) = (Vec::new(), Vec::new());
+    let (mut parent, mut td) = (from_parent, base_td);
+    for i in 0..n {
+        let number = first_number + i as u64;
+        let uncle = header(number - 1, B256::repeat_byte(0x0c), B256::ZERO, difficulty);
+        let mut h = header(number, parent, state_root, difficulty);
+        h.uncle_count = 1;
+        h.ommers_hash = rustock_execution::processor::compute_ommers_hash(std::slice::from_ref(&uncle));
+        parent = h.hash();
+        td += 2 * difficulty;
+        tds.push(U256::from(td));
+        blocks.push(Block { header: h, transactions: Vec::new(), ommers: vec![uncle] });
+    }
+    (blocks, tds)
+}
+
 struct Fixture {
     store: Arc<BlockStore>,
     trie: Arc<MemoryTrieStore>,
@@ -137,6 +163,8 @@ impl Fixture {
         let genesis = header(0, B256::ZERO, B256::ZERO, 100);
         let hash = genesis.hash();
         self.store.put_header_with_hash(hash, &genesis).expect("genesis");
+        // As `setup_genesis` records it: genesis's total difficulty is its own.
+        self.store.put_total_difficulty(hash, genesis.difficulty).expect("td");
         self.store.put_canonical_hash(0, hash).expect("index");
         hash
     }
@@ -167,7 +195,6 @@ fn headers_for(blocks: &[Block], point: u64, count: u32) -> Vec<Header> {
 
 /// Answers every header and skeleton request the session makes, until it
 /// leaves the header phase. Returns the actions it was left with.
-#[allow(dead_code)] // no caller; see the dead-code issue before deleting
 fn answer_header_walk(
     session: &mut SnapSession,
     blocks: &[Block],
@@ -1712,6 +1739,43 @@ fn offered_totals_may_grow_by_more_than_the_header_difficulty() {
     assert!(
         super::session::check_chain_shape(&blocks, &difficulties).is_ok(),
         "the uncle's difficulty counts toward the total"
+    );
+}
+
+/// **An honest claim counts the uncles a header walk never sees.** rskj peers
+/// send no uncles with headers, so the walk counts each block's own
+/// difficulty: on mainnet, a little over half the work. Checked against that
+/// and the checkpoint's own uncles, every honest claim was refused -- mainnet's
+/// #9381160 carries 6.24e28, its headers alone 3.54e28 -- and the peer making
+/// it was charged for a lie it had not told.
+#[test]
+fn an_honest_claim_counts_the_uncles_a_header_walk_never_sees() {
+    let f = fixture(20);
+    let genesis = f.with_genesis();
+    // Each block has an uncle as heavy as itself: half the work is in uncles.
+    let (blocks, tds) = chain_with_uncles(1, 4, genesis, 100, f.state_root);
+    let mut session = f.session(HeaderVerifier::new());
+    let actions = session.on_status(&blocks, &tds, 8_000, 0);
+    answer_header_walk(&mut session, &blocks, actions);
+    assert_eq!(session.failure(), None);
+    assert_eq!(session.phase(), Phase::DownloadingState);
+}
+
+/// And what the walk allows for the uncles it did not see is a bound, not a
+/// pass: a claim beyond what they could add is refused.
+#[test]
+fn a_claim_beyond_what_the_unseen_uncles_could_add_is_refused() {
+    let f = fixture(20);
+    let genesis = f.with_genesis();
+    // Totals far past what four uncles could weigh, even each at the floor.
+    let (blocks, tds) = chain_with_uncles(1, 4, genesis, 1_000_000_000_000_000_000, f.state_root);
+    let mut session = f.session(HeaderVerifier::new());
+    let actions = session.on_status(&blocks, &tds, 8_000, 0);
+    answer_header_walk(&mut session, &blocks, actions);
+    assert!(
+        matches!(session.failure(), Some(SnapFailure::OverstatedDifficulty { .. })),
+        "{:?}",
+        session.failure()
     );
 }
 

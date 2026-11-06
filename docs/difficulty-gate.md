@@ -397,6 +397,11 @@ The walk only produces the exact number if the peer sends the uncles. From an
 `rsk/62` peer — every rskj node today — the walk sums header difficulty alone,
 which is a **lower** bound on the chain's work. That is worse than the gate's
 upper bound, not better: see `headers.rs` `uncles_omitted`, and issue #258.
+The walk does bound what it cannot count (`HeaderWalk::work_ceiling`: each
+unseen uncle at most a fiftieth over the heaviest trunk block it could hang
+from), so its check of the claim is sound against such a peer too; but that
+check comes after the walk, so the gate still decides whether the walk is
+worth its cost.
 
 Capabilities are negotiated per peer and known before the status response is
 handled, so this is decidable at run time rather than something to wait for a

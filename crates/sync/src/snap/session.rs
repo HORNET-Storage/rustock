@@ -1088,29 +1088,28 @@ impl SnapSession {
         // a walk: on mainnet the second session "verified" the chain in four
         // seconds, on the strength of the first one's refused total.
         //
-        // The walk has read every header from the checkpoint down to a block
-        // this node already trusted, so the work of that chain is known. The
-        // claimed cumulative difficulty may exceed it only by the checkpoint
-        // block's own contribution -- the one header the walk never visits as
-        // a candidate.
+        // The walk has read every header from the checkpoint, its first, down
+        // to a block this node already trusted, and counted each run as it
+        // joined the chain. Uncles it could not count: they travel in bodies,
+        // which a header walk never fetches, and rskj peers send none
+        // alongside. Taken for a ceiling, with only the checkpoint's own
+        // uncles allowed for, that floor refused every honest peer on mainnet:
+        // #9381160 carries 6.24e28, and its headers alone 3.54e28.
         //
-        // That contribution includes the checkpoint's uncles, whose headers
-        // are not in hand here: only `uncle_count` is. An uncle is a sibling,
-        // computed from the same parent, so its difficulty is close to the
-        // block's own; `difficulty * (1 + uncle_count)` is therefore a sound
-        // upper bound without pretending to a precision the data does not
-        // support. Bounding it low instead would reject every honest peer
-        // whose totals are right, which is what the header-only bound did.
+        // What the walk did see bounds the uncles it did not, and
+        // `HeaderWalk::work_ceiling` adds that bound to the floor. With every
+        // uncle sent, the ceiling is the exact work.
         //
         // The claim is written as this node's own total difficulty at the
-        // checkpoint, so it is worth establishing rather than accepting.
-        if let Some(established) = self.walk.as_ref().and_then(|w| w.established_difficulty()) {
-            let ceiling = established.saturating_add(
-                checkpoint.as_ref().map_or(U256::ZERO, |h| {
-                    h.difficulty
-                        .saturating_mul(U256::from(1u64).saturating_add(U256::from(h.uncle_count)))
-                }),
-            );
+        // checkpoint, so it is worth bounding rather than accepting.
+        let judged = self.walk.as_ref().and_then(|walk| {
+            Some((
+                walk.established_difficulty()?,
+                walk.work_ceiling(self.config.min_difficulty)?,
+                walk.uncles_omitted(),
+            ))
+        });
+        if let Some((_, ceiling, _)) = judged {
             if self.checkpoint_td > ceiling {
                 return self.fail(SnapFailure::OverstatedDifficulty {
                     claimed: self.checkpoint_td,
@@ -1156,12 +1155,21 @@ impl SnapSession {
             let _ = self.store.set_head(hash);
         }
 
-        info!(
-            target: "rustock::snap",
-            "header chain verified back to #{}; downloading state at #{}",
-            self.walk.as_ref().map_or(0, |w| w.frontier()),
-            checkpoint.as_ref().map_or(0, |h| h.number)
-        );
+        let frontier = self.walk.as_ref().map_or(0, |w| w.frontier());
+        let at = checkpoint.as_ref().map_or(0, |h| h.number);
+        match judged {
+            Some((established, ceiling, uncles)) => info!(
+                target: "rustock::snap",
+                "header chain verified back to #{frontier}: work {established} counted, at most \
+                 {ceiling} with the {uncles} uncles a header walk cannot see, against {} claimed; \
+                 downloading state at #{at}",
+                self.checkpoint_td
+            ),
+            None => info!(
+                target: "rustock::snap",
+                "header chain verified back to #{frontier}; downloading state at #{at}"
+            ),
+        }
         self.set_phase(Phase::DownloadingState);
         self.poll()
     }

@@ -128,7 +128,8 @@ up:
 
 This is the same 10.5 GB the current walk would have to pay for an exact total.
 It does not pay it today, which is #258, and the consequence is that
-`walked_difficulty` understates the chain.
+`walked_difficulty` understates the chain, and the walk bounds the rest from
+above (`HeaderWalk::work_ceiling`) rather than counting it.
 
 ### RSKIP-699 does not remove this
 
