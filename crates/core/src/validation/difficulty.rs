@@ -80,7 +80,17 @@ impl DifficultyRule {
             return parent.difficulty;
         }
 
-        let calc_dur = (1 + header.uncle_count) * self.config.duration_limit;
+        // rskj: `int calcDur = (1 + uncleCount) * duration`, in Java `int`
+        // arithmetic, which wraps. Nothing ties a header's uncle count to the
+        // uncles it carries, so the count is the miner's to choose, and one
+        // that wraps the product to zero or below makes any block late: a
+        // lower difficulty, which rskj takes, and so must this. Both
+        // timestamps are Java `long`s, so the gap fits an `i64`.
+        let calc_dur = i64::from(
+            1i32.wrapping_add(header.uncle_count as i32)
+                .wrapping_mul(self.config.duration_limit as i32),
+        );
+        let delta = delta as i64;
 
         let sign = if calc_dur > delta {
             1i8
@@ -209,5 +219,26 @@ mod rskip97_tests {
         let parent = header_at(100, 1_000_000, U256::from(1_048_576u64));
         let got = rule.difficulty_for_child(&parent, 101, 1_000_000 + 599, 0);
         assert_ne!(got, U256::from(131_072u64), "599s is under the ten-minute threshold");
+    }
+
+    /// rskj works out the expected time in Java `int` arithmetic, and nothing
+    /// ties a header's uncle count to its uncles. A count that wraps the
+    /// product to zero, or below it, makes a block late however soon it came,
+    /// and its difficulty falls.
+    #[test]
+    fn the_expected_time_wraps_as_a_java_int() {
+        let rule = DifficultyRule { config: Arc::new(ChainConfig::mainnet()) };
+        let parent = header_at(5_000_000, 1_000_000, U256::from(10u128.pow(21)));
+        let step = parent.difficulty / U256::from(400);
+        let child = |uncles: u64| {
+            rule.difficulty_for_child(&parent, 5_000_001, 1_000_000 + 10, uncles)
+        };
+
+        // (1 + 1) * 14: 28 seconds expected, and 10 is sooner.
+        assert_eq!(child(1), parent.difficulty + step);
+        // (1 + 2^31 - 1) * 14 wraps to 0, and 10 is later.
+        assert_eq!(child(i32::MAX as u64), parent.difficulty - step);
+        // (1 + 2^30) * 14 wraps below zero.
+        assert_eq!(child(1 << 30), parent.difficulty - step);
     }
 }
