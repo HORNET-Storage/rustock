@@ -5357,6 +5357,141 @@ async fn the_watchdog_retreat_stops_at_genesis() {
     assert_eq!(crate::invariant::check(&store, None, crate::Scope::Full), Ok(()));
 }
 
+/// A failed snapshot sync stays recoverable through the watchdog's retreat.
+///
+/// Mainnet, 6 November 2026. A light node's snapshot sync gave up after five
+/// attempts, leaving genesis, headers from #9,372,260 up that link to nothing
+/// below them, and no executed head. The watchdog's first escalation retreated
+/// the head one block, and the retreat recorded #9,388,799 as executed: a
+/// block nothing had executed, with no state under it. From then on every
+/// check found execution stranded, and a restart could not help, because
+/// snapshot sync starts only on a node that has executed nothing; it declined,
+/// saying ordinary sync was the shorter path. Only a wiped data folder got the
+/// node going again.
+#[tokio::test]
+async fn a_retreat_after_a_failed_snapshot_sync_leaves_it_free_to_try_again() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+    // The checkpoint's window: linked to itself and to nothing below, its
+    // state roots nowhere in the trie store.
+    let mut parent = B256::repeat_byte(0x9a);
+    for n in 1_000..=1_010u64 {
+        let mut h = dummy_header(n, parent, U256::from(1));
+        h.state_root = B256::repeat_byte(0x5a);
+        store.update_head(&h, U256::from(n)).unwrap();
+        parent = h.hash();
+    }
+    assert_eq!(store.exec_head().unwrap(), None, "precondition: nothing executed");
+
+    let trie = Arc::new(rustock_trie::MemoryTrieStore::new()) as Arc<dyn rustock_trie::TrieStore>;
+    let mut service = service_over(store.clone()).with_trie_store_for_test(trie);
+
+    // The watchdog's first escalation.
+    service.reverify_head_lineage(1);
+
+    let head = store.header(store.head().unwrap().unwrap()).unwrap().unwrap();
+    assert_eq!(head.number, 1_009, "precondition: the retreat happened");
+    assert_eq!(
+        store.exec_head().unwrap(),
+        None,
+        "the retreat recorded as executed a block nothing executed"
+    );
+
+    // And the node can still do the one thing that gets it going: try the
+    // snapshot again.
+    service.start_snap_sync(crate::snap::SnapConfig::default(), Arc::new(HeaderVerifier::new()));
+    assert!(
+        service.snap_phase().is_some(),
+        "snapshot sync declined to start on a node that has executed nothing"
+    );
+}
+
+/// What a node holds when its snapshot sync failed the final check: a linked
+/// chain, nothing executed, and in the trie store the root of the checkpoint's
+/// state -- downloaded, never verified, perhaps full of holes. No other block's
+/// state is there.
+fn chain_with_an_unverified_state(
+    len: u64,
+    checkpoint: u64,
+) -> (Arc<BlockStore>, tempfile::TempDir, Vec<Header>, Arc<dyn rustock_trie::TrieStore>) {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let unverified = B256::repeat_byte(0x77);
+    let mut headers = Vec::new();
+    let mut parent = B256::ZERO;
+    for n in 0..=len {
+        let mut h = dummy_header(n, parent, U256::from(1));
+        h.state_root = if n == checkpoint { unverified } else { B256::repeat_byte(0x5a) };
+        store.update_head(&h, U256::from(n + 1)).unwrap();
+        parent = h.hash();
+        headers.push(h);
+    }
+    let trie = Arc::new(rustock_trie::MemoryTrieStore::new()) as Arc<dyn rustock_trie::TrieStore>;
+    let root = rustock_trie::TrieNode::empty();
+    trie.put(unverified.as_slice(), &root.to_message(trie.as_ref()));
+    assert_eq!(store.exec_head().unwrap(), None, "precondition: nothing executed");
+    (store, dir, headers, trie)
+}
+
+/// A retreat on a node that has executed nothing rolls nothing back.
+///
+/// Rolling back from the head that stands in for execution walks down to the
+/// first block whose state root the trie store holds, and records it as
+/// executed. After a snapshot sync that failed its check, that block is the
+/// checkpoint, and its state is the one the check refused.
+#[tokio::test]
+async fn a_retreat_does_not_take_up_a_state_that_failed_its_check() {
+    let (store, _dir, headers, trie) = chain_with_an_unverified_state(10, 5);
+    let mut service = service_over(store.clone()).with_trie_store_for_test(trie);
+
+    service.reverify_head_lineage(1);
+
+    assert_eq!(store.head().unwrap(), Some(headers[9].hash()), "precondition: the retreat happened");
+    assert_eq!(
+        store.exec_head().unwrap(),
+        None,
+        "execution was recorded at a state nothing verified"
+    );
+}
+
+/// With nothing executed, I5 is the head off the chain, and gets the head's
+/// repair rather than execution's.
+///
+/// The check reads execution as the head when nothing is recorded, so a head
+/// that is not canonical reads as execution off the chain. Rolling execution
+/// back from there walks down to the unverified state, as above; re-seating
+/// the head is what the state calls for.
+#[tokio::test]
+async fn with_nothing_executed_a_head_off_the_chain_is_reseated_not_rolled_back() {
+    let (store, _dir, headers, trie) = chain_with_an_unverified_state(10, 5);
+    // The head names a sibling of #10, held but not canonical.
+    let mut sibling = dummy_header(10, headers[9].hash(), U256::from(1));
+    sibling.extra_data = vec![0xEE].into();
+    store.put_header(&sibling).unwrap();
+    store.set_head(sibling.hash()).unwrap();
+    let violation = crate::invariant::check(&store, None, crate::Scope::Full).unwrap_err();
+    assert_eq!(violation.relation(), "I5", "precondition: {violation}");
+
+    let mut service = service_over(store.clone()).with_trie_store_for_test(trie);
+    service.verify_coherence();
+    age_violation(&mut service, EXECUTION_OFF_CHAIN_GRACE + Duration::from_secs(1));
+    service.verify_coherence();
+
+    assert_eq!(
+        store.exec_head().unwrap(),
+        None,
+        "execution was recorded at a state nothing verified"
+    );
+    assert_eq!(
+        store.head().unwrap(),
+        Some(headers[10].hash()),
+        "the head should be back on the canonical chain"
+    );
+    assert_eq!(crate::invariant::check(&store, None, crate::Scope::Full), Ok(()));
+}
+
 // ── snapshot sync owns the peer set while it runs (#185) ─────────────────────
 
 /// **Header sync first, then state — never the reverse.**

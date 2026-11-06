@@ -252,6 +252,12 @@ impl BlockStore {
     ///
     /// `None` when the node has no head yet -- an empty database, before
     /// genesis. There is nothing to be incoherent about.
+    ///
+    /// With no executed head recorded -- a node that has executed nothing, as
+    /// one has until its snapshot sync finishes -- `executed` reads as the
+    /// head and `state_root` as zero. That keeps the relations between the
+    /// three keys checkable, but it is a stand-in, not a block whose state was
+    /// computed: code that moves execution reads [`BlockStore::exec_head`].
     pub fn cursor(&self) -> Result<Option<Cursor>> {
         let Some(head_hash) = self.head()? else {
             return Ok(None);
@@ -368,6 +374,10 @@ impl BlockStore {
     /// conservative: a block common to both branches. Re-executing a few
     /// blocks costs seconds; executing from the wrong branch costs a fork.
     ///
+    /// It only ever goes down, and only from execution that happened. Moving
+    /// the executed head anywhere else records as computed a state that was
+    /// not, and the node cannot resume from it.
+    ///
     /// The state root comes from the target header, which post-RSKIP126 is the
     /// committed unitrie root -- the same source the reorg path has always
     /// used.
@@ -378,6 +388,18 @@ impl BlockStore {
         new_head: &Validated,
     ) -> Result<()> {
         let Some(before) = before else { return Ok(()) };
+        // Nothing executed is nothing to bring back. Without a recorded
+        // executed head, `cursor` reads execution as the head, and taken at
+        // its word that stand-in is above any retreat -- so the rollback below
+        // recorded the retreat's target as executed. Mainnet, 6 November 2026:
+        // a light node whose snapshot sync had given up retreated from
+        // #9,388,800 to #9,388,799 on the watchdog's first escalation and was
+        // left "executed" at #9,388,799, with no state under it. A restart
+        // could not clear that either, because snapshot sync starts only on a
+        // node that has executed nothing.
+        if self.exec_head()?.is_none() {
+            return Ok(());
+        }
         let executed = before.executed;
 
         // What will the canonical block at the executed height be once this
@@ -403,6 +425,15 @@ impl BlockStore {
             Some(n) => n.saturating_sub(1).min(new_head.number()),
             None => new_head.number(),
         };
+
+        // A target at or above the executed height means this transition
+        // rewrites nothing at or below it: the executed block was off the
+        // chain before it began. Moving execution to the canonical block up
+        // there would claim a state never computed. That repair belongs to the
+        // sync layer, which can see what state is held (I5).
+        if target_number >= executed.number {
+            return Ok(());
+        }
 
         // Resolve the target on the chain as it will be after this batch.
         let target_hash = new_head
@@ -785,5 +816,95 @@ mod tests {
             );
             assert_eq!(store.canonical_hash(c.validated_head.number + 1).unwrap(), None);
         }
+    }
+
+    // -- Execution that never happened ------------------------------------
+
+    /// A coherent chain 0..=len and no executed head: what a node holds before
+    /// it has executed anything, as a light node does until its snapshot sync
+    /// finishes.
+    fn chain_never_executed(len: u64) -> (BlockStore, tempfile::TempDir, Vec<Header>) {
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+        let mut hs = Vec::new();
+        let mut parent = B256::ZERO;
+        for n in 0..=len {
+            let h = header(n, parent, 0);
+            store.update_head(&h, U256::from(n + 1)).unwrap();
+            parent = h.hash();
+            hs.push(h);
+        }
+        assert_eq!(store.exec_head().unwrap(), None, "precondition: nothing executed");
+        (store, dir, hs)
+    }
+
+    /// A retreat on a node that has executed nothing leaves it having executed
+    /// nothing. It used to record the retreat's target as executed: on
+    /// mainnet, a block with no state under it, which even a restart could not
+    /// undo.
+    #[test]
+    fn retreating_a_node_that_executed_nothing_records_no_execution() {
+        let (store, _d, hs) = chain_never_executed(10);
+        let v = Validated::prove(&store, hs[9].hash()).unwrap();
+        let cursor = store.apply(&Transition::Retreat { to: v }).unwrap();
+
+        assert_eq!(cursor.validated_head.number, 9, "the retreat itself happens");
+        assert_eq!(
+            store.exec_head().unwrap(),
+            None,
+            "a retreat recorded as executed a block nothing executed"
+        );
+    }
+
+    /// The same for a reorg: adopting a fork records no execution, at the fork
+    /// point or anywhere else.
+    #[test]
+    fn adopting_a_fork_on_a_node_that_executed_nothing_records_no_execution() {
+        let (store, _d, hs) = chain_never_executed(10);
+        // A fork from #4: 5', 6', 7'.
+        let a = header(5, hs[4].hash(), 99);
+        let b = header(6, a.hash(), 99);
+        let c = header(7, b.hash(), 99);
+        for h in [&a, &b, &c] {
+            stash(&store, h);
+        }
+        let v = Validated::prove(&store, c.hash()).unwrap();
+        assert_eq!(v.lineage()[0].0, 5, "precondition: the fork rewrites from #5");
+
+        let cursor = store.apply(&Transition::Adopt { head: v }).unwrap();
+
+        assert_eq!(cursor.validated_head.hash, c.hash(), "the fork is adopted");
+        assert_eq!(
+            store.exec_head().unwrap(),
+            None,
+            "adopting a fork recorded execution the node never did"
+        );
+    }
+
+    /// Execution only comes down. When the executed block was off the chain
+    /// before a transition that rewrites only above it, moving execution to the
+    /// canonical block up there would claim a state never computed. It stays
+    /// where it is, for the sync layer's repair (I5), which can see what state
+    /// is held.
+    #[test]
+    fn execution_already_off_the_chain_is_not_moved_up() {
+        let (store, _d, hs) = chain(10);
+        // Executed at a sibling of #6, which is not canonical.
+        let sibling = header(6, hs[5].hash(), 99);
+        stash(&store, &sibling);
+        let root = B256::repeat_byte(0x66);
+        store.set_exec_head(sibling.hash(), root).unwrap();
+
+        // One block on top of the chain: the transition rewrites #11 alone.
+        let next = header(11, hs[10].hash(), 0);
+        stash(&store, &next);
+        let v = Validated::prove(&store, next.hash()).unwrap();
+        store.apply(&Transition::Adopt { head: v }).unwrap();
+
+        assert_eq!(
+            store.exec_head().unwrap(),
+            Some((sibling.hash(), root)),
+            "execution was moved off the block it ran at, to one it never ran"
+        );
     }
 }

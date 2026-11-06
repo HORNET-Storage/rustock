@@ -2259,6 +2259,15 @@ impl SyncService {
                         );
                         self.repair_canonical_gap(cursor.validated_head.number, at.saturating_sub(1));
                     }
+                    // With nothing executed, the executed head the check read
+                    // is the head standing in for it, so what is off the chain
+                    // is the head: I8, and I8's repair. Rolling back from the
+                    // stand-in would walk down to whatever state the store
+                    // holds -- after a snapshot sync that failed its check, a
+                    // state that was never verified.
+                    Violation::ExecutedOffChain { .. } if self.recorded_execution().is_none() => {
+                        self.reverify_head_lineage(0);
+                    }
                     Violation::ExecutedOffChain { at, hash, canonical } => {
                         if self.violation_held_for(&v, EXECUTION_OFF_CHAIN_GRACE) {
                             warn!(
@@ -2572,6 +2581,20 @@ impl SyncService {
             self.publish_block(hash, &header, &transactions, true);
             hash = header.parent_hash;
         }
+    }
+
+    /// The executed head, if this node has executed anything.
+    ///
+    /// Not `cursor().executed`, which reads as the head when nothing is
+    /// recorded. Rolling back from that stand-in walks the ancestry of a block
+    /// nobody executed, and on a node with no state but genesis -- a light
+    /// node whose snapshot sync gave up -- it reports on every escalation that
+    /// the node needs a resync, about execution that never happened.
+    fn recorded_execution(&self) -> Option<rustock_storage::BlockRef> {
+        let store = &self.manager.store;
+        let (hash, _) = store.exec_head().ok().flatten()?;
+        let header = store.header(hash).ok().flatten()?;
+        Some(rustock_storage::BlockRef::new(header.number, hash))
     }
 
     /// Move execution to the highest block on the executed head's own ancestry
@@ -2956,13 +2979,14 @@ impl SyncService {
                         );
                         self.last_body_height = self.last_body_height.min(dest.number);
                         // Execution follows the head, exactly as it does in
-                        // orphan recovery. Reading the cursor again rather
+                        // orphan recovery. Reading the store again rather
                         // than reusing `cursor.executed` matters: the retreat
                         // may already have moved execution, and rolling back
                         // from a stale reference would walk the ancestry of a
-                        // block that is no longer the executed head.
-                        if let Ok(Some(after)) = self.manager.store.cursor() {
-                            self.roll_execution_back(after.executed);
+                        // block that is no longer the executed head. And only
+                        // execution that happened is rolled back.
+                        if let Some(executed) = self.recorded_execution() {
+                            self.roll_execution_back(executed);
                         }
                     }
                     Err(e) => warn!(target: "rustock::sync", "Head re-verification: retreat failed: {:?}", e),
