@@ -1102,7 +1102,9 @@ async fn test_skeleton_round_transitions_to_next_skeleton() {
             Vec::new()
         };
     for (req_id, asked) in pending {
-        service.on_body_response(asked, req_id, vec![], vec![]).await;
+        service
+            .on_body_response(asked, req_id, vec![], vec![], None)
+            .await;
     }
 
     // After all bodies downloaded, should continue to DownloadingSkeleton
@@ -1183,7 +1185,7 @@ async fn a_body_that_does_not_match_its_header_is_charged_and_refetched() {
     // b1's header commits to an empty body. Send an uncle it never had.
     let bogus_uncle = dummy_header(0, B256::repeat_byte(0xEE), U256::from(1));
     service
-        .on_body_response(peer, 7, vec![], vec![bogus_uncle])
+        .on_body_response(peer, 7, vec![], vec![bogus_uncle], None)
         .await;
 
     assert_eq!(
@@ -1238,7 +1240,9 @@ async fn a_matching_body_is_stored_and_its_supplier_remembered() {
         id_index,
     };
 
-    service.on_body_response(peer, 7, vec![], vec![]).await;
+    service
+        .on_body_response(peer, 7, vec![], vec![], None)
+        .await;
 
     assert_eq!(
         scored(&scoring, peer, EventType::InvalidBlock),
@@ -1326,7 +1330,9 @@ async fn test_failed_body_send_stays_tracked_for_retry() {
     // send fails (dead peer). The request must stay tracked so the stalled
     // retry re-attempts it — dropping it would orphan b2 forever and the
     // batch could never complete.
-    service.on_body_response(B512::repeat_byte(9), 7, vec![], vec![]).await;
+    service
+        .on_body_response(B512::repeat_byte(9), 7, vec![], vec![], None)
+        .await;
 
     match &service.state {
         SyncState::DownloadingBodies { in_flight, .. } => {
@@ -1537,7 +1543,9 @@ async fn test_late_body_response_on_superseded_id_still_applies() {
     // Late response on the SUPERSEDED id 7 must still store b1. It comes from
     // the peer id 7 was sent to -- the retry went to a fresh id, and the old
     // id keeps its own peer, which is what lets a late answer still land.
-    service.on_body_response(peer, 7, vec![], vec![]).await;
+    service
+        .on_body_response(peer, 7, vec![], vec![], None)
+        .await;
     assert!(
         store.body(b1.hash()).unwrap().is_some(),
         "late response on a superseded id must still apply its body"
@@ -1552,7 +1560,9 @@ async fn test_late_body_response_on_superseded_id_still_applies() {
 
     // Duplicate: the retried id now arrives too — must be ignored, no panic,
     // batch state unchanged (b2 still the only thing outstanding).
-    service.on_body_response(B512::repeat_byte(9), new_id, vec![], vec![]).await;
+    service
+        .on_body_response(B512::repeat_byte(9), new_id, vec![], vec![], None)
+        .await;
     match &service.state {
         SyncState::DownloadingBodies { in_flight, .. } => {
             assert!(!in_flight.contains_key(&0));
@@ -2241,7 +2251,9 @@ async fn test_follow_mode_buffers_out_of_order_body() {
         req_id,
         (h102_hash, h102, std::time::Instant::now(), B512::repeat_byte(9)),
     );
-    service.on_body_response(B512::repeat_byte(9), req_id, vec![], vec![]).await;
+    service
+        .on_body_response(B512::repeat_byte(9), req_id, vec![], vec![], None)
+        .await;
 
     // #102 must remain buffered (parent #101 is not our head), not executed.
     assert!(service.follow_buffer.contains_key(&102),
@@ -3584,6 +3596,7 @@ async fn test_sync_handler_forwards_body_response() {
         id: 42,
         transactions: vec![],
         uncles: vec![],
+        extension: Some(an_extension(1)),
     };
     let msg = P2pMessage::RskMessage(RskMessage::new(RskSubMessage::BodyResponse(resp)));
 
@@ -3591,10 +3604,21 @@ async fn test_sync_handler_forwards_body_response() {
     assert!(handler_resp.is_none());
 
     match event_rx.try_recv().unwrap() {
-        SyncEvent::BodyResponse { id, transactions, uncles, .. } => {
+        SyncEvent::BodyResponse {
+            id,
+            transactions,
+            uncles,
+            extension,
+            ..
+        } => {
             assert_eq!(id, 42);
             assert!(transactions.is_empty());
             assert!(uncles.is_empty());
+            assert_eq!(
+                extension,
+                Some(an_extension(1)),
+                "the extension goes on with the body"
+            );
         }
         other => panic!("Expected BodyResponse event, got {:?}", other),
     }
@@ -3645,7 +3669,9 @@ async fn test_body_download_state_machine() {
         None
     };
     if let Some((req_id, asked)) = pending {
-        service.on_body_response(asked, req_id, vec![], vec![]).await;
+        service
+            .on_body_response(asked, req_id, vec![], vec![], None)
+            .await;
     }
 
     assert!(matches!(service.state, SyncState::Following),
@@ -6965,7 +6991,9 @@ async fn answer_body_requests(service: &mut SyncService, uncles_of: impl Fn(B256
             _ => return,
         };
         for (id, hash, peer) in asked {
-            service.on_body_response(peer, id, vec![], uncles_of(hash)).await;
+            service
+                .on_body_response(peer, id, vec![], uncles_of(hash), None)
+                .await;
         }
     }
     panic!("the service kept asking for bodies: {:?}", service.state);
@@ -7075,7 +7103,9 @@ async fn a_followed_block_counts_its_uncles_when_its_body_comes() {
     service
         .pending_follow_bodies
         .insert(7, (b2.hash(), b2.clone(), std::time::Instant::now(), peer));
-    service.on_body_response(peer, 7, vec![], uncles).await;
+    service
+        .on_body_response(peer, 7, vec![], uncles, None)
+        .await;
 
     assert_eq!(store.total_difficulty(b2.hash()).unwrap(), Some(U256::from(33)));
 }
@@ -7519,7 +7549,9 @@ async fn a_body_from_a_peer_that_was_not_asked_is_ignored() {
     // b1's header commits to an empty body, so this payload is the correct
     // one. It is still refused, because of who sent it.
     let stranger = B512::repeat_byte(0x09);
-    service.on_body_response(stranger, 7, vec![], vec![]).await;
+    service
+        .on_body_response(stranger, 7, vec![], vec![], None)
+        .await;
 
     assert!(
         store.body(b1.hash()).unwrap().is_none(),
@@ -7534,10 +7566,355 @@ async fn a_body_from_a_peer_that_was_not_asked_is_ignored() {
     }
 
     // The peer that was asked is still able to answer it.
-    service.on_body_response(asked, 7, vec![], vec![]).await;
+    service
+        .on_body_response(asked, 7, vec![], vec![], None)
+        .await;
     assert!(
         store.body(b1.hash()).unwrap().is_some(),
         "the genuine answer must still be accepted"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A header that came compressed takes the extension sent beside its body.
+//
+// From RSKIP-351 rskj sends a chain's headers compressed: a version-1 or
+// version-2 header holds only a commitment to its extension -- the block's
+// logs bloom, execution edges and base event -- and the extension comes beside
+// the block's body (`BodyResponseMessage`), which rskj sets on the header
+// before the block runs (`DownloadingBodiesSyncState.newBody`). While it was
+// dropped, testnet's first block after a snapshot whose bloom wasn't empty
+// failed `logs bloom mismatch`, its receipts all rskj's.
+// ---------------------------------------------------------------------------
+
+/// A version-2 extension whose bloom has one bit set: bit `bit`. Its edges
+/// are empty, as rskj emits them on every versioned header while RSKIP144 is
+/// active and the block has no sublists; the store's decoder counts on it.
+fn an_extension(bit: usize) -> rustock_core::types::header_extension::BlockHeaderExtension {
+    let mut logs_bloom = vec![0u8; 256];
+    logs_bloom[bit / 8] |= 0x80 >> (bit % 8);
+    rustock_core::types::header_extension::BlockHeaderExtension::V2 {
+        logs_bloom,
+        edges: Some(Vec::new()),
+        base_event: Some(Vec::new()),
+    }
+}
+
+/// `header` as rskj sends it to its peers, holding only the commitment to
+/// `extension` in its bloom's slot, with the UMM root and merged-mining fields
+/// that every versioned header has, and that the store's decoder counts on.
+fn compressed(
+    header: Header,
+    extension: &rustock_core::types::header_extension::BlockHeaderExtension,
+) -> Header {
+    let mut slot = Vec::new();
+    alloy_rlp::Encodable::encode(&extension.create_extension_data().as_slice(), &mut slot);
+    Header {
+        logs_bloom: Default::default(),
+        extension_data: Some(Bytes::from(slot)),
+        version_fields: None,
+        umm_root: Some(Bytes::new()),
+        bitcoin_merged_mining_header: Some(Bytes::from(vec![0u8; 80])),
+        bitcoin_merged_mining_merkle_proof: Some(Bytes::new()),
+        bitcoin_merged_mining_coinbase_transaction: Some(Bytes::new()),
+        cached_hash: None,
+        cached_hash_for_merged_mining: None,
+        ..header
+    }
+}
+
+/// A service over `store` with one peer, `asked`, connected.
+async fn service_with_a_peer(store: Arc<BlockStore>, asked: B512) -> SyncService {
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store, verifier, peer_store.clone()));
+    let (_event_tx, event_rx) = mpsc::unbounded_channel();
+    let service = SyncService::new(manager, peer_store.clone(), event_rx);
+    let (tx, rx) = mpsc::channel(rustock_networking::peers::PEER_CHANNEL_CAPACITY);
+    // Kept open, so that what is sent to the peer has somewhere to go.
+    std::mem::forget(rx);
+    peer_store.add_peer(asked, tx).await;
+    service
+}
+
+/// The batch path. A body without the extension its header commits to, or
+/// with another, is refused, and the request stays outstanding. With it, the
+/// header is stored with its bloom, edges and base event, under the same hash,
+/// and the batch carries the completed header to execution.
+#[tokio::test]
+async fn a_compressed_header_is_stored_with_the_extension_that_came_beside_its_body() {
+    let store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+    let extension = an_extension(77);
+    let b1 = compressed(dummy_header(1, genesis.hash(), U256::from(1)), &extension);
+    let b2 = dummy_header(2, b1.hash(), U256::from(1));
+    let hash = b1.hash();
+    for h in [&b1, &b2] {
+        store.put_header(h).unwrap();
+    }
+    assert_eq!(
+        store.header(hash).unwrap(),
+        Some(b1.clone()),
+        "stored as it came"
+    );
+
+    let asked = B512::repeat_byte(0x01);
+    let mut service = service_with_a_peer(store.clone(), asked).await;
+    let mut in_flight = std::collections::HashMap::new();
+    in_flight.insert(
+        0usize,
+        InFlightBody {
+            req_id: 7,
+            sent: Instant::now(),
+            peer: asked,
+        },
+    );
+    let mut id_index = std::collections::HashMap::new();
+    id_index.insert(7u64, (0usize, asked));
+    service.state = SyncState::DownloadingBodies {
+        peer_best: 2,
+        pending_headers: vec![(hash, b1.clone()), (b2.hash(), b2.clone())],
+        next_request: 1,
+        in_flight,
+        id_index,
+    };
+
+    for (sent, why) in [
+        (None, "no extension"),
+        (Some(an_extension(78)), "another extension"),
+    ] {
+        service
+            .on_body_response(asked, 7, vec![], vec![], sent)
+            .await;
+        assert!(
+            store.body(hash).unwrap().is_none(),
+            "{why}: no body is stored"
+        );
+        assert_eq!(
+            store.header(hash).unwrap(),
+            Some(b1.clone()),
+            "{why}: nor the header changed"
+        );
+        match &service.state {
+            SyncState::DownloadingBodies {
+                in_flight,
+                id_index,
+                ..
+            } => {
+                assert!(
+                    in_flight.contains_key(&0),
+                    "{why}: the request stays outstanding"
+                );
+                assert!(id_index.contains_key(&7), "{why}: and keeps its id");
+            }
+            other => panic!("expected DownloadingBodies, got {other:?}"),
+        }
+    }
+
+    service
+        .on_body_response(asked, 7, vec![], vec![], Some(extension.clone()))
+        .await;
+    assert!(store.body(hash).unwrap().is_some(), "the body is stored");
+    let stored = store.header(hash).unwrap().expect("the header");
+    assert_eq!(stored.extension(), Some(extension.clone()));
+    assert_eq!(stored.logs_bloom.as_slice(), extension.logs_bloom());
+    assert_eq!(
+        stored.hash(),
+        hash,
+        "the same hash, derived from the fields"
+    );
+    match &service.state {
+        SyncState::DownloadingBodies {
+            pending_headers, ..
+        } => {
+            assert_eq!(
+                pending_headers[0].1.extension(),
+                Some(extension),
+                "the batch runs it"
+            );
+        }
+        other => panic!("expected DownloadingBodies, got {other:?}"),
+    }
+}
+
+/// Follow mode takes the extension the same way, and buffers the completed
+/// header for execution.
+#[tokio::test]
+async fn a_followed_compressed_header_takes_the_extension_that_came_beside_its_body() {
+    let store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+    let extension = an_extension(3);
+    let b1 = compressed(dummy_header(1, genesis.hash(), U256::from(1)), &extension);
+    let hash = b1.hash();
+    store.put_header(&b1).unwrap();
+
+    let asked = B512::repeat_byte(0x01);
+    let mut service = service_with_a_peer(store.clone(), asked).await;
+    service.state = SyncState::Following;
+    service
+        .pending_follow_bodies
+        .insert(7, (hash, b1.clone(), Instant::now(), asked));
+
+    service
+        .on_body_response(asked, 7, vec![], vec![], None)
+        .await;
+    assert!(store.body(hash).unwrap().is_none(), "no body is stored");
+    assert!(
+        service.pending_follow_bodies.contains_key(&7),
+        "it is asked for again"
+    );
+    assert!(service.follow_buffer.is_empty());
+
+    service
+        .on_body_response(asked, 7, vec![], vec![], Some(extension.clone()))
+        .await;
+    assert!(store.body(hash).unwrap().is_some(), "the body is stored");
+    assert_eq!(
+        store.header(hash).unwrap().and_then(|h| h.extension()),
+        Some(extension.clone())
+    );
+    assert!(!service.pending_follow_bodies.contains_key(&7));
+    // No block has run, so nothing drains the buffer.
+    let (buffered, header, ..) = service.follow_buffer.get(&1).expect("buffered");
+    assert_eq!((*buffered, header.extension()), (hash, Some(extension)));
+}
+
+/// A local block source that has every body, empty.
+struct EveryBody;
+
+impl ExternalBlockSource for EveryBody {
+    fn body_by_hash(&self, _: B256) -> Option<(Vec<rustock_core::Transaction>, Vec<Header>)> {
+        Some((Vec::new(), Vec::new()))
+    }
+}
+
+/// A body stored beside a header that holds only its commitment -- derived
+/// from the header, before that was refused -- is dropped when its batch
+/// starts, and asked of a peer, neither derived again nor filled from a local
+/// source, which has no extension to give. A header that holds its own fields
+/// keeps its body.
+#[tokio::test]
+async fn a_body_stored_without_its_header_extension_is_asked_for_again() {
+    let store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+    let b1 = compressed(derivable_header(1, genesis.hash()), &an_extension(5));
+    let b2 = dummy_header(2, b1.hash(), U256::from(1));
+    let hash = b1.hash();
+    for (number, h) in [(1, &b1), (2, &b2)] {
+        store.put_header(h).unwrap();
+        store.put_canonical_hash(number, h.hash()).unwrap();
+        store
+            .put_total_difficulty(h.hash(), U256::from(number + 1))
+            .unwrap();
+    }
+    store.update_head(&b2, U256::from(3)).unwrap();
+    store
+        .put_body(hash, &[rustock_core::Transaction::remasc(1)], &[])
+        .unwrap();
+    store.put_body(b2.hash(), &[], &[]).unwrap();
+
+    let service = service_with_a_peer(store.clone(), B512::repeat_byte(0x01)).await;
+    let mut service = service.with_block_source(Arc::new(EveryBody));
+    service.start_body_downloads(2).await;
+
+    assert!(store.body(hash).unwrap().is_none(), "the body is dropped");
+    assert!(
+        store.body(b2.hash()).unwrap().is_some(),
+        "a whole header keeps its body"
+    );
+    assert_eq!(service.derived_bodies, 0, "and not derived again");
+    match &service.state {
+        SyncState::DownloadingBodies {
+            pending_headers,
+            in_flight,
+            ..
+        } => {
+            assert_eq!(pending_headers.len(), 2);
+            assert_eq!(in_flight.len(), 1, "it is asked of the peer");
+        }
+        other => panic!("expected DownloadingBodies, got {other:?}"),
+    }
+}
+
+/// Follow mode drops such a body too, rather than run the block without its
+/// bloom, and asks for it again.
+#[tokio::test]
+async fn follow_mode_asks_again_for_a_body_stored_without_its_header_extension() {
+    let store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+    store.put_body(genesis.hash(), &[], &[]).unwrap();
+    store.set_exec_head(genesis.hash(), B256::ZERO).unwrap();
+    let b1 = compressed(derivable_header(1, genesis.hash()), &an_extension(6));
+    let hash = b1.hash();
+    store.put_header(&b1).unwrap();
+    store.put_canonical_hash(1, hash).unwrap();
+    let stale = [rustock_core::Transaction::remasc(1)];
+    store.put_body(hash, &stale, &[]).unwrap();
+
+    let mut service = service_with_a_peer(store.clone(), B512::repeat_byte(0x01)).await;
+    service.state = SyncState::Following;
+    service.refill_follow_buffer_from_store();
+    assert!(
+        service.follow_buffer.is_empty(),
+        "not run without its bloom"
+    );
+    assert!(store.body(hash).unwrap().is_none(), "the body is dropped");
+
+    store.put_body(hash, &stale, &[]).unwrap();
+    service.fill_follow_body_gap().await;
+    assert!(store.body(hash).unwrap().is_none(), "dropped again");
+    assert_eq!(
+        service.pending_follow_bodies.len(),
+        1,
+        "and asked of the peer"
+    );
+}
+
+/// A body is served with its header's extension, as rskj's
+/// `NodeBlockProcessor.processBodyRequest` sends it; for a header that holds
+/// only the commitment, which has none to send, no body is served.
+#[tokio::test]
+async fn a_served_body_carries_its_header_extension() {
+    use rustock_networking::protocol::rsk::BodyRequest;
+    use rustock_networking::protocol::{P2pHandler, P2pMessage, RskMessage, RskSubMessage};
+
+    let store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+    let extension = an_extension(9);
+    let whole = compressed(dummy_header(1, B256::ZERO, U256::from(1)), &extension)
+        .with_extension(&extension)
+        .expect("its own extension");
+    let only_committed = compressed(
+        dummy_header(2, whole.hash(), U256::from(1)),
+        &an_extension(10),
+    );
+    for h in [&whole, &only_committed] {
+        store.put_header(h).unwrap();
+        store.put_body(h.hash(), &[], &[]).unwrap();
+    }
+
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store, verifier, peer_store));
+    let (event_tx, _event_rx) = mpsc::unbounded_channel();
+    let handler = SyncHandler::new(manager, event_tx);
+    let ask = |hash| {
+        let req = BodyRequest { id: 33, hash };
+        let msg = P2pMessage::RskMessage(RskMessage::new(RskSubMessage::BodyRequest(req)));
+        handler.handle_message(B512::repeat_byte(0x01), &msg)
+    };
+    match ask(whole.hash()) {
+        Some(P2pMessage::RskMessage(RskMessage {
+            sub_message: RskSubMessage::BodyResponse(r),
+        })) => assert_eq!(r.extension, Some(extension)),
+        other => panic!("expected a body, got {other:?}"),
+    }
+    assert!(
+        ask(only_committed.hash()).is_none(),
+        "no extension to send beside it"
     );
 }
 

@@ -198,12 +198,10 @@ impl Header {
     /// literal bloom commits to no extension, and accepting one would let a
     /// peer attach edges or a base event to a block that never had them.
     ///
-    /// Nothing calls this today, deliberately. An extension that arrives
-    /// separately from its header -- in a body response, say -- is discarded
-    /// rather than checked, because the fields are bound to the block only
-    /// while they travel inside the header. This is the gate any future code
-    /// that does accept one must pass through; see the body decoder in
-    /// `rustock-networking` for the other end of the rule.
+    /// This is the gate an extension that arrives apart from its header must
+    /// pass: the fields are bound to the block by the commitment its hash
+    /// covers, so one that doesn't match it is not the block's.
+    /// [`Header::with_extension`] passes through it.
     pub fn accepts_extension(
         &self,
         extension: &crate::types::header_extension::BlockHeaderExtension,
@@ -218,24 +216,80 @@ impl Header {
     /// is derived from the bloom, edges and base event the header already
     /// holds -- keeping a second copy would let the two disagree.
     fn compressed_extension_field(&self) -> Option<Vec<u8>> {
+        let extension = self.literal_extension()?;
+        let mut out = Vec::new();
+        extension
+            .create_extension_data()
+            .as_slice()
+            .encode(&mut out);
+        Some(out)
+    }
+
+    /// The extension the fields of a versioned header make up: its bloom,
+    /// edges and base event, whether or not the header also holds the
+    /// commitment to them.
+    fn literal_extension(&self) -> Option<crate::types::header_extension::BlockHeaderExtension> {
         use crate::types::header_extension::BlockHeaderExtension;
         let v = self.version_fields.as_ref()?;
         let bloom = self.logs_bloom.as_slice().to_vec();
-        let extension = match v.version {
-            1 => BlockHeaderExtension::V1 { logs_bloom: bloom, edges: v.edges.clone() },
+        match v.version {
+            1 => Some(BlockHeaderExtension::V1 {
+                logs_bloom: bloom,
+                edges: v.edges.clone(),
+            }),
             // A V2 extension always has a base event; a header that omitted
             // the field still commits to an empty one, which is what rskj
             // substitutes when it accepts the short form.
-            2 => BlockHeaderExtension::V2 {
+            2 => Some(BlockHeaderExtension::V2 {
                 logs_bloom: bloom,
                 edges: v.edges.clone(),
                 base_event: Some(v.base_event.as_ref().map(|b| b.to_vec()).unwrap_or_default()),
-            },
-            _ => return None,
-        };
-        let mut out = Vec::new();
-        extension.create_extension_data().as_slice().encode(&mut out);
-        Some(out)
+            }),
+            _ => None,
+        }
+    }
+
+    /// The RSKIP-351 extension this header holds, as rskj's `getExtension`
+    /// gives it to send beside the block's body: its bloom, edges and base
+    /// event. `None` for a version-0 header, which has none, and for one
+    /// that holds only the commitment to its extension, as headers sent
+    /// compressed do until a body brings it.
+    pub fn extension(&self) -> Option<crate::types::header_extension::BlockHeaderExtension> {
+        if self.extension_data.is_some() {
+            return None;
+        }
+        self.literal_extension()
+    }
+
+    /// This header with the extension its commitment names, as rskj takes the
+    /// one a peer sends beside a block's body (`DownloadingBodiesSyncState`
+    /// `.newBody`, `header.setExtension`) before the block is checked and run:
+    /// its bloom, edges and base event in place of the commitment. They hash
+    /// back to the commitment, so the header's hash is the same.
+    ///
+    /// `None` unless this header holds only the commitment, as a compressed
+    /// header does, and `extension` is the one it names, with a bloom of 256
+    /// bytes. rskj sets whatever it is sent and lets execution find out; this
+    /// takes only the extension the block's hash covers, which for every
+    /// block a miner built is the one an honest peer sends.
+    pub fn with_extension(
+        &self,
+        extension: &crate::types::header_extension::BlockHeaderExtension,
+    ) -> Option<Header> {
+        if self.extension_data.is_none() || !self.accepts_extension(extension) {
+            return None;
+        }
+        let logs_bloom = <[u8; 256]>::try_from(extension.logs_bloom()).ok()?;
+        Some(Header {
+            logs_bloom: Bloom::from(logs_bloom),
+            extension_data: None,
+            version_fields: Some(HeaderVersionFields {
+                version: extension.version(),
+                edges: extension.edges().map(<[i16]>::to_vec),
+                base_event: extension.base_event().map(Bytes::copy_from_slice),
+            }),
+            ..self.clone()
+        })
     }
 
     fn encode_base_fields(&self, list: &mut Vec<u8>, compressed: bool) {
@@ -1368,6 +1422,111 @@ mod versioned_wire_header_tests {
         let mut v0 = decode(V1_WIRE);
         v0.version_fields = None;
         assert_eq!(v0.encode_compressed(), wire(&v0));
+    }
+
+    /// **The extension beside a body.** A header read compressed, as rskj's
+    /// peers send a chain's headers, holds only the commitment to its
+    /// extension. Given the extension it names, as rskj sets the one sent
+    /// beside the block's body, it is the header the network sends whole: the
+    /// same wire form byte for byte, the same hashes, the same extension. It
+    /// takes no other -- another bloom, another version, a bloom not 256 bytes
+    /// long -- and a header that holds its own fields, or none, takes none.
+    #[test]
+    fn a_compressed_header_takes_the_extension_its_commitment_names() {
+        use crate::types::header_extension::BlockHeaderExtension;
+        let wire = |header: &Header| {
+            let mut out = Vec::new();
+            header.encode(&mut out);
+            out
+        };
+        for full_form in [V1_WIRE, V2_WIRE, V2_FULL] {
+            let full = from_the_network(full_form);
+            let extension = full
+                .extension()
+                .expect("a versioned header's own extension");
+            let compressed =
+                from_the_network(&alloy_primitives::hex::encode(full.encode_compressed()));
+            assert!(compressed.extension_data.is_some());
+            assert_eq!(compressed.extension(), None, "only the commitment");
+            let mut both = compressed.clone();
+            both.version_fields = full.version_fields.clone();
+            assert_eq!(
+                both.extension(),
+                None,
+                "its hash commits through the commitment alone"
+            );
+            assert_eq!(compressed.hash(), full.hash());
+
+            let completed = compressed
+                .with_extension(&extension)
+                .expect("the one it names");
+            assert_eq!(wire(&completed), wire(&full), "#{}", full.number);
+            assert_eq!(completed.extension(), Some(extension.clone()));
+            let derived = Header {
+                cached_hash: None,
+                cached_hash_for_merged_mining: None,
+                ..completed.clone()
+            };
+            assert_eq!(
+                (derived.hash(), derived.hash_for_merged_mining()),
+                (full.hash(), full.hash_for_merged_mining())
+            );
+
+            let mut bloom = extension.logs_bloom().to_vec();
+            bloom[0] ^= 1;
+            let edges = extension.edges().map(<[i16]>::to_vec);
+            let others = [
+                match &extension {
+                    BlockHeaderExtension::V1 { .. } => BlockHeaderExtension::V1 {
+                        logs_bloom: bloom,
+                        edges: edges.clone(),
+                    },
+                    BlockHeaderExtension::V2 { base_event, .. } => BlockHeaderExtension::V2 {
+                        logs_bloom: bloom,
+                        edges: edges.clone(),
+                        base_event: base_event.clone(),
+                    },
+                },
+                match &extension {
+                    BlockHeaderExtension::V1 { logs_bloom, .. } => BlockHeaderExtension::V2 {
+                        logs_bloom: logs_bloom.clone(),
+                        edges: edges.clone(),
+                        base_event: Some(Vec::new()),
+                    },
+                    BlockHeaderExtension::V2 { logs_bloom, .. } => BlockHeaderExtension::V1 {
+                        logs_bloom: logs_bloom.clone(),
+                        edges,
+                    },
+                },
+            ];
+            for other in &others {
+                assert_eq!(compressed.with_extension(other), None, "#{}", full.number);
+            }
+            assert_eq!(
+                full.with_extension(&extension),
+                None,
+                "it holds its own fields"
+            );
+        }
+
+        // A bloom that isn't 256 bytes long, though the commitment names it.
+        let short = BlockHeaderExtension::V2 {
+            logs_bloom: vec![0; 255],
+            edges: None,
+            base_event: Some(Vec::new()),
+        };
+        let mut committed = from_the_network(V2_COMPRESSED);
+        let mut slot = Vec::new();
+        short.create_extension_data().as_slice().encode(&mut slot);
+        committed.extension_data = Some(Bytes::from(slot));
+        assert!(committed.accepts_extension(&short));
+        assert_eq!(committed.with_extension(&short), None);
+
+        // A version-0 header has none, and takes none.
+        let mut v0 = decode(V1_WIRE);
+        v0.version_fields = None;
+        assert_eq!(v0.extension(), None);
+        assert_eq!(v0.with_extension(&short), None);
     }
 
     /// A header decoded without caching either hash, so `hash()` and

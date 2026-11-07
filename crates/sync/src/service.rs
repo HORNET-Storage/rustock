@@ -757,13 +757,45 @@ impl SyncService {
 
     /// Fill a missing body from the local block source, if available. Returns
     /// true when the body was found and stored (so no peer request is needed).
+    ///
+    /// Not for a header that holds only its RSKIP-351 commitment: the source
+    /// gives transactions and uncles, never the extension such a header needs.
     fn try_fill_body_locally(&self, hash: B256) -> bool {
         let Some(source) = &self.block_source else {
             return false;
         };
+        if matches!(self.manager.store.header(hash), Ok(Some(h)) if h.extension_data.is_some()) {
+            return false;
+        }
         match source.body_by_hash(hash) {
             Some((txs, ommers)) => self.manager.store.put_body(hash, &txs, &ommers).is_ok(),
             None => false,
+        }
+    }
+
+    /// Drop the body stored for the block `hash` if its header, `header`,
+    /// holds only the commitment to its RSKIP-351 extension.
+    ///
+    /// A body is stored beside such a header only once the extension that
+    /// came with it has completed the header, so one found beside it came
+    /// without: derived from the header, before that was refused. Its block
+    /// can't be run, its bloom missing, so it is dropped and asked for again.
+    fn drop_body_without_extension(&self, hash: B256, header: &Header) {
+        if header.extension_data.is_none() || !matches!(self.manager.store.body(hash), Ok(Some(_)))
+        {
+            return;
+        }
+        match self.manager.store.delete_body(hash) {
+            Ok(()) => debug!(
+                target: "rustock::sync",
+                "Dropped the body of #{}, stored without its header's extension; asking for it again",
+                header.number
+            ),
+            Err(e) => warn!(
+                target: "rustock::sync",
+                "Could not drop the body of #{}, stored without its header's extension: {e:?}",
+                header.number
+            ),
         }
     }
 
@@ -2010,6 +2042,7 @@ impl SyncService {
             let Ok(Some(header)) = self.manager.store.header(hash) else {
                 break;
             };
+            self.drop_body_without_extension(hash, &header);
             if self.manager.store.body(hash).ok().flatten().is_none() {
                 missing.push(header);
             }
@@ -2259,6 +2292,7 @@ impl SyncService {
             let Ok(Some(hash)) = self.manager.store.canonical_hash(number) else { break };
             let Ok(Some(header)) = self.manager.store.header(hash) else { break };
             // No body yet: `fill_follow_body_gap` is the path for that one.
+            self.drop_body_without_extension(hash, &header);
             let Ok(Some((txs, uncles))) = self.manager.store.body(hash) else { break };
             self.follow_buffer.insert(number, (hash, header, txs, uncles));
         }
@@ -3597,8 +3631,15 @@ impl SyncService {
                 }
                 self.on_headers_with_uncles_response(peer, entries).await;
             }
-            SyncEvent::BodyResponse { peer, id, transactions, uncles } => {
-                self.on_body_response(peer, id, transactions, uncles).await;
+            SyncEvent::BodyResponse {
+                peer,
+                id,
+                transactions,
+                uncles,
+                extension,
+            } => {
+                self.on_body_response(peer, id, transactions, uncles, extension)
+                    .await;
             }
             SyncEvent::SnapStatusResponse {
                 peer,
@@ -4217,6 +4258,7 @@ impl SyncService {
         for num in start..=our_height {
             if let Ok(Some(hash)) = self.manager.store.canonical_hash(num) {
                 if let Ok(Some(header)) = self.manager.store.header(hash) {
+                    self.drop_body_without_extension(hash, &header);
                     if matches!(self.manager.store.body(hash), Ok(None))
                         && !self.try_fill_body_locally(hash)
                     {
@@ -4873,13 +4915,14 @@ impl SyncService {
         request_id: u64,
         transactions: Vec<Transaction>,
         uncles: Vec<Header>,
+        extension: Option<rustock_core::types::header_extension::BlockHeaderExtension>,
     ) {
         rustock_core::metrics::BODIES_RECEIVED.inc();
         let old = std::mem::take(&mut self.state);
         match old {
             SyncState::DownloadingBodies {
                 peer_best,
-                pending_headers,
+                mut pending_headers,
                 next_request,
                 mut in_flight,
                 mut id_index,
@@ -4937,29 +4980,60 @@ impl SyncService {
                     // strikes it has not earned.
                     self.body_peer_strikes.remove(&peer);
                     let (hash, header) = &pending_headers[idx];
+                    let (hash, number) = (*hash, header.number);
 
                     // Does this body belong to that header? Receipt is the one
                     // moment the sender is unambiguous, and two hashes settle
-                    // it. A mismatch is not stored and the request goes back
-                    // in flight, so the stall path asks somebody else.
-                    if let Some(what) =
-                        crate::body_check::body_mismatch(header, &transactions, &uncles)
-                    {
-                        self.charge_bad_body(peer, header.number, what);
-                        in_flight.insert(idx, req);
-                        id_index.insert(request_id, (idx, peer));
-                        self.state = SyncState::DownloadingBodies {
-                            peer_best,
-                            pending_headers,
-                            next_request,
-                            in_flight,
-                            id_index,
+                    // it. A header that came compressed takes the extension sent
+                    // beside the body, and a body without the one it commits to
+                    // fails the same way. A mismatch is not stored and the
+                    // request goes back in flight, so the stall path asks
+                    // somebody else.
+                    let checked =
+                        match crate::body_check::body_mismatch(header, &transactions, &uncles) {
+                            Some(what) => Err(what),
+                            None => crate::body_check::completed_header(header, extension.as_ref()),
                         };
-                        return;
+                    let completed = match checked {
+                        Ok(completed) => completed,
+                        Err(what) => {
+                            self.charge_bad_body(peer, number, what);
+                            in_flight.insert(idx, req);
+                            id_index.insert(request_id, (idx, peer));
+                            self.state = SyncState::DownloadingBodies {
+                                peer_best,
+                                pending_headers,
+                                next_request,
+                                in_flight,
+                                id_index,
+                            };
+                            return;
+                        }
+                    };
+                    // The header with its extension is stored before the body,
+                    // so that a body never sits beside a header still missing it.
+                    if let Some(completed) = completed {
+                        if let Err(e) = self.manager.store.put_header_with_hash(hash, &completed) {
+                            error!(
+                                target: "rustock::sync",
+                                "Failed to store the header of #{number} with its extension: {e:?}"
+                            );
+                            in_flight.insert(idx, req);
+                            id_index.insert(request_id, (idx, peer));
+                            self.state = SyncState::DownloadingBodies {
+                                peer_best,
+                                pending_headers,
+                                next_request,
+                                in_flight,
+                                id_index,
+                            };
+                            return;
+                        }
+                        pending_headers[idx].1 = completed;
                     }
-                    self.body_providers.insert(header.number, peer);
+                    self.body_providers.insert(number, peer);
 
-                    if let Err(e) = self.manager.store.put_body(*hash, &transactions, &uncles) {
+                    if let Err(e) = self.manager.store.put_body(hash, &transactions, &uncles) {
                         error!(
                             target: "rustock::sync",
                             "Failed to store body for {:?}: {:?}", hash, e
@@ -5024,16 +5098,39 @@ impl SyncService {
                     self.pending_follow_bodies.remove(&request_id)
                 {
                     // Same check as the batch path, same reason.
-                    if let Some(what) =
-                        crate::body_check::body_mismatch(&header, &transactions, &uncles)
-                    {
-                        self.charge_bad_body(peer, header.number, what);
-                        // Put it back so the follow-mode retry re-requests it;
-                        // dropping the entry would strand the block instead.
-                        self.pending_follow_bodies
-                            .insert(request_id, (hash, header, sent, peer));
-                        return;
-                    }
+                    let checked =
+                        match crate::body_check::body_mismatch(&header, &transactions, &uncles) {
+                            Some(what) => Err(what),
+                            None => {
+                                crate::body_check::completed_header(&header, extension.as_ref())
+                            }
+                        };
+                    let header = match checked {
+                        Ok(None) => header,
+                        Ok(Some(completed)) => {
+                            if let Err(e) =
+                                self.manager.store.put_header_with_hash(hash, &completed)
+                            {
+                                error!(
+                                    target: "rustock::sync",
+                                    "Failed to store the header of #{} with its extension: {e:?}",
+                                    completed.number
+                                );
+                                self.pending_follow_bodies
+                                    .insert(request_id, (hash, header, sent, peer));
+                                return;
+                            }
+                            completed
+                        }
+                        Err(what) => {
+                            self.charge_bad_body(peer, header.number, what);
+                            // Put it back so the follow-mode retry re-requests it;
+                            // dropping the entry would strand the block instead.
+                            self.pending_follow_bodies
+                                .insert(request_id, (hash, header, sent, peer));
+                            return;
+                        }
+                    };
                     self.body_providers.insert(header.number, peer);
 
                     if let Err(e) = self.manager.store.put_body(hash, &transactions, &uncles) {

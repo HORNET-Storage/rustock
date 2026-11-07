@@ -1126,6 +1126,13 @@ impl BlockStore {
             .context("Failed to write block body")
     }
 
+    /// Removes a block's body, so that the sync asks for it again.
+    pub fn delete_body(&self, hash: B256) -> Result<()> {
+        self.db
+            .delete_cf(self.cf(CF_BODIES)?, hash.as_slice())
+            .context("Failed to delete block body")
+    }
+
     /// Attaches a freezer, so header runs can be served from flat files.
     pub fn set_freezer(&self, freezer: Arc<crate::freezer::Freezer>) {
         *self.freezer.write().unwrap() = Some(freezer);

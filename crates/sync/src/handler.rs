@@ -267,11 +267,21 @@ impl SyncHandler {
         let store = &self.manager.store;
         // Above the simulated head this node has nothing to say, even though
         // the block is on disk.
-        if let Some(h) = store.header(hash).ok().flatten() {
+        let header = store.header(hash).ok().flatten();
+        if let Some(h) = &header {
             if !self.may_serve(h.number) {
                 return None;
             }
         }
+        // rskj `NodeBlockProcessor.processBodyRequest` sends the header's
+        // RSKIP-351 extension beside the body, which a peer needs for a
+        // header it got compressed. A header that holds only its commitment
+        // has none to send, and a body without it is no use to the peer.
+        let extension = match &header {
+            Some(h) if h.extension_data.is_some() => return None,
+            Some(h) => h.extension(),
+            None => None,
+        };
         let (transactions, uncles) = store.body(hash).ok()??;
 
         trace!(
@@ -284,6 +294,7 @@ impl SyncHandler {
             id: request_id,
             transactions,
             uncles,
+            extension,
         };
         Some(P2pMessage::RskMessage(RskMessage::new(
             RskSubMessage::BodyResponse(resp),
@@ -610,6 +621,7 @@ impl P2pHandler for SyncHandler {
                         id: r.id,
                         transactions: r.transactions.clone(),
                         uncles: r.uncles.clone(),
+                        extension: r.extension.clone(),
                     });
                 }
 

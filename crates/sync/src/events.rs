@@ -1,5 +1,6 @@
 use alloy_primitives::{B256, B512};
 use rustock_core::types::header::Header;
+use rustock_core::types::header_extension::BlockHeaderExtension;
 use rustock_core::types::transaction::Transaction;
 use alloy_primitives::U256;
 use rustock_core::types::block::Block;
@@ -42,6 +43,9 @@ pub enum SyncEvent {
         id: u64,
         transactions: Vec<Transaction>,
         uncles: Vec<Header>,
+        /// The RSKIP-351 extension the peer sent beside the body, which a
+        /// header that came compressed needs (`body_check::completed_header`).
+        extension: Option<BlockHeaderExtension>,
     },
     NewBlockHashes {
         peer: B512,

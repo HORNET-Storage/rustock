@@ -1,6 +1,7 @@
 use alloy_rlp::{Decodable, Encodable, RlpDecodable, RlpEncodable, Header as RlpHeader};
 use alloy_primitives::{B256, Bytes, U256};
 use rustock_core::{Header, Transaction};
+use rustock_core::types::header_extension::BlockHeaderExtension;
 use rustock_core::rlp_compat::{decode_u8_lenient, decode_u64_lenient, decode_u256_lenient, decode_u32_lenient};
 use super::snap;
 
@@ -241,6 +242,12 @@ pub struct BodyResponse {
     pub id: u64,
     pub transactions: Vec<Transaction>,
     pub uncles: Vec<Header>,
+    /// The RSKIP-351 extension of the block's header -- its logs bloom,
+    /// execution edges and base event -- which rskj sends beside the body of
+    /// a version-1 or version-2 block (`BodyResponseMessage`), whose header
+    /// goes to peers holding only a commitment to it. `None` for a version-0
+    /// block.
+    pub extension: Option<BlockHeaderExtension>,
 }
 
 /// Request the hash of the block at a given height (type 8).
@@ -601,7 +608,8 @@ impl RskSubMessage {
                 out.extend_from_slice(&params);
             }
             RskSubMessage::BodyResponse(r) => {
-                // RLP([id, RLP([txs_list, uncles_list])])
+                // RLP([id, RLP([txs_list, uncles_list, extension?])]), the
+                // extension as rskj's `BlockHeaderExtension.toEncoded` writes it.
                 let mut txs_payload = Vec::new();
                 for tx in &r.transactions {
                     // As in `encode_block`: serve the bytes the header commits
@@ -620,11 +628,17 @@ impl RskSubMessage {
                 RlpHeader { list: true, payload_length: uncles_payload.len() }.encode(&mut uncles_list);
                 uncles_list.extend_from_slice(&uncles_payload);
 
-                let body_len = txs_list.len() + uncles_list.len();
+                let extension = r
+                    .extension
+                    .as_ref()
+                    .map(BlockHeaderExtension::to_encoded)
+                    .unwrap_or_default();
+                let body_len = txs_list.len() + uncles_list.len() + extension.len();
                 let mut body = Vec::new();
                 RlpHeader { list: true, payload_length: body_len }.encode(&mut body);
                 body.extend_from_slice(&txs_list);
                 body.extend_from_slice(&uncles_list);
+                body.extend_from_slice(&extension);
 
                 let mut params = Vec::new();
                 r.id.encode(&mut params);
@@ -869,35 +883,51 @@ impl Decodable for RskMessage {
                 // Decode uncles list
                 let uncles_h = RlpHeader::decode(&mut body_data)?;
                 let mut uncles_body = &body_data[..uncles_h.payload_length];
+                body_data = &body_data[uncles_h.payload_length..];
                 let mut uncles = Vec::new();
                 while !uncles_body.is_empty() {
                     uncles.push(Header::decode_with_hash(&mut uncles_body)?);
                 }
 
-                // The optional BlockHeaderExtension is skipped, and that is a
-                // rule rather than a convenience.
+                // rskj `MessageType.BODY_RESPONSE`: a third element is the
+                // block header's RSKIP-351 extension, which
+                // `BlockHeaderExtension.fromEncoded` reads whole, and a body of
+                // any other length has none.
                 //
-                // From RSKIP-351 a header can carry its bloom, execution
-                // edges and base event as a commitment -- `RLP[version,
-                // keccak(extension)]` -- instead of the literal fields. The
-                // block hash covers that commitment, so those fields are
-                // bound to the block only while they travel *inside* the
-                // header, which is the form this decoder receives and the
-                // form `Header::encode_base_fields` hashes.
-                //
-                // An extension delivered here arrives beside the header with
-                // nothing tying it to that commitment. Attaching it would
-                // leave the block holding fields no miner committed to while
-                // its hash still matched, and a block stored that way would
-                // re-decode to a different hash than it was filed under.
-                //
-                // So: this is discarded because it is unbound, not because it
-                // is unneeded. If a later change does need it -- serving
-                // light clients, or filling a bloom without executing -- it
-                // must first pass `Header::accepts_extension`, which exists
-                // for this and is otherwise unused.
+                // From RSKIP-351 a header goes to peers with its bloom, execution
+                // edges and base event folded into a commitment --
+                // `RLP[version, keccak(extension)]` -- in the bloom's slot, and the
+                // extension comes here, beside the block's body. It travels apart
+                // from the header, so nothing in this message binds it to the
+                // block: the sync takes it only once it matches the commitment
+                // that the header's hash covers (`Header::with_extension`), and a
+                // header that holds its own fields takes none.
+                let mut rest = Vec::new();
+                while !body_data.is_empty() {
+                    let mut item = body_data;
+                    let item_h = RlpHeader::decode(&mut item)?;
+                    let length = body_data.len() - item.len() + item_h.payload_length;
+                    let element = body_data
+                        .get(..length)
+                        .ok_or(alloy_rlp::Error::InputTooShort)?;
+                    rest.push(element);
+                    body_data = &body_data[length..];
+                }
+                let extension = match rest.as_slice() {
+                    [extension] => {
+                        Some(BlockHeaderExtension::from_encoded(extension).map_err(|_| {
+                            alloy_rlp::Error::Custom("malformed block header extension")
+                        })?)
+                    }
+                    _ => None,
+                };
 
-                RskSubMessage::BodyResponse(BodyResponse { id, transactions, uncles })
+                RskSubMessage::BodyResponse(BodyResponse {
+                    id,
+                    transactions,
+                    uncles,
+                    extension,
+                })
             }
             6 => {
                 // NewBlockHashes: RLP list of [hash, number] pairs
@@ -1070,6 +1100,7 @@ mod tests {
             id: 7,
             transactions: vec![tx],
             uncles: Vec::new(),
+            extension: None,
         }));
         msg.encode(&mut buf);
         let decoded = RskMessage::decode(&mut buf.as_slice()).expect("decodes");
@@ -1348,6 +1379,7 @@ mod tests {
             id: 55,
             transactions: vec![],
             uncles: vec![],
+            extension: None,
         };
         let msg = RskMessage::new(RskSubMessage::BodyResponse(resp));
 
@@ -1387,6 +1419,7 @@ mod tests {
             id: 77,
             transactions: vec![tx],
             uncles: vec![],
+            extension: None,
         };
         let msg = RskMessage::new(RskSubMessage::BodyResponse(resp));
 
@@ -1462,6 +1495,7 @@ mod tests {
             id: 100,
             transactions: transactions.clone(),
             uncles: uncles.clone(),
+            extension: None,
         };
         let msg = RskMessage::new(RskSubMessage::BodyResponse(resp));
 
@@ -1527,6 +1561,7 @@ mod tests {
             id: 88,
             transactions: vec![],
             uncles: vec![uncle],
+            extension: None,
         };
         let msg = RskMessage::new(RskSubMessage::BodyResponse(resp));
 
@@ -1544,6 +1579,119 @@ mod tests {
             assert_eq!(r.uncles[0].difficulty, U256::from(500));
         } else {
             panic!("Expected BodyResponse, got {:?}", decoded.sub_message);
+        }
+    }
+
+    /// A body response with these elements after its id, framed as rskj frames
+    /// a message: `RLP([RLP([15, RLP_String(RLP([id, RLP(elements)]))])])`.
+    fn body_frame(id: u64, elements: &[Vec<u8>]) -> Vec<u8> {
+        let wrap = |list: bool, payload: &[u8]| {
+            let mut out = Vec::new();
+            RlpHeader {
+                list,
+                payload_length: payload.len(),
+            }
+            .encode(&mut out);
+            out.extend_from_slice(payload);
+            out
+        };
+        let mut params = Vec::new();
+        id.encode(&mut params);
+        params.extend_from_slice(&wrap(true, &elements.concat()));
+        let mut message = Vec::new();
+        15u8.encode(&mut message);
+        message.extend_from_slice(&wrap(false, &wrap(true, &params)));
+        wrap(true, &wrap(true, &message))
+    }
+
+    /// **The extension beside a body.** rskj sends a version-1 or version-2
+    /// block's header extension as the body's third element
+    /// (`BodyResponseMessage`), as `BlockHeaderExtension.toEncoded` writes it,
+    /// and reads one only from a body of exactly three
+    /// (`MessageType.BODY_RESPONSE`), refusing a third that isn't one.
+    #[test]
+    fn a_body_carries_its_header_extension_as_rskj_sends_it() {
+        let empty = vec![0xc0];
+        let mut bloom = vec![0u8; 256];
+        bloom[3] = 0x40;
+        let extensions = [
+            BlockHeaderExtension::V1 {
+                logs_bloom: bloom.clone(),
+                edges: Some(vec![2, 5]),
+            },
+            BlockHeaderExtension::V2 {
+                logs_bloom: bloom.clone(),
+                edges: None,
+                base_event: Some(vec![0xbe; 9]),
+            },
+            BlockHeaderExtension::V2 {
+                logs_bloom: bloom,
+                edges: Some(vec![]),
+                base_event: Some(Vec::new()),
+            },
+        ];
+        for extension in extensions {
+            let msg = RskMessage::new(RskSubMessage::BodyResponse(BodyResponse {
+                id: 9,
+                transactions: vec![],
+                uncles: vec![],
+                extension: Some(extension.clone()),
+            }));
+            let mut buf = Vec::new();
+            msg.encode(&mut buf);
+            assert_eq!(
+                buf,
+                body_frame(9, &[empty.clone(), empty.clone(), extension.to_encoded()])
+            );
+            match RskMessage::decode(&mut buf.as_slice())
+                .expect("decodes")
+                .sub_message
+            {
+                RskSubMessage::BodyResponse(r) => assert_eq!(r.extension, Some(extension)),
+                other => panic!("decoded as {other:?}"),
+            }
+        }
+
+        // Without one, as for a version-0 block, the body has two elements.
+        let msg = RskMessage::new(RskSubMessage::BodyResponse(BodyResponse {
+            id: 9,
+            transactions: vec![],
+            uncles: vec![],
+            extension: None,
+        }));
+        let mut buf = Vec::new();
+        msg.encode(&mut buf);
+        assert_eq!(buf, body_frame(9, &[empty.clone(), empty.clone()]));
+
+        // With a fourth element, rskj reads no extension at all.
+        let extension = BlockHeaderExtension::V1 {
+            logs_bloom: vec![0; 256],
+            edges: None,
+        }
+        .to_encoded();
+        let four = body_frame(
+            9,
+            &[empty.clone(), empty.clone(), extension.clone(), extension],
+        );
+        match RskMessage::decode(&mut four.as_slice())
+            .expect("decodes")
+            .sub_message
+        {
+            RskSubMessage::BodyResponse(r) => assert_eq!(r.extension, None),
+            other => panic!("decoded as {other:?}"),
+        }
+
+        // A string, an unknown version, a list of one: none is an extension.
+        for bad in [
+            vec![0x83, 1, 2, 3],
+            vec![0xc2, 0x03, 0x80],
+            vec![0xc1, 0x01],
+        ] {
+            let frame = body_frame(9, &[empty.clone(), empty.clone(), bad.clone()]);
+            assert!(
+                RskMessage::decode(&mut frame.as_slice()).is_err(),
+                "{bad:02x?}"
+            );
         }
     }
 
