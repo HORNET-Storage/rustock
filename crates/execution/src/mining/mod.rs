@@ -18,6 +18,7 @@
 
 pub mod dev;
 pub mod coinbase;
+pub mod extra_data;
 pub mod partition;
 pub mod workload;
 pub mod fork_detection;
@@ -27,13 +28,15 @@ pub mod uncles;
 pub mod template;
 
 pub use server::{
-    ChainAccess, ImportResult, MinerServer, MinerWork, StoreChainAccess, SubmitError,
-    SubmittedBlockInfo, extract_merged_mining_hash,
+    ChainAccess, ImportResult, MinerServer, MinerWork, RebuildPolicy, StoreChainAccess,
+    SubmissionRateLimiter, SubmitError, SubmittedBlockInfo, SyncGate,
+    extract_merged_mining_hash,
 };
 pub use uncles::{UNCLE_GENERATION_LIMIT, UNCLE_LIST_LIMIT, select_uncles};
 pub use template::{
     BlockTemplate, BlockTemplateBuilder, MiningConfig, NoPendingTransactions, PendingTransaction,
-    PendingTransactionSource, TemplateError, difficulty_to_target, remasc_transaction,
+    PendingTransactionSource, TemplateError, difficulty_to_target, next_minimum_gas_price,
+    remasc_transaction,
 };
 
 #[cfg(test)]

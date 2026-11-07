@@ -3529,17 +3529,17 @@ impl crate::server::GasPriceSource for FixedGasPrice {
     fn gas_price(&self) -> U256 {
         U256::from(self.0)
     }
-
     fn is_fee_market_working(&self) -> bool {
         self.1
     }
 }
 
-/// rskj answers with `GasPriceTracker.getGasPrice()` -- a percentile over
-/// recent transactions, floored at the block minimum times 1.1 -- not with the
-/// block's `minimumGasPrice`, which is the floor for *validity* rather than
-/// the price to pay for inclusion. A wallet trusting the floor during
-/// congestion underpays and waits.
+/// rskj `EthereumImplTest.getGasPrice_returns_trackerValue_when_feeMarketWorking_is_true`:
+/// with the fee market working, the answer is `GasPriceTracker.getGasPrice()`
+/// -- a percentile over recent transactions, floored at the block minimum
+/// times 1.1 -- not the block's `minimumGasPrice`, which is the floor for
+/// *validity* rather than the price to pay for inclusion. A wallet trusting
+/// the floor during congestion underpays and waits.
 #[tokio::test]
 async fn test_eth_gas_price_uses_the_tracker() {
     let (mut state, _tmp) = setup_state();
@@ -3570,6 +3570,32 @@ async fn test_eth_gas_price_ignores_the_tracker_without_a_fee_market() {
         json!("0x3e252e0"),
         "the head's 59,240,000 times 1.1, not the tracker's 123,456,789"
     );
+}
+
+/// The number from the run that found this, pinned.
+///
+/// rsk-clients-lab's campaign `2026-10-28-c6` had a chain whose minimum had
+/// walked down to 587 wei; rskj answered 645 and this node answered the
+/// tracker's 26,065,600. 587 x 1.1 is 645.7, and rskj truncates it through
+/// `BigDecimal.toBigInteger()`, so 645 is the answer and 646 would be wrong.
+/// The exact ratio this node uses truncates identically here -- see
+/// `GAS_PRICE_MULTIPLIER_NUM` for where the two forms part company, which is
+/// nowhere a real chain reaches.
+#[tokio::test]
+async fn test_eth_gas_price_truncates_the_multiplier_like_rskj() {
+    let (mut state, tmp) = setup_state();
+    let _ = tmp;
+    let mut header = state.store.header(state.store.head().unwrap().unwrap()).unwrap().unwrap();
+    header.minimum_gas_price = U256::from(587u64);
+    header.cached_hash = None;
+    let hash = header.hash();
+    state.store.put_header(&header).unwrap();
+    state.store.put_canonical_hash(header.number, hash).unwrap();
+    state.store.set_head(hash).unwrap();
+    state.gas_price = Some(Arc::new(FixedGasPrice(26_065_600, false)));
+
+    let r = dispatch_for_test(&state, make_request("eth_gasPrice", json!([]))).await;
+    assert_eq!(r.result.unwrap(), json!("0x285"), "587 x 1.1 truncated is 645 (0x285), not 646");
 }
 
 /// Without a tracker -- a node built without sync -- the same branch answers,

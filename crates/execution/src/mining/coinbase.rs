@@ -58,6 +58,12 @@ pub fn build_coinbase(tag_payload: &B256, extra_nonce: u64) -> BtcTransaction {
 /// `bits` is not consulted by RSK -- merged mining checks the Bitcoin hash
 /// against *RSK's* difficulty, not Bitcoin's, so a block here need not be a
 /// valid Bitcoin block at all. It is carried because the field exists.
+///
+/// `time` is consulted: RSKIP179 requires it within five minutes of the RSK
+/// header's timestamp, so it is the same clock the template was stamped
+/// from (rskj `MinerUtils.getBitcoinMergedMiningBlock` uses the wall clock;
+/// this one adds whatever `evm_increaseTime` has accumulated, as the
+/// template does, so a development chain moved into the future still mines).
 pub fn build_bitcoin_block(coinbase: BtcTransaction, nonce: u32) -> BtcBlock {
     let merkle_root = TxMerkleNode::from_byte_array(coinbase.compute_txid().to_byte_array());
     BtcBlock {
@@ -65,7 +71,7 @@ pub fn build_bitcoin_block(coinbase: BtcTransaction, nonce: u32) -> BtcBlock {
             version: BlockVersion::from_consensus(0x2000_0000),
             prev_blockhash: BlockHash::all_zeros(),
             merkle_root,
-            time: 0,
+            time: u32::try_from(super::dev::now_with_offset()).unwrap_or(u32::MAX),
             bits: CompactTarget::from_consensus(0x207f_ffff),
             nonce,
         },

@@ -9,8 +9,7 @@
 
 use alloy_primitives::{Address, B256, Bloom, Bytes, U256};
 use rustock_core::config::ChainConfig;
-use rustock_core::validation::DifficultyRule;
-use rustock_core::validation::block_rules::BlockTxsMaxGasPriceRule;
+use rustock_core::validation::{DifficultyRule, ValidationError};
 use rustock_core::{Block, Header, Transaction, ordered_tx_trie_root};
 use rustock_trie::{AccountState, TrieKeySlice, TrieNode, TrieStore, account_key};
 use std::collections::HashMap;
@@ -99,6 +98,11 @@ pub enum TemplateError {
     Partition(#[from] crate::executor::ExecutionError),
     #[error("storage error: {0}")]
     Storage(#[from] anyhow::Error),
+    /// The assembled block fails a rule every peer applies on import. The
+    /// builder is meant to make this unreachable; it is checked because the
+    /// alternative is a chain of blocks nobody else accepts.
+    #[error("the assembled block fails a block rule: {0}")]
+    SelfCheck(ValidationError),
 }
 
 /// A transaction waiting to be mined, with its sender already recovered.
@@ -117,6 +121,17 @@ pub struct PendingTransaction {
 /// sync crate, which depends on this one.
 pub trait PendingTransactionSource: Send + Sync {
     fn pending(&self) -> Vec<PendingTransaction>;
+
+    /// Transactions the builder found unusable, which rskj's
+    /// `BlockToMineBuilder` removes from the pool
+    /// (`transactionPool.removeTransactions`): those `filterTransactions`
+    /// set aside as priced under the block's minimum or over the RSKIP252
+    /// cap, and those the EVM refused to run (`getInvalidTransactions`): a
+    /// nonce the state no longer expects, a balance that no longer covers
+    /// them, too little intrinsic gas. A pool that does not would hand them
+    /// back on every rebuild. The default does nothing, which is right for
+    /// a source that is not a pool.
+    fn remove_transactions(&self, _hashes: &[B256]) {}
 }
 
 /// Nothing to mine but the REMASC transaction. Useful on regtest and in tests,
@@ -186,13 +201,23 @@ impl BlockTemplateBuilder {
         let minimum_gas_price =
             next_minimum_gas_price(parent.minimum_gas_price, self.mining_config.min_gas_price_target);
 
-        let mut transactions = self.select_transactions(
-            pending,
-            &state_root,
-            number,
-            minimum_gas_price,
-            gas_limit,
-        );
+        let (candidates, to_remove) =
+            self.select_transactions(pending, &state_root, minimum_gas_price, number);
+        // rskj `BlockToMineBuilder.build`: `removePendingTransactions(txsToRemove)`
+        // right after the filter, before anything executes.
+        if !to_remove.is_empty() {
+            tracing::debug!(
+                target: "rustock::mining",
+                "Removing {} transaction(s) from the pool: priced outside what the block may carry",
+                to_remove.len()
+            );
+            pending.remove_transactions(&to_remove);
+        }
+        let has_candidates = !candidates.is_empty();
+        // Kept by position, so a candidate the probe refuses can be named
+        // back to the pool.
+        let candidate_hashes: Vec<B256> = candidates.iter().map(|c| c.hash).collect();
+        let mut transactions: Vec<Transaction> = candidates.into_iter().map(|c| c.tx).collect();
         // Not appended by the executor: REMASC is an ordinary entry in the
         // block's transaction list, recognised by shape. A template without it
         // executes to a different state root, and the failure reads as an
@@ -240,19 +265,53 @@ impl BlockTemplateBuilder {
             cached_hash_for_merged_mining: None,
         };
 
-        // RSKIP-144: decide the partition, which also decides the order.
+        // The probe: execute the candidates once, in selection order, to
+        // learn two things only execution can tell.
         //
-        // The transactions are executed once in selection order to learn what
-        // each one touches, the partitioner places them from that, and the
-        // block is then rebuilt in sublist order and executed again. rskj
-        // does the first pass and reorders its receipts rather than
-        // re-executing, relying on a collision-free partition reaching the
-        // same state either way -- which is true, and is the theorem the
-        // validator exists to check rather than assume. Executing the block
-        // that will actually be published is the cheaper thing to be sure of,
-        // and the receipts have to be rebuilt regardless: `cumulativeGasUsed`
-        // restarts at each sublist.
-        let partitioned = self.partition(number, gas_limit, &transactions, &header, &state_root)?;
+        // Which ones fit. rskj's `BlockToMineBuilder` fills a block by gas
+        // **used**: a candidate must fit in the block limit minus the gas the
+        // earlier ones consumed (`TransactionExecutor.gasIsValid`), and once
+        // it has run only its own consumption counts against the next. A
+        // sender that declares more gas than it uses costs the block nothing.
+        // Fitting by declared limits instead -- what this did before -- left
+        // blocks 40% empty under ordinary wallets, which over-provision as a
+        // matter of course.
+        //
+        // And, under RSKIP-144, what each one touches, which decides the
+        // partition and with it the order. rskj does the first pass and
+        // reorders its receipts rather than re-executing, relying on a
+        // collision-free partition reaching the same state either way --
+        // which is true, and is the theorem the validator exists to check
+        // rather than assume. Executing the block that will actually be
+        // published is the cheaper thing to be sure of, and the receipts
+        // have to be rebuilt regardless: `cumulativeGasUsed` restarts at each
+        // sublist.
+        //
+        // Skipped on an idle chain: REMASC alone always fits and has nothing
+        // to partition, and the final execution below is the one that counts.
+        let partitioned = if has_candidates {
+            let (kept, partitioned, invalid) =
+                self.probe_and_partition(number, gas_limit, transactions, &header, &state_root)?;
+            transactions = kept;
+            header.transactions_root = ordered_tx_trie_root(&transactions, rskip126);
+            // rskj `BlockToMineBuilder.build`: "Evicting {} invalid
+            // transaction(s) from pool after exception during block
+            // execution". Done here, on the source, because the probe
+            // only knows positions.
+            if !invalid.is_empty() {
+                let hashes: Vec<B256> =
+                    invalid.iter().filter_map(|&i| candidate_hashes.get(i).copied()).collect();
+                tracing::warn!(
+                    target: "rustock::mining",
+                    "Evicting {} invalid transaction(s) from the pool: the EVM refused them while building the template",
+                    hashes.len()
+                );
+                pending.remove_transactions(&hashes);
+            }
+            partitioned
+        } else {
+            None
+        };
         if let Some(partitioned) = partitioned {
             transactions = partitioned.transactions;
             header.transactions_root = ordered_tx_trie_root(&transactions, rskip126);
@@ -279,8 +338,21 @@ impl BlockTemplateBuilder {
         let hash_for_merged_mining =
             fork_detection::apply_to_hash(header.hash_for_merged_mining(), &fork_data);
 
+        let block = Block { header, ..block };
+        // The rules a peer runs on the body before executing it: the gas
+        // price floor and the RSKIP252 cap, REMASC last, extra data, the
+        // minimum gas price step. Selection is meant to satisfy them; this is
+        // the check that it did, before the block is handed out rather than
+        // after every rskj node has refused it. The ancestry rules (uncles,
+        // fork detection) are not run here: the first needs the store the
+        // import path has, the second the merged-mining fields a solution
+        // fills in.
+        self.processor
+            .validate_block_body_rules(&block, Some(parent))
+            .map_err(TemplateError::SelfCheck)?;
+
         Ok(BlockTemplate {
-            block: Block { header, ..block },
+            block,
             hash_for_merged_mining,
             target: difficulty_to_target(difficulty),
             fees_paid_to_miner: executed.paid_fees,
@@ -288,31 +360,35 @@ impl BlockTemplateBuilder {
         })
     }
 
-    /// Place the block's transactions in sublists, as rskj's miner does.
+    /// Execute the candidates once, keep the ones that fit, and under
+    /// RSKIP-144 place the kept ones in sublists, as rskj's miner does.
     ///
-    /// `None` when the block declares no partition: RSKIP-144 inactive, or
-    /// the partition came out all-sequential, which rskj spells as an empty
-    /// edges array and we spell as no extension at all.
+    /// `transactions` is the selection in price order, REMASC last. The
+    /// first element of the result is what survived: every candidate the
+    /// executor dropped, for not fitting the block's remaining gas or for
+    /// being refused by the EVM (see
+    /// [`crate::RskExecutor::execute_block_for_mining`]), is gone, in the
+    /// order the rest already had. The second is the partition, `None` when
+    /// the block declares none: RSKIP-144 inactive, or the partition came
+    /// out all-sequential, which rskj spells as an empty edges array and we
+    /// spell as no extension at all. The third is the indices, into
+    /// `transactions`, of the candidates the EVM refused: the pool should
+    /// hear about those.
     ///
-    /// The transactions are executed once here, in selection order, only to
-    /// learn what each one touches. That is also how rskj learns it, and it
-    /// is an approximation on purpose: a transaction is placed from an
-    /// execution against the accumulating sequential state, while its
-    /// sublist will run against the parent state. Where the two differ the
-    /// partition is wrong, and the validator is what catches it -- which is
-    /// why the validator re-checks instead of trusting the header.
-    fn partition(
+    /// The placement is an approximation on purpose: a transaction is placed
+    /// from an execution against the accumulating sequential state, while
+    /// its sublist will run against the parent state. Where the two differ
+    /// the partition is wrong, and the validator is what catches it -- which
+    /// is why the validator re-checks instead of trusting the header.
+    fn probe_and_partition(
         &self,
         number: u64,
         gas_limit: U256,
-        transactions: &[Transaction],
+        transactions: Vec<Transaction>,
         header: &Header,
         state_root: &TrieNode,
-    ) -> Result<Option<Partitioned>, TemplateError> {
-        if !self.hardfork_cfg.has_rskip144(number) {
-            return Ok(None);
-        }
-
+    ) -> Result<(Vec<Transaction>, Option<Partitioned>, Vec<usize>), TemplateError> {
+        let rskip144 = self.hardfork_cfg.has_rskip144(number);
         let chain_id = self.hardfork_cfg.chain_id;
         let with_senders: Vec<(Transaction, Address)> = transactions
             .iter()
@@ -322,8 +398,10 @@ impl BlockTemplateBuilder {
             })
             .collect();
 
-        crate::collision::start_per_transaction(crate::collision::write_semantics(number));
-        let executed = self.processor.executor().execute_block(
+        if rskip144 {
+            crate::collision::start_per_transaction(crate::collision::write_semantics(number));
+        }
+        let executed = self.processor.executor().execute_block_for_mining(
             header,
             &with_senders,
             state_root,
@@ -331,8 +409,34 @@ impl BlockTemplateBuilder {
         );
         // Taken whether or not execution succeeded, so a failure cannot leave
         // this probe's keys behind for the next template.
-        let touched = crate::collision::finish().unwrap_or_default();
-        let executed = executed?;
+        let touched = if rskip144 { crate::collision::finish() } else { None };
+        let (executed, dropped) = executed?;
+        if !dropped.is_empty() {
+            tracing::debug!(
+                target: "rustock::mining",
+                unfitting = dropped.unfitting.len(),
+                invalid = dropped.invalid.len(),
+                kept = transactions.len() - dropped.unfitting.len() - dropped.invalid.len(),
+                "transactions left out of the template"
+            );
+        }
+        let invalid = dropped.invalid.clone();
+
+        // What ran, with each transaction's probe index: `tx_results` is one
+        // per executed transaction, `touched` is keyed by the probe index.
+        let kept: Vec<(usize, Transaction, Address)> = with_senders
+            .into_iter()
+            .enumerate()
+            .filter(|(i, _)| !dropped.contains(*i))
+            .map(|(i, (tx, sender))| (i, tx, sender))
+            .collect();
+        debug_assert_eq!(kept.len(), executed.tx_results.len(), "one result per executed transaction");
+        let kept_transactions: Vec<Transaction> = kept.iter().map(|(_, tx, _)| tx.clone()).collect();
+
+        if !rskip144 {
+            return Ok((kept_transactions, None, invalid));
+        }
+        let touched = touched.unwrap_or_default();
 
         let mut partitioner = crate::mining::partition::SublistPartitioner::new(
             rustock_core::validation::block_rules::TX_EXECUTION_THREADS,
@@ -340,8 +444,8 @@ impl BlockTemplateBuilder {
             self.chain_config.min_sequential_set_gas_limit,
         );
 
-        let mut placed: Vec<usize> = Vec::with_capacity(transactions.len());
-        for (index, tx) in transactions.iter().enumerate() {
+        let mut placed: Vec<usize> = Vec::with_capacity(kept.len());
+        for (index, (probe_index, tx, sender)) in kept.iter().enumerate() {
             let Some(result) = executed.tx_results.get(index) else {
                 continue;
             };
@@ -349,15 +453,15 @@ impl BlockTemplateBuilder {
             // REMASC closes the sequential sublist and is not placed by the
             // ordinary rule -- it is the block's last transaction by
             // definition.
-            if index + 1 == transactions.len() && crate::mining::template::is_remasc(tx) {
+            if index + 1 == kept.len() && is_remasc(tx) {
                 partitioner.add_remasc(index, result.gas_used);
                 placed.push(index);
                 continue;
             }
 
-            let keys = touched.keys(index);
+            let keys = touched.keys(*probe_index);
             let footprint = crate::mining::partition::TxFootprint {
-                sender: with_senders[index].1,
+                sender: *sender,
                 gas_limit: tx.gas_limit.saturating_to::<u64>(),
                 gas_used: result.gas_used,
                 reads: keys.map(|k| k.read().iter().cloned().collect()).unwrap_or_default(),
@@ -381,15 +485,16 @@ impl BlockTemplateBuilder {
 
         let edges = partitioner.edges();
         if edges.is_empty() {
-            return Ok(None);
+            return Ok((kept_transactions, None, invalid));
         }
 
         let order = partitioner.transactions_in_order();
         debug_assert_eq!(order.len(), placed.len(), "every placed transaction is ordered");
-        Ok(Some(Partitioned {
-            transactions: order.iter().map(|&i| transactions[i].clone()).collect(),
+        let partitioned = Partitioned {
+            transactions: order.iter().map(|&i| kept_transactions[i].clone()).collect(),
             edges,
-        }))
+        };
+        Ok((kept_transactions, Some(partitioned), invalid))
     }
 
     /// Reload the parent's state root from the trie store.
@@ -403,81 +508,92 @@ impl BlockTemplateBuilder {
             .ok_or(TemplateError::ParentStateMissing { root })
     }
 
-    /// Pick transactions to include: best price first, each sender's
-    /// transactions in nonce order and starting from the nonce the state
-    /// expects, skipping anything underpriced, *overpriced*, or that no
-    /// longer fits.
+    /// Pick the candidates, best price first, each sender's transactions in
+    /// nonce order and starting from the nonce the state expects, skipping
+    /// anything priced outside what the block may carry.
     ///
-    /// **Both ends of the price range are consensus rules, not policy.** The
-    /// floor is `TxsMinGasPriceRule` and the ceiling is
-    /// [`BlockTxsMaxGasPriceRule`] -- RSKIP252, 100x the block's
-    /// `minimumGasPrice`. A miner that applies only the floor seals blocks
-    /// that every validator on the network rejects, which is worse than
-    /// mining nothing: the work is spent and the block is refused. rskj drops
-    /// both in `MinerUtils.filterTransactions` (`isHighGasPriced`), and this
-    /// is the same filter on the same rule the import path already enforces.
-    ///
-    /// REMASC needs no exemption here even though the rule grants it one: it
-    /// is never in the pool, and `build` appends it after this returns.
+    /// rskj `BlockToMineBuilder.getTransactions` with
+    /// `MinerUtils.filterTransactions`: every pending transaction that passes
+    /// is a candidate; which ones fit the block is decided by executing them
+    /// (see `probe_and_partition`), not here. The second element is rskj's
+    /// `txsToRemove`: what the pool should drop.
     fn select_transactions(
         &self,
         pending: &dyn PendingTransactionSource,
         state_root: &TrieNode,
-        number: u64,
         minimum_gas_price: U256,
-        block_gas_limit: U256,
-    ) -> Vec<Transaction> {
+        number: u64,
+    ) -> (Vec<PendingTransaction>, Vec<B256>) {
         let ordered = order_by_price_sender_and_nonce(pending.pending());
+        let rskip252 = number >= self.processor.rskip252_height();
+        filter_candidates(ordered, minimum_gas_price, rskip252, |sender| {
+            account_nonce(state_root, self.trie_store.as_ref(), sender)
+        })
+    }
+}
 
-        // `TxGasPriceCap.isSurpassed` short-circuits on a zero minimum, so a
-        // chain whose minimum is zero -- regtest, and mainnet before the fee
-        // market moved -- has no ceiling at all. Matching that is what keeps
-        // this filter from dropping everything on such a chain.
-        let max_gas_price = (number >= self.chain_config.activation_heights.fingerroot500
-            && !minimum_gas_price.is_zero())
-        .then(|| {
-            minimum_gas_price.saturating_mul(U256::from(
-                BlockTxsMaxGasPriceRule::FOR_BLOCK_MULTIPLIER,
-            ))
-        });
+/// rskj `MinerUtils.filterTransactions`, on transactions already in
+/// `order_by_price_sender_and_nonce` order.
+///
+/// Three things rule a transaction out. Priced under the block's minimum
+/// (`isLowGasPriced`): the block would fail `TxsMinGasPriceRule`. Priced over
+/// 100 times the block's minimum once RSKIP252 is active (`isHighGasPriced`,
+/// `TxGasPriceCap.FOR_BLOCK`): the block would fail `BlockTxsMaxGasPriceRule`
+/// on every peer, and the one case the cap short-circuits -- a zero minimum --
+/// is the one where there is no cap to exceed. Both of those go to
+/// `txsToRemove`, the second element: rskj drops them from the pool, since a
+/// later block is no likelier to carry them. And a nonce that is not the
+/// next one the sender's account expects, which stays in the pool. Only a
+/// gap blocks the sender's later transactions; a nonce below the expected
+/// one is a mined leftover and the next may still be wanted.
+///
+/// `nonce_of` reads the sender's nonce from the state the block builds on,
+/// once per sender.
+pub(crate) fn filter_candidates(
+    ordered: Vec<PendingTransaction>,
+    minimum_gas_price: U256,
+    rskip252_active: bool,
+    mut nonce_of: impl FnMut(&Address) -> u64,
+) -> (Vec<PendingTransaction>, Vec<B256>) {
+    let cap = (rskip252_active && !minimum_gas_price.is_zero()).then(|| {
+        minimum_gas_price.saturating_mul(U256::from(
+            rustock_core::validation::block_rules::BlockTxsMaxGasPriceRule::FOR_BLOCK_MULTIPLIER,
+        ))
+    });
 
-        let mut next_nonce: HashMap<Address, u64> = HashMap::new();
-        let mut gas_committed = U256::ZERO;
-        let mut selected = Vec::new();
+    let mut next_nonce: HashMap<Address, u64> = HashMap::new();
+    let mut gapped: std::collections::HashSet<Address> = std::collections::HashSet::new();
+    let mut selected = Vec::new();
+    let mut to_remove = Vec::new();
 
-        for candidate in ordered {
-            if candidate.tx.gas_price < minimum_gas_price {
-                continue;
-            }
-            if max_gas_price.is_some_and(|cap| candidate.tx.gas_price > cap) {
-                continue;
-            }
-
-            let expected = *next_nonce.entry(candidate.sender).or_insert_with(|| {
-                account_nonce(state_root, self.trie_store.as_ref(), &candidate.sender)
-            });
-            if candidate.tx.nonce != expected {
-                // A gap, or a nonce already used. Later transactions from this
-                // sender cannot execute either, but they are cheap to skip and
-                // dropping the sender outright would need a second pass.
-                continue;
-            }
-
-            // The executor charges each transaction its own gas limit against
-            // the block's; there is no partial inclusion, so a transaction
-            // that does not fit is skipped and a cheaper one may still fit.
-            let after = gas_committed + candidate.tx.gas_limit;
-            if after > block_gas_limit {
-                continue;
-            }
-
-            gas_committed = after;
-            next_nonce.insert(candidate.sender, expected + 1);
-            selected.push(candidate.tx);
+    for candidate in ordered {
+        if candidate.tx.gas_price < minimum_gas_price {
+            to_remove.push(candidate.hash);
+            continue;
+        }
+        if cap.is_some_and(|cap| candidate.tx.gas_price > cap) {
+            to_remove.push(candidate.hash);
+            continue;
+        }
+        if gapped.contains(&candidate.sender) {
+            continue;
         }
 
-        selected
+        let expected = *next_nonce
+            .entry(candidate.sender)
+            .or_insert_with(|| nonce_of(&candidate.sender));
+        if candidate.tx.nonce != expected {
+            if candidate.tx.nonce > expected {
+                gapped.insert(candidate.sender);
+            }
+            continue;
+        }
+
+        next_nonce.insert(candidate.sender, expected + 1);
+        selected.push(candidate);
     }
+
+    (selected, to_remove)
 }
 
 /// rskj `PendingState.sortByPriceTakingIntoAccountSenderAndNonce`: cluster by
@@ -648,7 +764,7 @@ fn next_gas_limit(parent: &Header, target: Option<U256>) -> U256 {
 /// child may move the minimum gas price by at most 1% of the parent's, or by
 /// one wei when 1% rounds to nothing. The parent's own value is always in
 /// range, so `None` -- inherit -- is always valid.
-fn next_minimum_gas_price(parent_price: U256, target: Option<U256>) -> U256 {
+pub fn next_minimum_gas_price(parent_price: U256, target: Option<U256>) -> U256 {
     let Some(target) = target else {
         return parent_price;
     };

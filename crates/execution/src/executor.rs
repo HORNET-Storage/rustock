@@ -35,6 +35,31 @@ pub struct TxExecutionResult {
     pub reached_sequential_only: bool,
 }
 
+/// What the miner's execution mode left out of the block, by index into the
+/// transaction list it was given. See [`RskExecutor::execute_block_for_mining`].
+#[derive(Debug, Default)]
+pub struct MiningDrops {
+    /// Did not fit in the block's remaining gas, or followed a dropped
+    /// transaction of the same sender. Still a fine transaction for a later
+    /// block; the pool keeps it.
+    pub unfitting: Vec<usize>,
+    /// Refused by the EVM before it ran: a nonce the state does not expect,
+    /// a balance that no longer covers it, too little intrinsic gas. rskj
+    /// collects these as `BlockResult.getInvalidTransactions()` and the
+    /// miner removes them from the pool.
+    pub invalid: Vec<usize>,
+}
+
+impl MiningDrops {
+    pub fn is_empty(&self) -> bool {
+        self.unfitting.is_empty() && self.invalid.is_empty()
+    }
+    /// Whether `index` was dropped for either reason.
+    pub fn contains(&self, index: usize) -> bool {
+        self.unfitting.contains(&index) || self.invalid.contains(&index)
+    }
+}
+
 /// Result of executing an entire block.
 #[derive(Debug)]
 pub struct BlockExecutionResult {
@@ -248,17 +273,8 @@ impl RskExecutor {
             crate::hardfork::RSK_MAINNET_CHAIN_ID => crate::remasc::RemascConfig::mainnet(),
             _ => crate::remasc::RemascConfig::regtest(),
         };
-        let bridge_constants = match hardfork_cfg.chain_id {
-            crate::hardfork::RSK_TESTNET_CHAIN_ID => crate::bridge::constants::BridgeConstants::testnet(),
-            crate::hardfork::RSK_MAINNET_CHAIN_ID => crate::bridge::constants::BridgeConstants::mainnet(),
-            _ => crate::bridge::constants::BridgeConstants::regtest(),
-        };
-        let free_bridge_senders = bridge_constants
-            .genesis_federation_public_keys
-            .iter()
-            .chain(bridge_constants.authorized_free_tx_keys.iter())
-            .filter_map(|hex| rsk_address_from_pubkey_hex(hex))
-            .collect();
+        let bridge_constants = bridge_constants_for(hardfork_cfg.chain_id);
+        let free_bridge_senders = free_bridge_senders(&bridge_constants);
         Self {
             hardfork_cfg,
             block_store,
@@ -286,12 +302,7 @@ impl RskExecutor {
         mut self,
         constants: crate::bridge::constants::BridgeConstants,
     ) -> Self {
-        self.free_bridge_senders = constants
-            .genesis_federation_public_keys
-            .iter()
-            .chain(constants.authorized_free_tx_keys.iter())
-            .filter_map(|hex| rsk_address_from_pubkey_hex(hex))
-            .collect();
+        self.free_bridge_senders = free_bridge_senders(&constants);
         self.bridge_constants = constants;
         self
     }
@@ -810,6 +821,55 @@ impl RskExecutor {
         .map(|(result, _)| result)
     }
 
+    /// Execute a block the miner is assembling, dropping what does not fit.
+    ///
+    /// rskj's `BlockToMineBuilder` executes its candidates through
+    /// `BlockExecutor.executeAndFill`, which discards an invalid transaction
+    /// instead of failing the block, and a transaction is invalid when its
+    /// gas limit does not fit in the block's limit minus the gas **used** so
+    /// far (`TransactionExecutor.gasIsValid`). That is the rule this applies:
+    /// a candidate that does not fit is skipped without running, and so is
+    /// every later candidate from the same sender, whose nonce can no longer
+    /// match (rskj executes those and discards them on the nonce check; the
+    /// outcome is the same).
+    ///
+    /// A candidate the EVM refuses before running it -- rskj's
+    /// `executeTransaction() == false`, or an exception it collects in
+    /// `invalidTransactions` -- is dropped the same way and reported apart,
+    /// so the miner can remove it from the pool as `BlockToMineBuilder`
+    /// does. Only a database error still fails the run: that is the node's
+    /// problem, not the transaction's.
+    ///
+    /// Returns the result of the transactions that ran, in order, and what
+    /// was dropped. `tx_results` has one entry per transaction that ran, so
+    /// a caller pairs them up by removing the dropped indices first.
+    ///
+    /// Always one run over the whole list: the miner partitions from what
+    /// this reports and the block it publishes is executed again as it will
+    /// be validated.
+    pub fn execute_block_for_mining(
+        &self,
+        header: &Header,
+        transactions: &[(rustock_core::Transaction, Address)],
+        state_root: &TrieNode,
+        trie_store: Arc<dyn TrieStore>,
+    ) -> Result<(BlockExecutionResult, MiningDrops), ExecutionError> {
+        let mut dropped = MiningDrops::default();
+        let (result, _) = self.run_sublist(
+            header,
+            transactions,
+            0..transactions.len(),
+            state_root,
+            trie_store,
+            crate::tracer::RskTracer::new(0),
+            TracedTxs::None,
+            U256::ZERO,
+            true,
+            Some(&mut dropped),
+        )?;
+        Ok((result, dropped))
+    }
+
     /// Execute a block, recording the call tree of **every** transaction.
     ///
     /// This is what the `trace_*` namespace needs, and it is one block pass:
@@ -946,6 +1006,7 @@ impl RskExecutor {
                 traced,
                 U256::ZERO,
                 true,
+                None,
             );
         }
 
@@ -1004,6 +1065,7 @@ impl RskExecutor {
             TracedTxs::None,
             U256::ZERO,
             true,
+            None,
         )?;
         let base_root = crate::state::apply_state_changes(
             state_root,
@@ -1071,6 +1133,7 @@ impl RskExecutor {
                             traced,
                             U256::ZERO,
                             false,
+                            None,
                         );
                         let keys = crate::collision::finish();
                         let records = crate::silent::finish();
@@ -1150,6 +1213,7 @@ impl RskExecutor {
             traced,
             fees_carried,
             false,
+            None,
         )?;
         let sequential_us = at_sequential.elapsed().as_micros() as u64;
 
@@ -1231,6 +1295,12 @@ impl RskExecutor {
         // later sublist -- rskj's `maintainPrecompiledContractStorageRoots`
         // runs once, on the block's own repository, before any sublist.
         run_maintenance: bool,
+        // `discard_unfitting`: the miner's mode. A transaction whose gas
+        // limit does not fit in what the block has left, or that the EVM
+        // refuses to run, is skipped and its index recorded here, instead
+        // of failing the run as it does when validating. See
+        // `execute_block_for_mining`.
+        mut discard_unfitting: Option<&mut MiningDrops>,
     ) -> Result<
         (BlockExecutionResult, std::collections::BTreeMap<usize, crate::tracer::ProgramTrace>),
         ExecutionError,
@@ -1320,6 +1390,18 @@ impl RskExecutor {
         // its fees once on its own account and again when the sequential
         // sublist settles the block's total.
         let ends_the_block = range.end == transactions.len();
+        // Whether this run is the whole block as one, with nothing before or
+        // after it. Only then is the block's gas limit the container a
+        // transaction has to fit in (see the fit rule below); a sublist's
+        // container is the sublist's own limit, which this run does not know.
+        let whole_block = run_maintenance && ends_the_block;
+        let block_gas_limit = header.gas_limit.saturating_to::<u64>();
+        // Mining mode only: senders with a dropped transaction. Their later
+        // ones cannot execute (the nonce is now out of sequence) and rskj's
+        // `executeAndFill` discards them on the nonce check; dropping them
+        // here spares the run from executing what is known to fail.
+        let mut dropped_senders: std::collections::HashSet<Address> =
+            std::collections::HashSet::new();
 
         let mut total_gas = 0u64;
         let mut total_fees = fees_carried;
@@ -1384,6 +1466,49 @@ impl RskExecutor {
             // RSKIP-144: everything this transaction touches belongs to the
             // sublist that runs it. Inert unless the block declares edges.
             crate::collision::begin_transaction(i);
+
+            // rskj `TransactionExecutor.gasIsValid`: a transaction's gas
+            // **limit** must fit in the container's limit minus the gas
+            // **used** before it. The two quantities differ on purpose -- a
+            // sender's over-provisioned limit costs the block nothing once
+            // the transaction has run -- and the rule is consensus: in rskj a
+            // transaction that does not fit is invalid, and a block carrying
+            // one is rejected ("Too much gas used in this block"). Mining
+            // mode drops it instead, as rskj's `executeAndFill` does.
+            //
+            // REMASC declares no gas and is exempt by construction. Checked
+            // only when this run's container is the block itself: a sublist
+            // run is measured against the sublist's limit, which the
+            // partition validator enforces separately.
+            if !Self::is_remasc_tx(tx) && (whole_block || discard_unfitting.is_some()) {
+                let tx_gas_limit = tx.gas_limit.saturating_to::<u64>();
+                let fits = total_gas.saturating_add(tx_gas_limit) <= block_gas_limit;
+                let sender_dropped = dropped_senders.contains(sender);
+                if !fits || sender_dropped {
+                    if let Some(dropped) = discard_unfitting.as_deref_mut() {
+                        debug!(
+                            tx_index = i,
+                            tx_gas_limit,
+                            available = block_gas_limit.saturating_sub(total_gas),
+                            sender_dropped,
+                            "mining: dropping a transaction that does not fit the block"
+                        );
+                        dropped.unfitting.push(i);
+                        dropped_senders.insert(*sender);
+                        {
+                            use revm::context_interface::ContextTr;
+                            evm.ctx.chain_mut().raw_storage.discard_tx();
+                        }
+                        continue;
+                    }
+                    return Err(ExecutionError::Evm(format!(
+                        "Too much gas used in this block: available in block: {} tx sent: {}",
+                        block_gas_limit.saturating_sub(total_gas),
+                        tx_gas_limit
+                    )));
+                }
+            }
+
             if Self::is_remasc_tx(tx) {
                 debug!(tx_index = i, "executing REMASC system call");
                 if traced.includes(i) {
@@ -1781,15 +1906,38 @@ impl RskExecutor {
                 // for every other -- and `run` is the same code path an EVM
                 // built without an inspector takes, because revm carries the
                 // inspector as a field that only `inspect_run` consults.
-                let out = if traced.includes(i) {
+                let out: Result<_, revm::context::result::EVMError<_>> = if traced.includes(i) {
                     use revm::inspector::InspectorHandler;
                     handler.inspect_run(&mut evm)
                 } else {
                     handler.run(&mut evm)
                 };
-                out.map_err(|e: revm::context::result::EVMError<_>| {
-                    ExecutionError::Evm(format!("{e:?}"))
-                })?
+                match out {
+                    Ok(result) => result,
+                    // The miner's mode: a transaction the EVM would not run
+                    // is dropped, not fatal. revm's `catch_error` has
+                    // already discarded the transaction's own journal
+                    // (`JournalTr::discard_tx`), so the block's state is as
+                    // it was before this transaction; the raw-storage
+                    // overlay is wound back the same way. A database error
+                    // is the node's, and still fails the run.
+                    Err(e)
+                        if discard_unfitting.is_some()
+                            && !matches!(e, revm::context::result::EVMError::Database(_)) =>
+                    {
+                        debug!(tx_index = i, error = ?e, "mining: dropping a transaction the EVM refused");
+                        if let Some(drops) = discard_unfitting.as_deref_mut() {
+                            drops.invalid.push(i);
+                        }
+                        dropped_senders.insert(*sender);
+                        {
+                            use revm::context_interface::ContextTr;
+                            evm.ctx.chain_mut().raw_storage.discard_tx();
+                        }
+                        continue;
+                    }
+                    Err(e) => return Err(ExecutionError::Evm(format!("{e:?}"))),
+                }
             };
 
             let success = result.is_success();
@@ -2077,6 +2225,29 @@ pub enum ExecutionError {
     /// state is written; see `crate::supply`.
     #[error("transaction {index} of block #{number} created {created} wei of rBTC")]
     SupplyCreated { number: u64, index: usize, created: alloy_primitives::U256 },
+}
+
+/// The Bridge constants a chain id selects: testnet's, mainnet's, or
+/// regtest's for anything else.
+pub fn bridge_constants_for(chain_id: u64) -> crate::bridge::constants::BridgeConstants {
+    match chain_id {
+        crate::hardfork::RSK_TESTNET_CHAIN_ID => crate::bridge::constants::BridgeConstants::testnet(),
+        crate::hardfork::RSK_MAINNET_CHAIN_ID => crate::bridge::constants::BridgeConstants::mainnet(),
+        _ => crate::bridge::constants::BridgeConstants::regtest(),
+    }
+}
+
+/// The senders whose transactions to the Bridge are free before
+/// `areBridgeTxsPaid`: the genesis federation and the authorized free-tx
+/// keys (rskj `BridgeUtils.isFreeBridgeTx`). Shared by the executor and the
+/// transaction pool, which must agree on what costs nothing.
+pub fn free_bridge_senders(constants: &crate::bridge::constants::BridgeConstants) -> Vec<Address> {
+    constants
+        .genesis_federation_public_keys
+        .iter()
+        .chain(constants.authorized_free_tx_keys.iter())
+        .filter_map(|hex| rsk_address_from_pubkey_hex(hex))
+        .collect()
 }
 
 /// Derives an RSK address from a secp256k1 public key in SEC1 hex

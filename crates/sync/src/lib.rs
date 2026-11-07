@@ -24,7 +24,7 @@ pub mod watchdog;
 pub use events::SyncEvent;
 pub use handler::SyncHandler;
 pub use manager::SyncManager;
-pub use service::{ExternalBlockSource, SyncService};
+pub use service::{BestBlockListeners, ExternalBlockSource, SyncService};
 pub use state::{InFlightBody, SyncState};
 pub use invariant::{Scope, Violation};
 pub use tracker::PeerChunkTracker;

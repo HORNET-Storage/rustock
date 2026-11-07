@@ -292,6 +292,9 @@ index_history = false               # light: this index exists to answer RPC abo
 # enabled = false                   # default — serve the mnr_* namespace
 # coinbase = "0x…"                  # default: unset — REQUIRED when enabled
 # extra_data = ""                   # default — at most 32 bytes
+# min_gas_price = 0                 # default: unset — wei to steer the block minimum toward, 1% per block (rskj miner.minGasPrice)
+# submission_rate_limit_ms = 0      # default — refuse a second submission inside this window (rskj workSubmissionRateLimitInMills)
+# update_work_on_new_transaction = false  # default — rebuild when arrivals pay a tenth of the candidate's fees (rskj updateWorkOnNewTransaction)
 # refresh_secs = 60                 # default
 
 # Per-account virtual gas quota (rskj TxQuotaChecker). An account accumulates

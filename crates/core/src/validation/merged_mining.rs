@@ -29,6 +29,66 @@ pub struct MergedMiningRule {
     pub config: std::sync::Arc<ChainConfig>,
 }
 
+/// rskj `BlockTimeStampValidationRule.isBitcoinTimestampValid` (RSKIP179,
+/// iris300): the Bitcoin block a header was merged-mined in and the header
+/// itself must be timestamped within `max_timestamps_diff` seconds of each
+/// other, strictly. rskj's `Constants.getMaxTimestampsDiffInSecs`: 5 minutes,
+/// or 2 hours on testnet from RSKIP297 (hop400) on.
+///
+/// From the activation on a header without a decodable merged-mining header
+/// is invalid outright, as it is in rskj. The rule does not depend on
+/// `skip_pow_validation`: rskj's `miner.server.skipPowValidation` reaches
+/// `ProofOfWorkRule` only.
+pub struct BitcoinTimestampRule {
+    pub config: std::sync::Arc<ChainConfig>,
+}
+
+impl BitcoinTimestampRule {
+    /// rskj `Constants.DEFAULT_MAX_TIMESTAMPS_DIFF_IN_SECS`.
+    pub const DEFAULT_MAX_TIMESTAMPS_DIFF_IN_SECS: u64 = 5 * 60;
+    /// rskj `Constants.TESTNET_MAX_TIMESTAMPS_DIFF_IN_SECS`.
+    pub const TESTNET_MAX_TIMESTAMPS_DIFF_IN_SECS: u64 = 120 * 60;
+    /// rskj `Constants.TESTNET_CHAIN_ID`.
+    const TESTNET_CHAIN_ID: u8 = 31;
+
+    /// rskj `Constants.getMaxTimestampsDiffInSecs` for a block at `number`.
+    pub fn max_timestamps_diff(&self, number: u64) -> u64 {
+        if self.config.chain_id == Self::TESTNET_CHAIN_ID
+            && number >= self.config.activation_heights.hop400
+        {
+            Self::TESTNET_MAX_TIMESTAMPS_DIFF_IN_SECS
+        } else {
+            Self::DEFAULT_MAX_TIMESTAMPS_DIFF_IN_SECS
+        }
+    }
+}
+
+impl HeaderValidator for BitcoinTimestampRule {
+    fn validate(&self, header: &Header) -> Result<(), ValidationError> {
+        use bitcoin::block::Header as BtcHeader;
+        use bitcoin::consensus::Decodable;
+
+        if header.number < self.config.activation_heights.iris300 {
+            return Ok(());
+        }
+        let btc_header_bytes = header
+            .bitcoin_merged_mining_header
+            .as_ref()
+            .ok_or(ValidationError::BitcoinHeaderDecodeError)?;
+        let mut reader = &btc_header_bytes[..];
+        let btc_header: BtcHeader = Decodable::consensus_decode(&mut reader)
+            .map_err(|_| ValidationError::BitcoinHeaderDecodeError)?;
+
+        let btc = u64::from(btc_header.time);
+        let rsk = header.timestamp;
+        let max = self.max_timestamps_diff(header.number);
+        if rsk.abs_diff(btc) >= max {
+            return Err(ValidationError::BitcoinTimestampTooFar { rsk, btc, max });
+        }
+        Ok(())
+    }
+}
+
 impl HeaderValidator for MergedMiningRule {
     fn validate(&self, header: &Header) -> Result<(), ValidationError> {
         use bitcoin::consensus::Decodable;

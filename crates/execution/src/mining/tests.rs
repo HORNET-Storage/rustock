@@ -44,6 +44,7 @@ fn test_chain_config() -> Arc<ChainConfig> {
             papyrus200: u64::MAX,
             iris300: 0,
             fingerroot500: 0,
+            hop400: 0,
             // Active from genesis: this fixture mines blocks back to back,
             // so the ten-minute drop would only add noise.
             rskip97: Some(0),
@@ -573,6 +574,77 @@ fn transaction_ordering_is_stable_for_equal_prices() {
     assert_eq!(key(&first), key(&second));
 }
 
+/// rskj `MinerUtilsTest.filterTransactions_whenRskip252EnabledThenTxWithMoreGasPriceThanCapExcluded`:
+/// minimum 2, cap 200; one transaction at 199 stays, one at 201 goes.
+#[test]
+fn filter_transactions_when_rskip252_enabled_then_tx_with_more_gas_price_than_cap_excluded() {
+    let min = U256::from(2);
+    let under = pending_tx(Address::repeat_byte(0xA1), 0, 199, 1);
+    let over = pending_tx(Address::repeat_byte(0xB2), 0, 201, 2);
+    let ordered = super::template::order_by_price_sender_and_nonce_for_test(vec![under.clone(), over]);
+
+    let (kept, to_remove) = super::template::filter_candidates(ordered, min, true, |_| 0);
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0].tx.gas_price, under.tx.gas_price);
+    assert_eq!(to_remove, vec![B256::repeat_byte(2)], "the over-cap one is for the pool to drop");
+}
+
+/// rskj `MinerUtilsTest.filterTransactions_whenRskip252DisabledThenTxIncludedRegardlessGasPrice`:
+/// before RSKIP252 there is no cap, and a price a trillion over it is fine.
+#[test]
+fn filter_transactions_when_rskip252_disabled_then_tx_included_regardless_gas_price() {
+    let min = U256::from(2);
+    let under = pending_tx(Address::repeat_byte(0xA1), 0, 199, 1);
+    let over = pending_tx(Address::repeat_byte(0xB2), 0, 200 + 1_000_000_000_000, 2);
+    let ordered = super::template::order_by_price_sender_and_nonce_for_test(vec![under, over]);
+
+    let (kept, to_remove) = super::template::filter_candidates(ordered, min, false, |_| 0);
+    assert_eq!(kept.len(), 2);
+    assert!(to_remove.is_empty());
+}
+
+/// `TxGasPriceCap.isSurpassed` has no cap when the block's minimum is zero,
+/// as on regtest: 100 times nothing is nothing, and rskj short-circuits
+/// rather than reject everything priced above zero.
+#[test]
+fn filter_transactions_has_no_cap_when_the_minimum_is_zero() {
+    let ordered = vec![pending_tx(Address::repeat_byte(0xA1), 0, 1_000_000, 1)];
+    let (kept, _) = super::template::filter_candidates(ordered, U256::ZERO, true, |_| 0);
+    assert_eq!(kept.len(), 1);
+}
+
+/// rskj `MinerUtilsTest.invalidGasPriceTransactionTest`: a transaction under
+/// the block's minimum is not a candidate, and goes to `txsToRemove`.
+#[test]
+fn invalid_gas_price_transaction_test() {
+    let ordered = vec![pending_tx(Address::repeat_byte(0xA1), 0, 1, 1)];
+    let (kept, to_remove) = super::template::filter_candidates(ordered, U256::from(2), true, |_| 0);
+    assert!(kept.is_empty());
+    assert_eq!(to_remove, vec![B256::repeat_byte(1)]);
+}
+
+/// rskj `MinerUtils.filterTransactions`: a nonce gap blocks the sender's
+/// later transactions, a nonce below the expected one does not.
+#[test]
+fn filter_transactions_skips_a_sender_past_a_nonce_gap_but_not_past_a_mined_leftover() {
+    let a = Address::repeat_byte(0xA1);
+    let b = Address::repeat_byte(0xB2);
+    let ordered = super::template::order_by_price_sender_and_nonce_for_test(vec![
+        // `a` expects nonce 1: nonce 0 is a mined leftover, 1 and 2 are wanted.
+        pending_tx(a, 0, 100, 1),
+        pending_tx(a, 1, 100, 2),
+        pending_tx(a, 2, 100, 3),
+        // `b` expects nonce 0: 1 is a gap, and 2 is behind it.
+        pending_tx(b, 1, 100, 4),
+        pending_tx(b, 2, 100, 5),
+    ]);
+    let (kept, to_remove) =
+        super::template::filter_candidates(ordered, U256::ZERO, true, |s| u64::from(*s == a));
+    let nonces: Vec<u64> = kept.iter().map(|p| p.tx.nonce).collect();
+    assert_eq!(nonces, vec![1, 2]);
+    assert!(to_remove.is_empty(), "a nonce out of sequence stays in the pool");
+}
+
 fn pending_tx(sender: Address, nonce: u64, gas_price: u64, seed: u8) -> PendingTransaction {
     PendingTransaction {
         tx: rustock_core::Transaction {
@@ -640,23 +712,170 @@ fn a_solution_completes_a_block_and_is_imported() {
 /// Submitting the same solution twice is a race, not an error: two workers of
 /// the same pool can both report it. The second must say so rather than claim
 /// the work was never handed out.
+/// rskj `MinerServerTest.submitTwoBitcoinBlocksAtSameTimeWithoutRateLimit`:
+/// the same solution twice is `OK` both times, the second reporting the
+/// block as already there (`addNewMinedBlock` answers `EXIST`), not as an
+/// error about a parent the first submission moved.
 #[test]
-fn a_repeated_solution_reports_the_block_as_already_present() {
+fn submit_two_bitcoin_blocks_at_same_time_without_rate_limit() {
     let fx = fixture(20);
     let work = fx.server.get_work().unwrap();
     let raw = bitcoin::consensus::serialize(&solve(&work));
 
-    assert_eq!(
-        fx.server.submit_bitcoin_block(&raw).unwrap().block_imported_result,
-        ImportResult::ImportedBest
+    let first = fx.server.submit_bitcoin_block(&raw).unwrap();
+    assert_eq!(first.block_imported_result, ImportResult::ImportedBest);
+    let second = fx.server.submit_bitcoin_block(&raw).unwrap();
+    assert_eq!(second.block_imported_result, ImportResult::Exist);
+    assert_eq!(second.block_hash, first.block_hash);
+    assert_eq!(second.block_included_height, first.block_included_height);
+}
+
+// ── rskj SubmissionRateLimitHandlerTest ───────────────────────────────
+
+fn limiter_with_clock(window_ms: u64) -> (SubmissionRateLimiter, Arc<std::sync::atomic::AtomicU64>) {
+    let clock = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let c = clock.clone();
+    let limiter = SubmissionRateLimiter::with_clock(
+        window_ms,
+        Box::new(move || c.load(std::sync::atomic::Ordering::Relaxed)),
     );
-    // The head moved, so the work is now for a parent that is no longer the
-    // executed head -- which is exactly what a duplicate looks like from here.
-    let err = fx.server.submit_bitcoin_block(&raw).unwrap_err();
-    assert!(
-        matches!(err, SubmitError::ParentNoLongerHead { .. }),
-        "unexpected error: {err}"
-    );
+    (limiter, clock)
+}
+
+/// rskj `ofMiningConfig_WhenRateLimitIsZero_ThenHandlerShouldBeDisabled` and
+/// `..._WhenRateLimitIsNegative_...`: the window is unsigned here, so zero is
+/// the one disabling value.
+#[test]
+fn of_mining_config_when_rate_limit_is_zero_then_handler_should_be_disabled() {
+    assert!(!SubmissionRateLimiter::new(0).is_enabled());
+    assert!(!SubmissionRateLimiter::disabled().is_enabled());
+}
+
+/// rskj `ofMiningConfig_WhenRateLimitIsPositive_ThenHandlerShouldBeEnabled`.
+#[test]
+fn of_mining_config_when_rate_limit_is_positive_then_handler_should_be_enabled() {
+    assert!(SubmissionRateLimiter::new(1).is_enabled());
+}
+
+/// rskj `isSubmissionAllowed_WhenDisabled_ThenShouldReturnTrue`.
+#[test]
+fn is_submission_allowed_when_disabled_then_should_return_true() {
+    let (limiter, _) = limiter_with_clock(0);
+    assert!(limiter.is_submission_allowed());
+    limiter.on_submit();
+    assert!(limiter.is_submission_allowed());
+}
+
+/// rskj `isSubmissionAllowed_WhenEnabledAndLimitNotExceeded_ThenShouldReturnTrue`.
+#[test]
+fn is_submission_allowed_when_enabled_and_limit_not_exceeded_then_should_return_true() {
+    let (limiter, clock) = limiter_with_clock(1);
+    clock.store(1, std::sync::atomic::Ordering::Relaxed);
+    assert!(limiter.is_submission_allowed());
+    clock.store(2, std::sync::atomic::Ordering::Relaxed);
+    limiter.on_submit();
+    clock.store(3, std::sync::atomic::Ordering::Relaxed);
+    assert!(limiter.is_submission_allowed());
+}
+
+/// rskj `isSubmissionAllowed_WhenEnabledAndLimitExceeded_ThenShouldReturnFalse`.
+#[test]
+fn is_submission_allowed_when_enabled_and_limit_exceeded_then_should_return_false() {
+    let (limiter, clock) = limiter_with_clock(1);
+    clock.store(1, std::sync::atomic::Ordering::Relaxed);
+    assert!(limiter.is_submission_allowed());
+    clock.store(2, std::sync::atomic::Ordering::Relaxed);
+    limiter.on_submit();
+    assert!(!limiter.is_submission_allowed());
+}
+
+// ── rskj MinerServerTest: rebuild triggers and notify ─────────────────
+
+/// rskj `secondBuildBlockToMineTurnsNotifyFlagOff`: rebuilding on the same
+/// parent hands out the same work, no longer flagged for notification.
+#[test]
+fn second_build_block_to_mine_turns_notify_flag_off() {
+    let fx = fixture(20);
+    let work = fx.server.get_work().unwrap();
+    assert!(work.notify);
+    fx.server.build_work().unwrap();
+    let again = fx.server.get_work().unwrap();
+    assert_eq!(again.block_hash_for_merged_mining, work.block_hash_for_merged_mining);
+    assert!(!again.notify);
+}
+
+/// rskj `rebuildsOnlyOnceArrivingFeesAreMaterialAgainstTheCandidate`: a
+/// candidate paying 1000 and a fraction of 0.1; arrivals of 40 each
+/// trigger a rebuild on the third, and the accumulator starts over.
+#[test]
+fn rebuilds_only_once_arriving_fees_are_material_against_the_candidate() {
+    let policy = RebuildPolicy::new(0.1);
+    let candidate = Some(U256::from(1_000));
+    let paying_40 = [pending_tx(Address::repeat_byte(0xA1), 0, 40, 1).tx];
+    // `pending_tx` declares 21,000 gas; rskj's `txPaying` is price times
+    // limit, so make the limit one.
+    let mut tx = paying_40[0].clone();
+    tx.gas_limit = U256::from(1);
+    let paying_40 = [tx];
+
+    assert!(!policy.worth_rebuilding(candidate, &paying_40), "40 of the 100 needed");
+    assert!(!policy.worth_rebuilding(candidate, &paying_40), "80 is still below");
+    assert!(policy.worth_rebuilding(candidate, &paying_40), "crossing 100 triggers");
+    assert!(!policy.worth_rebuilding(candidate, &paying_40), "and resets the accumulator");
+}
+
+/// rskj `rebuildsOnEveryBatchWhenThereIsNoCandidateToCompareAgainst`.
+#[test]
+fn rebuilds_on_every_batch_when_there_is_no_candidate_to_compare_against() {
+    let policy = RebuildPolicy::new(0.1);
+    let any = [pending_tx(Address::repeat_byte(0xA1), 0, 1, 1).tx];
+    assert!(policy.worth_rebuilding(None, &any));
+    assert!(policy.worth_rebuilding(Some(U256::ZERO), &any), "a candidate paying nothing counts as none");
+}
+
+// ── rskj MinimumGasPriceCalculatorTest ────────────────────────────────
+
+/// rskj `increaseMgp`: 1000 toward 2000 steps to 1010.
+#[test]
+fn increase_mgp() {
+    assert_eq!(next_minimum_gas_price(U256::from(1000), Some(U256::from(2000))), U256::from(1010));
+}
+
+/// rskj `decreaseMGP`: 1000 toward 900 steps to 990.
+#[test]
+fn decrease_mgp() {
+    assert_eq!(next_minimum_gas_price(U256::from(1000), Some(U256::from(900))), U256::from(990));
+}
+
+/// rskj `mgpOnRage`: a target inside the 1% band is reached at once.
+#[test]
+fn mgp_on_range() {
+    assert_eq!(next_minimum_gas_price(U256::from(1000), Some(U256::from(995))), U256::from(995));
+}
+
+/// rskj `previousMgpEqualsTarget`.
+#[test]
+fn previous_mgp_equals_target() {
+    assert_eq!(next_minimum_gas_price(U256::from(1000), Some(U256::from(1000))), U256::from(1000));
+}
+
+/// rskj `previousValueIsZero`: 1% of nothing is one wei.
+#[test]
+fn previous_value_is_zero() {
+    assert_eq!(next_minimum_gas_price(U256::ZERO, Some(U256::from(1000))), U256::from(1));
+}
+
+/// rskj `previousValueIsSmallTargetIsZero`: one wei can step down to zero.
+#[test]
+fn previous_value_is_small_target_is_zero() {
+    assert_eq!(next_minimum_gas_price(U256::from(1), Some(U256::ZERO)), U256::ZERO);
+}
+
+/// rskj `cantGetMGPtoBeNegative`: a negative target has no counterpart in
+/// an unsigned type; what is checked is that nothing steps below zero.
+#[test]
+fn cant_get_mgp_to_be_negative() {
+    assert_eq!(next_minimum_gas_price(U256::ZERO, Some(U256::ZERO)), U256::ZERO);
 }
 
 /// A coinbase tagged with a hash this node never handed out cannot be matched
@@ -1219,17 +1438,36 @@ mod uncle_tests {
 
 mod partitioned_templates {
     use super::*;
-    use crate::mining::template::{PendingTransaction, PendingTransactionSource};
+    use crate::mining::template::{PendingTransaction, PendingTransactionSource, is_remasc};
     use k256::ecdsa::SigningKey;
     use rustock_core::Transaction;
     use sha3::Digest;
 
-    /// A pool that hands out exactly what it was given.
-    struct Pool(Vec<PendingTransaction>);
+    /// A pool that hands out exactly what it was given, minus what the
+    /// builder told it to evict, and remembers every eviction call.
+    struct RecordingPool {
+        txs: std::sync::Mutex<Vec<PendingTransaction>>,
+        evictions: std::sync::Mutex<Vec<Vec<B256>>>,
+    }
 
-    impl PendingTransactionSource for Pool {
+    #[allow(non_snake_case)]
+    fn Pool(txs: Vec<PendingTransaction>) -> RecordingPool {
+        RecordingPool { txs: std::sync::Mutex::new(txs), evictions: std::sync::Mutex::new(Vec::new()) }
+    }
+
+    impl RecordingPool {
+        fn evictions(&self) -> Vec<Vec<B256>> {
+            self.evictions.lock().unwrap().clone()
+        }
+    }
+
+    impl PendingTransactionSource for RecordingPool {
         fn pending(&self) -> Vec<PendingTransaction> {
-            self.0.clone()
+            self.txs.lock().unwrap().clone()
+        }
+        fn remove_transactions(&self, hashes: &[B256]) {
+            self.evictions.lock().unwrap().push(hashes.to_vec());
+            self.txs.lock().unwrap().retain(|p| !hashes.contains(&p.hash));
         }
     }
 
@@ -1245,10 +1483,24 @@ mod partitioned_templates {
 
     /// A plain transfer from `from` to `to`, signed.
     fn transfer(from: &SigningKey, to: Address, nonce: u64, chain_id: u64) -> PendingTransaction {
+        transfer_with(from, to, nonce, chain_id, 1, 21_000)
+    }
+
+    /// A plain transfer at a given gas price and declared gas limit. The
+    /// limit is what the sender *declares*; a transfer uses 21,000 whatever
+    /// it declares, which is what the packing tests turn on.
+    fn transfer_with(
+        from: &SigningKey,
+        to: Address,
+        nonce: u64,
+        chain_id: u64,
+        gas_price: u64,
+        gas_limit: u64,
+    ) -> PendingTransaction {
         let mut tx = Transaction {
             nonce,
-            gas_price: U256::from(1),
-            gas_limit: U256::from(21_000),
+            gas_price: U256::from(gas_price),
+            gas_limit: U256::from(gas_limit),
             to: Bytes::copy_from_slice(to.as_slice()),
             value: U256::from(1_000),
             input: Bytes::new(),
@@ -1303,6 +1555,18 @@ mod partitioned_templates {
         senders: u8,
         hardfork_cfg: RskHardforkConfig,
     ) -> (BlockTemplateBuilder, Header, Vec<SigningKey>, Arc<dyn TrieStore>, Arc<BlockStore>) {
+        fixture_with_forks_priced(senders, hardfork_cfg, 0)
+    }
+
+    /// `fixture_with_forks` on a chain whose blocks carry `minimum_gas_price`,
+    /// which the template inherits -- the RSKIP252 cap is 100 times it, and
+    /// there is no cap at zero.
+    #[allow(clippy::type_complexity)]
+    fn fixture_with_forks_priced(
+        senders: u8,
+        hardfork_cfg: RskHardforkConfig,
+        minimum_gas_price: u64,
+    ) -> (BlockTemplateBuilder, Header, Vec<SigningKey>, Arc<dyn TrieStore>, Arc<BlockStore>) {
         let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
         let store = Arc::new(BlockStore::open(dir.path()).unwrap());
         let trie_store: Arc<dyn TrieStore> = Arc::new(MemoryTrieStore::new());
@@ -1335,6 +1599,7 @@ mod partitioned_templates {
             let mut header = header_at(number, parent_hash, state_root);
             header.difficulty = U256::from(2);
             header.gas_limit = U256::from(10_000_000u64);
+            header.minimum_gas_price = U256::from(minimum_gas_price);
             let hash = header.hash();
             store.put_header_with_hash(hash, &header).unwrap();
             store.put_canonical_hash(number, hash).unwrap();
@@ -1501,6 +1766,227 @@ mod partitioned_templates {
             .process_block(&template.block, &parent_state, trie_store)
             .expect("the block validates");
     }
+
+    // ── packing by gas used, and the RSKIP252 cap ─────────────────────
+
+    /// Ten transfers, each declaring 3 M gas and using 21,000, on a 10 M
+    /// block. By declared limits three fit; by gas used, which is rskj's
+    /// rule (`TransactionExecutor.gasIsValid` against the gas used so far),
+    /// all ten do. Checked on a chain without RSKIP-144 and on one with it,
+    /// where the probe also feeds the partitioner and a dropped index
+    /// would misalign the footprints.
+    #[test]
+    fn a_block_is_filled_by_gas_used_not_by_declared_limits() {
+        for forks in [RskHardforkConfig::all_active(33), RskHardforkConfig::all_active_parallel(33)] {
+            let (builder, parent, keys, trie_store, store) = fixture_with_forks(10, forks.clone());
+            let chain_id = 33;
+            let pool = Pool(
+                keys.iter()
+                    .enumerate()
+                    .map(|(i, k)| {
+                        transfer_with(k, Address::repeat_byte(0xD0 + i as u8), 0, chain_id, 1, 3_000_000)
+                    })
+                    .collect(),
+            );
+
+            let template = builder
+                .build(std::slice::from_ref(&parent), Vec::new(), &pool)
+                .expect("the template builds");
+            assert_eq!(
+                template.block.transactions.len(),
+                11,
+                "ten transfers and REMASC: declared limits sum to 30 M, gas used to 210,000"
+            );
+            assert_eq!(template.block.header.gas_used, 10 * 21_000);
+
+            let processor = BlockProcessor::new(forks, store);
+            let parent_state = builder.load_state_root(parent.state_root).unwrap();
+            processor
+                .process_block(&template.block, &parent_state, trie_store)
+                .expect("a block this miner built must be one this node would accept");
+        }
+    }
+
+    /// The rule is a limit on the declared gas against what is left, not on
+    /// the sum of what is used: a transaction declaring more than the block
+    /// has left is dropped however little it would use, and so are the same
+    /// sender's later ones, whose nonce can no longer follow.
+    #[test]
+    fn a_transaction_that_does_not_fit_is_dropped_with_its_senders_successors() {
+        let (builder, parent, keys, trie_store, store) =
+            fixture_with_forks(2, RskHardforkConfig::all_active(33));
+        let chain_id = 33;
+        let (first, second) = (&keys[0], &keys[1]);
+        let pool = Pool(vec![
+            // Best price, goes first, leaves 10 M - 21,000 of room.
+            transfer_with(first, Address::repeat_byte(0xE1), 0, chain_id, 10, 9_990_000),
+            // Declares more than that: dropped without running.
+            transfer_with(second, Address::repeat_byte(0xE2), 0, chain_id, 5, 9_990_000),
+            // Would fit on its own, but its nonce follows a dropped one.
+            transfer_with(second, Address::repeat_byte(0xE3), 1, chain_id, 5, 21_000),
+        ]);
+
+        let template = builder
+            .build(std::slice::from_ref(&parent), Vec::new(), &pool)
+            .expect("the template builds");
+        let senders: Vec<Address> = template
+            .block
+            .transactions
+            .iter()
+            .filter(|tx| !is_remasc(tx))
+            .map(|tx| tx.recover_sender(chain_id).unwrap())
+            .collect();
+        assert_eq!(senders, vec![address_of(first)], "only the first sender's transfer is in");
+
+        let processor = BlockProcessor::new(RskHardforkConfig::all_active(33), store);
+        let parent_state = builder.load_state_root(parent.state_root).unwrap();
+        processor
+            .process_block(&template.block, &parent_state, trie_store)
+            .expect("the block validates");
+    }
+
+    /// rskj `MinerUtilsTest.filterTransactions_whenRskip252EnabledThenTxWithMoreGasPriceThanCapExcluded`,
+    /// through the whole template: on a chain whose minimum is 100, a
+    /// transfer paying 10,000 (the cap) is mined and one paying 10,001 is
+    /// not -- and the block passes the rule an rskj peer applies on import.
+    #[test]
+    fn a_transaction_over_the_rskip252_cap_is_left_out_of_the_template() {
+        let (builder, parent, keys, trie_store, store) =
+            fixture_with_forks_priced(2, RskHardforkConfig::all_active(33), 100);
+        let chain_id = 33;
+        let pool = Pool(vec![
+            transfer_with(&keys[0], Address::repeat_byte(0xF1), 0, chain_id, 10_001, 21_000),
+            transfer_with(&keys[1], Address::repeat_byte(0xF2), 0, chain_id, 10_000, 21_000),
+        ]);
+
+        let template = builder
+            .build(std::slice::from_ref(&parent), Vec::new(), &pool)
+            .expect("the template builds");
+        assert_eq!(template.block.header.minimum_gas_price, U256::from(100));
+        let prices: Vec<U256> = template
+            .block
+            .transactions
+            .iter()
+            .filter(|tx| !is_remasc(tx))
+            .map(|tx| tx.gas_price)
+            .collect();
+        assert_eq!(prices, vec![U256::from(10_000)], "at the cap is in, over it is out");
+
+        let processor = BlockProcessor::new(RskHardforkConfig::all_active(33), store);
+        processor
+            .validate_block_rules(&template.block, Some(&parent))
+            .expect("the block passes BlockTxsMaxGasPriceRule");
+        let parent_state = builder.load_state_root(parent.state_root).unwrap();
+        processor
+            .process_block(&template.block, &parent_state, trie_store)
+            .expect("and executes");
+    }
+
+
+    // ── invalid pending transactions: dropped and evicted ────────────
+
+    /// A transfer the EVM refuses before running it: the value is more than
+    /// the sender holds (the fixture funds 1 RBTC).
+    fn unaffordable_transfer(from: &SigningKey, nonce: u64, chain_id: u64) -> PendingTransaction {
+        let mut ptx = transfer(from, Address::repeat_byte(0xEE), nonce, chain_id);
+        ptx.tx.value = U256::from(10u64).pow(U256::from(18)) * U256::from(2);
+        sign(&mut ptx.tx, from, chain_id);
+        ptx.hash = B256::from_slice(&sha3::Keccak256::digest(ptx.tx.rlp_for_trie()));
+        ptx
+    }
+
+    /// rskj `BlockToMineBuilderEvictionEndToEndTest.build_whenTxExecutionThrowsError_doesNotPropagateAndEvictsTxFromPool`
+    /// and `BlockToMineBuilderInvalidTxEvictionTest.build_whenBlockResultHasInvalidTxs_shouldEvictThemFromPool`:
+    /// the template builds without the refused transaction, the other
+    /// sender's transfer is mined, and the pool is told to remove it.
+    #[test]
+    fn build_when_tx_execution_throws_error_does_not_propagate_and_evicts_tx_from_pool() {
+        let (builder, parent, keys, trie_store, store) =
+            fixture_with_forks(2, RskHardforkConfig::all_active(33));
+        let chain_id = 33;
+        let bad = unaffordable_transfer(&keys[0], 0, chain_id);
+        let good = transfer(&keys[1], Address::repeat_byte(0xE9), 0, chain_id);
+        let pool = Pool(vec![bad.clone(), good.clone()]);
+
+        let template = builder
+            .build(std::slice::from_ref(&parent), Vec::new(), &pool)
+            .expect("the template builds although one candidate is invalid");
+        let mined: Vec<Address> = template
+            .block
+            .transactions
+            .iter()
+            .filter(|tx| !is_remasc(tx))
+            .map(|tx| tx.recover_sender(chain_id).unwrap())
+            .collect();
+        assert_eq!(mined, vec![good.sender], "the good transfer is in, the refused one is not");
+        assert_eq!(pool.evictions(), vec![vec![bad.hash]], "the pool is told exactly which one");
+
+        let processor = BlockProcessor::new(RskHardforkConfig::all_active(33), store);
+        let parent_state = builder.load_state_root(parent.state_root).unwrap();
+        processor
+            .process_block(&template.block, &parent_state, trie_store)
+            .expect("the block validates");
+    }
+
+    /// rskj `BlockToMineBuilderInvalidTxEvictionTest.build_whenBlockResultHasNoInvalidTxs_shouldNotEvictFromPool`.
+    #[test]
+    fn build_when_block_result_has_no_invalid_txs_should_not_evict_from_pool() {
+        let (builder, parent, keys, _, _) = fixture_with_forks(1, RskHardforkConfig::all_active(33));
+        let pool = Pool(vec![transfer(&keys[0], Address::repeat_byte(0xE8), 0, 33)]);
+        builder.build(std::slice::from_ref(&parent), Vec::new(), &pool).expect("builds");
+        assert!(pool.evictions().is_empty(), "nothing to evict, nothing said");
+    }
+
+    /// rskj `BlockToMineBuilderEvictionEndToEndTest.build_afterErrorTxEvicted_subsequentBuildProducesBlockAndIsNotRePoisoned`:
+    /// once evicted the transaction is gone, and the next build sees a clean
+    /// pool.
+    #[test]
+    fn build_after_error_tx_evicted_subsequent_build_produces_block_and_is_not_re_poisoned() {
+        let (builder, parent, keys, _, _) = fixture_with_forks(1, RskHardforkConfig::all_active(33));
+        let bad = unaffordable_transfer(&keys[0], 0, 33);
+        let pool = Pool(vec![bad.clone()]);
+
+        let first = builder.build(std::slice::from_ref(&parent), Vec::new(), &pool).expect("first");
+        assert_eq!(first.block.transactions.len(), 1, "REMASC only");
+        assert_eq!(pool.evictions(), vec![vec![bad.hash]]);
+
+        let second = builder.build(std::slice::from_ref(&parent), Vec::new(), &pool).expect("second");
+        assert_eq!(second.block.transactions.len(), 1);
+        assert_eq!(pool.evictions().len(), 1, "the pool no longer serves it, so nothing more to evict");
+        assert!(pool.pending().is_empty());
+    }
+
+    /// A transaction dropped for not fitting is not invalid: the pool keeps
+    /// it for a later block, and the builder says nothing to the pool.
+    #[test]
+    fn an_unfitting_transaction_is_not_evicted() {
+        let (builder, parent, keys, _, _) = fixture_with_forks(2, RskHardforkConfig::all_active(33));
+        let pool = Pool(vec![
+            transfer_with(&keys[0], Address::repeat_byte(0xE1), 0, 33, 10, 9_990_000),
+            transfer_with(&keys[1], Address::repeat_byte(0xE2), 0, 33, 5, 9_990_000),
+        ]);
+        let template = builder.build(std::slice::from_ref(&parent), Vec::new(), &pool).expect("builds");
+        assert_eq!(template.block.transactions.len(), 2, "one transfer and REMASC");
+        assert!(pool.evictions().is_empty());
+        assert_eq!(pool.pending().len(), 2);
+    }
+
+    /// rskj `MinerUtilsTest.invalidGasPriceTransactionTest`, through the
+    /// template: a pending transaction under the block's minimum is left out
+    /// and the pool is told to drop it, as `txsToRemove` has it.
+    #[test]
+    fn an_underpriced_pending_transaction_is_evicted() {
+        let (builder, parent, keys, _, _) =
+            fixture_with_forks_priced(2, RskHardforkConfig::all_active(33), 100);
+        let cheap = transfer_with(&keys[0], Address::repeat_byte(0xE5), 0, 33, 99, 21_000);
+        let fair = transfer_with(&keys[1], Address::repeat_byte(0xE6), 0, 33, 100, 21_000);
+        let pool = Pool(vec![cheap.clone(), fair.clone()]);
+        let template = builder.build(std::slice::from_ref(&parent), Vec::new(), &pool).expect("builds");
+        assert_eq!(template.block.transactions.len(), 2, "the fair one and REMASC");
+        assert_eq!(pool.evictions(), vec![vec![cheap.hash]]);
+        assert_eq!(pool.pending().len(), 1);
+    }
+
 }
 
 // ── RSKIP-252: the miner's own price ceiling ──────────────────────────

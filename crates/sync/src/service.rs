@@ -22,6 +22,32 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
+
+/// Who to tell when a block becomes the executed best block: rskj's
+/// `EthereumListener.onBestBlock`, which the miner uses to rebuild its
+/// candidate. Registered after the service starts, which is why it is a
+/// shared slot and not a builder argument: the miner is built later.
+#[derive(Default)]
+pub struct BestBlockListeners {
+    listeners: std::sync::RwLock<Vec<Arc<dyn Fn(&Header) + Send + Sync>>>,
+}
+
+impl BestBlockListeners {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    pub fn add(&self, listener: Arc<dyn Fn(&Header) + Send + Sync>) {
+        self.listeners.write().unwrap_or_else(|e| e.into_inner()).push(listener);
+    }
+
+    pub fn notify(&self, header: &Header) {
+        let listeners = self.listeners.read().unwrap_or_else(|e| e.into_inner()).clone();
+        for listener in listeners {
+            listener(header);
+        }
+    }
+}
 use tokio::task::JoinHandle;
 use tracing::{info, debug, trace, warn, error};
 
@@ -556,6 +582,8 @@ pub struct SyncService {
     /// only consecutive, parent-linked blocks from the executed head.
     pub(crate) follow_buffer: BTreeMap<u64, (B256, Header, Vec<Transaction>, Vec<Header>)>,
     tx_pool: Option<Arc<crate::TransactionPool>>,
+    /// Told of every block this service executes as best.
+    best_block_listeners: Arc<BestBlockListeners>,
     blocks_since_flush: u64,
     /// Blocks executed per durability point while catching up. See
     /// `execution_commit`.
@@ -680,6 +708,7 @@ impl SyncService {
             underivable: std::collections::HashSet::new(),
             follow_buffer: BTreeMap::new(),
             tx_pool: None,
+            best_block_listeners: BestBlockListeners::new(),
             blocks_since_flush: 0,
             trie_flush_every: crate::execution_commit::DEFAULT_FLUSH_EVERY,
             sidelined: HashMap::new(),
@@ -733,6 +762,13 @@ impl SyncService {
     }
 
     /// Attach a transaction pool for removing mined txs during block processing.
+    /// Share the best-block listeners, so a component built after the
+    /// service starts (the miner) can still register.
+    pub fn with_best_block_listeners(mut self, listeners: Arc<BestBlockListeners>) -> Self {
+        self.best_block_listeners = listeners;
+        self
+    }
+
     pub fn with_tx_pool(mut self, pool: Arc<crate::TransactionPool>) -> Self {
         self.tx_pool = Some(pool);
         self
@@ -5146,6 +5182,7 @@ impl SyncService {
                 self.credit_executed_bodies(header.number);
                 self.gas_price.on_block(header, &block.transactions);
                 self.gas_price.on_best_block(header);
+                self.best_block_listeners.notify(header);
                 self.publish_block(hash, header, &block.transactions, false);
                 self.current_state_root = Some(result.new_state_root);
                 true

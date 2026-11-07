@@ -40,6 +40,9 @@ pub enum ValidationError {
     #[error("Failed to decode Bitcoin block header")]
     BitcoinHeaderDecodeError,
 
+    #[error("RSKIP179: RSK timestamp {rsk} and Bitcoin block time {btc} differ by {max} s or more")]
+    BitcoinTimestampTooFar { rsk: u64, btc: u64, max: u64 },
+
     #[error("Failed to decode Bitcoin coinbase transaction")]
     BitcoinCoinbaseDecodeError,
 
@@ -197,9 +200,11 @@ impl HeaderVerifier {
                 max_gas_limit: config.max_gas_limit 
             })
             .with_static_rule(MergedMiningRule { config: config.clone() })
+            .with_static_rule(BitcoinTimestampRule { config: config.clone() })
             .with_static_rule(block_rules::ExtraDataRule::default())
             .with_parent_rule(BlockNumberRule)
-            .with_parent_rule(TimestampRule::new(15)) // 15s drift
+            // rskj `newBlockMaxSecondsInTheFuture`; zero turns the rule off.
+            .with_parent_rule(TimestampRule::new(config.max_future_block_time))
             .with_parent_rule(BlockParentGasLimitRule { config: config.clone() })
             .with_parent_rule(block_rules::PrevMinGasPriceRule)
             .with_parent_rule(DifficultyRule { config })
@@ -270,7 +275,7 @@ pub mod merged_mining;
 
 pub use header_rules::{BlockNumberRule, ParentHashRule, TimestampRule, GasUsedRule, GasLimitBoundsRule, BlockParentGasLimitRule};
 pub use difficulty::DifficultyRule;
-pub use merged_mining::MergedMiningRule;
+pub use merged_mining::{BitcoinTimestampRule, MergedMiningRule};
 pub use block_rules::{
     BlockTxsMaxGasPriceRule, ExtraDataRule, PrevMinGasPriceRule, RemascValidationRule,
     TxsMinGasPriceRule,

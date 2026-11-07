@@ -288,8 +288,11 @@
 [mining]
 # enabled = false                   # default — serve the mnr_* namespace
 # coinbase = "0x…"                  # default: unset — REQUIRED when enabled
-# extra_data = ""                   # default — at most 32 bytes
+# extra_data = ""                   # default — client string, cut to fit rskj's 32-byte [1, "<version>-<commit>", extra] field
 # refresh_secs = 60                 # default
+# min_gas_price = 0                 # default: unset — wei to steer the block minimum toward, 1% per block (rskj miner.minGasPrice)
+# submission_rate_limit_ms = 0      # default — refuse a second submission inside this window (rskj workSubmissionRateLimitInMills)
+# update_work_on_new_transaction = false  # default — rebuild when arrivals pay a tenth of the candidate's fees (rskj updateWorkOnNewTransaction)
 
 # Per-account virtual gas quota (rskj TxQuotaChecker). An account accumulates
 # quota while idle and spends it when broadcasting, so one that floods the

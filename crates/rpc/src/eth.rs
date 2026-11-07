@@ -135,6 +135,16 @@ fn head_minimum_times_multiplier(minimum: &alloy_primitives::U256) -> alloy_prim
 /// deliberately: `rpc` does not depend on `sync` -- that is what
 /// `GasPriceSource` exists to avoid -- so sharing them would mean adding the
 /// dependency this trait was written to prevent.
+///
+/// **rskj does this in floating point** -- `BigDecimal.valueOf(minimum
+/// .doubleValue() * minGasPriceMultiplier).toBigInteger()` -- and an exact
+/// ratio is not the same function. Checked rather than assumed: the two
+/// agree on every minimum below 2^53, including all 2,061,855 values under
+/// 2e8 that were compared one by one, and part company only above it, where
+/// the double runs out of mantissa. A minimum gas price up there is 1 RBTC
+/// per gas, so the divergence is unreachable; the integer form is kept for
+/// being exact and float-free, and the boundary is written down so the next
+/// reader does not have to rediscover where it lies.
 const GAS_PRICE_MULTIPLIER_NUM: u64 = 11;
 const GAS_PRICE_MULTIPLIER_DEN: u64 = 10;
 

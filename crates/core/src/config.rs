@@ -33,6 +33,10 @@ pub struct ActivationHeights {
     pub iris300: u64,
     /// Fingerroot500 hardfork – enables RSKIP252 (transaction gas price cap).
     pub fingerroot500: u64,
+    /// Hop400 hardfork – enables RSKIP297, which widens the RSKIP179
+    /// Bitcoin-to-RSK timestamp window on testnet (5 minutes to 2 hours).
+    /// Read only on testnet; mainnet keeps 5 minutes at every height.
+    pub hop400: u64,
     /// Height at which RSKIP97 -- "no 10-minute difficulty drop" -- activates,
     /// or `None` where it never does.
     ///
@@ -72,6 +76,7 @@ impl ActivationHeights {
             papyrus200: 2_392_700,
             iris300: 3_614_800,
             fingerroot500: 5_468_000,
+            hop400: 4_598_500,
             // reference.conf: `rskip97 = orchid`, not overridden by main.conf.
             rskip97: Some(729_000),
         }
@@ -86,6 +91,7 @@ impl ActivationHeights {
             papyrus200: 863_000,
             iris300: 2_060_500,
             fingerroot500: 4_015_800,
+            hop400: 3_103_000,
             // testnet.conf: `rskip97 = -1  # disable orchid difficulty drop`.
             rskip97: None,
         }
@@ -98,6 +104,7 @@ impl ActivationHeights {
             papyrus200: u64::MAX,
             iris300: 0,
             fingerroot500: 0,
+            hop400: 0,
             // regtest.conf: `rskip97 = -1`, same as testnet.
             rskip97: None,
         }
@@ -111,8 +118,14 @@ pub struct ChainConfig {
     pub duration_limit: u64,
     pub difficulty_divisor: U256,
     pub min_difficulty: U256,
+    /// rskj `Constants.newBlockMaxSecondsInTheFuture`: how far past the
+    /// node's clock a header may be timestamped. 60 on mainnet, 540 on
+    /// testnet, 0 on regtest, where zero turns the timestamp rule off
+    /// altogether (parent comparison included), as it does in rskj.
     pub max_future_block_time: u64,
     pub gas_limit_bound_divisor: u64,
+    /// rskj `Constants.getMinGasLimit()`: 3,000,000 on every network
+    /// (`GasLimitRule`). Every rskj genesis declares more.
     pub min_gas_limit: u64,
     pub max_gas_limit: u64,
     /// The gas the sequential sublist is guaranteed under RSKIP-144
@@ -132,9 +145,9 @@ impl ChainConfig {
             duration_limit: 14,
             difficulty_divisor: U256::from(50),
             min_difficulty: U256::from(7_000_000_000_000_000u64), // 7e15, FALLBACK_MINING_DIFFICULTY / 2
-            max_future_block_time: 540,
+            max_future_block_time: 60,
             gas_limit_bound_divisor: 1024,
-            min_gas_limit: 5000,
+            min_gas_limit: 3_000_000,
             max_gas_limit: 1_000_000_000,
             min_sequential_set_gas_limit: 10_000_000,
             activation_heights: ActivationHeights::mainnet(),
@@ -150,7 +163,7 @@ impl ChainConfig {
             min_difficulty: U256::from(131072),
             max_future_block_time: 540,
             gas_limit_bound_divisor: 1024,
-            min_gas_limit: 5000,
+            min_gas_limit: 3_000_000,
             max_gas_limit: 1_000_000_000,
             min_sequential_set_gas_limit: 10_000_000,
             activation_heights: ActivationHeights::testnet(),
@@ -166,7 +179,7 @@ impl ChainConfig {
             min_difficulty: U256::from(1),
             max_future_block_time: 0,
             gas_limit_bound_divisor: 1024,
-            min_gas_limit: 1,
+            min_gas_limit: 3_000_000,
             max_gas_limit: 10_000_000,
             min_sequential_set_gas_limit: 6_800_000,
             activation_heights: ActivationHeights::regtest(),

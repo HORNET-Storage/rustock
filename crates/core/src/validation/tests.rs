@@ -395,3 +395,200 @@ fn test_merged_mining_required_after_orchid() {
     let res = rule.validate(&header);
     assert!(res.is_err());
 }
+
+// ── RSKIP179: the Bitcoin-to-RSK timestamp link ───────────────────────
+
+/// A serialized Bitcoin header whose only field of interest is `time`.
+fn btc_header_at(time: u32) -> Bytes {
+    use bitcoin::hashes::Hash;
+    let h = BtcHeader {
+        version: bitcoin::block::Version::from_consensus(0x2000_0000),
+        prev_blockhash: bitcoin::BlockHash::all_zeros(),
+        merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+        time,
+        bits: bitcoin::CompactTarget::from_consensus(0x207f_ffff),
+        nonce: 0,
+    };
+    Bytes::from(bitcoin::consensus::encode::serialize(&h))
+}
+
+fn rskip179_rule(config: crate::config::ChainConfig) -> BitcoinTimestampRule {
+    BitcoinTimestampRule { config: Arc::new(config) }
+}
+
+/// rskj `BlockTimeStampValidationRuleTest.timestampsAreCloseEnough`: equal
+/// times pass; exactly five minutes apart fails (strict); one second inside
+/// the window passes, in either direction.
+#[test]
+fn timestamps_are_close_enough() {
+    let max = BitcoinTimestampRule::DEFAULT_MAX_TIMESTAMPS_DIFF_IN_SECS;
+    // regtest activates iris300 at genesis.
+    let rule = rskip179_rule(crate::config::ChainConfig::regtest());
+    let check = |rsk: u64, btc: u64| {
+        let mut header = create_dummy_header(10, rsk, B256::ZERO);
+        header.bitcoin_merged_mining_header = Some(btc_header_at(btc as u32));
+        rule.validate(&header)
+    };
+
+    assert!(check(1_000, 1_000).is_ok());
+    assert!(matches!(
+        check(1_000, 1_000 + max),
+        Err(ValidationError::BitcoinTimestampTooFar { rsk: 1_000, btc, max: m }) if btc == 1_000 + max && m == max
+    ));
+    assert!(check(1_001, 1_000 + max).is_ok());
+    assert!(check(1_000 + max, 1_001).is_ok());
+}
+
+/// Before RSKIP179 the rule is off: no header, any distance.
+#[test]
+fn bitcoin_timestamp_is_not_checked_before_rskip179() {
+    let mut config = crate::config::ChainConfig::regtest();
+    config.activation_heights.iris300 = 100;
+    let rule = rskip179_rule(config);
+
+    let mut header = create_dummy_header(99, 1_000, B256::ZERO);
+    assert!(rule.validate(&header).is_ok(), "no merged-mining header, and no rule yet");
+    header.bitcoin_merged_mining_header = Some(btc_header_at(1_000_000));
+    assert!(rule.validate(&header).is_ok());
+
+    header.number = 100;
+    assert!(rule.validate(&header).is_err(), "from the activation on, a million seconds is too far");
+}
+
+/// rskj: from RSKIP179 on, a missing or undecodable merged-mining header
+/// fails the rule by itself.
+#[test]
+fn a_header_without_a_decodable_bitcoin_header_fails_rskip179() {
+    let rule = rskip179_rule(crate::config::ChainConfig::regtest());
+    let mut header = create_dummy_header(10, 1_000, B256::ZERO);
+    assert!(matches!(rule.validate(&header), Err(ValidationError::BitcoinHeaderDecodeError)));
+    header.bitcoin_merged_mining_header = Some(Bytes::from_static(&[0x00]));
+    assert!(matches!(rule.validate(&header), Err(ValidationError::BitcoinHeaderDecodeError)));
+}
+
+/// rskj `Constants.getMaxTimestampsDiffInSecs`: testnet widens the window to
+/// two hours from RSKIP297 (hop400); mainnet keeps five minutes.
+#[test]
+fn testnet_widens_the_window_from_rskip297() {
+    let testnet = rskip179_rule(crate::config::ChainConfig::testnet());
+    let hop400 = testnet.config.activation_heights.hop400;
+    assert_eq!(testnet.max_timestamps_diff(hop400 - 1), 5 * 60);
+    assert_eq!(testnet.max_timestamps_diff(hop400), 120 * 60);
+
+    let mainnet = rskip179_rule(crate::config::ChainConfig::mainnet());
+    let hop400 = mainnet.config.activation_heights.hop400;
+    assert_eq!(mainnet.max_timestamps_diff(hop400), 5 * 60);
+
+    // An hour apart on testnet after hop400 passes; on mainnet it does not.
+    let mut header = create_dummy_header(testnet.config.activation_heights.hop400, 10_000, B256::ZERO);
+    header.bitcoin_merged_mining_header = Some(btc_header_at(10_000 + 3_600));
+    assert!(testnet.validate(&header).is_ok());
+    header.number = mainnet.config.activation_heights.hop400;
+    assert!(mainnet.validate(&header).is_err());
+}
+
+// ── rskj BlockTimeStampValidationRuleTest, the clock and the parent ───
+
+/// The rskj fixture: `validPeriod` 540, the clock at 10,000 s.
+const VALID_PERIOD: u64 = 540;
+const NOW: u64 = 10_000;
+
+fn at(timestamp: u64) -> Header {
+    create_dummy_header(10, timestamp, B256::ZERO)
+}
+
+/// rskj `blockInThePast`.
+#[test]
+fn block_in_the_past() {
+    let rule = TimestampRule::new(VALID_PERIOD);
+    assert!(rule.validate_at(NOW, &at(NOW - 1_000)).is_ok());
+}
+
+/// rskj `blockInTheFutureLimit`: exactly the period ahead is still valid.
+#[test]
+fn block_in_the_future_limit() {
+    let rule = TimestampRule::new(VALID_PERIOD);
+    assert!(rule.validate_at(NOW, &at(NOW + VALID_PERIOD)).is_ok());
+}
+
+/// rskj `blockInTheFuture`: twice the period ahead is not.
+#[test]
+fn block_in_the_future() {
+    let rule = TimestampRule::new(VALID_PERIOD);
+    assert!(matches!(
+        rule.validate_at(NOW, &at(NOW + 2 * VALID_PERIOD)),
+        Err(ValidationError::TimestampInFuture { current: NOW, got }) if got == NOW + 2 * VALID_PERIOD
+    ));
+}
+
+/// rskj `blockTimeLowerThanParentBlockHeaderTime`, `...Equals...`,
+/// `...GreaterThan...`: strictly after the parent, or invalid.
+#[test]
+fn block_time_against_the_parents() {
+    let rule = TimestampRule::new(VALID_PERIOD);
+    let header = at(NOW);
+    assert!(matches!(
+        rule.validate_with_parent_at(NOW, &header, &at(NOW + 1_000)),
+        Err(ValidationError::TimestampOlderThanParent { .. })
+    ));
+    assert!(matches!(
+        rule.validate_with_parent_at(NOW, &header, &at(NOW)),
+        Err(ValidationError::TimestampOlderThanParent { .. })
+    ));
+    assert!(rule.validate_with_parent_at(NOW, &header, &at(NOW - 1_000)).is_ok());
+}
+
+/// rskj `validPeriodLength == 0`, regtest's setting: the rule is off, the
+/// parent comparison with it.
+#[test]
+fn a_zero_period_turns_the_timestamp_rule_off() {
+    let rule = TimestampRule::new(0);
+    assert!(rule.validate_at(NOW, &at(NOW + 1_000_000)).is_ok());
+    assert!(rule.validate_with_parent_at(NOW, &at(NOW), &at(NOW + 1_000)).is_ok());
+}
+
+/// rskj `Constants`: `newBlockMaxSecondsInTheFuture` per network, and
+/// `getMinGasLimit()` on all of them.
+#[test]
+fn the_chain_configs_carry_rskj_constants() {
+    use crate::config::ChainConfig;
+    assert_eq!(ChainConfig::mainnet().max_future_block_time, 60);
+    assert_eq!(ChainConfig::testnet().max_future_block_time, 540);
+    assert_eq!(ChainConfig::regtest().max_future_block_time, 0);
+    for config in [ChainConfig::mainnet(), ChainConfig::testnet(), ChainConfig::regtest()] {
+        assert_eq!(config.min_gas_limit, 3_000_000);
+    }
+}
+
+// ── rskj GasLimitRuleTests ────────────────────────────────────────────
+
+fn gas_limit_rule() -> GasLimitBoundsRule {
+    GasLimitBoundsRule { min_gas_limit: 3_000_000, max_gas_limit: u64::MAX }
+}
+
+fn with_gas_limit(gas_limit: u64) -> Header {
+    let mut header = create_dummy_header(10, 1_000, B256::ZERO);
+    header.gas_limit = U256::from(gas_limit);
+    header
+}
+
+/// rskj `gasLimitGreaterThanMinimumGasLimit`.
+#[test]
+fn gas_limit_greater_than_minimum_gas_limit() {
+    assert!(gas_limit_rule().validate(&with_gas_limit(3_000_000 + 1)).is_ok());
+}
+
+/// rskj `gasLimitEqualMinimumGasLimit`.
+#[test]
+fn gas_limit_equal_minimum_gas_limit() {
+    assert!(gas_limit_rule().validate(&with_gas_limit(3_000_000)).is_ok());
+}
+
+/// rskj `gasLimitLessThanMinimumGasLimit`.
+#[test]
+fn gas_limit_less_than_minimum_gas_limit() {
+    assert!(matches!(
+        gas_limit_rule().validate(&with_gas_limit(3_000_000 - 1)),
+        Err(ValidationError::GasLimitOutOfBounds { min: 3_000_000, got: 2_999_999, .. })
+    ));
+}

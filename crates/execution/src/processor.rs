@@ -635,11 +635,7 @@ impl BlockProcessor {
         block: &Block,
         parent: Option<&rustock_core::Header>,
     ) -> Result<(), ValidationError> {
-        use rustock_core::validation::block_rules::{
-            BlockTxsMaxGasPriceRule, ExtraDataRule, PrevMinGasPriceRule, RemascValidationRule,
-            TxsMinGasPriceRule,
-        };
-        use rustock_core::validation::{BlockValidator, HeaderValidator, ParentHeaderValidator};
+        use rustock_core::validation::{HeaderValidator, ParentHeaderValidator};
 
         let number = block.header.number;
 
@@ -651,22 +647,7 @@ impl BlockProcessor {
             return Ok(());
         }
 
-        // rskj TxsMinGasPriceRule -- unconditional.
-        TxsMinGasPriceRule.validate_block(block)?;
-        // rskj BlockTxsMaxGasPriceRule -- RSKIP252 (fingerroot500).
-        BlockTxsMaxGasPriceRule {
-            rskip252_height: self.rskip252_height(),
-        }
-        .validate_block(block)?;
-        // rskj RemascValidationRule -- unconditional.
-        RemascValidationRule.validate_block(block)?;
-        // rskj ExtraDataRule -- unconditional, 32 bytes.
-        ExtraDataRule::default().validate(&block.header)?;
-
-        if let Some(parent) = parent {
-            // rskj PrevMinGasPriceRule -- unconditional.
-            PrevMinGasPriceRule.validate_with_parent(&block.header, parent)?;
-        }
+        self.validate_block_body_rules(block, parent)?;
 
         // rskj BlockUnclesValidationRule. The ommers HASH is checked in
         // process_block; this decides whether the uncles are admissible.
@@ -697,6 +678,47 @@ impl BlockProcessor {
         Ok(())
     }
 
+    /// The rules of [`Self::validate_block_rules`] that read only the block
+    /// and its parent: the transaction gas price rules, REMASC's presence,
+    /// the extra data size and the minimum gas price range. No ancestry, no
+    /// merged-mining fields.
+    ///
+    /// Split out for the miner, which runs them on the block it assembled
+    /// before handing out work: these are the rules a block could break
+    /// through what it carries rather than how it was mined, and rskj never
+    /// produces such a block because `MinerUtils.filterTransactions` applies
+    /// the same price rules on the way in. A template that fails here is a
+    /// bug in the builder, caught before every peer rejects the block.
+    pub fn validate_block_body_rules(
+        &self,
+        block: &Block,
+        parent: Option<&rustock_core::Header>,
+    ) -> Result<(), ValidationError> {
+        use rustock_core::validation::block_rules::{
+            BlockTxsMaxGasPriceRule, ExtraDataRule, PrevMinGasPriceRule, RemascValidationRule,
+            TxsMinGasPriceRule,
+        };
+        use rustock_core::validation::{BlockValidator, HeaderValidator, ParentHeaderValidator};
+
+        // rskj TxsMinGasPriceRule -- unconditional.
+        TxsMinGasPriceRule.validate_block(block)?;
+        // rskj BlockTxsMaxGasPriceRule -- RSKIP252 (fingerroot500).
+        BlockTxsMaxGasPriceRule {
+            rskip252_height: self.rskip252_height(),
+        }
+        .validate_block(block)?;
+        // rskj RemascValidationRule -- unconditional.
+        RemascValidationRule.validate_block(block)?;
+        // rskj ExtraDataRule -- unconditional, 32 bytes.
+        ExtraDataRule::default().validate(&block.header)?;
+
+        if let Some(parent) = parent {
+            // rskj PrevMinGasPriceRule -- unconditional.
+            PrevMinGasPriceRule.validate_with_parent(&block.header, parent)?;
+        }
+        Ok(())
+    }
+
     /// `validate_block_rules` with the parent resolved from the block store —
     /// the shape the sync path wants, mirroring rskj `BlockValidatorImpl`,
     /// which looks the parent up the same way and returns invalid when it is
@@ -711,12 +733,11 @@ impl BlockProcessor {
     }
 
     /// RSKIP252 (`fingerroot500`) for this chain.
-    fn rskip252_height(&self) -> u64 {
-        match self.hardfork_cfg.chain_id {
-            crate::hardfork::RSK_MAINNET_CHAIN_ID => 5_468_000,
-            crate::hardfork::RSK_TESTNET_CHAIN_ID => 4_015_800,
-            _ => 0,
-        }
+    ///
+    /// Shared with the miner, which applies the same cap when it selects
+    /// transactions (rskj `MinerUtils.isHighGasPriced`).
+    pub fn rskip252_height(&self) -> u64 {
+        rskip252_height_for(self.hardfork_cfg.chain_id)
     }
 
     /// RSKIP110 (`wasabi100`) for this chain.
@@ -1274,6 +1295,59 @@ mod tests {
         assert_eq!(result.receipts.len(), 1);
         assert!(result.receipts[0].status);
         assert_eq!(result.receipts[0].cumulative_gas_used, 21_000);
+    }
+
+    /// rskj `TransactionExecutor.gasIsValid`: a transaction's declared gas
+    /// limit must fit in the block's limit minus the gas used before it, or
+    /// the transaction is invalid and the block with it ("Too much gas used
+    /// in this block"). Two transfers each declaring 6,790,000 on a
+    /// 6,800,000 block: the first fits, the second does not, although
+    /// together they would *use* 42,000.
+    #[test]
+    fn a_transaction_whose_limit_exceeds_the_blocks_remaining_gas_invalidates_the_block() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+        let chain_id = 33u64;
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let block_store =
+            Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+
+        let mut root = root;
+        let mut txs = Vec::new();
+        for seed in [1u8, 2] {
+            let key = SigningKey::from_slice(&[seed; 32]).unwrap();
+            root = put_account(&root, store.as_ref(), &sender_address(&key), 0, one_rbtc);
+            let mut tx = Transaction {
+                nonce: 0,
+                gas_price: U256::from(0),
+                gas_limit: U256::from(6_790_000),
+                to: Bytes::copy_from_slice(Address::repeat_byte(0xBB).as_slice()),
+                value: U256::from(1_000),
+                input: Bytes::new(),
+                v: 0,
+                r: U256::ZERO,
+                s: U256::ZERO,
+                cached_rlp: None,
+            };
+            sign_tx(&mut tx, &key, chain_id);
+            txs.push(tx);
+        }
+
+        let processor = BlockProcessor::new(test_hardfork_cfg(), block_store);
+
+        // One alone fits, and uses 21,000.
+        let one = Block {
+            header: dummy_header(8_000_000),
+            transactions: vec![txs[0].clone()],
+            ommers: vec![],
+        };
+        let result = processor.execute_block(&one, &root, store.clone()).expect("one fits");
+        assert_eq!(result.gas_used, 21_000);
+
+        // Two do not: 21,000 used plus 6,790,000 declared is over 6,800,000.
+        let two = Block { header: dummy_header(8_000_000), transactions: txs, ommers: vec![] };
+        let err = processor.execute_block(&two, &root, store).expect_err("the second does not fit");
+        assert!(err.to_string().contains("Too much gas used in this block"), "got {err}");
     }
 
     /// A transaction that reaches the Bridge may only sit in the sequential
@@ -2822,5 +2896,16 @@ mod sender_cache_integration {
         let p = processor(Some(cache.clone()));
         assert_eq!(p.recover_senders(&txs, 33).unwrap(), want);
         assert_eq!(p.recover_senders(&txs, 33).unwrap(), want, "and again from the cache");
+    }
+}
+
+/// RSKIP252 (`fingerroot500`) for a chain id: mainnet's and testnet's
+/// heights, genesis anywhere else. The block rule, the miner's selection
+/// and the pool's per-transaction cap all read it.
+pub fn rskip252_height_for(chain_id: u64) -> u64 {
+    match chain_id {
+        crate::hardfork::RSK_MAINNET_CHAIN_ID => 5_468_000,
+        crate::hardfork::RSK_TESTNET_CHAIN_ID => 4_015_800,
+        _ => 0,
     }
 }

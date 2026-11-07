@@ -35,6 +35,15 @@ impl ParentHeaderValidator for ParentHashRule {
     }
 }
 
+/// rskj `BlockTimeStampValidationRule`: a header may not be timestamped more
+/// than `max_future_offset` seconds past the node's clock, and must be
+/// strictly after its parent.
+///
+/// The bound is `Constants.newBlockMaxSecondsInTheFuture`: 60 on mainnet, 540
+/// on testnet, 0 on regtest. Zero is rskj's "off", for the whole rule: the
+/// parent comparison goes with it (`validPeriodLength == 0` returns true
+/// from both `isValid` overloads), which is what lets a regtest replay
+/// blocks whose clock has nothing to do with the node's.
 pub struct TimestampRule {
     max_future_offset: u64,
 }
@@ -43,15 +52,19 @@ impl TimestampRule {
     pub fn new(max_future_offset: u64) -> Self {
         Self { max_future_offset }
     }
-}
 
-impl HeaderValidator for TimestampRule {
-    fn validate(&self, header: &Header) -> Result<(), ValidationError> {
-        let now = SystemTime::now()
+    fn now() -> Result<u64, ValidationError> {
+        Ok(SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|_| ValidationError::SystemTimeError)?
-            .as_secs();
-            
+            .as_secs())
+    }
+
+    /// `validate` against a given clock, for tests.
+    pub fn validate_at(&self, now: u64, header: &Header) -> Result<(), ValidationError> {
+        if self.max_future_offset == 0 {
+            return Ok(());
+        }
         if header.timestamp > now + self.max_future_offset {
             return Err(ValidationError::TimestampInFuture {
                 current: now,
@@ -60,11 +73,18 @@ impl HeaderValidator for TimestampRule {
         }
         Ok(())
     }
-}
 
-impl ParentHeaderValidator for TimestampRule {
-    fn validate_with_parent(&self, header: &Header, parent: &Header) -> Result<(), ValidationError> {
-        self.validate(header)?;
+    /// `validate_with_parent` against a given clock, for tests.
+    pub fn validate_with_parent_at(
+        &self,
+        now: u64,
+        header: &Header,
+        parent: &Header,
+    ) -> Result<(), ValidationError> {
+        if self.max_future_offset == 0 {
+            return Ok(());
+        }
+        self.validate_at(now, header)?;
         if header.timestamp <= parent.timestamp {
             return Err(ValidationError::TimestampOlderThanParent {
                 parent: parent.timestamp,
@@ -72,6 +92,18 @@ impl ParentHeaderValidator for TimestampRule {
             });
         }
         Ok(())
+    }
+}
+
+impl HeaderValidator for TimestampRule {
+    fn validate(&self, header: &Header) -> Result<(), ValidationError> {
+        self.validate_at(Self::now()?, header)
+    }
+}
+
+impl ParentHeaderValidator for TimestampRule {
+    fn validate_with_parent(&self, header: &Header, parent: &Header) -> Result<(), ValidationError> {
+        self.validate_with_parent_at(Self::now()?, header, parent)
     }
 }
 
@@ -89,6 +121,8 @@ impl HeaderValidator for GasUsedRule {
     }
 }
 
+/// rskj `GasLimitRule` (`Constants.getMinGasLimit()`, 3,000,000 on every
+/// network) and the upper bound rustock adds for its own arithmetic.
 pub struct GasLimitBoundsRule {
     pub min_gas_limit: u64,
     pub max_gas_limit: u64,

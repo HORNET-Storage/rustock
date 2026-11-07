@@ -19,6 +19,78 @@ fn db_path() -> Option<String> {
     std::env::var("RUSTOCK_BLOCKS_DB").ok()
 }
 
+/// RSKIP179 against the chain itself.
+///
+/// `BitcoinTimestampRule` is a consensus rule added from an rskj parity
+/// review, and the mainnet replay is the only thing that can show it is not
+/// stricter than the chain it has to accept: every block from iris300 on was
+/// produced by rskj miners that enforced this rule, so every one of them must
+/// pass. A rule that rejects even one is a fork.
+///
+/// Dense rather than sampled around iris300, because the activation edge is
+/// where an off-by-one in the height comparison would show.
+#[test]
+#[ignore = "requires a synced block store (RUSTOCK_BLOCKS_DB)"]
+fn rskip179_accepts_every_sampled_mainnet_block() {
+    use rustock_core::config::ChainConfig;
+    use rustock_core::validation::{BitcoinTimestampRule, HeaderValidator};
+
+    let Some(path) = db_path() else {
+        eprintln!("RUSTOCK_BLOCKS_DB not set; skipping");
+        return;
+    };
+    let store = Arc::new(BlockStore::open_read_only(&path).expect("open block store"));
+    let head = store
+        .head()
+        .expect("head")
+        .and_then(|h| store.header(h).ok().flatten())
+        .expect("head header");
+
+    let config = Arc::new(ChainConfig::mainnet());
+    let iris300 = config.activation_heights.iris300;
+    let rule = BitcoinTimestampRule { config: config.clone() };
+
+    let mut heights: Vec<u64> = (1..=head.number).step_by(20_000).collect();
+    // Either side of the activation, one block at a time.
+    for d in 0..200u64 {
+        if iris300 >= 100 && iris300 - 100 + d <= head.number {
+            heights.push(iris300 - 100 + d);
+        }
+    }
+    heights.sort_unstable();
+    heights.dedup();
+
+    let (mut checked, mut below, mut worst) = (0usize, 0usize, 0u64);
+    let mut failures: Vec<(u64, String)> = Vec::new();
+    for number in heights {
+        let Some(hash) = store.canonical_hash(number).ok().flatten() else { continue };
+        let Some(header) = store.header(hash).ok().flatten() else { continue };
+        if header.number < iris300 {
+            below += 1;
+        }
+        if let Err(e) = rule.validate(&header) {
+            failures.push((number, e.to_string()));
+        } else if header.number >= iris300 {
+            // How close the chain actually runs to the 300 s bound.
+            if let Some(bytes) = header.bitcoin_merged_mining_header.as_ref() {
+                use bitcoin::consensus::Decodable;
+                if let Ok(btc) =
+                    <bitcoin::block::Header as Decodable>::consensus_decode(&mut &bytes[..])
+                {
+                    worst = worst.max(header.timestamp.abs_diff(u64::from(btc.time)));
+                }
+            }
+        }
+        checked += 1;
+    }
+    println!(
+        "RSKIP179: checked {checked} mainnet headers ({below} below iris300), \
+         largest timestamp gap seen {worst}s against a 300s bound, failures {}",
+        failures.len()
+    );
+    assert!(failures.is_empty(), "RSKIP179 rejects real mainnet blocks: {failures:?}");
+}
+
 #[test]
 #[ignore = "requires a synced block store (RUSTOCK_BLOCKS_DB)"]
 fn block_rules_accept_every_sampled_mainnet_block() {
