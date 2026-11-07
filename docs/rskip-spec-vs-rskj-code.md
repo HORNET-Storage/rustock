@@ -222,11 +222,13 @@ if (!usingCompressedEncoding) {
 
 | | field 6 | after `ummRoot` |
 |---|---|---|
-| **uncompressed** (wire, storage) | the real 256-byte `logsBloom` | `version`, then `edges` if any |
-| **compressed** (block hash only) | `RLP.encodeElement(extensionData)` | nothing |
+| **uncompressed** (blocks on the wire, storage) | the real 256-byte `logsBloom` | `version`, then `edges` if any |
+| **compressed** (block hash; headers sent to peers) | `RLP.encodeElement(extensionData)` | nothing |
 
 `getEncodedForHash() = getEncoded(true, !rskip92, true)` — the hash uses the
-compressed form; the network never sends it.
+compressed form. So does `BlockHeadersResponseMessage`, which sends a chain's
+headers to peers with `getEncodedCompressed`; the bloom and edges then come
+beside each block's body, as the third element of `BodyResponseMessage`.
 
 **What rustock does.** `Header::decode` dispatches on how many RLP items remain
 after the base fields: 3 means the three merged-mining fields, 4 means
@@ -359,13 +361,19 @@ So a versioned header has **two serialisations**, and only one is documented:
 
 | | field 6 | after `ummRoot` |
 |---|---|---|
-| **wire / storage** (uncompressed) | the real 256-byte bloom | `version`, `edges?`, `baseEvent` |
-| **block hash** (compressed) | `encodeElement(RLP([version, hash]))` | nothing |
+| **blocks on the wire, storage** (uncompressed) | the real 256-byte bloom | `version`, `edges?`, `baseEvent` |
+| **block hash, headers sent to peers** (compressed) | `encodeElement(RLP([version, hash]))` | nothing |
 
-`getEncodedForHash() = getEncoded(true, !rskip92, true)` — the compressed form
-exists only to be hashed and is never transmitted. RSKIP-351 describes only the
-compressed shape and calls it "the extended header"; nothing says the wire form
-keeps the bloom and appends the fields separately.
+`getEncodedForHash() = getEncoded(true, !rskip92, true)` — the block hash
+covers the compressed form, and `BlockHeadersResponseMessage` sends a chain's
+headers in it (`getEncodedCompressed`). Their bloom, edges and base event come
+beside each block's body instead, as the third element of `BodyResponseMessage`,
+which `DownloadingBodiesSyncState.newBody` sets on the header before the block
+runs; rustock takes it only if it matches the commitment
+(`Header::with_extension`). A whole block (`BlockMessage`, a snapshot's blocks)
+carries the full form. RSKIP-351 describes only the compressed shape and calls
+it "the extended header"; nothing says the full form keeps the bloom and
+appends the fields separately.
 
 An implementer reading the RSKIPs would decode every testnet header wrongly:
 the version byte lands where the merged-mining header is expected and every
