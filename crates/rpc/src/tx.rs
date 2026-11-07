@@ -164,7 +164,6 @@ pub(crate) fn compute_tx_hash(tx: &rustock_core::Transaction) -> B256 {
 /// does not recover is a real thing -- REMASC's has none at all -- and
 /// a receipt with an obviously wrong field beats one that fails.
 fn recover_sender_or_zero(tx: &rustock_core::Transaction, state: &RpcState) -> Address {
-    let chain_id = state.hardfork_cfg.as_ref().map(|c| c.chain_id).unwrap_or(30);
-    tx.recover_sender(chain_id).unwrap_or(Address::ZERO)
+    tx.recover_sender(crate::helpers::chain_id_of(state)).unwrap_or(Address::ZERO)
 }
 

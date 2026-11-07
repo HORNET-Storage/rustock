@@ -3712,6 +3712,61 @@ fn setup_state_for_tracing() -> (RpcState, tempfile::TempDir, B256, Address, Add
     (state, tmp, tx_hash, sender, caller, callee)
 }
 
+/// `eth_getBlockBy*` with full transactions must name the real sender.
+///
+/// It used to hardcode `from` to the zero address, so every transaction in
+/// every block reported the same impossible sender while
+/// `eth_getTransactionByHash` reported the right one. Nothing errored: an
+/// indexer reading blocks in bulk would simply attribute the whole chain to
+/// 0x0. The fixture signs a real transaction, so the expected sender is a
+/// known key rather than whatever the field happens to hold.
+#[tokio::test]
+async fn a_block_with_full_transactions_names_the_real_sender() {
+    let (state, _tmp, tx_hash, sender, _caller, _callee) = setup_state_for_tracing();
+    let expected = format!("{sender:#x}");
+
+    for (method, arg) in [
+        ("eth_getBlockByNumber", json!(["0x2a", true])),
+        ("eth_getBlockByHash", json!([format!("{:#x}", state.store.canonical_hash(42).unwrap().unwrap()), true])),
+    ] {
+        let resp = dispatch_for_test(&state, make_request(method, arg)).await;
+        let block = resp.result.expect("the block must be returned");
+        let txs = block["transactions"].as_array().expect("full transaction objects");
+        assert_eq!(txs.len(), 1, "{method}");
+        assert_eq!(txs[0]["from"], expected, "{method} reported the wrong sender");
+        assert_ne!(
+            txs[0]["from"],
+            json!("0x0000000000000000000000000000000000000000"),
+            "{method} is back to the hardcoded zero sender"
+        );
+    }
+
+    // The two endpoints must not disagree about the same transaction: that
+    // disagreement is what made the original bug invisible.
+    let by_hash = dispatch_for_test(
+        &state,
+        make_request("eth_getTransactionByHash", json!([format!("{tx_hash:#x}")])),
+    )
+    .await
+    .result
+    .unwrap();
+    let by_block = dispatch_for_test(&state, make_request("eth_getBlockByNumber", json!(["0x2a", true])))
+        .await
+        .result
+        .unwrap();
+    assert_eq!(by_hash["from"], by_block["transactions"][0]["from"]);
+}
+
+/// Hash-only mode returns strings, and must keep doing so: the sender fix
+/// touches the same branch.
+#[tokio::test]
+async fn a_block_without_full_transactions_still_returns_bare_hashes() {
+    let (state, _tmp, tx_hash, _s, _c, _ce) = setup_state_for_tracing();
+    let resp = dispatch_for_test(&state, make_request("eth_getBlockByNumber", json!(["0x2a", false]))).await;
+    let txs = resp.result.unwrap()["transactions"].clone();
+    assert_eq!(txs, json!([format!("{tx_hash:#x}")]));
+}
+
 /// `trace_transaction` returns the transaction's own trace followed by the
 /// internal call, in rskj's flattened shape.
 #[tokio::test]

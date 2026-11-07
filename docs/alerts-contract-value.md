@@ -108,6 +108,49 @@ one is consulted on every block. What it costs on the execution path is a
 `max()` over a vector that was built anyway, one header hash, and one mutex
 insert — and it is skipped entirely unless an observer is installed.
 
+## Reorgs
+
+The sweep advances by height and never walks backwards, so on its own it
+would examine a height once and move on. That is wrong on this chain: RSK
+reorgs constantly — at nearly every height on this node — and a block that
+stops being canonical *after* it was examined would never be replaced by the
+block that took its place.
+
+This is not a hypothetical. On 2026-11-07 two of seven Flyover peg-outs went
+unreported for exactly that reason: the watcher looked at #9390291 and
+#9390496 while a different block was canonical at each height, and never
+looked again.
+
+So before advancing, every sweep re-checks the last **128 heights** and
+re-examines any whose canonical hash has changed. The check is one
+canonical-hash lookup per height per poll; the expensive part — re-executing
+the block — happens only for a height that actually moved.
+
+Deduplication makes re-examination safe. An alert's key is the transaction
+hash plus its position in the call tree, and neither mentions a block, so a
+transfer that survived the reorg into the replacement is not reported twice.
+Anything genuinely new in the replacement is reported, which is the point.
+
+### Withdrawals
+
+The converse also matters. If a block produced an alert and the block that
+replaced it does not contain that transfer, the alert described something
+that did not happen. Mail cannot be unsent, so the log says so:
+
+```
+WARN WITHDRAWN: an alert reported from #9390291 is not in the block that
+     replaced it, so it describes a transfer that did not happen: <key>
+```
+
+A monitor that reports a theft that never occurred and never corrects itself
+is worse than one that is slightly late.
+
+### What this does not cover
+
+A reorg deeper than 128 blocks, or one that lands on a height the watcher has
+already forgotten. Nothing seen on this chain comes close, and the peg-out
+watch shares the same protection since both run from the same sweep.
+
 ## Falling behind
 
 `max_catchup_blocks` bounds the damage when the watcher falls behind. A node

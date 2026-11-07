@@ -198,13 +198,14 @@ pub fn eth_get_block_by_hash(
     id: Value,
     params: &Value,
     store: &BlockStore,
+    chain_id: u64,
 ) -> JsonRpcResponse {
     let Some(hash) = params.get(0).and_then(|v| v.as_str()).and_then(parse_b256) else {
         return JsonRpcResponse::error(id, INVALID_PARAMS, "Missing or invalid block hash");
     };
     let full_txs = params.get(1).and_then(|v| v.as_bool()).unwrap_or(false);
 
-    match build_block_dto_with_full_txs(store, hash, full_txs) {
+    match build_block_dto_with_full_txs(store, hash, full_txs, chain_id) {
         Some(dto) => JsonRpcResponse::success(id, serde_json::to_value(dto).unwrap()),
         None => JsonRpcResponse::success(id, Value::Null),
     }
@@ -214,6 +215,7 @@ pub fn eth_get_block_by_number(
     id: Value,
     params: &Value,
     store: &BlockStore,
+    chain_id: u64,
 ) -> JsonRpcResponse {
     let Some(bn_str) = params.get(0).and_then(|v| v.as_str()) else {
         return JsonRpcResponse::error(id, INVALID_PARAMS, "Missing block number parameter");
@@ -229,7 +231,7 @@ pub fn eth_get_block_by_number(
         _ => return JsonRpcResponse::success(id, Value::Null),
     };
 
-    match build_block_dto_with_full_txs(store, hash, full_txs) {
+    match build_block_dto_with_full_txs(store, hash, full_txs, chain_id) {
         Some(dto) => JsonRpcResponse::success(id, serde_json::to_value(dto).unwrap()),
         None => JsonRpcResponse::success(id, Value::Null),
     }
@@ -391,7 +393,10 @@ fn uncle_dto(
         uncle_hash,
         td,
         uncle_body.as_ref(),
+        // An uncle is never rendered with full transactions, so the chain id
+        // is unused.
         false,
+        30,
     ))
 }
 
@@ -420,6 +425,7 @@ fn build_block_dto_with_full_txs(
     store: &BlockStore,
     hash: alloy_primitives::B256,
     full_txs: bool,
+    chain_id: u64,
 ) -> Option<BlockResultDto> {
     let header = store.header(hash).ok()??;
     // A block that exists must not disappear because an auxiliary field will
@@ -430,7 +436,7 @@ fn build_block_dto_with_full_txs(
     // returned.
     let td = store.total_difficulty(hash).ok().flatten().unwrap_or_default();
     let body = held_or_implied_body(store, hash, &header)?;
-    Some(BlockResultDto::from_header_with_body(&header, hash, td, body.as_ref(), full_txs))
+    Some(BlockResultDto::from_header_with_body(&header, hash, td, body.as_ref(), full_txs, chain_id))
 }
 
 /// The block's body, or `None` when the node does not actually have the block.

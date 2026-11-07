@@ -104,6 +104,9 @@ struct Fixture {
     forwarder: Address,
     recipient: Address,
     block_hash: B256,
+    /// A second, empty block at the same height, not canonical. Lets a test
+    /// move the chain under the watcher the way a real reorg does.
+    alt_hash: B256,
 }
 
 /// One executed block, stored the way the node stores one.
@@ -192,7 +195,16 @@ fn build(tx_value: U256, forwarded: U256, tx_succeeds: bool) -> Fixture {
     store.put_receipts(block_hash, &[receipt]).unwrap();
     store.set_exec_head(block_hash, parent_state_root).unwrap();
 
-    Fixture { _tmp: tmp, store, trie: trie_store, sender, forwarder, recipient, block_hash }
+    // The rival block at the same height: same parent, no transactions, a
+    // different timestamp so it hashes differently.
+    let alt = Header { parent_hash, state_root: parent_state_root, timestamp: head.timestamp + 1, ..header(42) };
+    let alt_hash = alt.hash();
+    assert_ne!(alt_hash, block_hash);
+    store.put_header(&alt).unwrap();
+    store.put_body(alt_hash, &[], &[]).unwrap();
+    store.put_receipts(alt_hash, &[]).unwrap();
+
+    Fixture { _tmp: tmp, store, trie: trie_store, sender, forwarder, recipient, block_hash, alt_hash }
 }
 
 fn run_watch(f: &Fixture, threshold_rbtc: f64) -> Vec<Alert> {
@@ -200,6 +212,33 @@ fn run_watch(f: &Fixture, threshold_rbtc: f64) -> Vec<Alert> {
     // executing one, so the filter sees nothing and falls back to looking,
     // which is the safe answer it is supposed to give.
     run_watch_with(f, threshold_rbtc, 0.1, &MovementLog::default())
+}
+
+fn make_watcher(f: &Fixture, threshold_rbtc: f64, recorder: &Recorder) -> Watcher {
+    let hardfork = rustock_execution::RskHardforkConfig::mainnet();
+    let chain_id = hardfork.chain_id;
+    let processor = Arc::new(rustock_execution::BlockProcessor::new(hardfork, f.store.clone()));
+    Watcher::new(
+        f.store.clone(),
+        f.trie.clone(),
+        PegoutAlerts { enabled: false, start_block: Some(42), ..Default::default() },
+        vec![Box::new(recorder.clone())],
+        Vec::new(),
+    )
+    .unwrap()
+    .with_contract_value(
+        ContractValueAlerts {
+            enabled: true,
+            transfer_alert_btc: threshold_rbtc,
+            max_catchup_blocks: 128,
+            // No movement records in this fixture, so every block is
+            // examined -- which is what isolates the reorg behaviour.
+            replay_filter_btc: 0.1,
+        },
+        processor,
+        chain_id,
+        Arc::new(MovementLog::default()),
+    )
 }
 
 fn run_watch_with(
@@ -352,4 +391,74 @@ fn a_block_with_no_movement_record_is_examined_anyway() {
     let f = build(rbtc(100), rbtc(60), true);
     let alerts = run_watch_with(&f, 50.0, 0.1, &MovementLog::default());
     assert_eq!(alerts.len(), 2, "{alerts:#?}");
+}
+
+// ---------------------------------------------------------------------------
+// Reorgs
+// ---------------------------------------------------------------------------
+
+/// The bug this fixes, reproduced.
+///
+/// The watcher examines height 42 while an empty block is canonical there,
+/// moves past it, and the chain then reorgs to a block holding a 60 RBTC
+/// transfer. Before the fix the sweep never went back and the transfer was
+/// never reported -- which is exactly how two of seven Flyover peg-outs went
+/// unseen on mainnet on 2026-11-07.
+#[test]
+fn a_transfer_in_a_block_that_won_a_reorg_is_still_reported() {
+    let f = build(rbtc(100), rbtc(60), true);
+    let recorder = Recorder::default();
+    let mut w = make_watcher(&f, 50.0, &recorder);
+
+    // The empty block is canonical when the watcher first looks.
+    f.store.put_canonical_hash(42, f.alt_hash).unwrap();
+    w.sweep().unwrap();
+    assert!(recorder.0.lock().unwrap().is_empty(), "the empty block holds nothing");
+
+    // The chain reorgs to the block that carries the transfers.
+    f.store.put_canonical_hash(42, f.block_hash).unwrap();
+    w.sweep().unwrap();
+
+    let alerts = recorder.0.lock().unwrap().clone();
+    assert_eq!(alerts.len(), 2, "both transfers must surface after the reorg: {alerts:#?}");
+    assert!(transfer_of(&alerts, "into a contract").is_some());
+    assert!(transfer_of(&alerts, "out of a contract").is_some());
+}
+
+/// The same transaction seen again at the same height must not be mailed
+/// twice. Dedup is keyed by transaction hash and call-tree position, neither
+/// of which mentions a block, so re-examination is idempotent.
+#[test]
+fn re_examining_a_height_does_not_deliver_the_same_transfer_twice() {
+    let f = build(rbtc(100), rbtc(60), true);
+    let recorder = Recorder::default();
+    let mut w = make_watcher(&f, 50.0, &recorder);
+
+    w.sweep().unwrap();
+    assert_eq!(recorder.0.lock().unwrap().len(), 2);
+
+    // A reorg that swaps the block out and straight back in again.
+    f.store.put_canonical_hash(42, f.alt_hash).unwrap();
+    w.sweep().unwrap();
+    f.store.put_canonical_hash(42, f.block_hash).unwrap();
+    w.sweep().unwrap();
+
+    assert_eq!(
+        recorder.0.lock().unwrap().len(),
+        2,
+        "the same two transfers, not four"
+    );
+}
+
+/// A height the watcher never reached is not in its record, so rechecking
+/// must not invent work for it.
+#[test]
+fn a_height_never_examined_is_not_rechecked() {
+    let f = build(rbtc(100), rbtc(60), true);
+    let recorder = Recorder::default();
+    let mut w = make_watcher(&f, 50.0, &recorder);
+    // start_block is 42, so 41 and below were never examined; sweeping must
+    // not reach back for them.
+    w.sweep().unwrap();
+    assert_eq!(recorder.0.lock().unwrap().len(), 2);
 }

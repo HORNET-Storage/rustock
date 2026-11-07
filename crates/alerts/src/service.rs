@@ -13,7 +13,7 @@ use crate::watch;
 use alloy_primitives::{Address, B256, U256};
 use rustock_storage::BlockStore;
 use rustock_trie::{TrieNode, TrieStore};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -35,6 +35,34 @@ fn pegout_event_names() -> Vec<(B256, &'static str)> {
 /// Modification time of `path`, or `None` if it cannot be read right now.
 fn file_mtime(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+/// Heights re-examined on every sweep, in case the chain moved under them.
+///
+/// The sweep advances by height and never goes back. Without this, a block
+/// that stopped being canonical *after* it was examined is never replaced by
+/// the one that took its place, and whatever the replacement contains is
+/// never reported.
+///
+/// That is not hypothetical. This node reorgs at nearly every height on
+/// mainnet, and on 2026-11-07 two of seven Flyover peg-outs went unreported
+/// for exactly this reason: the watcher looked at #9390291 and #9390496 while
+/// a different block was canonical there, and never looked again.
+///
+/// 128 is far beyond any reorg depth seen here. It costs one canonical-hash
+/// lookup per height per poll; the expensive part -- re-examining the block --
+/// happens only for a height that actually changed.
+const REORG_RECHECK_DEPTH: u64 = 128;
+
+/// What the watcher saw at one height, so a reorg can be noticed afterwards.
+#[derive(Debug, Clone)]
+struct Examined {
+    /// The block that was canonical when this height was examined.
+    hash: B256,
+    /// Dedup keys of every alert this height produced -- whether or not it
+    /// was delivered, so a re-examination can tell which ones vanished with
+    /// the block they came from.
+    observed: Vec<String>,
 }
 
 pub struct Watcher {
@@ -79,6 +107,13 @@ pub struct Watcher {
     /// instead of thousands of lines -- but is never silent about the gap.
     skipped_too_far: Option<(u64, u64)>,
     skipped_no_state: Option<(u64, u64)>,
+    /// Recently examined heights and what they held, for reorg detection.
+    /// Bounded to [`REORG_RECHECK_DEPTH`] entries behind the head.
+    examined: BTreeMap<u64, Examined>,
+    /// Alert keys seen while examining the current block. Scratch, cleared
+    /// per block and moved into `examined` when the block is done.
+    observed: Vec<String>,
+    rechecked: u64,
 }
 
 impl Watcher {
@@ -119,6 +154,9 @@ impl Watcher {
             unrecorded: None,
             skipped_too_far: None,
             skipped_no_state: None,
+            examined: BTreeMap::new(),
+            observed: Vec::new(),
+            rechecked: 0,
         })
     }
 
@@ -413,6 +451,9 @@ impl Watcher {
         self.unrecorded = None;
         self.replays = 0;
         self.filtered = 0;
+        self.rechecked = 0;
+        // Before moving forward, make sure the ground has not shifted behind.
+        self.recheck_reorged(head);
         while self.next_block <= head {
             let n = self.next_block;
             if let Err(e) = self.process_block(n, head) {
@@ -423,8 +464,66 @@ impl Watcher {
             }
             self.next_block = n + 1;
         }
+        let floor = head.saturating_sub(REORG_RECHECK_DEPTH);
+        self.examined.retain(|&n, _| n >= floor);
         self.report_skipped();
         Ok(())
+    }
+
+    /// Alerts reported from a block that the block replacing it does not
+    /// contain -- so they describe transfers that did not happen.
+    #[allow(clippy::ptr_arg)]
+    fn withdrawn<'a>(before: &'a [String], after: &[String]) -> Vec<&'a String> {
+        before.iter().filter(|k| !after.contains(k)).collect()
+    }
+
+    /// Re-examine any recent height whose canonical block has changed.
+    ///
+    /// Deduplication does the rest: an alert whose transaction survived the
+    /// reorg into the replacement block has the same key -- the key is the
+    /// transaction hash and its position in the call tree, neither of which
+    /// mentions a height -- so it is not mailed twice. Anything genuinely new
+    /// in the replacement is reported, which is the whole point.
+    fn recheck_reorged(&mut self, head: u64) {
+        let floor = head.saturating_sub(REORG_RECHECK_DEPTH);
+        let changed: Vec<(u64, B256, B256)> = self
+            .examined
+            .range(floor..)
+            .filter_map(|(&number, seen)| match self.store.canonical_hash(number) {
+                Ok(Some(now)) if now != seen.hash => Some((number, seen.hash, now)),
+                _ => None,
+            })
+            .collect();
+
+        for (number, was, now) in changed {
+            tracing::info!(
+                target: "rustock::alerts::pegout",
+                "#{number} is now {now} (was {was}); re-examining it after a reorg"
+            );
+            let before =
+                self.examined.get(&number).map(|e| e.observed.clone()).unwrap_or_default();
+            if let Err(e) = self.process_block(number, head) {
+                tracing::warn!(
+                    target: "rustock::alerts::pegout",
+                    "re-examining #{number} after a reorg: {e:#}"
+                );
+                continue;
+            }
+            self.rechecked += 1;
+            let after =
+                self.examined.get(&number).map(|e| e.observed.clone()).unwrap_or_default();
+            // An alert that came from the block this reorg discarded, and is
+            // not in its replacement, describes something that did not
+            // happen. Mail cannot be unsent, so say so in the log rather than
+            // leave a false report standing.
+            for key in Self::withdrawn(&before, &after) {
+                tracing::warn!(
+                    target: "rustock::alerts::pegout",
+                    "WITHDRAWN: an alert reported from #{number} is not in the block that \
+                     replaced it, so it describes a transfer that did not happen: {key}"
+                );
+            }
+        }
     }
 
     /// Say out loud which blocks the contract-value watch did not look at.
@@ -434,11 +533,12 @@ impl Watcher {
     /// catching up from a day's downtime would otherwise emit thousands of
     /// identical lines.
     fn report_skipped(&mut self) {
-        if self.replays > 0 || self.filtered > 0 {
+        if self.replays > 0 || self.filtered > 0 || self.rechecked > 0 {
             tracing::debug!(
                 target: "rustock::alerts::pegout",
                 replayed = self.replays,
                 filtered = self.filtered,
+                rechecked_after_reorg = self.rechecked,
                 "contract value sweep"
             );
         }
@@ -485,6 +585,7 @@ impl Watcher {
             anyhow::bail!("no header");
         };
         let receipts = self.store.receipts(hash)?.unwrap_or_default();
+        self.observed.clear();
 
         if self.cfg.enabled {
             self.process_pegouts(number, &header, &receipts)?;
@@ -500,6 +601,10 @@ impl Watcher {
                 );
             }
         }
+        // Remember the block this height held and what it produced, so a
+        // later reorg at this height is noticed rather than silently missed.
+        let observed = std::mem::take(&mut self.observed);
+        self.examined.insert(number, Examined { hash, observed });
         Ok(())
     }
 
@@ -602,6 +707,7 @@ impl Watcher {
         }
 
         for alert in alerts {
+            self.observed.push(alert.dedup_key());
             self.deliver(alert);
         }
         Ok(())
@@ -762,18 +868,7 @@ impl Watcher {
             });
 
             for b in breaches {
-                tracing::warn!(
-                    target: "rustock::alerts::pegout",
-                    block = number,
-                    tx = %format!("0x{}", hex::encode(tx_hash)),
-                    from = %b.transfer.from,
-                    to = %b.transfer.to,
-                    amount_rbtc = %crate::config::wei_to_rbtc_string(b.transfer.value),
-                    amount_wei = %b.transfer.value,
-                    kind = b.transfer.kind.as_str(),
-                    "large transfer {}", b.direction.as_str()
-                );
-                found.push(Alert::LargeContractTransfer {
+                let alert = Alert::LargeContractTransfer {
                     block: number,
                     tx_hash,
                     from: format!("{}", b.transfer.from),
@@ -784,7 +879,25 @@ impl Watcher {
                     amount_wei: b.transfer.value.to_string(),
                     amount_rbtc: crate::config::wei_to_rbtc_string(b.transfer.value),
                     threshold_rbtc: threshold_rbtc.clone(),
-                });
+                };
+                // Log once per transfer, not once per sighting. The same
+                // transaction is seen again whenever a reorg moves it, and a
+                // log that counts those as separate events reads as a flurry
+                // of alerts where there was one.
+                if !self.seen.contains(&alert.dedup_key()) {
+                    tracing::warn!(
+                        target: "rustock::alerts::pegout",
+                        block = number,
+                        tx = %format!("0x{}", hex::encode(tx_hash)),
+                        from = %b.transfer.from,
+                        to = %b.transfer.to,
+                        amount_rbtc = %crate::config::wei_to_rbtc_string(b.transfer.value),
+                        amount_wei = %b.transfer.value,
+                        kind = b.transfer.kind.as_str(),
+                        "large transfer {}", b.direction.as_str()
+                    );
+                }
+                found.push(alert);
             }
         }
 
@@ -798,6 +911,7 @@ impl Watcher {
         );
 
         for alert in found {
+            self.observed.push(alert.dedup_key());
             self.deliver(alert);
         }
         Ok(())
@@ -896,5 +1010,45 @@ impl Watcher {
         let key = rustock_trie::storage_key(&rustock_execution::precompiles::BRIDGE_ADDR, &slot);
         root.get(&rustock_trie::TrieKeySlice::from_key(&key), self.trie.as_ref())
             .unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod reorg_tests {
+    use super::*;
+
+    fn v(xs: &[&str]) -> Vec<String> { xs.iter().map(|s| s.to_string()).collect() }
+
+    /// A transfer that survived the reorg into the replacement block is not
+    /// withdrawn -- it still happened, just in a different block.
+    #[test]
+    fn an_alert_present_in_the_replacement_is_not_withdrawn() {
+        let before = v(&["a", "b"]);
+        let after = v(&["b", "a"]);
+        assert!(Watcher::withdrawn(&before, &after).is_empty());
+    }
+
+    #[test]
+    fn an_alert_absent_from_the_replacement_is_withdrawn() {
+        let before = v(&["a", "b"]);
+        let after = v(&["b"]);
+        assert_eq!(Watcher::withdrawn(&before, &after), vec![&"a".to_string()]);
+    }
+
+    /// Something new in the replacement block is not a withdrawal; it is
+    /// reported through the ordinary path.
+    #[test]
+    fn an_alert_new_in_the_replacement_is_not_a_withdrawal() {
+        assert!(Watcher::withdrawn(&v(&["a"]), &v(&["a", "c"])).is_empty());
+    }
+
+    #[test]
+    fn a_block_that_produced_nothing_withdraws_nothing() {
+        assert!(Watcher::withdrawn(&[], &v(&["a"])).is_empty());
+    }
+
+    #[test]
+    fn everything_is_withdrawn_when_the_replacement_is_empty() {
+        assert_eq!(Watcher::withdrawn(&v(&["a", "b"]), &[]).len(), 2);
     }
 }

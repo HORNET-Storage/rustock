@@ -568,7 +568,24 @@ impl RskHardforkConfig {
         block_number >= height
     }
 
-    /// RSKIP124: public receiveHeaders with header-count-based cost (Wasabi100).
+    /// RSKIP124: header-count-based cost for `receiveHeaders`, and the
+    /// start of the only window in which that method is public
+    /// (Wasabi100).
+    ///
+    /// **This flag alone does not make `receiveHeaders` public.** rskj
+    /// computes `receiveHeadersIsPublic() = RSKIP124 && !RSKIP200`, so
+    /// the public window is Wasabi100 up to Iris300 and no further:
+    /// RSKIP200 introduced the singular, permissionless
+    /// `receiveHeader` and closed the plural one again, back to
+    /// `activeAndRetiringFederationOnly`. On any chain past Iris300 —
+    /// which is every live network — `receiveHeaders` is federation
+    /// members only.
+    ///
+    /// Reading this comment without that second half is an easy
+    /// mistake and has been made: it reads as "anyone may relay a
+    /// batch of headers", which is true only of a window that closed
+    /// in 2021. `bridge/mod.rs` has the gate; [`Self::has_rskip200`]
+    /// has the other half of the formula.
     pub fn has_rskip124(&self, block_number: u64) -> bool {
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Wasabi100
     }

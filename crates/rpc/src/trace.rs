@@ -645,10 +645,7 @@ fn sender_of(block: &rustock_core::Block, index: usize, chain_id: u64) -> Addres
         .unwrap_or(Address::ZERO)
 }
 
-/// rskj's chain id, which the sender recovery needs for EIP-155.
-fn chain_id_of(state: &RpcState) -> u64 {
-    state.hardfork_cfg.as_ref().map(|c| c.chain_id).unwrap_or(30)
-}
+use crate::helpers::chain_id_of;
 
 fn as_usize(v: &Value) -> Option<usize> {
     v.as_u64().map(|n| n as usize).or_else(|| {

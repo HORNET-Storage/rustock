@@ -30,6 +30,25 @@ ignore = [
     # rather than relaxing the unmaintained policy, so that a NEW unmaintained
     # crate still fails CI and forces a deliberate decision.
     { id = "RUSTSEC-2024-0436", reason = "paste, unmaintained; transitive via ark-* under revm precompiles" },
+    # pin-utils -- unmaintained; the upstream repository was archived on
+    # 2026-10-01, after its final release. There is no patched version to
+    # move to: the advisory lists `patched = []`, so 0.1.1 is flagged exactly
+    # as 0.1.0 is, and `cargo update` cannot resolve it.
+    #
+    # Transitive only, and not reachable from here: futures-util and hyper
+    # pull it in, which arrive through axum, futures and tokio-tungstenite.
+    # Dropping it is the futures ecosystem's job, not this node's.
+    #
+    # The crate is three macros and about 150 lines -- `pin_mut!`,
+    # `unsafe_pinned!`, `unsafe_unpinned!` -- with no functions, no types and
+    # no statics. It contributes no runtime code, so "unmaintained" here
+    # means the macros will not change, which is the one thing that cannot
+    # rot. `core::pin::pin!` has superseded `pin_mut!` since Rust 1.68 and
+    # pin-project-lite the other two, so the ecosystem is already moving.
+    #
+    # Explicit entry rather than relaxing the unmaintained policy, so a NEW
+    # unmaintained crate still fails CI and forces a deliberate decision.
+    { id = "RUSTSEC-2026-0441", reason = "pin-utils, unmaintained and archived with no patched version; transitive via futures-util and hyper, macros only" },
     # crypto-bigint 0.5.5 -- leading-zero counting, division and Montgomery
     # multiplication are not constant-time, so an operation on a secret
     # integer can leak it through timing. Fixed in 0.7.6, which we cannot

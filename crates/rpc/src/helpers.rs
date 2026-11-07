@@ -152,7 +152,9 @@ pub struct BlockResultDto {
 
 impl BlockResultDto {
     pub fn from_header(header: &Header, hash: B256, total_difficulty: U256) -> Self {
-        Self::from_header_with_body(header, hash, total_difficulty, None, false)
+        // No body, so no transaction will be rendered and the chain id is
+        // never consulted.
+        Self::from_header_with_body(header, hash, total_difficulty, None, false, 30)
     }
 
     pub fn from_header_with_body(
@@ -161,6 +163,7 @@ impl BlockResultDto {
         total_difficulty: U256,
         body: Option<&(Vec<rustock_core::Transaction>, Vec<Header>)>,
         full_txs: bool,
+        chain_id: u64,
     ) -> Self {
         let size = encoded_block_len(header, body);
 
@@ -169,7 +172,7 @@ impl BlockResultDto {
                 .enumerate()
                 .map(|(i, tx)| {
                     if full_txs {
-                        tx_to_json(tx, &hash, header.number, i)
+                        tx_to_json(tx, &hash, header.number, i, chain_id)
                     } else {
                         let h = tx_hash(tx);
                         serde_json::Value::String(to_hex_b256(&h))
@@ -270,16 +273,40 @@ fn tx_hash(tx: &rustock_core::Transaction) -> B256 {
     tx.tx_hash()
 }
 
+/// rskj's chain id, which EIP-155 sender recovery needs.
+///
+/// One copy, because the default is a trap: a hardcoded 30 recovers the wrong
+/// sender on every chain that is not mainnet, and the failure is silent --
+/// `recover_sender` returns a perfectly well-formed address for the wrong
+/// chain id. That bug has already been fixed once here; a second copy of the
+/// constant is how it comes back.
+pub fn chain_id_of(state: &crate::server::RpcState) -> u64 {
+    state.hardfork_cfg.as_ref().map(|c| c.chain_id).unwrap_or(30)
+}
+
 /// Format a transaction as a JSON object for `eth_getBlockBy*` (full tx mode).
-fn tx_to_json(tx: &rustock_core::Transaction, block_hash: &B256, block_number: u64, index: usize) -> serde_json::Value {
+///
+/// `from` is recovered here rather than left at zero. It costs one ECDSA
+/// recovery per transaction, which is what rskj pays too: the sender is not
+/// stored anywhere, it only exists in the signature. A transaction whose
+/// signature does not recover -- REMASC has none at all -- reports the zero
+/// address, matching `eth_getTransactionByHash`.
+fn tx_to_json(
+    tx: &rustock_core::Transaction,
+    block_hash: &B256,
+    block_number: u64,
+    index: usize,
+    chain_id: u64,
+) -> serde_json::Value {
     let hash = tx_hash(tx);
+    let from = tx.recover_sender(chain_id).unwrap_or(alloy_primitives::Address::ZERO);
     serde_json::json!({
         "hash": to_hex_b256(&hash),
         "nonce": to_hex_u64(tx.nonce),
         "blockHash": to_hex_b256(block_hash),
         "blockNumber": to_hex_u64(block_number),
         "transactionIndex": to_hex_u64(index as u64),
-        "from": "0x0000000000000000000000000000000000000000",
+        "from": format!("{from:#x}"),
         "to": to_hex_bytes(&tx.to),
         "value": to_hex_u256(&tx.value),
         "gasPrice": to_hex_u256(&tx.gas_price),
