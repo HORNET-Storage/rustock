@@ -56,6 +56,31 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, trace};
 
+/// What a slice asks for next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ask {
+    /// The cell holding the cursor. A cell is the unit a server can cache and
+    /// share; asking for the cursor exactly would give every client a
+    /// different range and every server a cache miss.
+    Cell,
+    /// The cursor itself, after a cell answer that did not move it -- a server
+    /// that caps its responses below the grid size will do that -- because
+    /// asking for the same cell again would produce the same answer forever.
+    /// Costs a cache miss at that server, which is strictly better than a
+    /// stall.
+    Cursor,
+    /// The offset just past the cursor, after every rskj chunk. An rskj server
+    /// answers any offset, starting with the node that holds it, so asking
+    /// just past the cursor picks up with the node that begins there, whatever
+    /// size the server serves. Asked at the cursor itself, it starts with the
+    /// node that ends there, which the last chunk brought; and when that node
+    /// has an embedded right child and no separate left one, rskj's walk sets
+    /// out from inside the child and counts the whole node from there, so a
+    /// node longer than the window is never kept, and the walk stops at it at
+    /// once: the same answer every time.
+    JustPast,
+}
+
 /// A contiguous stretch of the traversal that one worker walks front to back.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Slice {
@@ -66,24 +91,24 @@ struct Slice {
     cursor: u64,
     /// One past the last offset this slice is responsible for.
     end: u64,
-    /// Whether a request for `cursor` is outstanding.
-    in_flight: bool,
-    /// Ask for exactly `cursor` rather than the cell containing it.
-    ///
-    /// Set when a cell answer did not move the cursor -- a server that caps
-    /// its responses below the grid size will do that -- because asking for
-    /// the same cell again would produce the same answer forever. Costs a
-    /// cache miss at that server, which is strictly better than a stall.
-    ///
-    /// Set after every rskj chunk too. An rskj server answers any offset,
-    /// starting with the node that ends there, so asking for the cursor picks
-    /// up exactly where the last chunk stopped, whatever size it serves.
-    exact: bool,
+    /// What it asks for next.
+    next: Ask,
+    /// The offset of the request outstanding for this slice, if one is.
+    asked: Option<u64>,
 }
 
 impl Slice {
     fn wants_work(&self) -> bool {
-        !self.in_flight && self.cursor < self.end
+        self.asked.is_none() && self.cursor < self.end
+    }
+
+    /// The offset this slice asks for next.
+    fn asks(&self, grid: u64) -> u64 {
+        match self.next {
+            Ask::Cell => (self.cursor / grid) * grid,
+            Ask::Cursor => self.cursor,
+            Ask::JustPast => self.cursor + 1,
+        }
     }
 }
 
@@ -131,6 +156,10 @@ pub struct RebuiltChunk {
     /// Where the chunk's own nodes begin and end in the traversal, as the
     /// rebuild placed them. `None` when it carried none.
     pub span: Option<(u64, u64)>,
+    /// Where the node rskj's walk stopped at sits, once the rebuild has placed
+    /// it: the first that reached past the window, which rskj leaves out of
+    /// the chunk's own nodes and sends whole all the same.
+    pub stopped_at: Option<(u64, u64)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -145,7 +174,7 @@ pub enum ChunkError {
     Oversized { asked: u64, got: u64 },
     #[error("the chunk begins at offset {starts}, after the offset {asked} it answers")]
     Misplaced { asked: u64, starts: u64 },
-    #[error("the chunk carried no nodes of its own")]
+    #[error("the chunk placed no node, of its own or where the walk stopped")]
     Empty,
 }
 
@@ -221,7 +250,7 @@ impl StateDownload {
             .map(|i| {
                 let start = from + step * i as u64;
                 let end = if i + 1 == count { to } else { from + step * (i as u64 + 1) };
-                Slice { start, cursor: start, end, in_flight: false, exact: false }
+                Slice { start, cursor: start, end, next: Ask::Cell, asked: None }
             })
             .collect()
     }
@@ -235,17 +264,13 @@ impl StateDownload {
         // The cap is on requests, not on slices. Those were the same number
         // until the trie turned out bigger than advertised and more slices
         // were cut; keeping the two separate means the limit stays the limit.
-        if self.slices.iter().filter(|s| s.in_flight).count() >= self.max_in_flight {
+        if self.slices.iter().filter(|s| s.asked.is_some()).count() >= self.max_in_flight {
             return None;
         }
         let grid = self.grid;
         let slice = self.slices.iter_mut().find(|s| s.wants_work())?;
-        slice.in_flight = true;
-        // Asked for on the grid, whatever the cursor. A cell is the unit a
-        // server can cache and share; asking for `cursor` exactly would give
-        // every client a different range and every server a cache miss.
-        let from =
-            if slice.exact { slice.cursor } else { (slice.cursor / grid) * grid };
+        let from = slice.asks(grid);
+        slice.asked = Some(from);
         Some(ChunkRequest { from, budget: self.budget })
     }
 
@@ -256,7 +281,7 @@ impl StateDownload {
     /// verify.
     pub fn release(&mut self, from: u64) {
         if let Some(i) = self.slice_for(from) {
-            self.slices[i].in_flight = false;
+            self.slices[i].asked = None;
         }
     }
 
@@ -268,26 +293,24 @@ impl StateDownload {
     /// server takes.
     pub fn realign(&mut self, from: u64) {
         if let Some(i) = self.slice_for(from) {
-            self.slices[i].in_flight = false;
-            self.slices[i].exact = false;
+            self.slices[i].asked = None;
+            self.slices[i].next = Ask::Cell;
         }
     }
 
-    /// The slice an answer for `from` belongs to.
+    /// The slice waiting on an answer for `from`.
     ///
-    /// A cell begins at or before the cursor that asked for it, because the
-    /// request was aligned down to the grid. An exact match wins over an
-    /// aligned one, so two slices inside the same cell cannot be confused.
+    /// Each slice keeps the offset it asked. It used to be worked out again
+    /// from the slice, as its cursor or the cell holding it, preferring a
+    /// slice whose cursor was `from`. But a slice asking exactly is inside
+    /// its cell too, and took the answer of a slice that had asked for that
+    /// cell: that one waited for an answer already spent, and the first
+    /// slice's own came back unsolicited, to be charged to the honest peer
+    /// that sent it. And the first answer can reshape the slices, moving a
+    /// cursor whose request is out. Two slices that asked the same offset get
+    /// the same answer, so either may take it.
     fn slice_for(&self, from: u64) -> Option<usize> {
-        let grid = self.grid;
-        self.slices
-            .iter()
-            .position(|s| s.in_flight && s.cursor == from)
-            .or_else(|| {
-                self.slices
-                    .iter()
-                    .position(|s| s.in_flight && (s.cursor / grid) * grid == from)
-            })
+        self.slices.iter().position(|s| s.asked == Some(from))
     }
 
     /// Check a chunk and, if it holds up, keep it.
@@ -356,9 +379,13 @@ impl StateDownload {
             // An answer that moved nothing means this server serves less than
             // a whole cell, so the next request names the cursor exactly
             // rather than asking the same cell again and again.
-            slice.exact = reached <= slice.cursor;
+            slice.next = if reached <= slice.cursor {
+                Ask::Cursor
+            } else {
+                Ask::Cell
+            };
             slice.cursor = reached.max(slice.cursor);
-            slice.in_flight = false;
+            slice.asked = None;
         }
 
         trace!(
@@ -387,9 +414,21 @@ impl StateDownload {
     /// fetched. On mainnet that was 45.7% of the state, found only by the
     /// check after an hour's download, five attempts running.
     ///
-    /// The next request then names the cursor exactly: an rskj server
-    /// answers any offset, beginning with the node that ends there, so the
-    /// next chunk picks up where this one stopped.
+    /// The next request then names the offset just past the cursor: an rskj
+    /// server answers any offset, beginning with the node that holds it, so
+    /// the next chunk picks up with the node that begins where this one
+    /// stopped.
+    ///
+    /// What a chunk brings whole is its own nodes, and the node rskj's walk
+    /// stopped at when it follows them. rskj keeps a node among a chunk's own
+    /// only if it ends before `from + 50 * 1024`, and the first that does not
+    /// it sends whole all the same, which the rebuild has checked against the
+    /// root and placed. A node longer than that window is never among a
+    /// chunk's own, however it is asked for, and comes only this way: asked
+    /// where it begins, the chunk brings only the node before it, and asked
+    /// inside it, nothing of its own. Counted by its own nodes alone,
+    /// every answer was taken with the cursor where it was, and testnet's
+    /// download stood at 94% for hours, asking again.
     pub fn accept_rebuilt(
         &mut self,
         from: u64,
@@ -406,9 +445,21 @@ impl StateDownload {
             self.adopt_total(chunk.total);
         }
 
-        // Nothing of its own is what rskj sends for an offset past the end.
-        // Whatever was asked, the grid is the next thing to try.
-        let Some((starts, reached)) = chunk.span else {
+        // Its own nodes and the node the walk stopped at, when that follows
+        // them; with none of its own, the node it stopped at is the one
+        // holding the offset asked.
+        let covered = match (chunk.span, chunk.stopped_at) {
+            (Some((starts, reached)), Some((begins, ends))) if begins == reached => {
+                Some((starts, ends))
+            }
+            (None, stopped) => stopped,
+            (span, _) => span,
+        };
+        // Nothing to count it for: none of its own, and the node it stopped
+        // at not placed, as a node beside two children both left out cannot
+        // be. Not a shape Rootstock's state has. Asked on the grid, the walk
+        // may begin elsewhere.
+        let Some((starts, reached)) = covered else {
             self.realign(from);
             return Err(ChunkError::Empty);
         };
@@ -437,8 +488,8 @@ impl StateDownload {
                 .saturating_sub(slice.cursor)
                 .min(slice.end.saturating_sub(slice.cursor));
             slice.cursor = reached.max(slice.cursor);
-            slice.exact = true;
-            slice.in_flight = false;
+            slice.next = Ask::JustPast;
+            slice.asked = None;
         }
 
         trace!(
@@ -645,6 +696,7 @@ pub fn chunk_from_payload(
                 long_values: rebuilt.long_values,
                 total: rebuilt.total,
                 span: rebuilt.span,
+                stopped_at: rebuilt.stopped_at,
             }))
         }
     }

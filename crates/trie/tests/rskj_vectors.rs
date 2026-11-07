@@ -441,9 +441,9 @@ fn rskj_chunks_place_themselves_where_the_trie_has_them() {
     assert!(placed >= 6, "only {placed} chunks placed");
 }
 
-/// **Asked for where the last one stopped, rskj's chunks tile the trie** --
-/// each beginning at or before that point, the last ending at the trie's
-/// end -- which is how rustock's client asks for them.
+/// **Asked for just past where the last one stopped, rskj's chunks tile the
+/// trie** -- each beginning at or before that point, the last ending at the
+/// trie's end -- which is how rustock's client asks for them.
 ///
 /// Not how rskj's own client asks. It steps by its cell, trusting the chunk
 /// for `k * cell` to begin where the one before ended, and rskj's iterator
@@ -452,8 +452,8 @@ fn rskj_chunks_place_themselves_where_the_trie_has_them() {
 /// after it in the chunk is counted too far along and the chunk stops short
 /// of its cell. The nodes in the shortfall belong to no chunk at all. It
 /// happens at mainnet's 51,200-byte cells as well, so it is rskj's own snap
-/// sync that loses them; asking at the cursor, nothing is lost: the next
-/// answer begins with the node that ends there.
+/// sync that loses them; asking just past the cursor, nothing is lost: the
+/// next answer begins with the node that begins there.
 #[test]
 fn asked_where_they_stopped_rskj_chunks_tile_the_trie() {
     use rustock_trie::snapshot::chunk_from;
@@ -485,7 +485,7 @@ fn asked_where_they_stopped_rskj_chunks_tile_the_trie() {
             assert_eq!(end, stream[k + chunk.nodes.len() - 1].end(), "cell {cell} at {asked}");
             assert!(end > reached, "cell {cell} at {asked}: no progress");
             reached = end;
-            asked = reached;
+            asked = reached + 1;
         }
         assert_eq!(reached, total, "cell {cell}: ran past the end");
 
@@ -503,7 +503,7 @@ fn asked_where_they_stopped_rskj_chunks_tile_the_trie() {
     }
     assert!(
         stepping_by_the_cell_loses,
-        "rskj's stepping lost nothing here, so this trie no longer shows why the client asks at its cursor"
+        "rskj's stepping lost nothing here, so this trie no longer shows why the client asks where it stopped"
     );
 }
 
@@ -785,4 +785,210 @@ fn every_long_value_a_chunk_names_comes_with_it() {
         }
     }
     assert!(embedded > 0, "no embedded long value was exercised ({named} named in all)");
+}
+
+/// The Rootstock-shaped trie of [`unitrie`], with long code under some
+/// contracts and long values in some storage slots, longer than the windows
+/// the tests below ask with: as long as a contract's code, or a value of the
+/// Bridge's storage, is against rskj's 50 KiB.
+fn unitrie_with_long_values(accounts: usize) -> (TrieNode, MemoryTrieStore) {
+    use alloy_primitives::{Address, B256};
+    use rustock_trie::{account_key, code_key, storage_key};
+
+    let store = MemoryTrieStore::new();
+    let mut root = TrieNode::empty();
+    let put = |root: TrieNode, key: Vec<u8>, value: Vec<u8>| -> TrieNode {
+        root.put(&TrieKeySlice::from_key(&key), &value, &store)
+    };
+    for i in 0..accounts {
+        let address = Address::from_word(B256::from(alloy_primitives::U256::from(i as u64 + 1)));
+        root = put(
+            root,
+            account_key(&address),
+            vec![0xc4, (i as u8).wrapping_add(1), 0x82, 0x03, 0xe8],
+        );
+        if i % 3 == 0 {
+            continue;
+        }
+        let code_len = if i % 7 == 1 {
+            9_000 + i * 13
+        } else {
+            40 + i % 90
+        };
+        let code: Vec<u8> = (0..code_len)
+            .map(|b| (b as u8).wrapping_mul(i as u8 | 1))
+            .collect();
+        root = put(root, code_key(&address), code);
+        for slot in 0..(i % 6) as u64 {
+            let len = if slot == 0 && i % 11 == 2 {
+                12_000 + i * 7
+            } else {
+                1 + (slot as usize * 7) % 32
+            };
+            let value = vec![(slot as u8).wrapping_add(i as u8) | 1; len];
+            root = put(
+                root,
+                storage_key(&address, &B256::from(alloy_primitives::U256::from(slot))),
+                value,
+            );
+        }
+    }
+    root.save(&store, true);
+    (root, store)
+}
+
+/// What an rskj chunk covers, as rustock's client counts it: its own nodes,
+/// and the node its walk stopped at when that follows them; with none of its
+/// own, the node it stopped at, which holds the offset asked.
+fn covered(rebuilt: &rustock_trie::snapshot_legacy::Rebuilt) -> Option<(u64, u64)> {
+    match (rebuilt.span, rebuilt.stopped_at) {
+        (Some((start, end)), Some((begins, ends))) if begins == end => Some((start, ends)),
+        (None, stopped) => stopped,
+        (span, _) => span,
+    }
+}
+
+/// **Asked just past where the last one stopped, rskj's chunks tile any
+/// trie**, nodes longer than the window included, the way rustock's client
+/// asks for them: just past the cursor, the walk begins with the node that
+/// begins there, and each chunk covers what [`covered`] says. The node a walk
+/// stopped at is always the one after the chunk's own, where rustock's
+/// traversal has it.
+#[test]
+fn asked_just_past_where_they_stopped_rskj_chunks_tile_any_trie() {
+    use rustock_trie::snapshot::chunk_from;
+    use rustock_trie::snapshot_legacy::{legacy_chunk, rebuild};
+
+    let tries = [
+        (
+            "rskj's generator's",
+            trie(400),
+            vec![300u64, 777, 1024, 5000],
+        ),
+        ("Rootstock-shaped", unitrie(300), vec![300, 777, 1024, 5000]),
+        (
+            "with long values",
+            unitrie_with_long_values(200),
+            vec![2_000, 5_000],
+        ),
+    ];
+    for (name, (root, store), cells) in tries {
+        let root_hash = root.compute_hash(&store);
+        let root_bytes: [u8; 32] = root_hash.into();
+        let total = total_size(&root, &store);
+        let stream = chunk_from(&root, 0, u64::MAX, &store);
+        for cell in cells.into_iter().chain([total]) {
+            let (mut reached, mut requests) = (0u64, 0);
+            while reached < total {
+                requests += 1;
+                assert!(
+                    requests < 10_000,
+                    "{name}, cell {cell}: no progress from {reached}"
+                );
+                let asked = if reached == 0 { 0 } else { reached + 1 };
+                let chunk = legacy_chunk(&root_bytes, asked, asked + cell, &store).expect("builds");
+                let rebuilt = rebuild(&chunk, root_hash)
+                    .unwrap_or_else(|e| panic!("{name}, cell {cell} at {asked}: {e}"));
+                if let Some((begins, ends)) = rebuilt.stopped_at {
+                    let at = stream.iter().position(|n| n.offset == begins).unwrap_or_else(|| {
+                        panic!("{name}, cell {cell} at {asked}: stopped at {begins}, where no node begins")
+                    });
+                    assert_eq!(
+                        stream[at].end(),
+                        ends,
+                        "{name}, cell {cell} at {asked}: where it ends"
+                    );
+                    if let Some((_, end)) = rebuilt.span {
+                        assert_eq!(
+                            begins, end,
+                            "{name}, cell {cell} at {asked}: not the node after the chunk's own"
+                        );
+                    }
+                }
+                let (start, end) = covered(&rebuilt)
+                    .unwrap_or_else(|| panic!("{name}, cell {cell} at {asked}: nothing at all"));
+                assert!(
+                    start <= reached,
+                    "{name}, cell {cell} at {asked}: a gap from {reached} to {start}"
+                );
+                assert!(end > reached, "{name}, cell {cell} at {asked}: no progress");
+                reached = end;
+            }
+            assert_eq!(reached, total, "{name}, cell {cell}: ran past the end");
+        }
+    }
+}
+
+/// **A node longer than the window arrives whole where the walk stops.** Asked
+/// where it begins, rskj's chunk is only the node that ends there, when that
+/// one is short; asked inside it, a window or more from its end, nothing of
+/// its own. Either way it stopped at the long node, which leads the nodes it
+/// hands back, and the rebuild places it. With nothing of its own, the long
+/// node takes the first node's left hash, without which a contract's account
+/// over its storage, with its long code inside it, would not rebuild.
+#[test]
+fn a_node_longer_than_the_window_arrives_whole_where_the_walk_stops() {
+    use rustock_trie::snapshot::chunk_from;
+    use rustock_trie::snapshot_legacy::{legacy_chunk, rebuild};
+    use rustock_trie::NodeRef;
+
+    let (root, store) = unitrie_with_long_values(200);
+    let root_hash = root.compute_hash(&store);
+    let root_bytes: [u8; 32] = root_hash.into();
+    let stream = chunk_from(&root, 0, u64::MAX, &store);
+    let cell = 2_000u64;
+
+    let (mut long, mut after_short, mut over_storage) = (0, 0, 0);
+    for (i, node) in stream
+        .iter()
+        .enumerate()
+        .filter(|(i, n)| *i > 0 && n.span > cell)
+    {
+        long += 1;
+        let parsed = TrieNode::from_message(&node.message, &store);
+        over_storage += usize::from(matches!(parsed.left, NodeRef::Hash(_)));
+
+        if stream[i - 1].span < cell {
+            after_short += 1;
+            let at_start =
+                legacy_chunk(&root_bytes, node.offset, node.offset + cell, &store).expect("builds");
+            let rebuilt =
+                rebuild(&at_start, root_hash).unwrap_or_else(|e| panic!("at {}: {e}", node.offset));
+            assert_eq!(
+                rebuilt.span.map(|(_, end)| end),
+                Some(node.offset),
+                "asked at {}",
+                node.offset
+            );
+            assert_eq!(
+                rebuilt.stopped_at,
+                Some((node.offset, node.end())),
+                "asked at {}",
+                node.offset
+            );
+        }
+
+        let inside = node.offset + node.span - cell;
+        let within = legacy_chunk(&root_bytes, inside, inside + cell, &store).expect("builds");
+        assert!(
+            within.nodes.is_empty(),
+            "asked at {inside}, inside the node at {}",
+            node.offset
+        );
+        let rebuilt = rebuild(&within, root_hash).unwrap_or_else(|e| panic!("at {inside}: {e}"));
+        assert_eq!(rebuilt.span, None);
+        assert_eq!(
+            rebuilt.stopped_at,
+            Some((node.offset, node.end())),
+            "asked at {inside}"
+        );
+    }
+    assert!(
+        long >= 10 && after_short >= 5,
+        "only {long} nodes longer than the window, {after_short} after a short one"
+    );
+    assert!(
+        over_storage > 0,
+        "no long node with a separate left child: the left hash went untested"
+    );
 }

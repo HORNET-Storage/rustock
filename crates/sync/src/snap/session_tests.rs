@@ -913,8 +913,8 @@ fn an_rskj_chunk_for_another_offset_is_charged() {
 }
 
 /// An rskj chunk with nothing of its own -- what rskj answers when the node at
-/// the offset outruns its cell, or the offset is past the end -- is not held
-/// against the peer. It is about the offset, and the range is asked again.
+/// the offset outruns its cell -- is not held against the peer, and the node,
+/// which rskj sends whole on the stack it hands back, is kept.
 #[test]
 fn an_rskj_chunk_with_nothing_of_its_own_is_not_charged() {
     let f = fixture(250);
@@ -934,7 +934,51 @@ fn an_rskj_chunk_with_nothing_of_its_own_is_not_charged() {
     driver.on_chunk(id, server, &nothing, Refusal::None, &peers);
     assert!(driver.take_blame().is_empty(), "charged a peer for the offset it was asked");
     assert!(!driver.unhelpful().contains(&server), "stopped asking a peer that can serve");
-    assert_eq!(driver.state_progress().0, 0);
+    assert!(driver.state_progress().0 > 0, "the node at the offset, sent whole, was not kept");
+}
+
+/// **Answers that move nothing end the session**, however well they rebuild.
+/// Each was taken as progress and reset the count of answers in a row that
+/// added nothing, so a session whose answers no longer moved it asked again
+/// forever: testnet's stood at 94% for hours. They count now, and the session
+/// gives up, as it does when every answer declines.
+#[test]
+fn answers_that_move_nothing_end_the_session() {
+    let f = fixture(250);
+    let genesis = f.with_genesis();
+    let (blocks, tds) = chain(1, 3, genesis, 100, f.state_root);
+    let mut session = f.session(HeaderVerifier::new());
+    session.on_status(&blocks, &tds, 5_000, 0);
+    let top = blocks.last().unwrap().header.number;
+    let mut actions = session.on_headers(top, &headers_for(&blocks, top, top as u32));
+    assert_eq!(
+        session.phase(),
+        Phase::DownloadingState,
+        "{:?}",
+        session.failure()
+    );
+
+    // Every request gets the chunk for the trie's first 2,000 bytes: genuine,
+    // and taken, but after the first time it holds nothing not already held.
+    let first = rskj_chunk(&f, 0, 2_000);
+    let mut answers = 0;
+    while session.phase() == Phase::DownloadingState {
+        if actions.is_empty() {
+            actions = session.poll();
+        }
+        let Some(Action::RequestChunk { from, .. }) = actions.pop() else {
+            panic!("nothing asked, and the session still downloading");
+        };
+        answers += 1;
+        assert!(answers < 1_000, "the session never gave up");
+        actions.extend(session.on_chunk(from, &first, Refusal::None));
+    }
+    assert!(
+        matches!(session.failure(), Some(SnapFailure::NoProgress(_))),
+        "{:?}",
+        session.failure()
+    );
+    assert!(answers > 64, "gave up after {answers} answers");
 }
 
 /// The chunk requests among a batch of outbound messages: id, offset, peer.
@@ -948,9 +992,9 @@ fn chunk_requests(out: &[super::driver::Outbound]) -> Vec<(u64, u64, B512)> {
         .collect()
 }
 
-/// After an rskj chunk the session asks for exactly where it stopped, which
-/// only an rskj server takes; a server that refuses the offset as off its
-/// grid gets the cell next, not the same offset again.
+/// After an rskj chunk the session asks for the offset just past where it
+/// stopped, which only an rskj server takes; a server that refuses the offset
+/// as off its grid gets the cell next, not the same offset again.
 #[test]
 fn an_offset_refused_as_off_the_grid_is_asked_on_the_grid_next() {
     let f = fixture(250);
@@ -972,8 +1016,8 @@ fn an_offset_refused_as_off_the_grid_is_asked_on_the_grid_next() {
     let exact = chunk_requests(&out);
     let &(id, asked, peer) = exact
         .iter()
-        .find(|(_, asked, _)| *asked == cursor)
-        .unwrap_or_else(|| panic!("nothing asked at the cursor {cursor}: {exact:?}"));
+        .find(|(_, asked, _)| *asked == cursor + 1)
+        .unwrap_or_else(|| panic!("nothing asked just past the cursor {cursor}: {exact:?}"));
     assert_ne!(asked % 100_000, 0, "the exact offset happens to be on the grid; the test proves nothing");
 
     let refused = ChunkPayload::Proved { entries: Vec::new(), witness: Vec::new() };
@@ -985,7 +1029,7 @@ fn an_offset_refused_as_off_the_grid_is_asked_on_the_grid_next() {
         "the refused offset was not replaced by its cell: {next:?}"
     );
     assert!(
-        next.iter().all(|(_, asked, _)| *asked != cursor),
+        next.iter().all(|(_, asked, _)| *asked != cursor + 1),
         "the refused offset was asked again: {next:?}"
     );
 }

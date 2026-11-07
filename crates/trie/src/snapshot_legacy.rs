@@ -484,6 +484,19 @@ pub struct Rebuilt {
     /// `span_of`. This is what a download advances by, rather than by the
     /// range it asked for, which an rskj server does not honour.
     pub span: Option<(u64, u64)>,
+    /// Where the node rskj's walk stopped at sits, from where it begins to
+    /// where it ends. `None` when the walk ran to the trie's end, or the node
+    /// cannot be placed.
+    ///
+    /// rskj keeps a node among a chunk's own only if it ends before the
+    /// window does, and leaves the first one that does not on its stack. It
+    /// sends that node whole all the same, first among the nodes still owed
+    /// their right subtree, and the rebuild has checked it against the root
+    /// with the rest. A node longer than the window -- a contract's code sits
+    /// inside its account's entry, and a value of the Bridge's storage can
+    /// pass 50 KiB -- is never among a chunk's own nodes, wherever it is
+    /// asked for. It only ever arrives this way.
+    pub stopped_at: Option<(u64, u64)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -634,14 +647,41 @@ pub fn rebuild(chunk: &LegacyChunk, expected_root: B256) -> Result<Rebuilt, Rebu
         .children_size
         .checked_add(own[root_index])
         .ok_or(RebuildError::Malformed)?;
+    // Placed only when there is something to place: the chunk's own nodes, or
+    // the node its walk stopped at.
+    let starts = if chunk.nodes.is_empty() && chunk.post_root.is_empty() {
+        Vec::new()
+    } else {
+        placements(&stubs, &own, &left_of, &right_of, root_index)?
+    };
+    let first = chunk.pre_root.len();
     let span = match chunk.nodes.len() {
         0 => None,
-        n => {
-            let first = chunk.pre_root.len();
-            Some(span_of(&stubs, &own, &left_of, &right_of, root_index, first, first + n - 1)?)
+        n => Some(span_of(&stubs, &own, &starts, first, first + n - 1)?),
+    };
+    // rskj hands its stack back top-first, so the node it stopped at leads
+    // the nodes still owed their right subtree.
+    let stopped_at = if chunk.post_root.is_empty() {
+        None
+    } else {
+        let i = first + chunk.nodes.len();
+        match starts[i] {
+            Some(at) => Some((
+                at,
+                at.checked_add(entry(&stubs, &own, i)?)
+                    .ok_or(RebuildError::Unplaced)?,
+            )),
+            None => None,
         }
     };
-    Ok(Rebuilt { nodes, long_values, root, total, span })
+    Ok(Rebuilt {
+        nodes,
+        long_values,
+        root,
+        total,
+        span,
+        stopped_at,
+    })
 }
 
 /// Whether a node's left child is a node of its own: present, not embedded.
@@ -654,8 +694,8 @@ fn separate_right(flags: u8) -> bool {
     flags & 0b0000_0100 != 0 && flags & 0b0000_0001 == 0
 }
 
-/// Where a chunk's own nodes sit in the traversal, and that nothing between
-/// them was left out.
+/// Where each node of the rebuilt tree begins in the traversal; `None` for a
+/// node whose two children were both left out, which cannot be placed.
 ///
 /// rskj's format carries no offsets, and does not need to. The tree a chunk
 /// rebuilds to is the top of the real trie -- every node it carries, and the
@@ -665,27 +705,15 @@ fn separate_right(flags: u8) -> bool {
 /// root places every carried node exactly, by the arithmetic of
 /// [`crate::snapshot::seek`]: a node's entry begins after its left branch, and
 /// its right branch after its entry.
-///
-/// The nodes from `first` to `last` must then fill the stretch between them.
-/// A subtree left out in the middle, its hash handed in as the last node's
-/// left, still rebuilds to the right root; without this it is a stretch the
-/// chunk appears to cover and does not carry, a hole a download finds only at
-/// the end.
-///
-/// Returns where the first node's entry begins and the last's ends.
-fn span_of(
+fn placements(
     stubs: &[Stub],
     own: &[u64],
     left_of: &[Option<usize>],
     right_of: &[Option<usize>],
     root: usize,
-    first: usize,
-    last: usize,
-) -> Result<(u64, u64), RebuildError> {
+) -> Result<Vec<Option<u64>>, RebuildError> {
     let unplaced = || RebuildError::Unplaced;
-    // `total_size` and `stream_size`, from what the chunk carried.
     let total = |i: usize| stubs[i].children_size.checked_add(own[i]).ok_or_else(unplaced);
-    let entry = |i: usize| own[i].checked_add(stubs[i].embedded_total).ok_or_else(unplaced);
 
     let mut starts: Vec<Option<u64>> = vec![None; stubs.len()];
     // Each node, with the offset its subtree begins at.
@@ -716,18 +744,51 @@ fn span_of(
             stack.push((l, base));
         }
         if let Some(r) = right_of[i] {
-            stack.push((r, at.checked_add(entry(i)?).ok_or_else(unplaced)?));
+            stack.push((
+                r,
+                at.checked_add(entry(stubs, own, i)?).ok_or_else(unplaced)?,
+            ));
         }
     }
+    Ok(starts)
+}
 
+/// A node's entry in the traversal: its own bytes, and its embedded children,
+/// which sit inside it.
+fn entry(stubs: &[Stub], own: &[u64], i: usize) -> Result<u64, RebuildError> {
+    own[i]
+        .checked_add(stubs[i].embedded_total)
+        .ok_or(RebuildError::Unplaced)
+}
+
+/// Where a chunk's own nodes sit in the traversal, as [`placements`] has them,
+/// and that nothing between them was left out.
+///
+/// The nodes from `first` to `last` must fill the stretch between them. A
+/// subtree left out in the middle, its hash handed in as the last node's
+/// left, still rebuilds to the right root; without this it is a stretch the
+/// chunk appears to cover and does not carry, a hole a download finds only at
+/// the end.
+///
+/// Returns where the first node's entry begins and the last's ends.
+fn span_of(
+    stubs: &[Stub],
+    own: &[u64],
+    starts: &[Option<u64>],
+    first: usize,
+    last: usize,
+) -> Result<(u64, u64), RebuildError> {
+    let unplaced = || RebuildError::Unplaced;
     let start = starts[first].ok_or_else(unplaced)?;
     let end = starts[last]
         .ok_or_else(unplaced)?
-        .checked_add(entry(last)?)
+        .checked_add(entry(stubs, own, last)?)
         .ok_or_else(unplaced)?;
     let mut carried = 0u64;
     for i in first..=last {
-        carried = carried.checked_add(entry(i)?).ok_or_else(unplaced)?;
+        carried = carried
+            .checked_add(entry(stubs, own, i)?)
+            .ok_or_else(unplaced)?;
     }
     if end.checked_sub(start) != Some(carried) {
         return Err(unplaced());
@@ -762,6 +823,17 @@ fn assemble(chunk: &LegacyChunk) -> Result<Vec<Stub>, RebuildError> {
 
     for (body, hash) in &chunk.post_root {
         out.push(parse_stub(body, None, *hash, out.len())?);
+    }
+
+    // A chunk that carried none of its own began its walk at the node holding
+    // the offset asked, and stopped there at once: that node leads the ones
+    // still owed their right subtree, and the first node's left hash is its.
+    // Left without it, a node with a separate left child -- a contract's
+    // account over its storage, with its code inside it -- cannot be rebuilt.
+    if chunk.nodes.is_empty() {
+        if let Some(stub) = out.get_mut(first) {
+            stub.given_left = chunk.first_left;
+        }
     }
     Ok(out)
 }

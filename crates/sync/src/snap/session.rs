@@ -1237,19 +1237,12 @@ impl SnapSession {
             super::client::Arrived::Rebuilt(rebuilt) => {
                 let Some(download) = self.download.as_mut() else { return Vec::new() };
                 return match download.accept_rebuilt(from, &rebuilt) {
-                    Ok(progress) => {
-                        self.fruitless_chunks = 0;
-                        if progress.complete {
-                            self.finish_state_download()
-                        } else {
-                            self.poll()
-                        }
-                    }
+                    Ok(progress) => self.taken(progress),
                     Err(e) => {
                         debug!(target: "rustock::snap", "rskj chunk from offset {from} refused: {e}");
                         self.chunk_fault = Some(match e {
-                            // Nothing of its own: past the end, as rskj answers
-                            // an offset there. About the offset, not the peer.
+                            // Nothing it could be counted for: about the
+                            // offset and the shape of the trie, not the peer.
                             ChunkError::Empty => ChunkFault::Realign,
                             other => ChunkFault::Misbehaved(other),
                         });
@@ -1271,19 +1264,13 @@ impl SnapSession {
 
         let Some(download) = self.download.as_mut() else { return Vec::new() };
         match download.accept(from, &proof) {
-            Ok(progress) => {
-                self.fruitless_chunks = 0;
-                if progress.complete {
-                    return self.finish_state_download();
-                }
-            }
+            Ok(progress) => self.taken(progress),
             Err(e) => {
                 debug!(target: "rustock::snap", "chunk from offset {from} refused: {e}");
                 self.chunk_fault = Some(ChunkFault::Misbehaved(e));
-                return self.fruitless(from);
+                self.fruitless(from)
             }
         }
-        self.poll()
     }
 
     /// An answer that added nothing: put the range back, and count it.
@@ -1291,6 +1278,32 @@ impl SnapSession {
         if let Some(download) = self.download.as_mut() {
             download.release(from);
         }
+        self.no_progress()
+    }
+
+    /// A chunk the download took: the last one, one that moved it on, or one
+    /// that moved it nothing.
+    ///
+    /// A chunk taken that moves nothing is asked for again and comes back the
+    /// same, so it counts as an answer that added nothing. Counted only by
+    /// whether it was taken, each one started the count again: a node longer
+    /// than rskj's window held testnet's download at 94% for hours that way,
+    /// without a word. Nothing is given back to the download, which ended the
+    /// request when it took the chunk.
+    fn taken(&mut self, progress: super::client::Progress) -> Vec<Action> {
+        if progress.complete {
+            return self.finish_state_download();
+        }
+        if progress.advanced == 0 {
+            return self.no_progress();
+        }
+        self.fruitless_chunks = 0;
+        self.poll()
+    }
+
+    /// One more answer in a row that added nothing; at the limit, the session
+    /// stops and lets the caller try a different set of peers.
+    fn no_progress(&mut self) -> Vec<Action> {
         self.fruitless_chunks += 1;
         if self.fruitless_chunks >= FRUITLESS_CHUNKS_ALLOWED {
             return self.fail(SnapFailure::NoProgress(self.fruitless_chunks));

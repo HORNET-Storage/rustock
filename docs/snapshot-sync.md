@@ -651,11 +651,37 @@ state, found only by the completeness check after an hour's download, on five
 attempts running; `crates/cli/examples/snap_holes.rs` maps such holes, and put
 every missing byte past the first 51,200 of its cell.
 
-So the client advances by step 6's span, and asks next for exactly where the
-chunk stopped. rskj answers any offset, starting with the node that ends
-there, so the next chunk picks up from that point whatever size the server
-serves. A chunk that begins after the offset asked for is not an answer to it
-and is charged; one with no nodes of its own is about the offset and is not.
+So the client advances by what the chunk covers, and asks next for the offset
+just past where it stopped. rskj answers any offset, starting with the node
+that holds it, so the next chunk begins with the node that begins there,
+whatever size the server serves. A chunk that begins after the offset asked
+for is not an answer to it and is charged.
+
+What a chunk covers is its own nodes, placed by step 6, and the node rskj's
+walk stopped at when that one follows them. rskj keeps a node among a chunk's
+own only if it ends before `from + 50 * 1024`, and leaves the first that does
+not on its stack, which it hands back top-first: that node arrives whole,
+first among the nodes still owed their right subtree, and is rebuilt and
+checked with the rest. A node longer than that window -- an account with its
+contract's code embedded in it, or a long value of the Bridge's storage -- is
+never among a chunk's own, wherever it is asked for, and arrives only this
+way. Counted by its own nodes alone, a chunk asked where such a node began
+brought only the node before it, and one asked inside it nothing of its own;
+every answer was taken and none moved the cursor. On testnet at #8,261,160 the
+download stood at 94% for hours.
+
+Asking at the cursor itself, as the client did once it stopped advancing by
+the cell, stalls there too. rskj begins with the node that ends at the offset,
+and when that node has an embedded right child and no separate left one, its
+walk sets out from inside the child and counts the whole node from there. A
+long node is then never kept, and the walk stops at it at once, with the same
+answer every time. Just past the cursor, the walk begins with the node after
+it.
+
+An answer the client takes that moves nothing counts as one that added
+nothing. It did not before: each was taken, and taking one started the count
+again, so the stall never ended the session. Sixty-four such answers in a row
+end it, as sixty-four refusals do, and nobody is charged.
 
 Asking where the last chunk stopped also avoids a fault in rskj's own client,
 which steps by its cell and trusts the chunk for `k * cell` to begin where the
@@ -665,7 +691,11 @@ the node, everything after it in that chunk is counted too far along, and the
 chunk stops short of its cell. The nodes in the shortfall belong to no chunk at
 all. `asked_where_they_stopped_rskj_chunks_tile_the_trie` in
 `crates/trie/tests/rskj_vectors.rs` shows both: rskj's stepping losing nodes,
-and asking at the cursor losing none.
+and asking just past where the last chunk stopped losing none.
+`asked_just_past_where_they_stopped_rskj_chunks_tile_any_trie` shows it for
+tries with nodes longer than the window, and
+`a_node_longer_than_the_window_arrives_whole_where_the_walk_stops` where such
+a node comes.
 
 The root also commits to the trie's size, so a rebuilt chunk settles the total
 as a proved one does, and a peer's hint is never the last word on where the
