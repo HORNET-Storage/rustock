@@ -53,6 +53,8 @@ fn test_chain_config() -> Arc<ChainConfig> {
             // From genesis too: a partitioned template carries the version
             // fields RSKIP351 brings.
             rskip351: Some(0),
+            // Testnet's floor alone, and this chain is not testnet.
+            rskip290: None,
         },
         genesis_spec: None,
         skip_pow_validation: false,

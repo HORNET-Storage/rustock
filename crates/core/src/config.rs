@@ -65,6 +65,13 @@ pub struct ActivationHeights {
     /// `None` where it never does. rskj's `reference.conf` sets it at
     /// reed810, which mainnet has at -1, so no mainnet header carries it.
     pub rskip351: Option<u64>,
+    /// Height at which RSKIP290 -- testnet's minimum difficulty raised to
+    /// 550,000,000 -- activates, or `None` where it never does.
+    /// `reference.conf` sets it at hop400, and `testnet.conf` overrides it to
+    /// #2,581,800, half a million blocks sooner. rskj applies it on testnet
+    /// alone (`Constants.getMinimumDifficulty`), so on the other chains it
+    /// is recorded but changes nothing: see [`ChainConfig::min_difficulty_at`].
+    pub rskip290: Option<u64>,
 }
 
 /// Process-wide activation heights, consulted by block-hash computation
@@ -116,6 +123,8 @@ impl ActivationHeights {
             rskip144: None,
             // main.conf: `reed810 = -1`.
             rskip351: None,
+            // reference.conf: `rskip290 = hop400`. Mainnet's floor stays 7e15.
+            rskip290: Some(4_598_500),
         }
     }
 
@@ -136,6 +145,8 @@ impl ActivationHeights {
             rskip144: Some(7_139_600),
             // testnet.conf: `reed810 = 7139600`.
             rskip351: Some(7_139_600),
+            // testnet.conf: `rskip290 = 2581800`, not hop400.
+            rskip290: Some(2_581_800),
         }
     }
 
@@ -154,6 +165,8 @@ impl ActivationHeights {
             rskip144: None,
             // regtest.conf: `rskip351 = 1`.
             rskip351: Some(1),
+            // reference.conf's hop400, which regtest.conf puts at genesis.
+            rskip290: Some(0),
         }
     }
 }
@@ -164,6 +177,8 @@ pub struct ChainConfig {
     pub network_id: u64,
     pub duration_limit: u64,
     pub difficulty_divisor: U256,
+    /// rskj `Constants.minimumDifficulty`. The floor in force at a height,
+    /// which testnet raises from RSKIP290, is [`ChainConfig::min_difficulty_at`].
     pub min_difficulty: U256,
     /// The greatest difficulty at which a block below RSKIP98 (orchid) may
     /// be signed by a fallback-mining key rather than merge-mined: rskj
@@ -269,6 +284,23 @@ impl ChainConfig {
             skip_pow_validation: false,
             hardfork_overrides: Vec::new(),
             consensus_rule_overrides: Vec::new(),
+        }
+    }
+
+    /// The least difficulty a block at `number` may have: rskj
+    /// `Constants.getMinimumDifficulty`. `min_difficulty`, except on testnet
+    /// from RSKIP290, where it is 550,000,000. A falling difficulty is raised
+    /// to it, and before RSKIP97 a block ten minutes late drops to it.
+    ///
+    /// Holding testnet to 131,072 there made rustock expect 548,625,000 of
+    /// #6,360,768, a late block whose parent sat at the 550,000,000 floor,
+    /// and its snapshot sync refused the header.
+    pub fn min_difficulty_at(&self, number: u64) -> U256 {
+        // rskj's TESTNET_CHAIN_ID and TESTNET2_CHAIN_ID.
+        let testnet = matches!(self.chain_id, 31 | 34);
+        match self.activation_heights.rskip290 {
+            Some(height) if testnet && number >= height => U256::from(550_000_000u64),
+            _ => self.min_difficulty,
         }
     }
 

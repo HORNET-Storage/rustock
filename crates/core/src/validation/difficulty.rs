@@ -66,7 +66,7 @@ impl DifficultyRule {
         if !rskip97_active {
             let delta_ts = header.timestamp.saturating_sub(parent.timestamp);
             if delta_ts >= TEN_MINUTES {
-                return self.config.min_difficulty;
+                return self.config.min_difficulty_at(header.number);
             }
         }
 
@@ -121,9 +121,11 @@ impl DifficultyRule {
             U256::ZERO
         };
 
-        // Clamp to minimum difficulty — matches rskj's max(minDifficulty, fromParent).
-        if from_parent < self.config.min_difficulty {
-            self.config.min_difficulty
+        // Clamp to the floor in force at this height: rskj's
+        // max(getMinimumDifficulty(number), fromParent).
+        let floor = self.config.min_difficulty_at(header.number);
+        if from_parent < floor {
+            floor
         } else {
             from_parent
         }
@@ -137,7 +139,7 @@ mod rskip97_tests {
     use alloy_primitives::{Bytes, B256};
     use std::sync::Arc;
 
-    fn header_at(number: u64, timestamp: u64, difficulty: U256) -> Header {
+    pub(super) fn header_at(number: u64, timestamp: u64, difficulty: U256) -> Header {
         let mut h = Header {
             parent_hash: B256::ZERO,
             ommers_hash: B256::ZERO,
@@ -240,5 +242,72 @@ mod rskip97_tests {
         assert_eq!(child(i32::MAX as u64), parent.difficulty - step);
         // (1 + 2^30) * 14 wraps below zero.
         assert_eq!(child(1 << 30), parent.difficulty - step);
+    }
+}
+
+#[cfg(test)]
+mod rskip290_tests {
+    use super::rskip97_tests::header_at;
+    use super::*;
+    use crate::config::ChainConfig;
+    use std::sync::Arc;
+
+    fn testnet() -> DifficultyRule {
+        DifficultyRule {
+            config: Arc::new(ChainConfig::testnet()),
+        }
+    }
+
+    /// Testnet #6,360,768 and its parent, from the live chain: 120 seconds
+    /// apart, so the block is late and its difficulty falls, but not below
+    /// the 550,000,000 that RSKIP290 holds testnet to, where the parent
+    /// already sat. Held to 131,072, rustock expected 548,625,000, and its
+    /// snapshot sync refused the header after walking 1.9 million others.
+    #[test]
+    fn testnet_block_6360768_stays_on_rskip290s_floor() {
+        let parent = header_at(6_360_767, 1_746_607_067, U256::from(550_000_000u64));
+        let mut block = header_at(6_360_768, 1_746_607_187, U256::from(550_000_000u64));
+        assert_eq!(testnet().validate_with_parent(&block, &parent), Ok(()));
+        block.difficulty = U256::from(548_625_000u64);
+        assert!(testnet().validate_with_parent(&block, &parent).is_err());
+    }
+
+    /// testnet.conf activates RSKIP290 at #2,581,800, not at hop400.
+    #[test]
+    fn testnets_floor_rises_at_2581800() {
+        let late = |number: u64| {
+            let parent = header_at(number - 1, 1_000_000, U256::from(550_000_000u64));
+            testnet().difficulty_for_child(&parent, number, 1_000_000 + 60, 0)
+        };
+        assert_eq!(late(2_581_799), U256::from(548_625_000u64));
+        assert_eq!(late(2_581_800), U256::from(550_000_000u64));
+    }
+
+    /// The ten-minute drop, which testnet never retires, lands on the floor
+    /// in force: RSKIP290's from its height on.
+    #[test]
+    fn testnets_ten_minute_drop_lands_on_the_floor_in_force() {
+        let drop = |number: u64| {
+            let parent = header_at(number - 1, 1_000_000, U256::from(10_000_000_000u64));
+            testnet().difficulty_for_child(&parent, number, 1_000_000 + 600, 0)
+        };
+        assert_eq!(drop(2_581_799), U256::from(131_072u64));
+        assert_eq!(drop(2_581_800), U256::from(550_000_000u64));
+    }
+
+    /// rskj holds testnet alone to it. Mainnet's floor is 7e15, far above
+    /// 550,000,000, so taking RSKIP290 there would lower it; regtest's is 1,
+    /// and taking it would raise it.
+    #[test]
+    fn only_testnet_has_rskip290s_floor() {
+        for config in [ChainConfig::mainnet(), ChainConfig::regtest()] {
+            let floor = config.min_difficulty;
+            let rule = DifficultyRule {
+                config: Arc::new(config),
+            };
+            let parent = header_at(5_000_000, 1_000_000, floor);
+            let late = rule.difficulty_for_child(&parent, 5_000_001, 1_000_000 + 60, 0);
+            assert_eq!(late, floor);
+        }
     }
 }
