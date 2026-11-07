@@ -327,12 +327,14 @@ pub fn rsk_flush(id: Value, state: &RpcState) -> JsonRpcResponse {
 /// `System::exit`. The same is done here, with one addition that matters more
 /// on this node than on rskj: the trie store is flushed **first**.
 ///
-/// That ordering is the whole point of offering this at all. Stopping this
-/// node by killing it discards unflushed memtables, so the operating
-/// procedure is "SIGTERM and wait, never SIGKILL". This gives automation the
-/// same ordered stop without needing signal access to the process — useful for
-/// orchestration, and for anything that can reach the RPC port but not the
-/// process table.
+/// That ordering is the whole point of offering this at all. The node catches
+/// no signal -- only an rskj import does -- so SIGTERM stops it as abruptly as
+/// SIGKILL, and what the trie store holds unflushed is lost. Nothing is
+/// corrupted by that: the executed head never advances past what a crash
+/// keeps, so the node executes again from there. This gives automation an
+/// ordered stop, with nothing to execute again, without needing signal access
+/// to the process -- useful for orchestration, and for anything that can
+/// reach the RPC port but not the process table.
 ///
 /// The response is sent before the process exits, because a caller that gets
 /// no reply cannot tell "shut down" from "crashed".
