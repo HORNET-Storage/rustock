@@ -1,6 +1,8 @@
-use crate::helpers::{parse_b256, parse_block_number, to_hex_bytes};
+use crate::helpers::{parse_b256, parse_block_number, to_hex_bytes, to_hex_u64};
 use crate::types::*;
+use alloy_primitives::{b256, B256};
 use alloy_rlp::Encodable;
+use rustock_core::Header;
 use rustock_storage::BlockStore;
 use serde_json::{json, Value};
 
@@ -68,6 +70,151 @@ pub fn rsk_get_raw_block_header_by_number(
         }
         _ => JsonRpcResponse::success(id, Value::Null),
     }
+}
+
+/// The most blocks that one `rsk_getRawBlocks` call gives.
+pub const MAX_RAW_BLOCKS: u64 = 1_000;
+
+/// Keccak-256 of the empty RLP list: the uncles hash of a block that names no
+/// uncles.
+const EMPTY_UNCLES_HASH: B256 =
+    b256!("1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347");
+
+/// `rsk_getBlockNumberByHash(hash)`: the number of the block with hash `hash`
+/// on the chain this node follows, or null if it holds no such block there. A
+/// block it holds only on a fork has none.
+pub fn rsk_get_block_number_by_hash(
+    id: Value,
+    params: &Value,
+    store: &BlockStore,
+) -> JsonRpcResponse {
+    let Some(hash) = params.get(0).and_then(|v| v.as_str()).and_then(parse_b256) else {
+        return JsonRpcResponse::error(id, INVALID_PARAMS, "Missing or invalid block hash");
+    };
+    let header = match store.header(hash) {
+        Ok(Some(header)) => header,
+        Ok(None) => return JsonRpcResponse::success(id, Value::Null),
+        Err(e) => {
+            return JsonRpcResponse::error(
+                id,
+                INTERNAL_ERROR,
+                format!("Failed to read the header: {e}"),
+            )
+        }
+    };
+    match store.canonical_hash(header.number) {
+        Ok(Some(canonical)) if canonical == hash => {
+            JsonRpcResponse::success(id, json!(to_hex_u64(header.number)))
+        }
+        Ok(_) => JsonRpcResponse::success(id, Value::Null),
+        Err(e) => {
+            JsonRpcResponse::error(id, INTERNAL_ERROR, format!("Failed to read the chain: {e}"))
+        }
+    }
+}
+
+/// `rsk_getRawBlocks(from, to)`: the blocks numbered `from` to `to` on the
+/// chain this node follows, both included, oldest first, at most
+/// [`MAX_RAW_BLOCKS`] of them. Each is `{header, uncles}`: its header
+/// compressed, as rskj sends a chain's headers to its peers
+/// ([`Header::encode_compressed`]), and its uncles in full, as a block carries
+/// them and its uncles hash covers them, in the order it names them.
+///
+/// What it gives is one run of the chain: it stops before the first block it
+/// doesn't hold whole, header and uncles, and before one that doesn't follow
+/// the block before it, as when the chain moved while it read. A block whose
+/// uncles hash is the empty list's names none, so it is whole without its
+/// body; an uncle held only compressed isn't held whole, as its block's uncles
+/// hash covers it in full.
+pub fn rsk_get_raw_blocks(id: Value, params: &Value, store: &BlockStore) -> JsonRpcResponse {
+    let number = |at: usize| {
+        params
+            .get(at)
+            .and_then(|v| v.as_str())
+            .and_then(parse_quantity)
+    };
+    let (Some(from), Some(to)) = (number(0), number(1)) else {
+        return JsonRpcResponse::error(id, INVALID_PARAMS, "Missing or invalid block numbers");
+    };
+    if to >= from && to - from >= MAX_RAW_BLOCKS {
+        return JsonRpcResponse::error(
+            id,
+            INVALID_PARAMS,
+            format!("At most {MAX_RAW_BLOCKS} blocks at a time"),
+        );
+    }
+    let mut blocks = Vec::new();
+    let mut parent: Option<B256> = None;
+    for number in from..=to {
+        let (hash, header, uncles) = match whole_block(store, number) {
+            Ok(Some(block)) => block,
+            Ok(None) => break,
+            Err(e) => {
+                return JsonRpcResponse::error(
+                    id,
+                    INTERNAL_ERROR,
+                    format!("Failed to read block #{number}: {e}"),
+                )
+            }
+        };
+        if parent.is_some_and(|parent| header.parent_hash != parent) {
+            break;
+        }
+        parent = Some(hash);
+        let uncles: Vec<String> = uncles
+            .iter()
+            .map(|uncle| {
+                let mut out = Vec::new();
+                uncle.encode(&mut out);
+                to_hex_bytes(&out)
+            })
+            .collect();
+        blocks.push(json!({
+            "header": to_hex_bytes(&header.encode_compressed()),
+            "uncles": uncles,
+        }));
+    }
+    JsonRpcResponse::success(id, json!(blocks))
+}
+
+/// The block at `number` on the chain this node follows, its hash and its
+/// uncles, if the node holds the header and every uncle in full.
+fn whole_block(
+    store: &BlockStore,
+    number: u64,
+) -> anyhow::Result<Option<(B256, Header, Vec<Header>)>> {
+    let Some(hash) = store.canonical_hash(number)? else {
+        return Ok(None);
+    };
+    let Some(header) = store.header(hash)? else {
+        return Ok(None);
+    };
+    // The body's, or the freezer's once the body is gone.
+    let held = match store.uncles(hash)? {
+        Some(uncles) => Some(uncles),
+        None => match store.freezer() {
+            Some(freezer) => freezer.uncles(number)?,
+            None => None,
+        },
+    };
+    let uncles = match held {
+        Some(uncles) => uncles,
+        None if header.ommers_hash == EMPTY_UNCLES_HASH => Vec::new(),
+        None => return Ok(None),
+    };
+    if uncles.iter().any(|uncle| uncle.extension_data.is_some()) {
+        return Ok(None);
+    }
+    Ok(Some((hash, header, uncles)))
+}
+
+/// A block number as a `0x`-prefixed hex quantity, and nothing else.
+fn parse_quantity(text: &str) -> Option<u64> {
+    let digits = text.strip_prefix("0x")?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    u64::from_str_radix(digits, 16).ok()
 }
 
 /// `rsk_getStorageBytesAt` — the variable-length value at a storage key.

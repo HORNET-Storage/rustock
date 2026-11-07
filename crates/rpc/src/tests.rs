@@ -6094,3 +6094,503 @@ async fn storage_nodes_prove_a_slot_that_is_not() {
         "eth_getProof still answers an absent slot with an empty array"
     );
 }
+
+// ===== rsk_getBlockNumberByHash, rsk_getRawBlocks =====
+
+/// Testnet #8,260,761 in full, as rustock's testnet node took it with its
+/// block, which rskj hashes to 0x9a1cfe09...0d47 (core's `V2_FULL`).
+const TESTNET_FULL: &str = concat!(
+    "f9029ba0285f7c3513c466f54fde5f1b73b2d93b35374515472192250bd3a56396dc649ea01dcc4de8dec75d7aab85b5",
+    "67b6ccd41ad312451b948a7413f0a142fd40d4934794b774aa2876145b2f6f3de27e5e6ac970aa12d771a04aa4b67c3e",
+    "30508692f13e9e10758d907e7d851234cd6cd00d65aa49e5a1ac44a0f40c99e8151d350e30309fa0a74234c365961aa0",
+    "81ad18e51a4281c513ec76d0a066cfdb731f620cd96e2c2cb0f7d3c3a2879c29b40014aa27efbbf3cf9cd3b0f6b90100",
+    "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+    "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+    "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+    "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+    "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+    "00000000000000000000000000000000844edfab4b837e0c998400b71b0080846aec1a5c92d1018f564554495645522d",
+    "3733316239643880835a74cf8080028080b8507111010000000000000000000000000000000000000000000000000000",
+    "00000000000000135534881310aada94b2b5867af37e4e2fc48be028c35beeaa7f1dc4cf501e825d1aec6affff0f1d0d",
+    "16caea80b85800000000000003c09e1ed89b4ab8f092a3dc3a4b852db4552dfd95136f298514ba947d076032a8f20bbe",
+    "a052534b424c4f434b3a6e7fa68f56e3bc6085e7e02e325250f1c72ad9eef1a0d7693e516e10007e0c9900000000",
+);
+
+/// The same header compressed, as rskj sends a chain's headers to its peers
+/// (core's `V2_COMPRESSED`).
+const TESTNET_COMPRESSED: &str = concat!(
+    "f901b9a0285f7c3513c466f54fde5f1b73b2d93b35374515472192250bd3a56396dc649ea01dcc4de8dec75d7aab85b5",
+    "67b6ccd41ad312451b948a7413f0a142fd40d4934794b774aa2876145b2f6f3de27e5e6ac970aa12d771a04aa4b67c3e",
+    "30508692f13e9e10758d907e7d851234cd6cd00d65aa49e5a1ac44a0f40c99e8151d350e30309fa0a74234c365961aa0",
+    "81ad18e51a4281c513ec76d0a066cfdb731f620cd96e2c2cb0f7d3c3a2879c29b40014aa27efbbf3cf9cd3b0f6a3e202",
+    "a09aca8469839f117b1a26abbdea244a32cb0833e387cf6af9dc13eb336094d3c2844edfab4b837e0c998400b71b0080",
+    "846aec1a5c92d1018f564554495645522d3733316239643880835a74cf8080b850711101000000000000000000000000",
+    "000000000000000000000000000000000000000000135534881310aada94b2b5867af37e4e2fc48be028c35beeaa7f1d",
+    "c4cf501e825d1aec6affff0f1d0d16caea80b85800000000000003c09e1ed89b4ab8f092a3dc3a4b852db4552dfd9513",
+    "6f298514ba947d076032a8f20bbea052534b424c4f434b3a6e7fa68f56e3bc6085e7e02e325250f1c72ad9eef1a0d769",
+    "3e516e10007e0c9900000000",
+);
+
+/// Testnet #8,260,720 as rskj's peers sent it to rustock's testnet node,
+/// compressed (core's `V2_FROM_PEERS`).
+const TESTNET_FROM_PEERS: &str = concat!(
+    "f901f9a00bdcd28d517b22bc7b65bf669b05924ac8ba8a862ccb4b17d619fdbd8b9789f8a01dcc4de8dec75d7aab85b5",
+    "67b6ccd41ad312451b948a7413f0a142fd40d4934794ad418c1d48780005f6d847ef0a5e3bd93ea09090a0c545101cc3",
+    "df462f9c369b22f722ec66ade0f031b528512f12fceca574d0ecc8a01db2709b879ae45385439bc35bc1ce8e821de8ae",
+    "b4a4e8ec9c94cf9f3dc55f7ea01ddfe2c6ff70e83e21bc8a905eb71278aab2fc921dd08543c20451a2ccbf286da3e202",
+    "a03c015999cbb7ab1fdb80e23b658a251e424af79a99262579f2fd59bd50fddc78844f476ad3837e0c708400b71b0082",
+    "e8f8846aec16be92d1018f564554495645522d37333162396438855a76a29740835a5a088080b85000000020785e2a8b",
+    "51231a7478b788a2427a2a4c190c0f4e418e25c4ca0c000000000000ba37f569d2f87d917d83e79d50af85497b7d35f0",
+    "ebe4e7c57ddd76e80fb58dfca130ec6af0ff0f1a007dc5fa80b8910000000000000080f880b614920083ca51e27b69b7",
+    "d6dba5262da24a347487e62e8406463eb94d6a6088ac0000000000000000266a24aa21a9ede2f61c3f71d1defd3fa999",
+    "dfa36953755c690689799962b48bebd836974e8cf900000000000000002a6a52534b424c4f434b3a3d8461c1058c9db8",
+    "352ad0c0b7e56a1ba4fcac4da0d7693e516ef40a007e0c7000000000",
+);
+
+/// A header as the network reads one.
+fn testnet_header(hex: &str) -> Header {
+    let bytes = hex::decode(hex).unwrap();
+    Header::decode_with_hash(&mut bytes.as_slice()).unwrap()
+}
+
+/// A header in full, as hex.
+fn in_full(header: &Header) -> String {
+    use alloy_rlp::Encodable;
+    let mut out = Vec::new();
+    header.encode(&mut out);
+    hex::encode(out)
+}
+
+/// Puts `header` on the chain this node follows, and gives its hash.
+fn follow(store: &BlockStore, header: &Header) -> B256 {
+    let hash = header.hash();
+    store.put_header(header).unwrap();
+    store.put_canonical_hash(header.number, hash).unwrap();
+    hash
+}
+
+/// Puts `build(number)` for each of `numbers` on the chain this node follows,
+/// each naming the one before, and gives their hashes.
+fn follow_run(
+    store: &BlockStore,
+    numbers: std::ops::RangeInclusive<u64>,
+    build: impl Fn(u64) -> Header,
+) -> Vec<B256> {
+    let mut parent_hash = B256::repeat_byte(0x11);
+    numbers
+        .map(|number| {
+            parent_hash = follow(
+                store,
+                &Header {
+                    parent_hash,
+                    ..build(number)
+                },
+            );
+            parent_hash
+        })
+        .collect()
+}
+
+/// `rsk_getRawBlocks(from, to)`'s answer.
+async fn raw_blocks(state: &RpcState, from: &str, to: &str) -> JsonRpcResponse {
+    dispatch_for_test(state, make_request("rsk_getRawBlocks", json!([from, to]))).await
+}
+
+/// The blocks an answer of `rsk_getRawBlocks` gives: each header and its
+/// uncles, as hex.
+fn blocks_of(response: JsonRpcResponse) -> Vec<(String, Vec<String>)> {
+    let hex = |v: &Value| v.as_str().unwrap().strip_prefix("0x").unwrap().to_string();
+    response
+        .result
+        .expect("an answer")
+        .as_array()
+        .expect("an array of blocks")
+        .iter()
+        .map(|block| {
+            (
+                hex(&block["header"]),
+                block["uncles"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(hex)
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+/// The code of an error, if the answer is one.
+fn refused(response: JsonRpcResponse) -> Option<i64> {
+    response.error.map(|e| e.code)
+}
+
+/// A block's number on the chain this node follows, and on that chain alone.
+#[tokio::test]
+async fn block_number_by_hash_answers_for_the_chain_followed_alone() {
+    let (state, _tmp) = setup_state();
+    let number = |hash: String| {
+        dispatch_for_test(
+            &state,
+            make_request("rsk_getBlockNumberByHash", json!([hash])),
+        )
+    };
+    let head = state.store.head().unwrap().unwrap();
+    assert_eq!(
+        number(format!("{head:#x}")).await.result,
+        Some(json!("0x2a"))
+    );
+
+    // A block held only on a fork has none, nor has one not held.
+    let fork = Header {
+        extra_data: Bytes::from_static(b"fork"),
+        ..test_header(42)
+    };
+    state.store.put_header(&fork).unwrap();
+    assert_eq!(
+        number(format!("{:#x}", fork.hash())).await.result,
+        Some(Value::Null)
+    );
+    let unheld = B256::repeat_byte(7);
+    assert_eq!(
+        number(format!("{unheld:#x}")).await.result,
+        Some(Value::Null)
+    );
+
+    // A hash is 32 bytes.
+    assert_eq!(refused(number("0x2a".into()).await), Some(INVALID_PARAMS));
+}
+
+/// Blocks `from` to `to` oldest first, or as many from `from` as the chain
+/// holds; a version-0 header has one form.
+#[tokio::test]
+async fn raw_blocks_give_a_run_of_the_chain_oldest_first() {
+    let (state, _tmp) = setup_state();
+    follow_run(&state.store, 100..=104, test_header);
+    let run: Vec<(String, Vec<String>)> = (100..=104)
+        .map(|number| {
+            let hash = state.store.canonical_hash(number).unwrap().unwrap();
+            let header = state.store.header(hash).unwrap().unwrap();
+            assert_eq!(
+                header.encode_compressed(),
+                hex::decode(in_full(&header)).unwrap()
+            );
+            (in_full(&header), Vec::new())
+        })
+        .collect();
+    assert_eq!(blocks_of(raw_blocks(&state, "0x64", "0x68").await), run);
+    assert_eq!(
+        blocks_of(raw_blocks(&state, "0x65", "0x66").await),
+        run[1..3]
+    );
+    assert_eq!(
+        blocks_of(raw_blocks(&state, "0x68", "0x68").await),
+        run[4..]
+    );
+    assert_eq!(
+        blocks_of(raw_blocks(&state, "0x66", "0x70").await),
+        run[2..]
+    );
+    assert!(blocks_of(raw_blocks(&state, "0x69", "0x70").await).is_empty());
+    assert!(blocks_of(raw_blocks(&state, "0x68", "0x67").await).is_empty());
+}
+
+/// **A testnet header comes compressed**, as rskj sends a chain's headers to
+/// its peers: one held in full is compressed, one held compressed comes as
+/// held.
+#[tokio::test]
+async fn a_testnet_block_comes_with_its_header_compressed() {
+    let (state, _tmp) = setup_state();
+    follow(&state.store, &testnet_header(TESTNET_FULL));
+    assert_eq!(
+        blocks_of(raw_blocks(&state, "0x7e0c99", "0x7e0c99").await),
+        vec![(TESTNET_COMPRESSED.to_string(), Vec::new())]
+    );
+    follow(&state.store, &testnet_header(TESTNET_FROM_PEERS));
+    assert_eq!(
+        blocks_of(raw_blocks(&state, "0x7e0c70", "0x7e0c70").await),
+        vec![(TESTNET_FROM_PEERS.to_string(), Vec::new())]
+    );
+}
+
+/// **Uncles come in full**, the form their block's uncles hash covers, from
+/// the block's body or, once that is gone, from the freezer.
+#[tokio::test]
+async fn raw_blocks_carry_uncles_in_full_from_the_body_or_the_freezer() {
+    use rustock_execution::processor::compute_ommers_hash;
+
+    let (state, _tmp) = setup_state();
+    let testnet = testnet_header(TESTNET_FULL);
+    let other = Header {
+        extra_data: Bytes::from_static(b"an uncle"),
+        ..test_header(99)
+    };
+    let uncles = |number: u64| match number {
+        101 => vec![testnet.clone()],
+        102 => vec![other.clone()],
+        _ => Vec::new(),
+    };
+    let hashes = follow_run(&state.store, 100..=102, |number| Header {
+        ommers_hash: compute_ommers_hash(&uncles(number)),
+        ..test_header(number)
+    });
+    state.store.put_body(hashes[1], &[], &uncles(101)).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let freezer = Arc::new(rustock_storage::freezer::Freezer::open(dir.path()).unwrap());
+    freezer.put_uncles(102, &uncles(102)).unwrap();
+    state.store.set_freezer(freezer);
+
+    let blocks = blocks_of(raw_blocks(&state, "0x64", "0x66").await);
+    let carried: Vec<Vec<String>> = blocks.into_iter().map(|(_, uncles)| uncles).collect();
+    assert_eq!(
+        carried,
+        vec![
+            Vec::new(),
+            vec![TESTNET_FULL.to_string()],
+            vec![in_full(&other)]
+        ]
+    );
+}
+
+/// **What comes is one run of the chain held whole**: the answer stops before
+/// a block whose uncles the node doesn't hold, or holds only compressed, before
+/// a gap, and before a block that doesn't follow the one before it.
+#[tokio::test]
+async fn raw_blocks_stop_before_a_block_not_held_whole_or_not_following() {
+    use rustock_execution::processor::compute_ommers_hash;
+
+    let compressed = testnet_header(TESTNET_FROM_PEERS);
+    let naming = |at: u64, uncles: Vec<Header>| {
+        move |number: u64| Header {
+            ommers_hash: if number == at {
+                compute_ommers_hash(&uncles)
+            } else {
+                test_header(number).ommers_hash
+            },
+            ..test_header(number)
+        }
+    };
+
+    // #102 names uncles that the node doesn't hold.
+    let (state, _tmp) = setup_state();
+    follow_run(
+        &state.store,
+        100..=104,
+        naming(102, vec![compressed.clone()]),
+    );
+    assert_eq!(blocks_of(raw_blocks(&state, "0x64", "0x68").await).len(), 2);
+    assert!(blocks_of(raw_blocks(&state, "0x66", "0x68").await).is_empty());
+
+    // It holds them only compressed, as no block carries an uncle.
+    let (state, _tmp) = setup_state();
+    let hashes = follow_run(
+        &state.store,
+        100..=104,
+        naming(102, vec![compressed.clone()]),
+    );
+    state
+        .store
+        .put_body(hashes[2], &[], std::slice::from_ref(&compressed))
+        .unwrap();
+    assert_eq!(blocks_of(raw_blocks(&state, "0x64", "0x68").await).len(), 2);
+
+    // A gap: the node doesn't follow any block at #102.
+    let (state, _tmp) = setup_state();
+    let hashes = follow_run(&state.store, 100..=101, test_header);
+    let gap = Header {
+        parent_hash: hashes[1],
+        ..test_header(102)
+    };
+    state.store.put_header(&gap).unwrap();
+    let after = Header {
+        parent_hash: gap.hash(),
+        ..test_header(103)
+    };
+    follow(&state.store, &after);
+    assert_eq!(blocks_of(raw_blocks(&state, "0x64", "0x67").await).len(), 2);
+
+    // The chain moved at #102 while the answer was read.
+    let (state, _tmp) = setup_state();
+    follow_run(&state.store, 100..=103, test_header);
+    follow(
+        &state.store,
+        &Header {
+            parent_hash: B256::repeat_byte(0x33),
+            ..test_header(102)
+        },
+    );
+    assert_eq!(blocks_of(raw_blocks(&state, "0x64", "0x67").await).len(), 2);
+    assert_eq!(blocks_of(raw_blocks(&state, "0x66", "0x67").await).len(), 1);
+}
+
+/// At most a thousand blocks at a time, named as hex quantities.
+#[tokio::test]
+async fn raw_blocks_take_at_most_a_thousand_blocks_named_in_hex() {
+    let (state, _tmp) = setup_state();
+    follow_run(&state.store, 0..=1000, test_header);
+    assert_eq!(
+        blocks_of(raw_blocks(&state, "0x0", "0x3e7").await).len(),
+        1000
+    );
+    assert_eq!(
+        blocks_of(raw_blocks(&state, "0x1", "0x3e8").await).len(),
+        1000
+    );
+    assert_eq!(
+        refused(raw_blocks(&state, "0x0", "0x3e8").await),
+        Some(INVALID_PARAMS)
+    );
+    for (from, to) in [
+        ("100", "0x1"),
+        ("0x", "0x1"),
+        ("0xg", "0x1"),
+        ("0x+1", "0x2"),
+        ("0x1", "2"),
+    ] {
+        assert_eq!(
+            refused(raw_blocks(&state, from, to).await),
+            Some(INVALID_PARAMS),
+            "{from} {to}"
+        );
+    }
+    let alone = make_request("rsk_getRawBlocks", json!(["0x1"]));
+    assert_eq!(
+        refused(dispatch_for_test(&state, alone).await),
+        Some(INVALID_PARAMS)
+    );
+}
+
+// ===== rsk_getStateNodes =====
+
+/// `rsk_getStateNodes(hash, keys)`'s answer.
+async fn state_nodes(state: &RpcState, hash: B256, keys: &[Vec<u8>]) -> JsonRpcResponse {
+    let keys: Vec<String> = keys
+        .iter()
+        .map(|key| format!("0x{}", hex::encode(key)))
+        .collect();
+    dispatch_for_test(
+        state,
+        make_request("rsk_getStateNodes", json!([format!("{hash:#x}"), keys])),
+    )
+    .await
+}
+
+/// For each key, the walk along it from the block's state root: the code's
+/// ends at the code, and a slot's, held or not, is the walk
+/// `rsk_getStorageNodes` gives.
+#[tokio::test]
+async fn state_nodes_walk_each_key_from_the_blocks_state_root() {
+    use rustock_trie::{code_key, storage_key, TrieNode};
+
+    let (state, _tmp, addr, state_root) = setup_proof_state();
+    let trie_store = state.trie_store.clone().unwrap();
+    let head = state.store.head().unwrap().unwrap();
+    let keys = [
+        code_key(&addr),
+        storage_key(&addr, &B256::with_last_byte(1)),
+        storage_key(&addr, &B256::with_last_byte(3)),
+    ];
+    let walks = state_nodes(&state, head, &keys).await.result.unwrap();
+    let walks = walks.as_array().unwrap();
+    assert_eq!(walks.len(), 3);
+    for walk in walks {
+        assert_hangs_from(walk, state_root, &*trie_store);
+    }
+    let deepest = hex::decode(walks[0][0].as_str().unwrap().trim_start_matches("0x")).unwrap();
+    assert_eq!(
+        TrieNode::from_message(&deepest, &*trie_store).value,
+        Some(vec![0x60, 0x00, 0x60, 0x00])
+    );
+    for (walk, slot) in walks[1..].iter().zip(["0x1", "0x3"]) {
+        let req = make_request(
+            "rsk_getStorageNodes",
+            json!([format!("{addr:#x}"), [slot], "latest"]),
+        );
+        let r = dispatch_for_test(&state, req).await.result.unwrap();
+        assert_eq!(walk, &r["storage"][0]["nodes"], "slot {slot}");
+    }
+}
+
+/// Null where the node doesn't hold the block, or the state at its state
+/// root, or any state at all.
+#[tokio::test]
+async fn state_nodes_are_null_where_the_state_isnt_held() {
+    let (mut state, _tmp, addr, _) = setup_proof_state();
+    let keys = [rustock_trie::code_key(&addr)];
+    assert_eq!(
+        state_nodes(&state, B256::repeat_byte(7), &keys)
+            .await
+            .result,
+        Some(Value::Null)
+    );
+    let elsewhere = Header {
+        state_root: B256::repeat_byte(9),
+        ..test_header(43)
+    };
+    state.store.put_header(&elsewhere).unwrap();
+    assert_eq!(
+        state_nodes(&state, elsewhere.hash(), &keys).await.result,
+        Some(Value::Null)
+    );
+    let head = state.store.head().unwrap().unwrap();
+    state.trie_store = None;
+    assert_eq!(
+        state_nodes(&state, head, &keys).await.result,
+        Some(Value::Null)
+    );
+}
+
+/// **An incomplete state is an error, never an absence**: a walk it can't
+/// finish proves nothing either way.
+#[tokio::test]
+async fn state_nodes_are_an_error_where_the_state_is_incomplete() {
+    let (mut state, _tmp, addr, state_root) = setup_proof_state();
+    let whole = state.trie_store.clone().unwrap();
+    let partial = Arc::new(rustock_trie::MemoryTrieStore::new());
+    let root = whole.get(state_root.as_slice()).unwrap();
+    rustock_trie::TrieStore::put(&*partial, state_root.as_slice(), &root);
+    state.trie_store = Some(partial);
+    let head = state.store.head().unwrap().unwrap();
+    let error = state_nodes(&state, head, &[rustock_trie::code_key(&addr)])
+        .await
+        .error
+        .unwrap();
+    assert_eq!(error.code, INTERNAL_ERROR);
+    assert!(error.message.contains("incomplete"), "{}", error.message);
+}
+
+/// At most 64 keys at a time, each of at most 128 bytes, as `0x` hex.
+#[tokio::test]
+async fn state_nodes_take_at_most_64_keys_of_at_most_128_bytes() {
+    let (state, _tmp, _, _) = setup_proof_state();
+    let head = state.store.head().unwrap().unwrap();
+    let most = state_nodes(&state, head, &vec![vec![0xab; 128]; 64]).await;
+    assert_eq!(most.result.unwrap().as_array().unwrap().len(), 64);
+    assert_eq!(
+        refused(state_nodes(&state, head, &vec![vec![0xab]; 65]).await),
+        Some(INVALID_PARAMS)
+    );
+    assert_eq!(
+        refused(state_nodes(&state, head, &[vec![0xab; 129]]).await),
+        Some(INVALID_PARAMS)
+    );
+    for keys in [
+        json!(["0x123"]),
+        json!(["12"]),
+        json!(["0xzz"]),
+        json!([12]),
+        json!("0x12"),
+    ] {
+        let req = make_request("rsk_getStateNodes", json!([format!("{head:#x}"), keys]));
+        assert_eq!(
+            refused(dispatch_for_test(&state, req).await),
+            Some(INVALID_PARAMS),
+            "{keys}"
+        );
+    }
+    let unnamed = make_request("rsk_getStateNodes", json!(["0x12", ["0x12"]]));
+    assert_eq!(
+        refused(dispatch_for_test(&state, unnamed).await),
+        Some(INVALID_PARAMS)
+    );
+}

@@ -521,6 +521,25 @@ impl Header {
         alloy_primitives::keccak256(&buffer)
     }
 
+    /// The header as rskj sends a chain's headers to its peers
+    /// (`BlockHeader.getEncodedCompressed`): every field and all three
+    /// merged-mining fields, with a versioned header's commitment to its
+    /// extension in slot 6 and none of its own fields after `ummRoot`. rskj
+    /// reads a `BlockHeadersResponseMessage`'s headers so
+    /// (`decodeHeader(.., true)`), and a header taken from one is held so here.
+    /// A version-0 header has this one form.
+    pub fn encode_compressed(&self) -> Vec<u8> {
+        let payload = self.encode_payload(true, true);
+        let mut out = Vec::with_capacity(payload.len() + 4);
+        alloy_rlp::Header {
+            list: true,
+            payload_length: payload.len(),
+        }
+        .encode(&mut out);
+        out.extend_from_slice(&payload);
+        out
+    }
+
     /// Decode a header from RLP bytes and cache both of its hashes from those
     /// bytes, since re-encoding need not reproduce a peer's Java spelling of
     /// every field.
@@ -1257,6 +1276,99 @@ mod versioned_wire_header_tests {
         "00266a24aa21a9edf883a036547b5e0374127de8a7dbcfdd3624e87f59af6b6cc0da5e3ac8bbecb60000000000000000",
         "2a6a52534b424c4f434b3aa299d0e6dcc89894d1897433dcfc94cb400657c925509283bf09a213007407e800000000",
     );
+
+    /// Testnet #8,260,761 in full, as rustock's testnet node took it with its
+    /// block, which rskj hashes to 0x9a1cfe09...0d47.
+    const V2_FULL: &str = concat!(
+        "f9029ba0285f7c3513c466f54fde5f1b73b2d93b35374515472192250bd3a56396dc649ea01dcc4de8dec75d7aab85b5",
+        "67b6ccd41ad312451b948a7413f0a142fd40d4934794b774aa2876145b2f6f3de27e5e6ac970aa12d771a04aa4b67c3e",
+        "30508692f13e9e10758d907e7d851234cd6cd00d65aa49e5a1ac44a0f40c99e8151d350e30309fa0a74234c365961aa0",
+        "81ad18e51a4281c513ec76d0a066cfdb731f620cd96e2c2cb0f7d3c3a2879c29b40014aa27efbbf3cf9cd3b0f6b90100",
+        "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+        "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+        "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+        "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+        "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+        "00000000000000000000000000000000844edfab4b837e0c998400b71b0080846aec1a5c92d1018f564554495645522d",
+        "3733316239643880835a74cf8080028080b8507111010000000000000000000000000000000000000000000000000000",
+        "00000000000000135534881310aada94b2b5867af37e4e2fc48be028c35beeaa7f1dc4cf501e825d1aec6affff0f1d0d",
+        "16caea80b85800000000000003c09e1ed89b4ab8f092a3dc3a4b852db4552dfd95136f298514ba947d076032a8f20bbe",
+        "a052534b424c4f434b3a6e7fa68f56e3bc6085e7e02e325250f1c72ad9eef1a0d7693e516e10007e0c9900000000",
+    );
+
+    /// The same header compressed, as a converter written apart from this
+    /// crate compressed it, following rskj's `getEncodedCompressed`.
+    const V2_COMPRESSED: &str = concat!(
+        "f901b9a0285f7c3513c466f54fde5f1b73b2d93b35374515472192250bd3a56396dc649ea01dcc4de8dec75d7aab85b5",
+        "67b6ccd41ad312451b948a7413f0a142fd40d4934794b774aa2876145b2f6f3de27e5e6ac970aa12d771a04aa4b67c3e",
+        "30508692f13e9e10758d907e7d851234cd6cd00d65aa49e5a1ac44a0f40c99e8151d350e30309fa0a74234c365961aa0",
+        "81ad18e51a4281c513ec76d0a066cfdb731f620cd96e2c2cb0f7d3c3a2879c29b40014aa27efbbf3cf9cd3b0f6a3e202",
+        "a09aca8469839f117b1a26abbdea244a32cb0833e387cf6af9dc13eb336094d3c2844edfab4b837e0c998400b71b0080",
+        "846aec1a5c92d1018f564554495645522d3733316239643880835a74cf8080b850711101000000000000000000000000",
+        "000000000000000000000000000000000000000000135534881310aada94b2b5867af37e4e2fc48be028c35beeaa7f1d",
+        "c4cf501e825d1aec6affff0f1d0d16caea80b85800000000000003c09e1ed89b4ab8f092a3dc3a4b852db4552dfd9513",
+        "6f298514ba947d076032a8f20bbea052534b424c4f434b3a6e7fa68f56e3bc6085e7e02e325250f1c72ad9eef1a0d769",
+        "3e516e10007e0c9900000000",
+    );
+
+    /// Testnet #8,260,720 as rskj's peers sent it to rustock's testnet node,
+    /// compressed, which rskj hashes to 0xf343f40f...1bef.
+    const V2_FROM_PEERS: &str = concat!(
+        "f901f9a00bdcd28d517b22bc7b65bf669b05924ac8ba8a862ccb4b17d619fdbd8b9789f8a01dcc4de8dec75d7aab85b5",
+        "67b6ccd41ad312451b948a7413f0a142fd40d4934794ad418c1d48780005f6d847ef0a5e3bd93ea09090a0c545101cc3",
+        "df462f9c369b22f722ec66ade0f031b528512f12fceca574d0ecc8a01db2709b879ae45385439bc35bc1ce8e821de8ae",
+        "b4a4e8ec9c94cf9f3dc55f7ea01ddfe2c6ff70e83e21bc8a905eb71278aab2fc921dd08543c20451a2ccbf286da3e202",
+        "a03c015999cbb7ab1fdb80e23b658a251e424af79a99262579f2fd59bd50fddc78844f476ad3837e0c708400b71b0082",
+        "e8f8846aec16be92d1018f564554495645522d37333162396438855a76a29740835a5a088080b85000000020785e2a8b",
+        "51231a7478b788a2427a2a4c190c0f4e418e25c4ca0c000000000000ba37f569d2f87d917d83e79d50af85497b7d35f0",
+        "ebe4e7c57ddd76e80fb58dfca130ec6af0ff0f1a007dc5fa80b8910000000000000080f880b614920083ca51e27b69b7",
+        "d6dba5262da24a347487e62e8406463eb94d6a6088ac0000000000000000266a24aa21a9ede2f61c3f71d1defd3fa999",
+        "dfa36953755c690689799962b48bebd836974e8cf900000000000000002a6a52534b424c4f434b3a3d8461c1058c9db8",
+        "352ad0c0b7e56a1ba4fcac4da0d7693e516ef40a007e0c7000000000",
+    );
+
+    /// rskj sends a chain's headers to its peers compressed
+    /// (`getEncodedCompressed`), and reads them so: a versioned header's
+    /// commitment in slot 6, none of its own fields after `ummRoot`, and all
+    /// three merged-mining fields. A header taken in full compresses to what a
+    /// converter written apart from this crate makes of it; one that rskj's
+    /// peers sent compressed is held so, and written back the same in either
+    /// form, with rskj's hash.
+    #[test]
+    fn a_versioned_header_compresses_as_rskj_sends_it_to_its_peers() {
+        let hex = |text: &str| alloy_primitives::hex::decode(text).unwrap();
+        let wire = |header: &Header| {
+            let mut out = Vec::new();
+            header.encode(&mut out);
+            out
+        };
+        let hash: B256 = "0x9a1cfe099ff781afac37ad659654fd4c0e6fe400ba764be2f80bd3dec2600d47"
+            .parse()
+            .unwrap();
+        let full = from_the_network(V2_FULL);
+        assert_eq!((full.number, full.hash()), (8_260_761, hash));
+        assert_eq!(full.encode_compressed(), hex(V2_COMPRESSED));
+        assert_eq!(wire(&full), hex(V2_FULL));
+        // Read back as rskj's peers send it: the same hashes, and held
+        // compressed, no other form.
+        let read = from_the_network(V2_COMPRESSED);
+        assert_eq!(read.hash(), hash);
+        assert_eq!(read.hash_for_merged_mining(), full.hash_for_merged_mining());
+        assert_eq!(read.encode_compressed(), hex(V2_COMPRESSED));
+        assert_eq!(wire(&read), hex(V2_COMPRESSED));
+        // So for one that rskj's peers sent.
+        let peers = from_the_network(V2_FROM_PEERS);
+        let peers_hash: B256 = "0xf343f40fdd2152318c13fda9abdc80bb5e8a57a9166e831dfbdfb448f7821bef"
+            .parse()
+            .unwrap();
+        assert_eq!((peers.number, peers.hash()), (8_260_720, peers_hash));
+        assert_eq!(peers.encode_compressed(), hex(V2_FROM_PEERS));
+        assert_eq!(wire(&peers), hex(V2_FROM_PEERS));
+        // A version-0 header has one form.
+        let mut v0 = decode(V1_WIRE);
+        v0.version_fields = None;
+        assert_eq!(v0.encode_compressed(), wire(&v0));
+    }
 
     /// A header decoded without caching either hash, so `hash()` and
     /// `hash_for_merged_mining()` derive them by encoding: the path a header

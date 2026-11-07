@@ -272,6 +272,16 @@ The RPC server is compatible with rskj's JSON-RPC 2.0 interface. Supported metho
 
 - `eth_getBalance`, `eth_getTransactionCount`, `eth_getCode`, `eth_getStorageAt`
 
+**For light clients** (rustock's own, not rskj's: what a relay answers a light client from, which checks every byte itself):
+
+- `rsk_getStorageNodes(address, [slots], block)`: for each slot, whether it's held, its value, and the unitrie nodes from
+  the slot's key, or from where the key leaves the trie, up to the block's state root
+- `rsk_getStateNodes(blockHash, [keys])`: for each raw unitrie key, the nodes from where its walk ends up to the state root
+  of that block, or null if the node doesn't hold that state
+- `rsk_getBlockNumberByHash(hash)`: the block's number on the chain the node follows, or null
+- `rsk_getRawBlocks(from, to)`: one run of that chain, at most 1,000 blocks, each its header compressed, as rskj sends a
+  chain's headers to its peers, and its uncles in full
+
 **Execution:**
 
 - `eth_call`, `eth_estimateGas` (run against a forked state with full precompile and Bridge support)

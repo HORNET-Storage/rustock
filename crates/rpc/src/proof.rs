@@ -306,3 +306,101 @@ pub fn rsk_get_storage_nodes(id: Value, params: &Value, state: &RpcState) -> Jso
         }),
     )
 }
+
+/// The most keys that one `rsk_getStateNodes` call walks along.
+pub const MAX_STATE_KEYS: usize = 64;
+
+/// The longest key that `rsk_getStateNodes` walks along, in bytes: more than
+/// any key the unitrie holds, the longest being a storage key's 74.
+pub const MAX_STATE_KEY: usize = 128;
+
+/// `rsk_getStateNodes(blockHash, [keys])`: for each key, the unitrie nodes of
+/// the walk along it from the state root of the block with hash `blockHash`,
+/// from where the walk ends up to the root, as [`TrieNode::try_nodes_toward`]
+/// gives them; or null if this node doesn't hold the block's header, or the
+/// state at its state root.
+///
+/// A key is the trie's own, raw (`code_key`, `storage_key`, ...), so one call
+/// proves a contract's code and its slots together. The walk hangs from the
+/// header's own state root and no other, as that is what a caller checks it
+/// against, so a header from before wasabi, whose state root is no unitrie's,
+/// has no state here. Whether a key is held is the caller's to read from the
+/// nodes, as `rsk_getStorageNodes` describes. A node the store cannot produce
+/// is an error, never an absence.
+pub fn rsk_get_state_nodes(id: Value, params: &Value, state: &RpcState) -> JsonRpcResponse {
+    let Some(hash) = params
+        .get(0)
+        .and_then(|v| v.as_str())
+        .and_then(crate::helpers::parse_b256)
+    else {
+        return JsonRpcResponse::error(id, INVALID_PARAMS, "Missing or invalid block hash");
+    };
+    let Some(listed) = params.get(1).and_then(|v| v.as_array()) else {
+        return JsonRpcResponse::error(id, INVALID_PARAMS, "Missing key array");
+    };
+    if listed.len() > MAX_STATE_KEYS {
+        return JsonRpcResponse::error(
+            id,
+            INVALID_PARAMS,
+            format!("At most {MAX_STATE_KEYS} keys at a time"),
+        );
+    }
+    let mut keys = Vec::with_capacity(listed.len());
+    for key in listed {
+        match key.as_str().and_then(parse_state_key) {
+            Some(key) => keys.push(key),
+            None => {
+                return JsonRpcResponse::error(id, INVALID_PARAMS, format!("Invalid key: {key}"))
+            }
+        }
+    }
+
+    let header = match state.store.header(hash) {
+        Ok(Some(header)) => header,
+        Ok(None) => return JsonRpcResponse::success(id, Value::Null),
+        Err(e) => {
+            return JsonRpcResponse::error(
+                id,
+                INTERNAL_ERROR,
+                format!("Failed to read the header: {e}"),
+            )
+        }
+    };
+    let Some(trie_store) = state.trie_store.clone() else {
+        return JsonRpcResponse::success(id, Value::Null);
+    };
+    let store = &*trie_store;
+    let Some(message) = store.get(header.state_root.as_slice()) else {
+        return JsonRpcResponse::success(id, Value::Null);
+    };
+    let root = TrieNode::from_message(&message, store);
+
+    let mut walks: Vec<Vec<String>> = Vec::with_capacity(keys.len());
+    for key in &keys {
+        match root.try_nodes_toward(&TrieKeySlice::from_key(key), store) {
+            Ok(nodes) => walks.push(
+                nodes
+                    .iter()
+                    .map(|n| format!("0x{}", hex::encode(n.to_message(store))))
+                    .collect(),
+            ),
+            Err(missing) => {
+                return JsonRpcResponse::error(
+                    id,
+                    INTERNAL_ERROR,
+                    format!("The state is incomplete here: node {missing:#x} is missing"),
+                )
+            }
+        }
+    }
+    JsonRpcResponse::success(id, json!(walks))
+}
+
+/// A trie key as `0x`-prefixed hex, at most [`MAX_STATE_KEY`] bytes.
+fn parse_state_key(text: &str) -> Option<Vec<u8>> {
+    let digits = text.strip_prefix("0x")?;
+    if digits.len() > 2 * MAX_STATE_KEY {
+        return None;
+    }
+    hex::decode(digits).ok()
+}
