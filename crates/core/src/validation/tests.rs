@@ -997,6 +997,61 @@ fn default_rsk_holds_uncles_to_rskjs_uncle_rules() {
     assert_eq!(verifier.uncle_parent_rules().len(), 5, "rskj's five, in its order");
 }
 
+/// rskj reads a header's fields by its height (`BlockFactory.canBeDecoded`):
+/// a UMM root from RSKIPUMM, papyrus200, on and only then, and no RSKIP351
+/// fields where RSKIP351 is inactive, which is all of mainnet. The decoder
+/// reads by shape, so the verifier holds what it read to that, for a block
+/// and for an uncle alike, before anything else.
+#[test]
+fn a_header_carries_the_fields_rskj_reads_at_its_height() {
+    use crate::config::ChainConfig;
+    use crate::types::header::HeaderVersionFields;
+
+    let mainnet = Arc::new(ChainConfig::mainnet());
+    let papyrus = mainnet.activation_heights.papyrus200;
+    let rule = HeaderLayoutRule { config: mainnet.clone() };
+    let at = |number: u64, umm: bool| {
+        let mut header = create_dummy_header(number, 1000, B256::ZERO);
+        header.umm_root = umm.then(Bytes::new);
+        header
+    };
+    let misplaced = |number, present| Err(ValidationError::UmmRootMisplaced { number, present });
+
+    assert_eq!(rule.validate(&at(papyrus - 1, false)), Ok(()));
+    assert_eq!(rule.validate(&at(papyrus - 1, true)), misplaced(papyrus - 1, true));
+    assert_eq!(rule.validate(&at(papyrus, true)), Ok(()));
+    assert_eq!(rule.validate(&at(papyrus, false)), misplaced(papyrus, false));
+
+    let versioned = |mut header: Header| {
+        header.version_fields =
+            Some(HeaderVersionFields { version: 1, edges: Some(Vec::new()), base_event: None });
+        header
+    };
+    let compressed = |mut header: Header| {
+        header.extension_data = Some(Bytes::from(vec![0xc0]));
+        header
+    };
+    let tip = 9_400_000;
+    for header in [versioned(at(tip, true)), compressed(at(tip, true))] {
+        assert_eq!(
+            rule.validate(&header),
+            Err(ValidationError::VersionedBeforeRskip351 { number: tip })
+        );
+    }
+    // Testnet has RSKIP351 from reed810, #7,139,600.
+    let testnet = HeaderLayoutRule { config: Arc::new(ChainConfig::testnet()) };
+    let reed810 = 7_139_600;
+    assert_eq!(
+        testnet.validate(&versioned(at(reed810 - 1, true))),
+        Err(ValidationError::VersionedBeforeRskip351 { number: reed810 - 1 })
+    );
+    assert_eq!(testnet.validate(&versioned(at(reed810, true))), Ok(()));
+
+    let verifier = HeaderVerifier::default_rsk(mainnet);
+    assert_eq!(verifier.verify(&at(papyrus, false), None), misplaced(papyrus, false));
+    assert_eq!(verifier.verify_uncle(&at(papyrus, false)), misplaced(papyrus, false));
+}
+
 /// rskj's trunk takes the timestamp rule on the header alone. A block no
 /// later than its parent is one `BlockValidatorImpl` imports -- the parent
 /// form is for uncles, and for rskj's relay -- so this node must take it

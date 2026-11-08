@@ -93,6 +93,26 @@ fn count_rlp_items(buf: &[u8]) -> usize {
     count
 }
 
+/// rskj reads a header's number, gas used and timestamp with
+/// `longValueExact`, which throws past a Java `long`: it cannot read a header
+/// with one over `i64::MAX`.
+fn decode_java_long(buf: &mut &[u8]) -> alloy_rlp::Result<u64> {
+    let value = decode_u64_lenient(buf)?;
+    if value > i64::MAX as u64 {
+        return Err(alloy_rlp::Error::Custom("a header field past a Java long"));
+    }
+    Ok(value)
+}
+
+/// And its uncle count with `intValueExact`, which throws past a Java `int`.
+fn decode_java_int(buf: &mut &[u8]) -> alloy_rlp::Result<u64> {
+    let value = decode_u64_lenient(buf)?;
+    if value > i32::MAX as u64 {
+        return Err(alloy_rlp::Error::Custom("an uncle count past a Java int"));
+    }
+    Ok(value)
+}
+
 /// rskj `ByteUtil.rlpToShorts`: little-endian pairs.
 fn rlp_to_shorts(bytes: &[u8]) -> Vec<i16> {
     bytes.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect()
@@ -358,14 +378,14 @@ impl Header {
             logs_bloom,
             extension_data,
             difficulty: decode_u256_lenient(&mut body)?,
-            number: decode_u64_lenient(&mut body)?,
+            number: decode_java_long(&mut body)?,
             gas_limit: decode_u256_lenient(&mut body)?,
-            gas_used: decode_u64_lenient(&mut body)?,
-            timestamp: decode_u64_lenient(&mut body)?,
+            gas_used: decode_java_long(&mut body)?,
+            timestamp: decode_java_long(&mut body)?,
             extra_data: Bytes::decode(&mut body)?,
             paid_fees: decode_u256_lenient(&mut body)?,
             minimum_gas_price: decode_u256_lenient(&mut body)?,
-            uncle_count: decode_u64_lenient(&mut body)?,
+            uncle_count: decode_java_int(&mut body)?,
             umm_root: None,
             version_fields: None,
             bitcoin_merged_mining_header: None,
@@ -375,10 +395,11 @@ impl Header {
             cached_hash_for_merged_mining: None,
         };
 
-        // Count remaining RLP items to distinguish header format:
-        //   3 items → V0: btc_header, btc_merkle_proof, btc_coinbase_tx
-        //   4 items → V1 (RSKIP-153/Hop): umm_root, btc_header, btc_merkle_proof, btc_coinbase_tx
-        //   0-2     → partial (pre-orchid blocks without full mining data)
+        // What is left is told apart by count, since nothing here knows the
+        // network: none is a header without merged-mining fields, three are
+        // those fields, and four or more begin with a UMM root (RSKIPUMM,
+        // papyrus200). `HeaderLayoutRule` holds what was read to the fields
+        // rskj reads at the header's height.
         let remaining_items = count_rlp_items(body);
 
         if remaining_items >= 4 {
@@ -441,16 +462,20 @@ impl Header {
             header.version_fields = Some(HeaderVersionFields { version, edges, base_event });
         }
 
+        // rskj reads the three merged-mining fields together or not at all,
+        // and `canBeDecoded` counts a header's fields exactly: with one or two
+        // of them, or anything after them, it cannot read the header.
         if !body.is_empty() {
             header.bitcoin_merged_mining_header = Some(Bytes::decode(&mut body)?);
-        }
-        if !body.is_empty() {
             header.bitcoin_merged_mining_merkle_proof = Some(Bytes::decode(&mut body)?);
-        }
-        if !body.is_empty() {
             header.bitcoin_merged_mining_coinbase_transaction = Some(Bytes::decode(&mut body)?);
+            if !body.is_empty() {
+                return Err(alloy_rlp::Error::Custom(
+                    "a header with fields after its merged-mining fields",
+                ));
+            }
         }
-        
+
         Ok(header)
     }
 }
@@ -682,6 +707,93 @@ mod tests {
         // Hash check (just to ensure it doesn't panic)
         let hash = header.hash();
         assert_ne!(hash, B256::ZERO);
+    }
+
+    /// The items of an RLP list, each with its own header, as written.
+    fn items_of(encoded: &[u8]) -> Vec<Vec<u8>> {
+        let mut buf = encoded;
+        let list = alloy_rlp::Header::decode(&mut buf).unwrap();
+        assert!(list.list);
+        let mut body = &buf[..list.payload_length];
+        let mut items = Vec::new();
+        while !body.is_empty() {
+            let start = body;
+            let item = alloy_rlp::Header::decode(&mut body).unwrap();
+            let length = start.len() - body.len() + item.payload_length;
+            items.push(start[..length].to_vec());
+            body = &body[item.payload_length..];
+        }
+        items
+    }
+
+    /// An RLP list of items already written.
+    fn list_of(items: &[Vec<u8>]) -> Vec<u8> {
+        let payload = items.concat();
+        let mut list = Vec::new();
+        alloy_rlp::Header {
+            list: true,
+            payload_length: payload.len(),
+        }
+        .encode(&mut list);
+        list.extend_from_slice(&payload);
+        list
+    }
+
+    /// rskj reads a header's number, gas used and timestamp with
+    /// `longValueExact`, and its uncle count with `intValueExact`: one past a
+    /// Java `long`, or an `int`, and it cannot read the header at all.
+    #[test]
+    fn rskj_reads_no_header_past_a_java_long_or_int() {
+        let decodes = |change: &dyn Fn(&mut Header)| {
+            let mut header = standard_test_header();
+            change(&mut header);
+            let mut bytes = Vec::new();
+            header.encode(&mut bytes);
+            Header::decode(&mut bytes.as_slice()).is_ok()
+        };
+        let long = i64::MAX as u64;
+        let int = i32::MAX as u64;
+        assert!(decodes(&|h| h.number = long));
+        assert!(!decodes(&|h| h.number = long + 1));
+        assert!(decodes(&|h| h.gas_used = long));
+        assert!(!decodes(&|h| h.gas_used = long + 1));
+        assert!(decodes(&|h| h.timestamp = long));
+        assert!(!decodes(&|h| h.timestamp = long + 1));
+        assert!(decodes(&|h| h.uncle_count = int));
+        assert!(!decodes(&|h| h.uncle_count = int + 1));
+    }
+
+    /// rskj reads the merged-mining fields all three or none, and
+    /// `canBeDecoded` counts a header's fields exactly: with one or two of
+    /// them, or a field after them, it cannot read the header.
+    #[test]
+    fn rskj_reads_the_merged_mining_fields_all_three_or_none() {
+        let mut bytes = Vec::new();
+        Header {
+            umm_root: None,
+            ..standard_test_header()
+        }
+        .encode(&mut bytes);
+        let items = items_of(&bytes);
+        assert_eq!(
+            items.len(),
+            19,
+            "sixteen fields and three for merged mining"
+        );
+        // The sixteen fields, then `extra` items from the three.
+        let read = |extra: usize| {
+            let mut fields = items[..16].to_vec();
+            fields.extend(items[16..].iter().cycle().take(extra).cloned());
+            Header::decode(&mut list_of(&fields).as_slice())
+        };
+        assert!(read(0).is_ok(), "no merged-mining fields");
+        assert!(read(1).is_err());
+        assert!(read(2).is_err());
+        assert!(read(3).is_ok(), "the three merged-mining fields");
+        // Four are a UMM root and the three: which a header may carry is its
+        // height's to say, in `HeaderLayoutRule`.
+        assert!(read(4).is_ok_and(|header| header.umm_root.is_some()));
+        assert!(read(5).is_err(), "a field after the merged-mining fields");
     }
 
     #[test]

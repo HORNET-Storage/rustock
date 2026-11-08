@@ -60,6 +60,11 @@ pub struct ActivationHeights {
     /// activation). rskj's own regtest is the second case: `rskip144 = -1`
     /// with `rskip535 = 1`.
     pub rskip144: Option<u64>,
+    /// Height at which RSKIP351 -- versioned headers, the version and its
+    /// extension where a header had only a logs bloom -- activates, or
+    /// `None` where it never does. rskj's `reference.conf` sets it at
+    /// reed810, which mainnet has at -1, so no mainnet header carries it.
+    pub rskip351: Option<u64>,
 }
 
 /// Process-wide activation heights, consulted by block-hash computation
@@ -109,6 +114,8 @@ impl ActivationHeights {
             rskip97: Some(729_000),
             // main.conf: reed810 = -1.
             rskip144: None,
+            // main.conf: `reed810 = -1`.
+            rskip351: None,
         }
     }
 
@@ -124,8 +131,11 @@ impl ActivationHeights {
             hop400: 3_103_000,
             // testnet.conf: `rskip97 = -1  # disable orchid difficulty drop`.
             rskip97: None,
+
             // testnet.conf: reed810.
             rskip144: Some(7_139_600),
+            // testnet.conf: `reed810 = 7139600`.
+            rskip351: Some(7_139_600),
         }
     }
 
@@ -142,6 +152,8 @@ impl ActivationHeights {
             // regtest.conf: `rskip144 = -1`; rustock's regtest ladder does
             // not schedule reed810 either.
             rskip144: None,
+            // regtest.conf: `rskip351 = 1`.
+            rskip351: Some(1),
         }
     }
 }

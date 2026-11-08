@@ -49,6 +49,9 @@ fn test_chain_config() -> Arc<ChainConfig> {
             // so the ten-minute drop would only add noise.
             rskip97: Some(0),
             rskip144: None,
+            // From genesis too: a partitioned template carries the version
+            // fields RSKIP351 brings.
+            rskip351: Some(0),
         },
         genesis_spec: None,
         skip_pow_validation: false,

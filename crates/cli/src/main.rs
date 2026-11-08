@@ -3891,6 +3891,12 @@ fn apply_chain_options(mut config: ChainConfig, args: &Args) -> Result<ChainConf
         let (name, height) = parse_rskj_height("--consensus-rule", rule)?;
         match name.as_str() {
             "rskip97" => config.activation_heights.rskip97 = height,
+            // The ladder reads it from the overrides, and the header layout
+            // rule from the activation heights: both must move.
+            "rskip351" => {
+                config.activation_heights.rskip351 = height;
+                config.consensus_rule_overrides.push((name, height));
+            }
             _ => config.consensus_rule_overrides.push((name, height)),
         }
     }
@@ -5414,6 +5420,8 @@ mod genesis_tests {
         let config = apply_chain_options(ChainConfig::mainnet(), &mainnet_args(SEED_FLAGS)).unwrap();
         assert_eq!(config.chain_id, 30);
         assert_eq!(config.activation_heights.rskip144, Some(9_002_504));
+        // The header layout rule reads RSKIP351 here, the ladder below.
+        assert_eq!(config.activation_heights.rskip351, Some(9_002_504));
         assert_eq!(config.activation_heights.orchid, 729_000);
         assert_eq!(config.activation_heights.rskip97, Some(729_000));
         assert_eq!(config.activation_heights.papyrus200, 2_392_700);

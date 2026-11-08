@@ -70,6 +70,12 @@ pub enum ValidationError {
     #[error("UMM root is {len} bytes, must be empty or 20")]
     UmmRootInvalid { len: usize },
 
+    #[error("Header #{number} has a UMM root: {present}, which rskj reads from RSKIPUMM on and only then")]
+    UmmRootMisplaced { number: u64, present: bool },
+
+    #[error("Header #{number} carries RSKIP351 fields where RSKIP351 is inactive")]
+    VersionedBeforeRskip351 { number: u64 },
+
     #[error("Tx gas price {tx_gas_price} is below the block minimum {block_minimum}")]
     TxGasPriceBelowMinimum { tx_gas_price: U256, block_minimum: U256 },
 
@@ -214,6 +220,8 @@ impl HeaderVerifier {
     /// and cannot be reproduced by our standard `Header::hash()`.
     pub fn default_rsk(config: std::sync::Arc<crate::config::ChainConfig>) -> Self {
         let mut verifier = Self::new()
+            // First, as rskj reads a header with these fields or not at all.
+            .with_static_rule(HeaderLayoutRule { config: config.clone() })
             .with_static_rule(GasUsedRule)
             .with_static_rule(GasLimitBoundsRule { 
                 min_gas_limit: config.min_gas_limit, 
@@ -327,7 +335,7 @@ pub mod header_rules;
 pub mod difficulty;
 pub mod merged_mining;
 
-pub use header_rules::{BlockNumberRule, ParentHashRule, TimestampRule, GasUsedRule, GasLimitBoundsRule, BlockParentGasLimitRule};
+pub use header_rules::{BlockNumberRule, ParentHashRule, TimestampRule, GasUsedRule, GasLimitBoundsRule, BlockParentGasLimitRule, HeaderLayoutRule};
 pub use difficulty::DifficultyRule;
 pub use merged_mining::{BitcoinTimestampRule, MergedMiningRule};
 pub use block_rules::{
