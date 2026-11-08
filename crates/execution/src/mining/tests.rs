@@ -332,7 +332,7 @@ fn merkle_proofs_fold_back_to_the_root() {
         assert_eq!(proof.len() % 32, 0);
 
         let root = merkle::root_from_proof(&txids[0], &proof);
-        assert_eq!(root, reference_merkle_root(&txids), "{count} transactions");
+        assert_eq!(root, Some(reference_merkle_root(&txids)), "{count} transactions");
     }
 }
 
@@ -355,7 +355,7 @@ fn reference_merkle_root(txids: &[[u8; 32]]) -> [u8; 32] {
 fn a_single_transaction_block_needs_no_proof() {
     let proof = merkle::proof_from_txids(&[[7u8; 32]]).unwrap();
     assert!(proof.is_empty());
-    assert_eq!(merkle::root_from_proof(&[7u8; 32], &proof), [7u8; 32]);
+    assert_eq!(merkle::root_from_proof(&[7u8; 32], &proof), Some([7u8; 32]));
 }
 
 #[test]

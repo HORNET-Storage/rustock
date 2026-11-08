@@ -81,12 +81,13 @@ fn build_mm_proof(header: &Header, btc_bits: u32, rsk_tag_hash: Option<B256>) ->
     }
     compressed.extend_from_slice(&coinbase_bytes);
 
-    // Coinbase txid = double-SHA256 of raw tx, byte-reversed.
+    // A one-transaction block's merkle root is its coinbase's txid, in the
+    // internal byte order a Bitcoin header holds: double SHA-256 as it
+    // comes, not reversed for display.
     let first_hash = Sha256::digest(&coinbase_bytes);
     let txid_bytes = Sha256::digest(first_hash);
     let mut merkle_root_bytes = [0u8; 32];
     merkle_root_bytes.copy_from_slice(&txid_bytes);
-    merkle_root_bytes.reverse();
     let merkle_root = bitcoin::TxMerkleNode::from_byte_array(merkle_root_bytes);
 
     let btc_header = BtcHeader {
@@ -153,6 +154,9 @@ fn test_gas_used_rule() {
     header.gas_used = 90;
     assert!(rule.validate(&header).is_ok());
     
+    header.gas_used = 100;
+    assert!(rule.validate(&header).is_ok());
+
     header.gas_used = 110;
     assert!(matches!(rule.validate(&header), Err(ValidationError::GasUsedExceedsLimit { .. })));
 }
@@ -898,7 +902,7 @@ fn the_uncle_rule_runs_fork_detection_when_asked() {
 }
 
 /// The verifier every sync path holds judges uncles by rskj's uncle rules,
-/// not by a trunk header's: no extra-data cap or gas-limit bounds. The
+/// not by a trunk header's: no extra-data cap and no gas-limit bounds. The
 /// timestamp rule, RSKIP179 included, holds for both.
 #[test]
 fn default_rsk_holds_uncles_to_rskjs_uncle_rules() {
@@ -907,10 +911,21 @@ fn default_rsk_holds_uncles_to_rskjs_uncle_rules() {
 
     let mut chatty = uncle_of(&parent, 1010);
     chatty.extra_data = Bytes::from(vec![0xab; 40]);
-    chatty.gas_limit = U256::from(20_000_000);
     seal(&mut chatty, 1010);
     assert_eq!(verifier.verify_uncle(&chatty), Ok(()));
-    assert!(verifier.verify(&chatty, None).is_err(), "a trunk header may not carry either");
+    assert!(matches!(
+        verifier.verify(&chatty, None),
+        Err(ValidationError::ExtraDataTooLarge { .. })
+    ));
+
+    let mut thin = uncle_of(&parent, 1010);
+    thin.gas_limit = U256::from(2_999_999);
+    seal(&mut thin, 1010);
+    assert_eq!(verifier.verify_uncle(&thin), Ok(()));
+    assert_eq!(
+        verifier.verify(&thin, None),
+        Err(ValidationError::GasLimitOutOfBounds { min: 3_000_000, max: 10_000_000, got: 2_999_999 })
+    );
 
     let mut adrift = uncle_of(&parent, 1010);
     seal(&mut adrift, 1010 + 300);
@@ -919,4 +934,375 @@ fn default_rsk_holds_uncles_to_rskjs_uncle_rules() {
     }
 
     assert_eq!(verifier.uncle_parent_rules().len(), 5, "rskj's five, in its order");
+}
+
+/// rskj's trunk takes the timestamp rule on the header alone. A block no
+/// later than its parent is one `BlockValidatorImpl` imports -- the parent
+/// form is for uncles, and for rskj's relay -- so this node must take it
+/// too, or part from the chain the network follows.
+#[test]
+fn a_block_no_later_than_its_parent_joins_the_trunk_but_is_no_uncle() {
+    let verifier = HeaderVerifier::default_rsk(uncle_config());
+    let (_, parent, _) = uncle_chain(0);
+
+    let mut same = uncle_of(&parent, parent.timestamp);
+    seal(&mut same, parent.timestamp);
+    assert_eq!(verifier.verify(&same, Some(&parent)), Ok(()));
+
+    let older = Err(ValidationError::TimestampOlderThanParent {
+        parent: parent.timestamp,
+        got: parent.timestamp,
+    });
+    assert!(verifier
+        .uncle_parent_rules()
+        .iter()
+        .any(|rule| rule.validate_with_parent(&same, &parent) == older));
+}
+
+// --- the merged-mining proof, byte for byte as rskj's `ProofOfWorkRule`
+
+/// A regtest header at `number`, at difficulty 1, where any Bitcoin hash
+/// meets the target and only the coinbase and the merkle proof are in
+/// question.
+fn header_at(number: u64) -> Header {
+    let mut header = create_dummy_header(number, 1000, B256::ZERO);
+    header.difficulty = U256::from(1);
+    header
+}
+
+/// A coinbase in the compressed form a header carries: the SHA-256 initial
+/// state as its midstate, claiming `absorbed` bytes, then `tail`.
+fn compressed_coinbase(absorbed: u64, tail: &[u8]) -> Vec<u8> {
+    let mut out = absorbed.to_be_bytes().to_vec();
+    for word in merged_mining::SHA256_INITIAL_STATE {
+        out.extend_from_slice(&word.to_be_bytes());
+    }
+    out.extend_from_slice(tail);
+    out
+}
+
+/// A coinbase tail committing to `committed`: `before` bytes, the tag, the
+/// 32 committed bytes, then `after` bytes.
+fn tail_committing_to(committed: &[u8], before: usize, after: usize) -> Vec<u8> {
+    let mut tail = vec![0x11; before];
+    tail.extend_from_slice(merged_mining::RSK_TAG);
+    tail.extend_from_slice(committed);
+    tail.resize(tail.len() + after, 0x22);
+    tail
+}
+
+/// `header` merge-mined through `coinbase` and `proof`, by a Bitcoin header
+/// holding `wire_root` as its merkle root.
+fn mined_through(mut header: Header, coinbase: Vec<u8>, proof: Vec<u8>, wire_root: [u8; 32]) -> Header {
+    let btc = BtcHeader {
+        version: bitcoin::block::Version::from_consensus(1),
+        prev_blockhash: bitcoin::BlockHash::all_zeros(),
+        merkle_root: bitcoin::TxMerkleNode::from_byte_array(wire_root),
+        time: 1000,
+        bits: bitcoin::CompactTarget::from_consensus(0x207fffff),
+        nonce: 0,
+    };
+    header.bitcoin_merged_mining_header = Some(Bytes::from(bitcoin::consensus::serialize(&btc)));
+    header.bitcoin_merged_mining_coinbase_transaction = Some(Bytes::from(coinbase));
+    header.bitcoin_merged_mining_merkle_proof = Some(Bytes::from(proof));
+    header
+}
+
+/// A root as a Bitcoin header holds it, for one folded in display order.
+fn wire(display: [u8; 32]) -> [u8; 32] {
+    let mut out = display;
+    out.reverse();
+    out
+}
+
+fn regtest_merged_mining() -> MergedMiningRule {
+    MergedMiningRule { config: Arc::new(crate::config::ChainConfig::regtest()) }
+}
+
+/// rskj compares the root its proof folds to in bitcoinj's display order,
+/// against the root the Bitcoin header holds in wire order. A proof folding
+/// to the root's byte reversal proves nothing, and passed while either order
+/// did.
+#[test]
+fn the_merkle_root_is_compared_in_rskjs_byte_order_only() {
+    let header = header_at(10);
+    let tail = tail_committing_to(header.hash_for_merged_mining().as_slice(), 10, 20);
+    let coinbase = compressed_coinbase(0, &tail);
+    // No siblings: the root is the coinbase's own hash.
+    let root = merged_mining::compute_coinbase_hash(&coinbase);
+    assert_ne!(root, wire(root));
+
+    let right = mined_through(header.clone(), coinbase.clone(), Vec::new(), wire(root));
+    assert_eq!(regtest_merged_mining().validate(&right), Ok(()));
+    let reversed = mined_through(header, coinbase, Vec::new(), root);
+    assert_eq!(
+        regtest_merged_mining().validate(&reversed),
+        Err(ValidationError::BitcoinMerkleProofInvalid)
+    );
+}
+
+/// rskj: a coinbase runs past 64 bytes -- the count its midstate claims, read
+/// as a Java `long`, plus its tail -- so it cannot pass for an inner node of
+/// the merkle tree.
+#[test]
+fn the_coinbase_must_run_past_64_bytes() {
+    let header = header_at(10);
+    let hash = header.hash_for_merged_mining();
+    let judge = |absorbed: u64, after: usize| {
+        let coinbase = compressed_coinbase(absorbed, &tail_committing_to(hash.as_slice(), 0, after));
+        let root = merged_mining::compute_coinbase_hash(&coinbase);
+        regtest_merged_mining().validate(&mined_through(header.clone(), coinbase, Vec::new(), wire(root)))
+    };
+
+    // The tag and the hash are 41 bytes of tail.
+    assert_eq!(judge(0, 23), Err(ValidationError::CoinbaseTooShort { length: 64 }));
+    assert_eq!(judge(0, 24), Ok(()));
+    assert_eq!(judge(23, 0), Err(ValidationError::CoinbaseTooShort { length: 64 }));
+    assert_eq!(judge(24, 0), Ok(()));
+    // `u64::MAX` is -1 to a Java `long`, and takes a byte off.
+    assert_eq!(judge(u64::MAX, 24), Err(ValidationError::CoinbaseTooShort { length: 64 }));
+    assert_eq!(judge(u64::MAX, 25), Ok(()));
+    // A count that carries the sum past `i64::MAX` wraps it negative.
+    assert_eq!(
+        judge(i64::MAX as u64, 25),
+        Err(ValidationError::CoinbaseTooShort { length: i64::MAX.wrapping_add(66) })
+    );
+}
+
+/// The coinbase hash as BouncyCastle computes it from a restored midstate,
+/// worked out with `sha2`'s compression function rather than this crate's:
+/// the padding laid out from the tail's first byte, and the length the count
+/// plus the tail, in bits, wrapping as a Java `long` does. Display order.
+// `sha2` 0.10 takes its blocks as generic-array 0.14 arrays, which that
+// crate now marks deprecated in favour of a 1.x `sha2` has yet to adopt.
+#[allow(deprecated)]
+fn bouncycastle_coinbase_hash(absorbed: u64, tail: &[u8]) -> [u8; 32] {
+    use sha2::digest::generic_array::GenericArray;
+
+    let mut padded = tail.to_vec();
+    padded.push(0x80);
+    while padded.len() % 64 != 56 {
+        padded.push(0);
+    }
+    let bits = absorbed.wrapping_add(tail.len() as u64).wrapping_mul(8);
+    padded.extend_from_slice(&bits.to_be_bytes());
+    let mut state = merged_mining::SHA256_INITIAL_STATE;
+    for block in padded.chunks_exact(64) {
+        sha2::compress256(&mut state, &[*GenericArray::from_slice(block)]);
+    }
+    let mut once = [0u8; 32];
+    for (bytes, word) in once.chunks_exact_mut(4).zip(state) {
+        bytes.copy_from_slice(&word.to_be_bytes());
+    }
+    let mut hash: [u8; 32] = Sha256::digest(once).into();
+    hash.reverse();
+    hash
+}
+
+/// rskj resumes a coinbase's hash with BouncyCastle, which restores the
+/// midstate's byte count but starts its blocks afresh at the tail. A count
+/// that is not whole blocks is the miner's to write, and the hash must be
+/// the one rskj computes from it, or this node refuses a block rskj takes.
+#[test]
+fn a_coinbase_hashes_from_its_midstate_as_bouncycastle_does() {
+    // With nothing absorbed the midstate is SHA-256's start, and the hash is
+    // plain double SHA-256 of the tail, at every length the padding turns on.
+    for len in 0..=130usize {
+        let tail: Vec<u8> = (0..len).map(|i| i as u8).collect();
+        let mut expected: [u8; 32] = Sha256::digest(Sha256::digest(&tail)).into();
+        expected.reverse();
+        assert_eq!(
+            merged_mining::compute_coinbase_hash(&compressed_coinbase(0, &tail)),
+            expected,
+            "{len} bytes of tail"
+        );
+    }
+    // Counts of whole blocks and not, and ones that wrap the length.
+    let tail: Vec<u8> = (0..100u8).collect();
+    for absorbed in [64, 1, 63, 100, u64::MAX, u64::MAX - 99, 1 << 61] {
+        assert_eq!(
+            merged_mining::compute_coinbase_hash(&compressed_coinbase(absorbed, &tail)),
+            bouncycastle_coinbase_hash(absorbed, &tail),
+            "{absorbed} bytes absorbed"
+        );
+    }
+
+    // So a block whose coinbase claims one byte absorbed is one the rule
+    // takes, when its Bitcoin header commits to the hash rskj computes.
+    let header = header_at(10);
+    let tail = tail_committing_to(header.hash_for_merged_mining().as_slice(), 0, 24);
+    let root = bouncycastle_coinbase_hash(1, &tail);
+    let mined = mined_through(header, compressed_coinbase(1, &tail), Vec::new(), wire(root));
+    assert_eq!(regtest_merged_mining().validate(&mined), Ok(()));
+}
+
+/// Two merkle nodes, as rskj's `checkNotAValid64ByteTransaction` reads them
+/// -- left then right, display order -- that parse as a transaction with one
+/// input, one output of a satoshi, and scripts of `input` and `output` bytes.
+/// The left node only has to supply the input count, its fifth byte.
+fn transaction_shaped(input: u8, output: u8) -> ([u8; 32], [u8; 32]) {
+    let mut tx = [0x55u8; 64];
+    tx[4] = 1;
+    tx[37..41].copy_from_slice(&0u32.to_le_bytes());
+    tx[41] = input;
+    let at = 46 + usize::from(input);
+    tx[at] = 1;
+    tx[at + 1..at + 9].copy_from_slice(&1i64.to_le_bytes());
+    tx[at + 9] = output;
+    (tx[..32].try_into().unwrap(), tx[32..].try_into().unwrap())
+}
+
+/// rskj `MerkleTreeUtils.checkNotAValid64ByteTransaction`: each test it
+/// makes, at its bounds and past them.
+#[test]
+fn rskj_refuses_merkle_nodes_that_parse_as_a_transaction() {
+    use merged_mining::parses_as_a_64_byte_transaction as parses;
+
+    for input in 0..=4 {
+        let (left, right) = transaction_shaped(input, 4 - input);
+        assert!(parses(&left, &right), "{input} + {} bytes of script", 4 - input);
+    }
+    for (input, output) in [(1, 2), (2, 3)] {
+        let (left, right) = transaction_shaped(input, output);
+        assert!(!parses(&left, &right), "{input} + {output} bytes of script");
+    }
+
+    // The shape with two bytes of script each way, with `bytes` written at
+    // `at`.
+    let edited = |at: usize, bytes: &[u8]| {
+        let (left, right) = transaction_shaped(2, 2);
+        let mut tx = [0u8; 64];
+        tx[..32].copy_from_slice(&left);
+        tx[32..].copy_from_slice(&right);
+        tx[at..at + bytes.len()].copy_from_slice(bytes);
+        parses(&tx[..32].try_into().unwrap(), &tx[32..].try_into().unwrap())
+    };
+    // One input.
+    assert!(!edited(4, &[0]));
+    assert!(!edited(4, &[2]));
+    // Spending an output at most a million in, or the coinbase's.
+    assert!(edited(37, &1_000_000u32.to_le_bytes()));
+    assert!(!edited(37, &1_000_001u32.to_le_bytes()));
+    assert!(edited(37, &u32::MAX.to_le_bytes()));
+    assert!(!edited(37, &(u32::MAX - 1).to_le_bytes()));
+    // Script lengths over four, or negative as a Java byte.
+    for length in [5, 0x80, 0xff] {
+        assert!(!edited(41, &[length]), "input script of {length:#x}");
+        assert!(!edited(57, &[length]), "output script of {length:#x}");
+    }
+    // One output.
+    assert!(!edited(48, &[2]));
+    // Worth a satoshi to 21 million bitcoin.
+    for (value, parses_as_one) in [
+        (0i64, false),
+        (-1, false),
+        (2_100_000_000_000_000, true),
+        (2_100_000_000_000_001, false),
+    ] {
+        assert_eq!(edited(49, &value.to_le_bytes()), parses_as_one, "{value} satoshis");
+    }
+}
+
+/// rskj runs the guard at every fold of the proof, before any root is
+/// compared, so a block whose coinbase hash and first sibling parse as a
+/// transaction is no block at all.
+#[test]
+fn a_merkle_proof_through_a_transaction_shaped_pair_is_refused() {
+    let header = header_at(10);
+    let hash = header.hash_for_merged_mining();
+    // A coinbase whose hash supplies the input count, found by varying what
+    // follows the commitment.
+    let (coinbase, coinbase_hash) = (0..=u16::MAX)
+        .find_map(|salt| {
+            let mut tail = tail_committing_to(hash.as_slice(), 0, 24);
+            let end = tail.len();
+            tail[end - 2..].copy_from_slice(&salt.to_be_bytes());
+            let coinbase = compressed_coinbase(0, &tail);
+            let coinbase_hash = merged_mining::compute_coinbase_hash(&coinbase);
+            (coinbase_hash[4] == 1).then_some((coinbase, coinbase_hash))
+        })
+        .expect("a coinbase hash with 1 as its fifth byte");
+    let (_, sibling) = transaction_shaped(2, 2);
+
+    assert!(merged_mining::parses_as_a_64_byte_transaction(&coinbase_hash, &sibling));
+    assert_eq!(merged_mining::rskip92_merkle_root(&coinbase_hash, &sibling), None);
+    let root = merged_mining::combine_left_right(&coinbase_hash, &sibling);
+    let mined = mined_through(header.clone(), coinbase.clone(), sibling.to_vec(), wire(root));
+    assert_eq!(
+        regtest_merged_mining().validate(&mined),
+        Err(ValidationError::MerkleNodesFormTransaction)
+    );
+
+    // A byte more of output script and the pair is no transaction: the same
+    // block, with the root that sibling folds to, is merge-mined.
+    let mut other = sibling;
+    other[57 - 32] = 3;
+    assert!(!merged_mining::parses_as_a_64_byte_transaction(&coinbase_hash, &other));
+    let root = merged_mining::combine_left_right(&coinbase_hash, &other);
+    let mined = mined_through(header, coinbase, other.to_vec(), wire(root));
+    assert_eq!(regtest_merged_mining().validate(&mined), Ok(()));
+}
+
+/// rskj `BlockHeader.getHashRootForMergedMining`: a UMM root is 20 bytes or
+/// none, and any other length throws before there is a hash to look for.
+#[test]
+fn a_umm_root_is_twenty_bytes_or_none() {
+    for (len, valid) in [(0, true), (20, true), (19, false), (21, false), (32, false)] {
+        let mut header = header_at(10);
+        header.umm_root = Some(Bytes::from(vec![0x0c; len]));
+        seal(&mut header, 1000);
+        let verdict = regtest_merged_mining().validate(&header);
+        if valid {
+            assert_eq!(verdict, Ok(()), "{len} bytes");
+        } else {
+            assert_eq!(verdict, Err(ValidationError::UmmRootInvalid { len }), "{len} bytes");
+        }
+    }
+}
+
+/// rskj puts fork-detection data in the merged-mining hash from RSKIP110
+/// (wasabi100) on, and never below block 449. Where it does not, a coinbase
+/// commits to the whole hash, and twelve bytes of anything else after its
+/// first twenty commit to nothing.
+#[test]
+fn fork_detection_data_joins_the_hash_from_wasabi100_and_block_449() {
+    use crate::config::{ActivationHeights, ChainConfig};
+
+    // Regtest has RSKIP110 from genesis, so there the height alone decides;
+    // with wasabi100 at 1,000, it is wasabi100 that does.
+    let late = ChainConfig {
+        activation_heights: ActivationHeights { wasabi100: 1_000, ..ActivationHeights::regtest() },
+        ..ChainConfig::regtest()
+    };
+    for (config, number, altered_valid) in [
+        (ChainConfig::regtest(), 448, false),
+        (ChainConfig::regtest(), 449, true),
+        (late.clone(), 999, false),
+        (late, 1_000, true),
+    ] {
+        let rule = MergedMiningRule { config: Arc::new(config) };
+        let header = header_at(number);
+        let hash = header.hash_for_merged_mining();
+        let mut altered = hash;
+        altered[20..].copy_from_slice(&[0xfd; 12]);
+        let judge = |committed: B256| {
+            let mut mined = header.clone();
+            let (btc, coinbase, proof) = build_mm_proof(&mined, 0x207fffff, Some(committed));
+            mined.bitcoin_merged_mining_header = Some(btc);
+            mined.bitcoin_merged_mining_coinbase_transaction = Some(coinbase);
+            mined.bitcoin_merged_mining_merkle_proof = Some(proof);
+            rule.validate(&mined)
+        };
+
+        assert_eq!(judge(hash), Ok(()), "block {number}, the whole hash");
+        if altered_valid {
+            assert_eq!(judge(altered), Ok(()), "block {number}, fork-detection data");
+        } else {
+            assert_eq!(
+                judge(altered),
+                Err(ValidationError::BitcoinCoinbaseTagInvalid),
+                "block {number}, fork-detection data"
+            );
+        }
+    }
 }

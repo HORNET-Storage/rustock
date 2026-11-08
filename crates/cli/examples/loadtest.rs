@@ -779,6 +779,7 @@ fn remasc_tx() -> Transaction {
 /// is a handful of hashes rather than a search. Verification does the
 /// same work it would against a real mainnet target.
 fn seal_merged_mining(header: &mut Header) -> Result<()> {
+    use rustock_core::validation::fork_detection::REQUIRED_BLOCKS;
     use rustock_core::validation::merged_mining::compress_coinbase;
     use rustock_execution::mining::{coinbase, fork_detection, merkle};
 
@@ -788,7 +789,11 @@ fn seal_merged_mining(header: &mut Header) -> Result<()> {
     // hash is the one from before the transaction root was set.
     header.cached_hash = None;
     header.cached_hash_for_merged_mining = None;
-    let payload = fork_detection::apply_to_hash(header.hash_for_merged_mining(), &[0u8; 12]);
+    // From block 449 the hash's last twelve bytes are fork-detection data,
+    // and any twelve do here: this measures proof of work, not fork
+    // detection. Below 449 rskj wants the whole hash.
+    let fork_data: &[u8] = if header.number >= REQUIRED_BLOCKS { &[0u8; 12] } else { &[] };
+    let payload = fork_detection::apply_to_hash(header.hash_for_merged_mining(), fork_data);
 
     let cb = coinbase::build_coinbase(&payload, 0);
     let btc = coinbase::build_bitcoin_block(cb.clone(), 0);

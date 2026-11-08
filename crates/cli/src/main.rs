@@ -2583,11 +2583,19 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
 
     // The same chain configuration the header verifier uses: an uncle is
     // held to the rules a header is, on this chain's constants.
+    //
+    // Fork detection on, as rskj runs `ForkDetectionDataRule` on every block
+    // it imports and on every uncle. It reads the 449 headers below each
+    // one's parent: a few milliseconds a block, which a node following the
+    // chain can spare and a bulk replay -- the reason it is a switch at all --
+    // turns off for itself. The headers are here: the walk writes those under
+    // the checkpoint, and pruning keeps thousands more than 449.
     let mut block_processor = rustock_execution::BlockProcessor::new(
         hardfork_cfg.clone(),
         store.clone(),
     )
-    .with_chain_config(config.clone());
+    .with_chain_config(config.clone())
+    .with_fork_detection_validation(true);
     if let Some(cache) = &btc_block_cache {
         block_processor = block_processor.with_btc_block_cache(cache.clone());
     }
@@ -2603,9 +2611,10 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         );
     }
     info!(
-        "Block processor wired (hardfork config: {:?}, execution threads: {})",
+        "Block processor wired (hardfork config: {:?}, execution threads: {}, fork detection: {})",
         hardfork_cfg,
-        block_processor.execution_threads()
+        block_processor.execution_threads(),
+        block_processor.validates_fork_detection()
     );
 
     if let Some(count) = args.measure_block_reads {

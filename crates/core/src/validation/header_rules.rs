@@ -44,6 +44,13 @@ impl ParentHeaderValidator for ParentHashRule {
 /// parent comparison goes with it (`validPeriodLength == 0` returns true
 /// from both `isValid` overloads), which is what lets a regtest replay
 /// blocks whose clock has nothing to do with the node's.
+///
+/// rskj runs the parent form on uncles, and in its relay and snapshot
+/// validators. `BlockValidatorImpl`, which decides whether a block joins the
+/// chain, runs the rule on the header alone, as its header sync does: a
+/// block no later than its parent is one rskj imports. So
+/// [`HeaderVerifier::default_rsk`](super::HeaderVerifier::default_rsk) holds
+/// a trunk header to the clock alone, and an uncle to its parent too.
 pub struct TimestampRule {
     max_future_offset: u64,
 }

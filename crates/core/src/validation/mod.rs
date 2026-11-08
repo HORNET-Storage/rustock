@@ -61,6 +61,15 @@ pub enum ValidationError {
     #[error("Merged-mining merkle proof is {got} bytes, over the {max}-byte limit")]
     MerkleProofTooLarge { max: usize, got: usize },
 
+    #[error("Merged-mining coinbase is {length} bytes long, must be over 64")]
+    CoinbaseTooShort { length: i64 },
+
+    #[error("Two nodes of the merged-mining merkle proof parse as a 64-byte Bitcoin transaction")]
+    MerkleNodesFormTransaction,
+
+    #[error("UMM root is {len} bytes, must be empty or 20")]
+    UmmRootInvalid { len: usize },
+
     #[error("Tx gas price {tx_gas_price} is below the block minimum {block_minimum}")]
     TxGasPriceBelowMinimum { tx_gas_price: U256, block_minimum: U256 },
 
@@ -209,10 +218,12 @@ impl HeaderVerifier {
             })
             .with_static_rule(MergedMiningRule { config: config.clone() })
             .with_static_rule(BitcoinTimestampRule { config: config.clone() })
+            // rskj `newBlockMaxSecondsInTheFuture`; zero turns the rule off. On
+            // the header alone, as rskj's `BlockValidatorImpl` and its header
+            // sync run it: a block no later than its parent is one rskj imports.
+            .with_static_rule(TimestampRule::new(config.max_future_block_time))
             .with_static_rule(block_rules::ExtraDataRule::default())
             .with_parent_rule(BlockNumberRule)
-            // rskj `newBlockMaxSecondsInTheFuture`; zero turns the rule off.
-            .with_parent_rule(TimestampRule::new(config.max_future_block_time))
             .with_parent_rule(BlockParentGasLimitRule { config: config.clone() })
             .with_parent_rule(block_rules::PrevMinGasPriceRule)
             .with_parent_rule(DifficultyRule { config: config.clone() });

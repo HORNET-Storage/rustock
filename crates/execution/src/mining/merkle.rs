@@ -100,7 +100,8 @@ pub fn parse_wire_hashes(joined: &str) -> Result<Vec<[u8; 32]>, MerkleProofError
 }
 
 /// The merkle root a proof folds to, for checking a proof before it is put in
-/// a header. Mirrors the verifier exactly.
-pub fn root_from_proof(coinbase_hash: &[u8; 32], proof: &[u8]) -> [u8; 32] {
+/// a header. Mirrors the verifier exactly, `None` included: two nodes on the
+/// path that parse as a 64-byte Bitcoin transaction, which rskj refuses.
+pub fn root_from_proof(coinbase_hash: &[u8; 32], proof: &[u8]) -> Option<[u8; 32]> {
     rustock_core::validation::merged_mining::rskip92_merkle_root(coinbase_hash, proof)
 }

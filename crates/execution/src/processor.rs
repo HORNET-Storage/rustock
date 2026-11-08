@@ -291,6 +291,11 @@ impl BlockProcessor {
         self
     }
 
+    /// Whether the RSKIP110 fork-detection check runs.
+    pub fn validates_fork_detection(&self) -> bool {
+        self.validate_fork_detection_data
+    }
+
     /// Execute all transactions in a block without validating results against the header.
     ///
     /// Returns the processed block with receipts and new state root.
