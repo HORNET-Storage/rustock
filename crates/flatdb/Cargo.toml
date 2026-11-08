@@ -12,10 +12,13 @@ workspace = true
 [dependencies]
 memmap2 = "0.9"
 crc32fast = "1"
-rustix = { version = "1", features = ["fs"] }
 sha3 = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+
+# `fallocate`, which only Unix has; Windows reserves a segment with `set_len`.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }
