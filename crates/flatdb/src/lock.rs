@@ -3,7 +3,8 @@
 //! Two processes mapping the same heap would each believe they owned the
 //! write frontier. It is also the soundness argument for every `unsafe`
 //! mapping in this crate: no cooperating process truncates or rewrites a
-//! file while it is mapped. `flock` is released by the kernel when the
+//! file while it is mapped. The lock is `File::try_lock`: `flock` on Unix,
+//! `LockFileEx` on Windows. Either is released by the system when the
 //! process dies, so a crash does not leave the directory unopenable.
 
 use std::fs::File;
@@ -22,13 +23,13 @@ impl DbLock {
             .create(true)
             .truncate(false)
             .open(path)?;
-        match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+        match file.try_lock() {
             Ok(()) => Ok(Self { _file: file }),
-            Err(rustix::io::Errno::WOULDBLOCK) => Err(io::Error::new(
+            Err(std::fs::TryLockError::WouldBlock) => Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 format!("database is already open: {}", path.display()),
             )),
-            Err(e) => Err(io::Error::from(e)),
+            Err(std::fs::TryLockError::Error(e)) => Err(e),
         }
     }
 }
