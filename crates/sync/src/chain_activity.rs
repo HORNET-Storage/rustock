@@ -17,19 +17,63 @@ use std::time::Duration;
 /// Distinct from wall time on purpose: wall time includes waiting on the trie
 /// database, CPU time does not. Tracking both means the two can be compared,
 /// and the gap between them is where the node is waiting rather than working.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn thread_cpu_time() -> Duration {
     let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     // SAFETY: `ts` is a valid, initialised timespec and CLOCK_THREAD_CPUTIME_ID
-    // is always available on Linux. A failure leaves `ts` zeroed, which reports
-    // no CPU time rather than a wrong figure.
+    // is available on Linux and on macOS from 10.12. A failure leaves `ts`
+    // zeroed, which reports no CPU time rather than a wrong figure.
     unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
     Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
 }
 
+/// Windows has no thread CPU clock to read; `GetThreadTimes` gives the
+/// thread's kernel and user time instead, in the 100 ns units a FILETIME
+/// counts. It advances by scheduler ticks of about 15.6 ms, so a stretch of
+/// work shorter than a tick can read as none; the figures it feeds are
+/// averages over many blocks.
+#[cfg(windows)]
+pub fn thread_cpu_time() -> Duration {
+    #[repr(C)]
+    #[derive(Default, Clone, Copy)]
+    struct FileTime {
+        low: u32,
+        high: u32,
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentThread() -> *mut std::ffi::c_void;
+        fn GetThreadTimes(
+            thread: *mut std::ffi::c_void,
+            creation: *mut FileTime,
+            exit: *mut FileTime,
+            kernel: *mut FileTime,
+            user: *mut FileTime,
+        ) -> i32;
+    }
+    let (mut creation, mut exit, mut kernel, mut user) = Default::default();
+    // SAFETY: GetCurrentThread's pseudo-handle stands for the calling thread
+    // and needs no closing, and the four out-pointers are to valid FILETIMEs.
+    // A failure, zero, reports no CPU time rather than a wrong figure.
+    let ok = unsafe {
+        GetThreadTimes(
+            GetCurrentThread(),
+            &mut creation,
+            &mut exit,
+            &mut kernel,
+            &mut user,
+        )
+    };
+    if ok == 0 {
+        return Duration::ZERO;
+    }
+    let ticks = |t: FileTime| (u64::from(t.high) << 32) | u64::from(t.low);
+    Duration::from_nanos((ticks(kernel) + ticks(user)).saturating_mul(100))
+}
+
 /// Every other platform reports zero, so the ratios read as unavailable rather
 /// than wrong.
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 pub fn thread_cpu_time() -> Duration {
     Duration::ZERO
 }
