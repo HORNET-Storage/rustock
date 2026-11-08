@@ -205,6 +205,78 @@ pub(crate) fn secp_context() -> &'static secp256k1::Secp256k1<secp256k1::VerifyO
     CTX.get_or_init(secp256k1::Secp256k1::verification_only)
 }
 
+/// The sender rskj gives a transaction whose signature recovers the point at
+/// infinity rather than a key: the last 20 bytes of keccak256 of nothing.
+///
+/// libsecp256k1 refuses such a signature, and rskj takes it. Bouncy Castle
+/// encodes the point at infinity as the one byte `00`, and rskj's native
+/// service, its default, answers that same byte when libsecp256k1 refuses a
+/// key that would have been the point at infinity
+/// (`Secp256k1ServiceNative.recoverFromSignature`). `ECKey.getAddress` then
+/// hashes the encoding past its first byte, which is nothing. Testnet holds
+/// such transactions: the first in #8,269,754 is one, from an account that
+/// had sent ten before it.
+pub const INFINITY_SENDER: Address =
+    alloy_primitives::address!("dcc703c0e500b653ca82273b7bfad8045d85a470");
+
+/// The key a transaction's signature recovers, as rskj recovers it.
+enum Recovered {
+    /// A point on the curve.
+    Key(secp256k1::PublicKey),
+    /// The point at infinity, whose encoding to rskj, compressed or not, is
+    /// the one byte `00`: see [`INFINITY_SENDER`].
+    Infinity,
+}
+
+/// Whether a signature whose key libsecp256k1 refused to recover would have
+/// recovered the point at infinity, which is what rskj's native service asks
+/// when its recovery fails (`NativeSecp256k1.isInfinity`).
+///
+/// The key is r⁻¹(sR − eG), where R is the point whose x is r and whose y has
+/// the parity of the recovery ID, and e is the signing hash modulo the
+/// curve's order: it's the point at infinity just when R exists and sR = eG.
+/// `from_compact` has already held r and s below the order; rskj refuses
+/// either at zero before it recovers anything
+/// (`ECDSASignature.validateComponentsWithoutV`), and so does this.
+fn recovers_infinity(signature: &[u8; 64], recovery_id: u8, hash: &[u8; 32]) -> bool {
+    let (r, s) = signature.split_at(32);
+    if r.iter().all(|byte| *byte == 0) || s.iter().all(|byte| *byte == 0) {
+        return false;
+    }
+    let mut point = [0_u8; 33];
+    point[0] = 0x02 | recovery_id;
+    point[1..].copy_from_slice(r);
+    let Ok(point) = secp256k1::PublicKey::from_byte_array_compressed(point) else {
+        return false;
+    };
+    let order = U256::from_be_bytes(secp256k1::constants::CURVE_ORDER);
+    let e = U256::from_be_bytes(*hash);
+    let e = if e >= order { e - order } else { e };
+    // eG at e = 0 is no point, and sR always is one.
+    if e.is_zero() {
+        return false;
+    }
+    // The generator, whose y is even.
+    let mut generator = [0x02_u8; 33];
+    generator[1..].copy_from_slice(&secp256k1::constants::GENERATOR_X);
+    let mut s_bytes = [0_u8; 32];
+    s_bytes.copy_from_slice(s);
+    let (Ok(generator), Ok(s), Ok(e)) = (
+        secp256k1::PublicKey::from_byte_array_compressed(generator),
+        secp256k1::Scalar::from_be_bytes(s_bytes),
+        secp256k1::Scalar::from_be_bytes(e.to_be_bytes::<32>()),
+    ) else {
+        return false;
+    };
+    match (
+        point.mul_tweak(secp_context(), &s),
+        generator.mul_tweak(secp_context(), &e),
+    ) {
+        (Ok(sr), Ok(eg)) => sr == eg,
+        _ => false,
+    }
+}
+
 impl Transaction {
 
     /// Recover the sender address from the transaction signature.
@@ -218,7 +290,25 @@ impl Transaction {
     /// so at a full block it was the single largest cost outside execution
     /// -- 50 ms of a 205 ms block. See `cargo run --release --example
     /// validation_cost` and `docs/execution-performance.md`.
+    ///
+    /// A signature that recovers the point at infinity has the sender rskj
+    /// gives it, [`INFINITY_SENDER`].
     pub fn recover_sender(&self, chain_id: u64) -> anyhow::Result<Address> {
+        Ok(match self.recover_key(chain_id)? {
+            // The leading byte is the uncompressed-form marker and is not part
+            // of the key the address is taken from.
+            Recovered::Key(key) => {
+                let pubkey_hash = Keccak256::digest(&key.serialize_uncompressed()[1..]);
+                Address::from_slice(&pubkey_hash[12..])
+            }
+            Recovered::Infinity => INFINITY_SENDER,
+        })
+    }
+
+    /// The key this transaction's signature recovers, as rskj recovers it.
+    /// `recover_sender` and `btc_sender_hash160` both take it from here, so
+    /// they cannot drift apart on what a signature means.
+    fn recover_key(&self, chain_id: u64) -> anyhow::Result<Recovered> {
         let hash = self.signing_hash(chain_id);
 
         let recovery_id = if self.is_eip155(chain_id) {
@@ -246,14 +336,13 @@ impl Transaction {
             .map_err(|e| anyhow::anyhow!("invalid signature: {e}"))?;
         let message = secp256k1::Message::from_digest(hash.0);
 
-        let key = secp_context()
-            .recover_ecdsa(message, &signature)
-            .map_err(|e| anyhow::anyhow!("ECDSA recovery failed: {e}"))?;
-
-        // The leading byte is the uncompressed-form marker and is not part
-        // of the key the address is taken from.
-        let pubkey_hash = Keccak256::digest(&key.serialize_uncompressed()[1..]);
-        Ok(Address::from_slice(&pubkey_hash[12..]))
+        match secp_context().recover_ecdsa(message, &signature) {
+            Ok(key) => Ok(Recovered::Key(key)),
+            Err(_) if recovers_infinity(&sig_bytes, recovery_id, &hash.0) => {
+                Ok(Recovered::Infinity)
+            }
+            Err(e) => Err(anyhow::anyhow!("ECDSA recovery failed: {e}")),
+        }
     }
 
     pub fn is_eip155(&self, chain_id: u64) -> bool {
@@ -262,37 +351,14 @@ impl Transaction {
 
     /// Recover the compressed (33-byte) secp256k1 public key from the transaction signature.
     ///
-    /// Used to derive the BTC P2PKH address for peg-out destination:
-    /// `RIPEMD160(SHA256(compressed_pubkey))` = BTC hash160.
-    ///
-    /// Returns `None` if the signature is invalid or missing.
+    /// Returns `None` if the signature is invalid or missing, or recovers the
+    /// point at infinity, which has no such encoding: `btc_sender_hash160`
+    /// hashes rskj's one byte for it instead.
     pub fn recover_compressed_pubkey(&self, chain_id: u64) -> Option<[u8; 33]> {
-        let hash = self.signing_hash(chain_id);
-
-        let recovery_id = if self.is_eip155(chain_id) {
-            let rid = self.v as i64 - chain_id as i64 * 2 - 35;
-            if !(0..=1).contains(&rid) { return None; }
-            rid as u8
-        } else {
-            if self.v != 27 && self.v != 28 { return None; }
-            (self.v - 27) as u8
-        };
-
-        let mut sig_bytes = [0u8; 64];
-        sig_bytes[..32].copy_from_slice(&self.r.to_be_bytes::<32>());
-        sig_bytes[32..].copy_from_slice(&self.s.to_be_bytes::<32>());
-
-        // Confined to 0 or 1 above, so masking cannot turn a rejected id
-        // into an accepted one.
-        let recid = secp256k1::ecdsa::RecoveryId::from_u8_masked(recovery_id);
-        let signature =
-            secp256k1::ecdsa::RecoverableSignature::from_compact(&sig_bytes, recid).ok()?;
-        let message = secp256k1::Message::from_digest(hash.0);
-
-        // Same backend as `recover_sender`, for the same reason and so the
-        // two cannot drift apart on what a signature means.
-        let key = secp_context().recover_ecdsa(message, &signature).ok()?;
-        Some(key.serialize())
+        match self.recover_key(chain_id).ok()? {
+            Recovered::Key(key) => Some(key.serialize()),
+            Recovered::Infinity => None,
+        }
     }
 
     /// Compute the Keccak256 hash of this transaction's RLP bytes.
@@ -306,11 +372,15 @@ impl Transaction {
     ///
     /// Matches rskj's `BridgeUtils.recoverBtcAddressFromEthTransaction`:
     /// recovers the compressed public key from the ECDSA signature, then computes
-    /// `RIPEMD160(SHA256(compressed_pubkey))`.
+    /// `RIPEMD160(SHA256(compressed_pubkey))`. To rskj the point at infinity's
+    /// compressed encoding is the one byte `00` too, so a peg-out from
+    /// [`INFINITY_SENDER`] pays that byte's hash160.
     pub fn btc_sender_hash160(&self, chain_id: u64) -> Option<[u8; 20]> {
         use sha2::Digest as Sha2Digest;
-        let compressed = self.recover_compressed_pubkey(chain_id)?;
-        let sha256_hash = sha2::Sha256::digest(compressed);
+        let sha256_hash = match self.recover_key(chain_id).ok()? {
+            Recovered::Key(key) => sha2::Sha256::digest(key.serialize()),
+            Recovered::Infinity => sha2::Sha256::digest([0u8]),
+        };
         let hash160 = ripemd::Ripemd160::digest(sha256_hash);
         let mut arr = [0u8; 20];
         arr.copy_from_slice(&hash160);
@@ -529,6 +599,117 @@ mod tests {
         let sender = tx.recover_sender(30).unwrap();
         let expected: Address = "0x7e5f4552091a69125d5dfcb7b8c2659029395bdf".parse().unwrap();
         assert_eq!(sender, expected, "sender must recover from the original encoding");
+    }
+
+    /// Testnet block #8,269,754's first transaction, where the testnet node
+    /// stopped on 8 November: a transfer for chain 31 (v = 97) whose signature
+    /// recovers the point at infinity. rskj takes it, from 0xdcc703c0...a470
+    /// as the public node reports, and would pay a peg-out from it to the
+    /// hash160 of the one byte 00.
+    #[test]
+    fn a_testnet_transfer_whose_key_is_the_point_at_infinity_has_rskjs_sender() {
+        let hex = |text: &str| -> Vec<u8> {
+            (0..text.len())
+                .step_by(2)
+                .map(|at| u8::from_str_radix(&text[at..at + 2], 16).unwrap())
+                .collect()
+        };
+        let mut inner = vec![0x0a];
+        inner.extend(hex("8405f5e100"));
+        inner.extend(hex("825208"));
+        inner.extend(hex("947e5f4552091a69125d5dfcb7b8c2659029395bdf"));
+        inner.extend(hex("871c02a6fbc95200"));
+        inner.extend([0x80, 0x61]);
+        inner.extend(hex(
+            "a0cbe5079c44265dba4b8e6bb935f6ae95b7ba00df33ee4e27cdd709929de43037",
+        ));
+        inner.extend(hex(
+            "a05196f13a0727e24f3312944740d1a7c13ff62a61eae43840efb0869ce8f4bc93",
+        ));
+        let mut raw = Vec::new();
+        alloy_rlp::Header {
+            list: true,
+            payload_length: inner.len(),
+        }
+        .encode(&mut raw);
+        raw.extend_from_slice(&inner);
+
+        let tx = Transaction::decode(&mut raw.as_slice()).unwrap();
+        assert_eq!(
+            tx.tx_hash(),
+            B256::from_slice(&hex(
+                "574c3ba99e8f4cee089e984d18ff4ef82fd737c08857836a053d187fb095d5d9"
+            )),
+            "the bytes are the transaction on chain"
+        );
+        let expected: Address = "0xdcc703c0e500b653ca82273b7bfad8045d85a470"
+            .parse()
+            .unwrap();
+        assert_eq!(tx.recover_sender(31).unwrap(), expected);
+        assert_eq!(tx.recover_compressed_pubkey(31), None);
+        let hash160: [u8; 20] = hex("9f7fd096d37ed2c0e3f7f0cfc924beef4ffceb68")
+            .try_into()
+            .unwrap();
+        assert_eq!(tx.btc_sender_hash160(31), Some(hash160));
+    }
+
+    #[test]
+    fn the_infinity_sender_is_the_address_of_an_empty_key() {
+        assert_eq!(INFINITY_SENDER.as_slice(), &Keccak256::digest(b"")[12..]);
+    }
+
+    /// A signature made so that sR = eG, with R the generator and s the
+    /// signing hash, recovers the point at infinity whatever the transaction;
+    /// the same r with y's other parity recovers an ordinary key.
+    #[test]
+    fn a_signature_made_so_that_sr_is_eg_recovers_the_infinity_sender() {
+        let mut tx = Transaction {
+            nonce: 3,
+            gas_price: U256::from(60_000_000u64),
+            gas_limit: U256::from(21_000),
+            to: Bytes::from(vec![0x22; 20]),
+            value: U256::from(1),
+            input: Bytes::new(),
+            v: 33 * 2 + 35,
+            r: U256::from_be_bytes(secp256k1::constants::GENERATOR_X),
+            s: U256::ZERO,
+            cached_rlp: None,
+        };
+        let order = U256::from_be_bytes(secp256k1::constants::CURVE_ORDER);
+        tx.s = U256::from_be_bytes(tx.signing_hash_eip155(33).0) % order;
+        assert_eq!(tx.recover_sender(33).unwrap(), INFINITY_SENDER);
+
+        tx.v += 1;
+        let other = tx.recover_sender(33).unwrap();
+        assert_ne!(other, INFINITY_SENDER);
+        assert!(tx.recover_compressed_pubkey(33).is_some());
+    }
+
+    /// A signature whose R isn't on the curve, or whose s is zero, recovers no
+    /// key: rskj's native service, its default, recovers none from either, and
+    /// this refuses both, as it did before it took the point at infinity.
+    #[test]
+    fn a_signature_that_recovers_no_key_is_refused() {
+        let mut tx = Transaction {
+            nonce: 3,
+            gas_price: U256::from(60_000_000u64),
+            gas_limit: U256::from(21_000),
+            to: Bytes::from(vec![0x22; 20]),
+            value: U256::from(1),
+            input: Bytes::new(),
+            v: 33 * 2 + 35,
+            // 5³ + 7 has no square root modulo p.
+            r: U256::from(5),
+            s: U256::from(1),
+            cached_rlp: None,
+        };
+        let error = tx.recover_sender(33).unwrap_err().to_string();
+        assert!(error.contains("ECDSA recovery failed"), "{error}");
+        assert_eq!(tx.btc_sender_hash160(33), None);
+
+        tx.r = U256::from_be_bytes(secp256k1::constants::GENERATOR_X);
+        tx.s = U256::ZERO;
+        assert!(tx.recover_sender(33).is_err());
     }
 }
 
