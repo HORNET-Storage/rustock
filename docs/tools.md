@@ -34,6 +34,7 @@ usage.
 | [`scan_pegin_calls`](../crates/cli/examples/scan_pegin_calls.rs) | Find `registerBtcTransaction` calls by reading blocks, without executing them. |
 | [`scan_silent`](../crates/cli/examples/scan_silent.rs) | Read the silent-decision store: what the Bridge decided without logging it. |
 | [`check_supply`](../crates/cli/examples/check_supply.rs) | Replay canonical blocks and report any that do not conserve the native supply, changing nothing on disk. |
+| [`bridge_btc_holdings`](../crates/cli/examples/bridge_btc_holdings.rs) | How much bitcoin the peg holds and where it sits, listed outpoint by outpoint — the federation's own script and every Flyover-derived address, read from the unitrie without executing anything. |
 
 ## Chain and block inspection
 
@@ -57,6 +58,7 @@ usage.
 | [`diff_state`](../crates/cli/examples/diff_state.rs) | Localize a post-wasabi state-root divergence to the exact diverging trie leaves. Replays canonical blocks from the executed head up to `<number>` in memory (computing rustock's — possibly wrong — post-state trie), then diffs it against rskj's own unitrie for the *header's* state root, read directly from rskj's LevelDB. The dual walk descends only where the two tries' subtree hashes differ, so it visits a handful of nodes and finishes instantly even on a multi-million-leaf state. |
 | [`diff_roots`](../crates/cli/examples/diff_roots.rs) | Diff two unitrie roots that live in two different stores. |
 | [`diff_self`](../crates/cli/examples/diff_self.rs) | Diagnostic: show the unitrie leaf delta produced by executing a single block. Replays from the executed head to <number>-1 (the base), then executes <number> and hash-prune-diffs the two rustock-computed tries. Prints only the leaves that changed — the exact state delta of <number>. No rskj DB needed (both sides are rustock-computed); use when rskj isn't synced past the target. |
+| [`rbtc_supply`](../crates/cli/examples/rbtc_supply.rs) | Sum every rBTC balance in the unitrie at one block: a parallel whole-trie walk split by the committed `children_size`, reporting the account census, the conservation check against the premine, and the Bridge and REMASC balances. |
 | [`trie_footprint`](../crates/cli/examples/trie_footprint.rs) | Measure the trie working set of a range of blocks. |
 | [`trie_window`](../crates/cli/examples/trie_window.rs) | Measure the miss rate of a sliding-window trie cache against window length. |
 | [`lsm_stats`](../crates/cli/examples/lsm_stats.rs) | LSM shape and table properties of a trie store: level layout, and whether the SSTs carry bloom filters at all. |
