@@ -392,6 +392,9 @@ fn method_allows_static_call(name: &str) -> bool {
             | "getQueuedPegoutsCount"
             | "getEstimatedFeesForNextPegOutEvent"
             | "getEstimatedFeesForPegOutAmount"
+            // RSKIP502: the union bridge's two getters.
+            | "getUnionBridgeContractAddress"
+            | "getUnionBridgeLockingCap"
     )
 }
 
@@ -1268,6 +1271,20 @@ mod tests {
         assert!(method_allows_static_call("getFederationAddress"));
         assert!(method_allows_static_call("getBtcTransactionConfirmations"));
         assert!(method_allows_static_call("isBtcTxHashAlreadyProcessed"));
+        // The union bridge's getters are rskj's ALLOW_STATIC_CALL too, and
+        // its four mutators are not.
+        assert!(method_allows_static_call("getUnionBridgeContractAddress"));
+        assert!(method_allows_static_call("getUnionBridgeLockingCap"));
+        assert!(!method_allows_static_call("increaseUnionBridgeLockingCap"));
+        assert!(!method_allows_static_call("requestUnionBridgeRbtc"));
+
+        // Of the methods in this table, rskj's BridgeMethods marks 52
+        // ALLOW_STATIC_CALL (counted from its enum, rskj 9.1).
+        let static_callable = BRIDGE_METHODS
+            .iter()
+            .filter(|m| method_allows_static_call(m.name))
+            .count();
+        assert_eq!(static_callable, 52);
     }
 
     /// rskj `validateLocalCall`: a local-only getter reached by an on-chain call
