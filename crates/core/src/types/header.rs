@@ -42,16 +42,18 @@ pub struct Header {
     pub bitcoin_merged_mining_merkle_proof: Option<Bytes>,
     pub bitcoin_merged_mining_coinbase_transaction: Option<Bytes>,
 
-    /// Hash computed from the original RLP bytes received from the peer.
-    /// Java's RLP encoding may differ from Rust's canonical encoding (e.g.
-    /// leading zeros in BigInteger values), so we cache the hash at decode
-    /// time instead of recomputing it from re-encoded bytes.
+    /// The block hash, cached by `decode_with_hash` from the peer's own
+    /// encoding of each field. Java's RLP encoding may differ from Rust's
+    /// canonical encoding (e.g. leading zeros in BigInteger values), so the
+    /// hash is taken at decode time instead of from re-encoded bytes. It is
+    /// the hash of the form rskj hashes, which is not the form a versioned
+    /// header is sent in.
     #[serde(skip)]
     pub cached_hash: Option<B256>,
 
-    /// Merged mining hash computed from the original RLP bytes (base fields
-    /// only, excluding bitcoin mining fields). Cached at decode time for the
-    /// same Java RLP compatibility reasons as `cached_hash`.
+    /// The merged-mining hash, cached the same way and for the same Java RLP
+    /// reasons as `cached_hash`: the base fields and `ummRoot` only, without
+    /// the bitcoin mining fields.
     #[serde(skip)]
     pub cached_hash_for_merged_mining: Option<B256>,
 }
@@ -91,6 +93,26 @@ fn count_rlp_items(buf: &[u8]) -> usize {
         }
     }
     count
+}
+
+/// The items of the RLP list `encoded`, each in its whole encoding, header
+/// and payload, as the peer spelled it. `None` unless `encoded` is exactly
+/// one list of complete items.
+fn rlp_list_items(encoded: &[u8]) -> Option<Vec<&[u8]>> {
+    let mut rest = encoded;
+    let list = alloy_rlp::Header::decode(&mut rest).ok()?;
+    if !list.list || rest.len() != list.payload_length {
+        return None;
+    }
+    let mut items = Vec::new();
+    while !rest.is_empty() {
+        let mut temp = rest;
+        let item = alloy_rlp::Header::decode(&mut temp).ok()?;
+        let length = (rest.len() - temp.len()).checked_add(item.payload_length)?;
+        items.push(rest.get(..length)?);
+        rest = &rest[length..];
+    }
+    Some(items)
 }
 
 /// rskj reads a header's number, gas used and timestamp with
@@ -499,120 +521,101 @@ impl Header {
         alloy_primitives::keccak256(&buffer)
     }
 
-    /// Compute the RSKIP92 block hash from original encoded bytes: re-wrap the
-    /// list payload with the last two items (merkle proof, coinbase) dropped.
-    fn rskip92_hash_from_encoded(encoded: &[u8]) -> Option<B256> {
-        let mut parse = encoded;
-        let list_h = alloy_rlp::Header::decode(&mut parse).ok()?;
-        let body = parse.get(..list_h.payload_length)?;
-        let mut ends = Vec::new();
-        let mut cursor = body;
-        while !cursor.is_empty() {
-            let mut temp = cursor;
-            let item_h = alloy_rlp::Header::decode(&mut temp).ok()?;
-            if item_h.payload_length > temp.len() {
-                return None;
-            }
-            cursor = &temp[item_h.payload_length..];
-            ends.push(body.len() - cursor.len());
-        }
-        if ends.len() < 3 {
-            return None;
-        }
-        let payload = &body[..ends[ends.len() - 3]];
-        let mut buf = Vec::with_capacity(payload.len() + 4);
-        alloy_rlp::Header { list: true, payload_length: payload.len() }.encode(&mut buf);
-        buf.extend_from_slice(payload);
-        Some(alloy_primitives::keccak256(&buf))
+    /// Decode a header from RLP bytes and cache both of its hashes from those
+    /// bytes, since re-encoding need not reproduce a peer's Java spelling of
+    /// every field.
+    ///
+    /// rskj does not hash the form it sends. It hashes the compressed form,
+    /// which leaves out the merged-mining proof and coinbase (RSKIP-92) and,
+    /// for a versioned (RSKIP-351) header, the version, edges and base event
+    /// that follow `ummRoot` on the wire, whose commitment takes the bloom's
+    /// place in slot 6. So both hashes are built from the items as sent,
+    /// less those, with slot 6 swapped. Hashing a versioned header as sent
+    /// gave every testnet header from reed810 on a hash no other node agrees
+    /// with: no header named its parent, and the snapshot sync refused every
+    /// chain it was offered.
+    pub fn decode_with_hash(buf: &mut &[u8]) -> alloy_rlp::Result<Self> {
+        Self::decode_with_hash_and_activations(buf, crate::config::ActivationHeights::current())
     }
 
-    /// Decode a header from RLP bytes and compute the hash from those original
-    /// bytes (before our re-encoding potentially changes them).
-    pub fn decode_with_hash(buf: &mut &[u8]) -> alloy_rlp::Result<Self> {
-        use alloy_rlp::Decodable;
+    /// [`Self::decode_with_hash`] under explicit activation heights, which
+    /// decide what a lone item after a V2 version byte is, as they do for
+    /// [`Self::decode_with_activations`].
+    pub fn decode_with_hash_and_activations(
+        buf: &mut &[u8],
+        activations: &crate::config::ActivationHeights,
+    ) -> alloy_rlp::Result<Self> {
         let original = *buf;
-        let mut header = <Self as Decodable>::decode(buf)?;
-        let consumed = original.len() - buf.len();
-        let has_proof_and_coinbase = header.bitcoin_merged_mining_merkle_proof.is_some()
-            || header.bitcoin_merged_mining_coinbase_transaction.is_some();
-        header.cached_hash = if header.rskip92_active() && has_proof_and_coinbase {
-            Self::rskip92_hash_from_encoded(&original[..consumed])
+        let mut header = Self::decode_with_activations(buf, activations)?;
+        let encoded = &original[..original.len() - buf.len()];
+
+        // `decode` has just read this list, so its items split; were one too
+        // lenient for that, both hashes would be left to come from this
+        // node's own encoding instead.
+        let Some(items) = rlp_list_items(encoded) else {
+            return Ok(header);
+        };
+        // The sixteen base fields and `ummRoot`, then on the wire a versioned
+        // header's own fields, then the merged-mining fields.
+        let base = 16 + usize::from(header.umm_root.is_some());
+        let versioned = header.version_fields.as_ref().map_or(0, |v| {
+            1 + usize::from(v.edges.is_some()) + usize::from(v.base_event.is_some())
+        });
+        let (Some(base_items), Some(mining)) = (items.get(..base), items.get(base + versioned..))
+        else {
+            return Ok(header);
+        };
+        // A versioned header that sent its literal bloom is hashed with its
+        // commitment in slot 6, as `encode_base_fields` does.
+        let commitment = if header.extension_data.is_none() {
+            header.compressed_extension_field()
         } else {
             None
-        }
-        .or_else(|| Some(alloy_primitives::keccak256(&original[..consumed])));
-
-        // Compute merged mining hash from original RLP bytes.
-        // Three cases depending on ummRoot presence:
-        //   - ummRoot absent (peer omitted it): hash fields 0-15 only
-        //   - ummRoot present but empty: hash fields 0-16 (single keccak256)
-        //   - ummRoot present and non-empty (UMM): double-hash
-        //       keccak256( keccak256(RLP_LIST(fields_0_16))[0:20] ++ ummRoot )
-        let mut parse = &original[..consumed];
-        if let Ok(list_h) = alloy_rlp::Header::decode(&mut parse) {
-            let body = &parse[..list_h.payload_length];
-            let mut cursor = body;
-            for _ in 0..16 {
-                if cursor.is_empty() { break; }
-                let mut temp = cursor;
-                if let Ok(item_h) = alloy_rlp::Header::decode(&mut temp) {
-                    if item_h.payload_length > temp.len() { break; }
-                    cursor = &temp[item_h.payload_length..];
-                } else {
-                    break;
+        };
+        let hash_with = |mining: &[&[u8]]| {
+            let mut payload = Vec::with_capacity(encoded.len());
+            for (slot, item) in base_items.iter().enumerate() {
+                match &commitment {
+                    Some(field) if slot == 6 => payload.extend_from_slice(field),
+                    _ => payload.extend_from_slice(item),
                 }
             }
-            let mm_end = body.len() - cursor.len();
+            for item in mining {
+                payload.extend_from_slice(item);
+            }
+            let mut list = Vec::with_capacity(payload.len() + 9);
+            alloy_rlp::Header {
+                list: true,
+                payload_length: payload.len(),
+            }
+            .encode(&mut list);
+            list.extend_from_slice(&payload);
+            alloy_primitives::keccak256(&list)
+        };
 
-            let has_umm_root = header.umm_root.is_some();
-            let is_umm_block = header.umm_root.as_ref().is_some_and(|u| !u.is_empty());
+        // RSKIP-92: the block hash keeps the merged-mining header and leaves
+        // out the proof and the coinbase.
+        let hashed_mining = if header.rskip92_active() {
+            &mining[..mining.len().min(1)]
+        } else {
+            mining
+        };
+        header.cached_hash = Some(hash_with(hashed_mining));
 
-            let mm_hash = if has_umm_root {
-                // ummRoot is present in the RLP — include it in the hash payload.
-                // The miner included ummRoot when encoding for the merged mining
-                // hash, so we must do the same regardless of whether ummRoot is
-                // empty or non-empty.
-                let mut mm_end_with_umm = mm_end;
-                if !cursor.is_empty() {
-                    let mut temp = cursor;
-                    if let Ok(item_h) = alloy_rlp::Header::decode(&mut temp) {
-                        if item_h.payload_length <= temp.len() {
-                            let header_len = cursor.len() - temp.len();
-                            mm_end_with_umm += header_len + item_h.payload_length;
-                        }
-                    }
-                }
-                let mm_payload = &body[..mm_end_with_umm];
-                let mm_list_h = alloy_rlp::Header { list: true, payload_length: mm_payload.len() };
-                let mut mm_buf = Vec::with_capacity(mm_list_h.length() + mm_payload.len());
-                mm_list_h.encode(&mut mm_buf);
-                mm_buf.extend_from_slice(mm_payload);
-
-                if is_umm_block {
-                    // Non-empty ummRoot: apply UMM double-hash
-                    let umm_bytes = header.umm_root.as_ref().unwrap();
-                    let base = alloy_primitives::keccak256(&mm_buf);
-                    let mut input = Vec::with_capacity(20 + umm_bytes.len());
-                    input.extend_from_slice(&base.as_slice()[..20]);
-                    input.extend_from_slice(umm_bytes.as_ref());
+        // The merged-mining hash leaves out all three, and a UMM block then
+        // folds its root in: keccak(the first 20 bytes ++ ummRoot).
+        let for_merged_mining = hash_with(&[]);
+        header.cached_hash_for_merged_mining = Some(
+            match header.umm_root.as_ref().filter(|umm| !umm.is_empty()) {
+                Some(umm) => {
+                    let mut input = Vec::with_capacity(20 + umm.len());
+                    input.extend_from_slice(&for_merged_mining.as_slice()[..20]);
+                    input.extend_from_slice(umm.as_ref());
                     alloy_primitives::keccak256(&input)
-                } else {
-                    // Empty ummRoot present: single hash of fields 0-16
-                    alloy_primitives::keccak256(&mm_buf)
                 }
-            } else {
-                // No ummRoot in the RLP at all: hash of fields 0-15 only
-                let mm_payload = &body[..mm_end];
-                let mm_list_h = alloy_rlp::Header { list: true, payload_length: mm_payload.len() };
-                let mut mm_buf = Vec::with_capacity(mm_list_h.length() + mm_payload.len());
-                mm_list_h.encode(&mut mm_buf);
-                mm_buf.extend_from_slice(mm_payload);
-                alloy_primitives::keccak256(&mm_buf)
-            };
-
-            header.cached_hash_for_merged_mining = Some(mm_hash);
-        }
-
+                None => for_merged_mining,
+            },
+        );
         Ok(header)
     }
 
@@ -1172,6 +1175,21 @@ mod tests {
             b256!("a3403ff963cb87a3fb52371c690170f292e516d3ca367b73402f5c5900f140b1"),
             "must reproduce the hash testnet reached consensus on"
         );
+
+        // The network's decoder reaches it from the bytes as sent, edges and
+        // all, and the merged-mining hash the coinbase commits to.
+        let decoded = Header::decode_with_hash(&mut raw.as_slice()).unwrap();
+        assert_eq!(decoded.hash(), alloy_primitives::keccak256(&buf));
+        let coinbase = decoded
+            .bitcoin_merged_mining_coinbase_transaction
+            .clone()
+            .unwrap();
+        let tag = b"RSKBLOCK:";
+        let at = coinbase.windows(tag.len()).rposition(|w| w == tag).unwrap() + tag.len();
+        assert_eq!(
+            &decoded.hash_for_merged_mining()[..20],
+            &coinbase[at..at + 20]
+        );
     }
 
     /// Splits an RLP list into the payloads of its items.
@@ -1240,15 +1258,16 @@ mod versioned_wire_header_tests {
         "2a6a52534b424c4f434b3aa299d0e6dcc89894d1897433dcfc94cb400657c925509283bf09a213007407e800000000",
     );
 
+    /// A header decoded without caching either hash, so `hash()` and
+    /// `hash_for_merged_mining()` derive them by encoding: the path a header
+    /// built here takes.
     fn decode(hex: &str) -> Header {
         let bytes = alloy_primitives::hex::decode(hex).unwrap();
         let mut slice = bytes.as_slice();
         // Testnet headers, so testnet's RSKIP-144 height.
         let testnet = crate::config::ActivationHeights::testnet();
-        let mut h = Header::decode_with_activations(&mut slice, &testnet).unwrap();
-        // The decoder caches the hash of the bytes it was handed; clearing it
-        // forces `hash()` to re-derive, which is the thing under test.
-        h.cached_hash = None;
+        let h = Header::decode_with_activations(&mut slice, &testnet).unwrap();
+        assert_eq!((h.cached_hash, h.cached_hash_for_merged_mining), (None, None));
         h
     }
 
@@ -1467,5 +1486,152 @@ mod versioned_wire_header_tests {
         let mut slice = buf.as_slice();
         let again = Header::decode(&mut slice).unwrap();
         assert_eq!(again.version_fields, None);
+    }
+
+    /// A header decoded as the network decodes one: `decode_with_hash`, over
+    /// the whole of `hex`, under testnet's heights, whose headers these are.
+    fn from_the_network(hex: &str) -> Header {
+        let bytes = alloy_primitives::hex::decode(hex).unwrap();
+        let mut rest = bytes.as_slice();
+        let testnet = crate::config::ActivationHeights::testnet();
+        let h = Header::decode_with_hash_and_activations(&mut rest, &testnet).unwrap();
+        assert!(rest.is_empty(), "bytes after the header");
+        h
+    }
+
+    /// What the miner committed to in the coinbase after `RSKBLOCK:`: the
+    /// first 20 bytes of the merged-mining hash.
+    fn committed(h: &Header) -> Vec<u8> {
+        let coinbase = h
+            .bitcoin_merged_mining_coinbase_transaction
+            .as_ref()
+            .unwrap();
+        let tag = b"RSKBLOCK:";
+        let at = coinbase.windows(tag.len()).rposition(|w| w == tag).unwrap() + tag.len();
+        coinbase[at..at + 20].to_vec()
+    }
+
+    /// The network decodes headers with `decode_with_hash`, which caches
+    /// both hashes from the bytes sent. It used to hash those bytes whole,
+    /// and for a versioned header they are not what rskj hashes: every
+    /// testnet header from reed810 on got a hash no other node agrees with,
+    /// so none named its parent, and the snapshot sync refused every chain it
+    /// was offered as not forming one.
+    #[test]
+    fn the_network_decoder_hashes_a_versioned_header_as_rskj_does() {
+        for (wire, hash) in [
+            (
+                V1_WIRE,
+                "0xa44a88ce39fb3851d7f9b5ca9879b2c93b2544b12ac8239c034c6e589219c411",
+            ),
+            (
+                V2_WIRE,
+                "0x27138ca46912bd08e1a9a942a5e81d0ec96fc91820f539f7e872239b3a1626bd",
+            ),
+            (
+                V2_SHORT_WIRE,
+                "0x119296ea9d8d7efa82550bfb447ae9441ea75f9537f47917f1ca38e0b8982c05",
+            ),
+        ] {
+            let hash: B256 = hash.parse().unwrap();
+            let h = from_the_network(wire);
+            assert_eq!(h.cached_hash, Some(hash), "#{}", h.number);
+            // What testnet's miners committed to, so its hash rate attests to it.
+            let merged = h.cached_hash_for_merged_mining.unwrap();
+            assert_eq!(&merged[..20], committed(&h).as_slice(), "#{}", h.number);
+            // And a header built here derives both the same way.
+            let built = decode(wire);
+            assert_eq!(built.hash(), hash, "#{}", h.number);
+            assert_eq!(built.hash_for_merged_mining(), merged, "#{}", h.number);
+        }
+    }
+
+    /// Every layout the decoder reads, built here and read back as the
+    /// network reads it: what `decode_with_hash` caches from the items sent
+    /// is what this node derives by encoding. The captured headers above tie
+    /// both paths to rskj; this ties down where `ummRoot`, a versioned
+    /// header's own fields and the mining fields sit, across layouts no
+    /// captured header has: a UMM root, edges, a base event, no mining
+    /// fields, a header from before RSKIP-92.
+    #[test]
+    fn every_layout_caches_the_hashes_it_would_encode_to() {
+        let real = decode(V1_WIRE);
+        let umm = [None, Some(Bytes::new()), Some(Bytes::from(vec![0xab; 20]))];
+        let fields = |version, edges: Option<Vec<i16>>, base_event: Option<Bytes>| {
+            Some(HeaderVersionFields {
+                version,
+                edges,
+                base_event,
+            })
+        };
+        // RSKIP-144 decides what a lone item after a V2 version byte is: the
+        // edges where it is active, the base event where it is not. Each
+        // layout is read under heights that make it one rskj reads.
+        let with_144 = crate::config::ActivationHeights {
+            rskip144: Some(0),
+            ..crate::config::ActivationHeights::testnet()
+        };
+        let without_144 = crate::config::ActivationHeights {
+            rskip144: None,
+            ..crate::config::ActivationHeights::testnet()
+        };
+        let versions = [
+            (None, &with_144),
+            (fields(1, None, None), &with_144),
+            (fields(1, Some(vec![1, 3]), None), &with_144),
+            (fields(2, Some(vec![]), Some(Bytes::new())), &with_144),
+            (fields(2, Some(vec![2]), None), &with_144),
+            (fields(2, Some(vec![2]), Some(Bytes::from_static(b"base event"))), &with_144),
+            (fields(2, None, Some(Bytes::from_static(b"base event"))), &without_144),
+        ];
+        let mut layouts = 0;
+        for number in [100, real.number] {
+            for umm_root in &umm {
+                for (version_fields, activations) in &versions {
+                    for mining in [true, false] {
+                        // The decoder tells `ummRoot` from the mining fields
+                        // by count, so it reads one only beside them, and
+                        // the version fields only after one.
+                        if (umm_root.is_some() || version_fields.is_some()) && !mining {
+                            continue;
+                        }
+                        if version_fields.is_some() && umm_root.is_none() {
+                            continue;
+                        }
+                        let mut header = Header {
+                            number,
+                            umm_root: umm_root.clone(),
+                            version_fields: version_fields.clone(),
+                            ..real.clone()
+                        };
+                        if !mining {
+                            header.bitcoin_merged_mining_header = None;
+                            header.bitcoin_merged_mining_merkle_proof = None;
+                            header.bitcoin_merged_mining_coinbase_transaction = None;
+                        }
+                        let mut wire = Vec::new();
+                        header.encode(&mut wire);
+                        assert_eq!(
+                            Header::decode_with_activations(&mut wire.as_slice(), activations).unwrap(),
+                            header,
+                            "the layout reads back"
+                        );
+                        let cached =
+                            Header::decode_with_hash_and_activations(&mut wire.as_slice(), activations)
+                                .unwrap();
+                        assert_eq!(cached.cached_hash, Some(header.hash()), "{header:?}");
+                        assert_eq!(
+                            cached.cached_hash_for_merged_mining,
+                            Some(header.hash_for_merged_mining()),
+                            "{header:?}"
+                        );
+                        layouts += 1;
+                    }
+                }
+            }
+        }
+        // Per height: four version-0 layouts, and six versioned ones on
+        // each of two UMM roots.
+        assert_eq!(layouts, 2 * (4 + 6 * 2));
     }
 }

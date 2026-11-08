@@ -68,19 +68,29 @@ leading zeros. The rskj node inherited this behavior.
 
 **Cached hash from original bytes** (`crates/core/src/types/header.rs`):
 
-- `Header` carries an optional `cached_hash: Option<B256>` field.
-- `Header::decode_with_hash()` computes `keccak256` over the **original RLP
-  bytes** received from the peer (before decoding and re-encoding), and stores
-  the result in `cached_hash`.
+- `Header` carries an optional `cached_hash: Option<B256>` field, and
+  `cached_hash_for_merged_mining` beside it.
+- `Header::decode_with_hash()` builds both hashes from the **peer's own
+  encoding of each field**, as received, and stores them.
+- It hashes the form rskj hashes, which is not the form rskj sends. rskj
+  hashes a compressed encoding: from RSKIP-92 on the block hash leaves out
+  the merged-mining proof and coinbase, and a versioned (RSKIP-351) header,
+  sent with its literal bloom in slot 6 and its version, edges and base
+  event after `ummRoot`, is hashed without those three and with a commitment
+  to all four in slot 6. So `decode_with_hash` takes the items as sent,
+  leaves those out and swaps slot 6. Hashing the bytes whole gave every
+  testnet header from reed810 (#7,139,600) on a hash no other node agrees
+  with, and the snapshot sync found no chain in what it was offered.
 - `Header::hash()` returns `cached_hash` when present, falling back to
-  `keccak256(self.encode())` for locally-constructed headers.
-- The network message decoder (`crates/networking/src/protocol/rsk.rs`) uses
-  `decode_with_hash` for all `BlockHeadersResponse` payloads.
+  encoding the header for locally-constructed headers.
+- The network message decoder (`crates/networking/src/protocol/rsk.rs`), the
+  snapshot block decoder (`snap.rs`) and the freezer's uncles use
+  `decode_with_hash` for every header and uncle they read.
 
 This is the same approach used by production Ethereum clients (Geth, Reth):
-cache the hash from wire bytes rather than recomputing from re-encoded data.
-It decouples hash identity from encoding, making the client resilient to any
-encoding differences across implementations.
+cache the hash from the peer's bytes rather than recomputing from re-encoded
+data. It decouples hash identity from how this node would spell a field,
+making the client resilient to encoding differences across implementations.
 
 **ParentHashRule omission** (`crates/core/src/validation/mod.rs`):
 
@@ -106,9 +116,15 @@ it:
 - **Fragile over time**: if rskj changes how it encodes a field, our mimicry
   would silently break.
 
-The cached-hash approach is more robust: it works for all headers, all values,
-and all future protocol versions, without requiring byte-level encoding
-compatibility.
+The cached-hash approach is more robust: it works for all values, without
+requiring byte-level encoding compatibility. It does not spare the decoder
+from knowing which form rskj hashes: a header version that changes that
+form, as RSKIP-351 did, has to be taught to `decode_with_hash`.
+
+The encoder does now spell `difficulty`, `gasLimit` and `minimumGasPrice` as
+rskj does (`java_signed_bytes`), because a header this node builds has no
+peer's bytes to hash. That leaves the cache for headers from peers, whose
+fields need not be spelled as this node would spell them.
 
 ---
 
