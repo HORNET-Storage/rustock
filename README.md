@@ -348,6 +348,12 @@ crates/
   alerts/       Peg-out and node-health alerting; an observer with no hook in execution or sync
 ```
 
+`crates/cli/examples/` holds sixty small diagnostic and benchmark programs --
+"what did this block write", "where is RSKIP-144 actually used", "did a PowPeg
+functionary ever sign badly". They are cargo examples rather than node
+subcommands so they stay out of the binary's argument surface.
+[docs/tools.md](docs/tools.md) indexes all of them, and says which ones write.
+
 ### Log timestamps and timezones
 
 Log timestamps are **UTC by default** and RFC 3339 with one subsecond digit,
