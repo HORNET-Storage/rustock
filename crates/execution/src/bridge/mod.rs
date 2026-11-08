@@ -248,6 +248,10 @@ pub enum BridgeMethodEnabled {
     Since(crate::hardfork::RskNetworkUpgrade),
     /// Enabled only BEFORE the given network upgrade (legacy methods).
     Until(crate::hardfork::RskNetworkUpgrade),
+    /// Enabled where the rule's own predicate says so. For a rule whose
+    /// upgrade a network skips, which `Since` would read as implied by any
+    /// later upgrade there (see `RskHardforkConfig::has_rskip144`).
+    Rule(fn(&RskHardforkConfig, u64) -> bool),
 }
 
 impl BridgeMethodEnabled {
@@ -256,6 +260,7 @@ impl BridgeMethodEnabled {
             Self::Always => true,
             Self::Since(u) => hardfork_cfg.active_upgrade(block_number) >= *u,
             Self::Until(u) => hardfork_cfg.active_upgrade(block_number) < *u,
+            Self::Rule(active) => active(hardfork_cfg, block_number),
         }
     }
 }
@@ -268,14 +273,16 @@ fn method_enabled(name: &str) -> BridgeMethodEnabled {
     use crate::hardfork::RskNetworkUpgrade::*;
     use BridgeMethodEnabled::*;
     match name {
-        // RSKIP502 (reed810): the union bridge.
+        // RSKIP502 (reed810): the union bridge. By reed810's schedule, which
+        // mainnet never sets: `Since(Reed810)` read its vetiver900 as
+        // implying it.
         "setUnionBridgeContractAddressForTestnet"
         | "getUnionBridgeContractAddress"
         | "getUnionBridgeLockingCap"
         | "increaseUnionBridgeLockingCap"
         | "requestUnionBridgeRbtc"
         | "releaseUnionBridgeRbtc"
-        | "setUnionBridgeTransferPermissions" => Since(Reed810),
+        | "setUnionBridgeTransferPermissions" => Rule(RskHardforkConfig::has_rskip502),
         // !RSKIP87 / !RSKIP89
         "addLockWhitelistAddress" | "getBtcBlockchainBlockLocator" => Until(Orchid),
         // RSKIP87 / RSKIP89
@@ -1289,6 +1296,42 @@ mod tests {
         assert!(matches!(dynm.permission, BridgePermission::DynamicRskip220));
         assert!(method_only_allows_local_calls(dynm.permission, &cfg, pre_iris));
         assert!(!method_only_allows_local_calls(dynm.permission, &cfg, post_iris));
+    }
+
+    /// The union bridge's selectors follow reed810's schedule, which mainnet
+    /// never sets. Its vetiver900 outranks reed810, so the upgrade-order gate
+    /// these had made them methods on mainnet from #8,804,200, where rskj's
+    /// `parseData` finds no method: a call to one would have forked the node.
+    #[test]
+    fn the_union_bridge_is_never_a_method_on_mainnet() {
+        use crate::hardfork::RskHardforkConfig;
+        let mainnet = RskHardforkConfig::mainnet();
+        let testnet = RskHardforkConfig::testnet();
+        for signature in [
+            "setUnionBridgeContractAddressForTestnet(address)",
+            "getUnionBridgeContractAddress()",
+            "getUnionBridgeLockingCap()",
+            "increaseUnionBridgeLockingCap(uint256)",
+            "requestUnionBridgeRbtc(uint256)",
+            "releaseUnionBridgeRbtc()",
+            "setUnionBridgeTransferPermissions(bool,bool)",
+        ] {
+            let m = find_bridge_method(&compute_selector(signature)).unwrap();
+            for n in [8_804_199, 8_804_200, 9_500_000, u64::MAX] {
+                assert!(
+                    !m.enabled.is_enabled(&mainnet, n),
+                    "{signature} on mainnet at #{n}"
+                );
+            }
+            assert!(
+                !m.enabled.is_enabled(&testnet, 7_139_599),
+                "{signature} before reed810"
+            );
+            assert!(
+                m.enabled.is_enabled(&testnet, 7_139_600),
+                "{signature} at testnet's reed810"
+            );
+        }
     }
 
     /// A well-formed `receiveHeaders(bytes[])` with one empty header element

@@ -549,9 +549,9 @@ pub fn deserialize_utxo_list(data: &[u8]) -> Vec<BridgeUtxo> {
 /// ```
 ///
 /// and for testnet, the general key before RSKIP284, the pre-hop key between
-/// RSKIP284 and RSKIP293, the post-hop key after. Both activate at hop400
-/// (testnet #3,103,000), so the middle case is unreachable there -- it is
-/// modelled anyway because the rule is rskj's, not the schedule's.
+/// RSKIP284 and RSKIP293, the post-hop key after. `testnet.conf` moves
+/// RSKIP284 to #2,581,800 while RSKIP293 comes with hop400 at #3,103,000, so
+/// the pre-hop key held testnet's UTXOs for the 521,200 blocks between.
 ///
 /// Mainnet never moved: its UTXOs stayed under the general key throughout.
 ///
@@ -621,20 +621,33 @@ mod utxo_key_tests {
 
     /// Testnet moved the active federation's UTXOs twice; mainnet never did.
     ///
-    /// Ground truth: testnet #7,139,903 is a pegout batch where rskj spends
-    /// from `newFedBtcUTXOsForTestnetPostHop` and leaves
+    /// `testnet.conf` puts RSKIP284 at #2,581,800 and RSKIP293 comes with
+    /// hop400 at #3,103,000, so the pre-hop cell holds them in between. RSKj's
+    /// public testnet node shows it: `newFederationBtcUTXOsForTestnet` is
+    /// empty through #2,581,800 and an RLP list (`0xc0`) from #2,581,801. With
+    /// RSKIP284 read at hop400, the two moves coincided and that cell was
+    /// never reached.
+    ///
+    /// Ground truth for the second move: testnet #7,139,903 is a pegout batch
+    /// where rskj spends from `newFedBtcUTXOsForTestnetPostHop` and leaves
     /// `newFederationBtcUTXOs` untouched. Reading the general cell there
     /// selects different inputs, so the pegout transaction, its hash and its
     /// outpoint values all come out different.
     #[test]
-    fn testnet_moves_to_the_post_hop_cell_at_hop400() {
+    fn testnet_moves_through_the_pre_hop_cell_to_the_post_hop_cell() {
         let cfg = RskHardforkConfig::testnet();
-        // hop400 on testnet is #3,103,000; RSKIP284 and RSKIP293 both land there.
         assert_eq!(
-            new_federation_utxos_key(&cfg, 3_102_999),
+            new_federation_utxos_key(&cfg, 2_581_799),
             NEW_FEDERATION_BTC_UTXOS_KEY,
-            "before hop400 testnet used the general cell"
+            "before RSKIP284 testnet used the general cell"
         );
+        for h in [2_581_800, 3_000_000, 3_102_999] {
+            assert_eq!(
+                new_federation_utxos_key(&cfg, h),
+                NEW_FEDERATION_BTC_UTXOS_TESTNET_PRE_HOP_KEY,
+                "between RSKIP284 and hop400, at #{h}"
+            );
+        }
         assert_eq!(
             new_federation_utxos_key(&cfg, 3_103_000),
             NEW_FEDERATION_BTC_UTXOS_TESTNET_POST_HOP_KEY

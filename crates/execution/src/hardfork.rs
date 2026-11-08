@@ -177,9 +177,16 @@ impl RskHardforkConfig {
     /// gated on `reed810` being *scheduled*, and naming Vetiver900 alone
     /// does not schedule it -- see `has_rskip144`. A test that wants
     /// parallel sublists wants [`RskHardforkConfig::all_active_parallel`].
+    ///
+    /// Arrowhead631 is named for the same reason: testnet never schedules
+    /// it, so RSKIP-434 asks whether it is scheduled, not whether a later
+    /// upgrade is active.
     pub fn all_active(chain_id: u64) -> Self {
         Self {
-            activations: vec![(0, RskNetworkUpgrade::Vetiver900)],
+            activations: vec![
+                (0, RskNetworkUpgrade::Arrowhead631),
+                (0, RskNetworkUpgrade::Vetiver900),
+            ],
             chain_id,
             rule_overrides: Vec::new(),
         }
@@ -523,7 +530,15 @@ impl RskHardforkConfig {
 
     /// RSKIP284: BTC address-with-version serialization uses a single version
     /// byte instead of `BigInteger.toByteArray()` (Hop400, mainnet 4_598_500).
+    ///
+    /// Testnet moves it: `testnet.conf` sets `rskip284 = 2581800`, 521,200
+    /// blocks before testnet's hop400. Among other things it switches
+    /// testnet's ERP redeem script off the hard-coded one
+    /// (`NonStandardErpRedeemScriptBuilderFactory`).
     pub fn has_rskip284(&self, block_number: u64) -> bool {
+        if self.chain_id == RSK_TESTNET_CHAIN_ID {
+            return block_number >= 2_581_800;
+        }
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Hop400
     }
 
@@ -605,8 +620,16 @@ impl RskHardforkConfig {
     }
 
     /// RSKIP434: lifts the BTC chainwork-overflow header block (Arrowhead631).
+    ///
+    /// Whether arrowhead631 is scheduled, not an ordinal comparison: testnet
+    /// never schedules it (`arrowhead631 = -1` in `testnet.conf`, and in
+    /// `regtest.conf`), and its lovell700 outranks it, so `>= Arrowhead631`
+    /// turned this on at testnet #6,110,487. Inert there so far, since the
+    /// guard it lifts only applies to Bitcoin mainnet, but it is the trap
+    /// `has_rskip144` describes.
     pub fn has_rskip434(&self, block_number: u64) -> bool {
-        self.active_upgrade(block_number) >= RskNetworkUpgrade::Arrowhead631
+        self.activation_height(RskNetworkUpgrade::Arrowhead631)
+            .is_some_and(|h| block_number >= h)
     }
 
     /// RSKIP415: the `add_signature` event's `federatorRskAddress` topic is
@@ -807,16 +830,42 @@ impl RskHardforkConfig {
             .is_some_and(|h| block_number >= h)
     }
 
+    /// RSKIP502: the union bridge's seven Bridge methods (reed810).
+    ///
+    /// Not an ordinal comparison, for `has_rskip144`'s reason: mainnet
+    /// never schedules reed810, and nothing in `main.conf` moves this rule,
+    /// so rskj keeps the methods off there for good. `>= Reed810` had them
+    /// on from mainnet #8,804,200, where vetiver900 outranks reed810: a
+    /// call that rskj fails as an unknown method, rustock executed.
+    pub fn has_rskip502(&self, block_number: u64) -> bool {
+        self.activation_height(RskNetworkUpgrade::Reed810)
+            .is_some_and(|h| block_number >= h)
+    }
+
+    /// RSKIP529: the union bridge's super and base events, six more Bridge
+    /// methods on RSKIP502's schedule (reed810, never on mainnet).
+    pub fn has_rskip529(&self, block_number: u64) -> bool {
+        self.activation_height(RskNetworkUpgrade::Reed810)
+            .is_some_and(|h| block_number >= h)
+    }
+
     /// RSKIP535: the `baseEvent` header-extension field, which makes the
     /// header version 2.
     ///
-    /// `testnet.conf` sets `rskip535 = 7604200`, the vetiver900 height, with
-    /// the comment "To be activated in testnet only". Mainnet does not set it.
+    /// Each network schedules it on its own, apart from any upgrade:
+    /// `reference.conf` has `rskip535 = -1`, `testnet.conf` sets `7604200`
+    /// (the vetiver900 height, "To be activated in testnet only") and
+    /// `regtest.conf` sets `1`. Mainnet does not set it, so it never
+    /// activates there -- vetiver900 does not imply it.
     pub fn has_rskip535(&self, block_number: u64) -> bool {
         if let Some(height) = self.rule_override(ConsensusRule::Rskip535) {
             return height.is_some_and(|h| block_number >= h);
         }
-        self.active_upgrade(block_number) >= RskNetworkUpgrade::Vetiver900
+        match self.chain_id {
+            RSK_MAINNET_CHAIN_ID => false,
+            RSK_TESTNET_CHAIN_ID => block_number >= 7_604_200,
+            _ => block_number >= 1,
+        }
     }
 
     /// RSKIP536: additional BlockHeader precompile methods. Maps to reed810 in
@@ -1311,8 +1360,9 @@ mod override_tests {
         assert_eq!(cfg.activation_height(RskNetworkUpgrade::Reed810), None);
         assert!(!cfg.has_rskip144(9_003_580));
         assert!(!cfg.has_rskip351(9_003_580));
-        assert!(cfg.has_rskip535(8_804_200));
-        assert!(!cfg.has_rskip535(8_804_199));
+        // main.conf never sets rskip535 and reference.conf has it at -1.
+        assert!(!cfg.has_rskip535(8_804_200));
+        assert!(!cfg.has_rskip535(9_003_580));
         assert!(cfg.has_rskip536(8_804_200));
         assert_eq!(cfg.active_upgrade(8_804_200), RskNetworkUpgrade::Vetiver900);
         assert_eq!(cfg.active_upgrade(8_804_199), RskNetworkUpgrade::Reed800);
@@ -1350,5 +1400,157 @@ mod override_tests {
         assert!(!cfg.has_rskip144(8_000_000));
         assert!(!cfg.has_rskip535(8_000_000));
         assert_eq!(cfg.active_upgrade(7_604_200), RskNetworkUpgrade::Vetiver900);
+    }
+}
+
+/// Every rule this config answers for by predicate, against the height rskj
+/// activates it at on each network: `reference.conf` maps a rule to an
+/// upgrade (or a number), and `config/main.conf` and `config/testnet.conf`
+/// give the upgrades' heights and the `consensusRules` that move a rule off
+/// its upgrade.
+///
+/// `activation_heights_match_rskj_config` pins the upgrades. This pins the
+/// rules, which is where the two part: a network can move a rule off its
+/// upgrade (testnet's rskip132, rskip284 and rskip535, mainnet's rskip536),
+/// and an upgrade a network never schedules (mainnet's reed810, testnet's
+/// arrowhead631) is outranked there by the ones after it, so an ordinal
+/// `active_upgrade() >= X` turns its rules on where rskj never does.
+#[cfg(test)]
+mod rskj_schedule_tests {
+    use super::*;
+
+    type Predicate = fn(&RskHardforkConfig, u64) -> bool;
+
+    /// (rule, predicate, mainnet, testnet), from rskj 9.1's config files.
+    /// `None` is rskj's `-1`: never.
+    #[rustfmt::skip]
+    const SCHEDULE: &[(&str, Predicate, Option<u64>, Option<u64>)] = &[
+        ("areBridgeTxsPaid", RskHardforkConfig::has_are_bridge_txs_paid, Some(370_000), Some(114_000)),
+        ("rskip87", RskHardforkConfig::has_rskip87, Some(729_000), Some(0)),
+        ("rskip88", RskHardforkConfig::has_rskip88, Some(729_000), Some(0)),
+        ("rskip90", RskHardforkConfig::has_rskip90, Some(729_000), Some(0)),
+        ("rskip91", RskHardforkConfig::has_rskip91, Some(729_000), Some(0)),
+        ("rskip123", RskHardforkConfig::has_rskip123, Some(1_591_000), Some(0)),
+        ("rskip124", RskHardforkConfig::has_rskip124, Some(1_591_000), Some(0)),
+        ("rskip125", RskHardforkConfig::has_rskip125, Some(1_591_000), Some(0)),
+        ("rskip126", RskHardforkConfig::has_unitrie_state_root, Some(1_591_000), Some(0)),
+        ("rskip132", RskHardforkConfig::has_rskip132, Some(1_591_000), Some(43_550)),
+        ("rskip134", RskHardforkConfig::has_rskip134, Some(2_392_700), Some(863_000)),
+        ("rskip136", RskHardforkConfig::has_rskip136, Some(3_397), Some(0)),
+        ("rskip140", RskHardforkConfig::has_rskip140, Some(2_392_700), Some(863_000)),
+        ("rskip143", RskHardforkConfig::has_rskip143, Some(2_392_700), Some(863_000)),
+        ("rskip144", RskHardforkConfig::has_rskip144, None, Some(7_139_600)),
+        ("rskip146", RskHardforkConfig::has_rskip146, Some(2_392_700), Some(863_000)),
+        ("rskip150", RskHardforkConfig::has_rskip150, Some(2_018_000), Some(504_000)),
+        ("rskip152", RskHardforkConfig::has_chainid, Some(2_392_700), Some(863_000)),
+        ("rskip170", RskHardforkConfig::has_rskip170, Some(3_614_800), Some(2_060_500)),
+        ("rskip171", RskHardforkConfig::has_rskip171, Some(3_614_800), Some(2_060_500)),
+        ("rskip174", RskHardforkConfig::has_rskip174, Some(3_614_800), Some(2_060_500)),
+        ("rskip176", RskHardforkConfig::has_rskip176, Some(3_614_800), Some(2_060_500)),
+        ("rskip181", RskHardforkConfig::has_rskip181, Some(3_614_800), Some(2_060_500)),
+        ("rskip185", RskHardforkConfig::has_rskip185, Some(3_614_800), Some(2_060_500)),
+        ("rskip186", RskHardforkConfig::has_rskip186, Some(3_614_800), Some(2_060_500)),
+        ("rskip197", RskHardforkConfig::has_rskip197, Some(3_614_800), Some(2_060_500)),
+        ("rskip199", RskHardforkConfig::has_rskip199, Some(3_614_800), Some(2_060_500)),
+        ("rskip200", RskHardforkConfig::has_rskip200, Some(3_614_800), Some(2_060_500)),
+        ("rskip201", RskHardforkConfig::has_rskip201, Some(3_614_800), Some(2_060_500)),
+        ("rskip219", RskHardforkConfig::has_rskip219, Some(3_614_800), Some(2_060_500)),
+        ("rskip271", RskHardforkConfig::has_rskip271, Some(4_598_500), Some(3_103_000)),
+        ("rskip284", RskHardforkConfig::has_rskip284, Some(4_598_500), Some(2_581_800)),
+        ("rskip293", RskHardforkConfig::has_rskip293, Some(4_598_500), Some(3_103_000)),
+        ("rskip294", RskHardforkConfig::has_rskip294, Some(4_598_500), Some(3_103_000)),
+        ("rskip305", RskHardforkConfig::has_rskip305, Some(8_052_200), Some(6_835_700)),
+        ("rskip326", RskHardforkConfig::has_rskip326, Some(5_468_000), Some(4_015_800)),
+        ("rskip351", RskHardforkConfig::has_rskip351, None, Some(7_139_600)),
+        ("rskip353", RskHardforkConfig::has_rskip353, Some(4_976_300), Some(3_362_200)),
+        ("rskip357", RskHardforkConfig::has_rskip357, Some(4_976_300), Some(3_362_200)),
+        ("rskip374", RskHardforkConfig::has_rskip374, Some(5_468_000), Some(4_015_800)),
+        ("rskip375", RskHardforkConfig::has_rskip375, Some(5_468_000), Some(4_015_800)),
+        ("rskip376", RskHardforkConfig::has_rskip376, Some(6_223_700), Some(4_927_100)),
+        ("rskip377", RskHardforkConfig::has_rskip377, Some(5_468_000), Some(4_015_800)),
+        ("rskip379", RskHardforkConfig::has_rskip379, Some(6_223_700), Some(4_927_100)),
+        ("rskip383", RskHardforkConfig::has_rskip383, Some(5_468_000), Some(4_015_800)),
+        ("rskip385", RskHardforkConfig::has_rskip385, Some(5_468_000), Some(4_015_800)),
+        ("rskip398", RskHardforkConfig::has_push0, Some(6_223_700), Some(4_927_100)),
+        ("rskip400", RskHardforkConfig::has_reduced_calldata_cost, Some(6_223_700), Some(4_927_100)),
+        ("rskip412", RskHardforkConfig::has_basefee, Some(6_223_700), Some(4_927_100)),
+        ("rskip415", RskHardforkConfig::has_rskip415, Some(6_223_700), Some(4_927_100)),
+        ("rskip419", RskHardforkConfig::has_rskip419, Some(7_338_024), Some(6_110_487)),
+        ("rskip427", RskHardforkConfig::has_rskip427, Some(7_338_024), Some(6_110_487)),
+        ("rskip428", RskHardforkConfig::has_rskip428, Some(7_338_024), Some(6_110_487)),
+        ("rskip434", RskHardforkConfig::has_rskip434, Some(6_549_300), None),
+        ("rskip438", RskHardforkConfig::has_initcode_metering, Some(7_338_024), Some(6_110_487)),
+        ("rskip445", RskHardforkConfig::has_rskip445, Some(7_338_024), Some(6_110_487)),
+        ("rskip446", RskHardforkConfig::has_rskip446, Some(7_338_024), Some(6_110_487)),
+        ("rskip453", RskHardforkConfig::has_rskip453, Some(7_338_024), Some(6_110_487)),
+        ("rskip454", RskHardforkConfig::has_stored_block_v2, Some(7_338_024), Some(6_110_487)),
+        ("rskip459", RskHardforkConfig::has_rskip459, Some(7_338_024), Some(6_110_487)),
+        ("rskip502", RskHardforkConfig::has_rskip502, None, Some(7_139_600)),
+        ("rskip529", RskHardforkConfig::has_rskip529, None, Some(7_139_600)),
+        ("rskip535", RskHardforkConfig::has_rskip535, None, Some(7_604_200)),
+        ("rskip536", RskHardforkConfig::has_rskip536, Some(8_804_200), Some(7_139_600)),
+        ("rskip540", RskHardforkConfig::has_rskip540, Some(8_804_200), Some(7_604_200)),
+        ("rskip544", RskHardforkConfig::has_rskip544, Some(8_804_200), Some(7_604_200)),
+        ("rskip551", RskHardforkConfig::has_rskip551, Some(8_804_200), Some(7_604_200)),
+        ("rskip552", RskHardforkConfig::has_rskip552, Some(8_804_200), Some(7_604_200)),
+    ];
+
+    /// Far past every height either network schedules anything at.
+    const LATER: u64 = 50_000_000;
+
+    /// Where a rule rskj never turns on could wrongly be on: every height
+    /// either network schedules an upgrade or moves a rule to, and later.
+    fn probes() -> Vec<u64> {
+        let mut at: Vec<u64> = MAINNET_ACTIVATIONS
+            .iter()
+            .chain(TESTNET_ACTIVATIONS)
+            .map(|(h, _)| *h)
+            .collect();
+        at.extend([43_550, 2_581_800, 7_604_200, 8_804_200, LATER]);
+        at
+    }
+
+    fn check(cfg: &RskHardforkConfig, active: Predicate, rskj: Option<u64>) -> Result<(), String> {
+        match rskj {
+            Some(h) => {
+                if h > 0 && active(cfg, h - 1) {
+                    return Err(format!("already on at #{}", h - 1));
+                }
+                if !active(cfg, h) {
+                    return Err(format!("off at #{h}"));
+                }
+                if !active(cfg, LATER) {
+                    return Err(format!("off again by #{LATER}"));
+                }
+            }
+            None => {
+                if let Some(at) = probes().into_iter().find(|&n| active(cfg, n)) {
+                    return Err(format!("on at #{at}"));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn every_rule_activates_where_rskjs_config_puts_it() {
+        let mainnet = RskHardforkConfig::mainnet();
+        let testnet = RskHardforkConfig::testnet();
+        let mut wrong = Vec::new();
+        for &(rule, active, on_mainnet, on_testnet) in SCHEDULE {
+            for (network, cfg, rskj) in [
+                ("mainnet", &mainnet, on_mainnet),
+                ("testnet", &testnet, on_testnet),
+            ] {
+                if let Err(e) = check(cfg, active, rskj) {
+                    wrong.push(format!("{network} {rule}: {e}; rskj: {rskj:?}"));
+                }
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "rules off rskj's schedule:\n{}",
+            wrong.join("\n")
+        );
     }
 }
