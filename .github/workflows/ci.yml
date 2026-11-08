@@ -54,6 +54,28 @@ jobs:
       - name: Test
         run: cargo test --locked ${{ matrix.features.crate }} ${{ matrix.features.flags }}
 
+  # The node also runs on macOS and Windows, which the job above never
+  # builds on. The whole suite runs on both, default features: hashing,
+  # decoding and the consensus rules must give the same answers on every
+  # platform, and file handling, paths and line endings are where they can
+  # part. Clippy and the smtp build stay on Linux: the code differs by OS
+  # only in a few cfg'd lines, which the build here compiles with -D warnings.
+  test-platforms:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.93.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --locked --workspace
+      - name: Test
+        run: cargo test --locked --workspace
+
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
