@@ -395,4 +395,4 @@ Rustock executes blocks and maintains full state, but it is not yet feature-comp
 
 ## License
 
-MIT
+Licensed under the [MIT License](LICENSE).
