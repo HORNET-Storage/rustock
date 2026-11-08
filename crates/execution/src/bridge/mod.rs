@@ -214,7 +214,7 @@ fn abi_args_decode_ok(args: &[u8], signature: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// BridgeMethod — all 69 methods (32 tx-callable + 37 local-only)
+// BridgeMethod — all 83 methods (45 tx-callable, 37 local-only, 1 that turns)
 // ---------------------------------------------------------------------------
 
 /// Permission model for a Bridge method.
@@ -283,6 +283,13 @@ fn method_enabled(name: &str) -> BridgeMethodEnabled {
         | "requestUnionBridgeRbtc"
         | "releaseUnionBridgeRbtc"
         | "setUnionBridgeTransferPermissions" => Rule(RskHardforkConfig::has_rskip502),
+        // RSKIP529 (reed810): the union bridge's super and base events.
+        "getSuperEvent"
+        | "setSuperEvent"
+        | "clearSuperEvent"
+        | "getBaseEvent"
+        | "setBaseEvent"
+        | "clearBaseEvent" => Rule(RskHardforkConfig::has_rskip529),
         // !RSKIP87 / !RSKIP89
         "addLockWhitelistAddress" | "getBtcBlockchainBlockLocator" => Until(Orchid),
         // RSKIP87 / RSKIP89
@@ -395,6 +402,9 @@ fn method_allows_static_call(name: &str) -> bool {
             // RSKIP502: the union bridge's two getters.
             | "getUnionBridgeContractAddress"
             | "getUnionBridgeLockingCap"
+            // RSKIP529: the two event getters.
+            | "getSuperEvent"
+            | "getBaseEvent"
     )
 }
 
@@ -484,6 +494,13 @@ fn build_method_table() -> Vec<BridgeMethodInfo> {
         ("requestUnionBridgeRbtc",      "requestUnionBridgeRbtc(uint256)",                            Fixed(8000),  TransactionCallable),
         ("releaseUnionBridgeRbtc",      "releaseUnionBridgeRbtc()",                                   Fixed(8000),  TransactionCallable),
         ("setUnionBridgeTransferPermissions","setUnionBridgeTransferPermissions(bool,bool)",          Fixed(8000),  TransactionCallable),
+        // -- RSKIP529 union bridge events (reed810) --
+        ("getSuperEvent",               "getSuperEvent()",                                            Fixed(3000),  TransactionCallable),
+        ("setSuperEvent",               "setSuperEvent(bytes)",                                       Fixed(8000),  TransactionCallable),
+        ("clearSuperEvent",             "clearSuperEvent()",                                          Fixed(8000),  TransactionCallable),
+        ("getBaseEvent",                "getBaseEvent()",                                             Fixed(3000),  TransactionCallable),
+        ("setBaseEvent",                "setBaseEvent(bytes)",                                        Fixed(8000),  TransactionCallable),
+        ("clearBaseEvent",              "clearBaseEvent()",                                           Fixed(8000),  TransactionCallable),
         // -- Dynamic permission --
         ("getBtcBlockchainBestChainHeight","getBtcBlockchainBestChainHeight()",                       Fixed(19000), DynamicRskip220),
         // -- Local-only getters (needed for completeness; not consensus-critical) --
@@ -986,6 +1003,32 @@ fn execute_method<CTX: crate::RskContextTr>(
         "setUnionBridgeTransferPermissions" => {
             union::set_transfer_permissions(ctx, args, gas_cost, hardfork_cfg, caller)
         }
+        // RSKIP529: the super and base events, written only by the union
+        // bridge contract, against the same immediate caller.
+        "getSuperEvent" => union::get_event(ctx, union::SUPER_EVENT_KEY, gas_cost),
+        "setSuperEvent" => union::set_event(
+            ctx,
+            union::SUPER_EVENT_KEY,
+            args,
+            gas_cost,
+            hardfork_cfg,
+            caller,
+        ),
+        "clearSuperEvent" => {
+            union::clear_event(ctx, union::SUPER_EVENT_KEY, gas_cost, hardfork_cfg, caller)
+        }
+        "getBaseEvent" => union::get_event(ctx, union::BASE_EVENT_KEY, gas_cost),
+        "setBaseEvent" => union::set_event(
+            ctx,
+            union::BASE_EVENT_KEY,
+            args,
+            gas_cost,
+            hardfork_cfg,
+            caller,
+        ),
+        "clearBaseEvent" => {
+            union::clear_event(ctx, union::BASE_EVENT_KEY, gas_cost, hardfork_cfg, caller)
+        }
 
         // Phase 3: BTC transaction verification
         "registerBtcCoinbaseTransaction" => tx::register_btc_coinbase_transaction(ctx, args, gas_cost),
@@ -1158,15 +1201,16 @@ mod tests {
     }
 
     #[test]
-    fn method_table_has_77_entries() {
+    fn method_table_has_83_entries() {
         // 69 pre-vetiver methods + getEstimatedFeesForPegOutAmount (RSKIP540)
-        // + the seven union bridge methods (RSKIP502, reed810).
-        assert_eq!(BRIDGE_METHODS.len(), 77);
+        // + the seven union bridge methods (RSKIP502, reed810) + its six
+        // event methods (RSKIP529, reed810): rskj 9.1's BridgeMethods, whole.
+        assert_eq!(BRIDGE_METHODS.len(), 83);
     }
 
     #[test]
-    fn selector_map_has_77_entries() {
-        assert_eq!(BRIDGE_SELECTOR_MAP.len(), 77);
+    fn selector_map_has_83_entries() {
+        assert_eq!(BRIDGE_SELECTOR_MAP.len(), 83);
     }
 
     #[test]
@@ -1277,14 +1321,20 @@ mod tests {
         assert!(method_allows_static_call("getUnionBridgeLockingCap"));
         assert!(!method_allows_static_call("increaseUnionBridgeLockingCap"));
         assert!(!method_allows_static_call("requestUnionBridgeRbtc"));
+        // RSKIP529: the event getters may be static-called, setting and
+        // clearing may not.
+        assert!(method_allows_static_call("getSuperEvent"));
+        assert!(method_allows_static_call("getBaseEvent"));
+        assert!(!method_allows_static_call("setSuperEvent"));
+        assert!(!method_allows_static_call("clearBaseEvent"));
 
-        // Of the methods in this table, rskj's BridgeMethods marks 52
-        // ALLOW_STATIC_CALL (counted from its enum, rskj 9.1).
+        // rskj's BridgeMethods marks 54 methods ALLOW_STATIC_CALL (counted
+        // from its enum, rskj 9.1), and this table names every one.
         let static_callable = BRIDGE_METHODS
             .iter()
             .filter(|m| method_allows_static_call(m.name))
             .count();
-        assert_eq!(static_callable, 52);
+        assert_eq!(static_callable, 54);
     }
 
     /// rskj `validateLocalCall`: a local-only getter reached by an on-chain call
@@ -1332,6 +1382,12 @@ mod tests {
             "requestUnionBridgeRbtc(uint256)",
             "releaseUnionBridgeRbtc()",
             "setUnionBridgeTransferPermissions(bool,bool)",
+            "getSuperEvent()",
+            "setSuperEvent(bytes)",
+            "clearSuperEvent()",
+            "getBaseEvent()",
+            "setBaseEvent(bytes)",
+            "clearBaseEvent()",
         ] {
             let m = find_bridge_method(&compute_selector(signature)).unwrap();
             for n in [8_804_199, 8_804_200, 9_500_000, u64::MAX] {
@@ -1373,9 +1429,10 @@ mod tests {
             .filter(|m| m.permission == BridgePermission::TransactionCallable)
             .count();
         assert_eq!(
-            count, 39,
+            count, 45,
             "31 pre-vetiver methods with fixedPermission(false), \
-             getEstimatedFeesForPegOutAmount, and the seven union bridge methods"
+             getEstimatedFeesForPegOutAmount, the seven union bridge methods \
+             and its six event methods"
         );
     }
 

@@ -11,11 +11,15 @@
 //! single missing selector shows up as a failed transaction or a doubled gas
 //! bill rather than as anything naming the Bridge.
 //!
+//! RSKIP529 adds six more on the same schedule: a "super event" and a
+//! "base event", each a string of at most 128 bytes that only the union
+//! bridge contract may set or clear and anyone may read.
+//!
 //! Storage keys are `DataWord.fromLongString` -- keccak of the name -- not the
 //! right-aligned ASCII form the older Bridge cells use
 //! (`UnionBridgeStorageIndexKey`).
 
-use alloy_primitives::{Address, U256};
+use alloy_primitives::{Address, Bytes, U256};
 use revm::precompile::{PrecompileError, PrecompileOutput};
 
 use super::storage::{bridge_load_bytes, bridge_storage_key_long, bridge_store_bytes};
@@ -49,6 +53,13 @@ pub const UNION_LOCKING_CAP_KEY: &str = "unionBridgeLockingCap";
 pub const WEIS_TRANSFERRED_KEY: &str = "weisTransferredToUnionBridge";
 pub const UNION_REQUEST_ENABLED_KEY: &str = "unionBridgeRequestEnabled";
 pub const UNION_RELEASE_ENABLED_KEY: &str = "unionBridgeReleaseEnabled";
+/// RSKIP529. The event's bytes as they came, with no RLP around them.
+pub const SUPER_EVENT_KEY: &str = "superEvent";
+/// RSKIP529. Read into a mined header's `baseEvent` field under RSKIP535.
+pub const BASE_EVENT_KEY: &str = "baseEvent";
+
+/// rskj `UnionBridgeSupportImpl.MAX_EVENT_DATA_LENGTH`.
+pub const MAX_EVENT_DATA_LENGTH: usize = 128;
 
 /// rskj `UnionBridgeConstants`, per network.
 ///
@@ -415,6 +426,80 @@ pub fn set_transfer_permissions<CTX: crate::RskContextTr>(
     int_result(gas_cost, UnionResponse::Success.code())
 }
 
+/// `getSuperEvent()` / `getBaseEvent()` -> bytes: the event `key` holds,
+/// empty when there is none.
+///
+/// rskj `UnionBridgeStorageProviderImpl.getSuperEvent` takes the cell's bytes
+/// as they are (`data -> data`), with no RLP to strip, and an absent cell
+/// reads as the empty array.
+pub fn get_event<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    key: &str,
+    gas_cost: u64,
+) -> Result<PrecompileOutput, PrecompileError> {
+    let event = load_long(ctx, key);
+    let encoded = super::getters::abi_encode_bytes(&event);
+    Ok(PrecompileOutput::new(gas_cost, encoded.into()))
+}
+
+/// `setSuperEvent(bytes)` / `setBaseEvent(bytes)`, void.
+///
+/// rskj `UnionBridgeSupportImpl.setSuperEvent`: the caller must be the union
+/// bridge contract and the event at most 128 bytes. Unlike the RSKIP502
+/// methods, which answer a refusal with a response code, both checks throw
+/// `IllegalArgumentException`, so the call fails as any Bridge method that
+/// throws: its cost is spent and nothing is written.
+pub fn set_event<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    key: &str,
+    args: &[u8],
+    gas_cost: u64,
+    hardfork_cfg: &RskHardforkConfig,
+    sender: Address,
+) -> Result<PrecompileOutput, PrecompileError> {
+    let event = abi_bytes(args).ok_or_else(|| {
+        PrecompileError::other("union bridge event: the bytes argument does not decode")
+    })?;
+    require_union_bridge_caller(ctx, hardfork_cfg, sender)?;
+    if event.len() > MAX_EVENT_DATA_LENGTH {
+        return Err(PrecompileError::other(format!(
+            "union bridge event: {} bytes is above the maximum of {MAX_EVENT_DATA_LENGTH}",
+            event.len()
+        )));
+    }
+    // An empty event deletes the cell, as rskj's addStorageBytes does.
+    store_long(ctx, key, &event);
+    Ok(PrecompileOutput::new(gas_cost, Bytes::new()))
+}
+
+/// `clearSuperEvent()` / `clearBaseEvent()`, void: the union bridge contract
+/// sets the event to the empty array, which deletes the cell.
+pub fn clear_event<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    key: &str,
+    gas_cost: u64,
+    hardfork_cfg: &RskHardforkConfig,
+    sender: Address,
+) -> Result<PrecompileOutput, PrecompileError> {
+    require_union_bridge_caller(ctx, hardfork_cfg, sender)?;
+    store_long(ctx, key, &[]);
+    Ok(PrecompileOutput::new(gas_cost, Bytes::new()))
+}
+
+/// rskj `UnionBridgeSupportImpl.validateCallerIsUnionBridge`, which throws.
+fn require_union_bridge_caller<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    hardfork_cfg: &RskHardforkConfig,
+    sender: Address,
+) -> Result<(), PrecompileError> {
+    if sender != contract_address(ctx, hardfork_cfg) {
+        return Err(PrecompileError::other(
+            "union bridge event: the caller is not the union bridge contract",
+        ));
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -433,6 +518,22 @@ fn abi_uint(args: &[u8], index: usize) -> Option<U256> {
 
 fn abi_bool(args: &[u8], index: usize) -> Option<bool> {
     abi_word(args, index).map(|w| w.iter().any(|b| *b != 0))
+}
+
+/// The single `bytes` argument, read as rskj's `BytesType.decode` reads it:
+/// the offset and the length are each the low 32 bits of their word as a
+/// Java int (`IntType.decodeInt(..).intValue()`), so high bits are ignored
+/// where `U256::to::<usize>` would panic. The dispatcher has already checked
+/// that the arguments decode (`abi_args_decode_ok`); `None` is a backstop.
+fn abi_bytes(args: &[u8]) -> Option<Vec<u8>> {
+    let int_at = |at: usize| -> Option<usize> {
+        let word = args.get(at..at.checked_add(32)?)?;
+        usize::try_from(i32::from_be_bytes(word[28..32].try_into().ok()?)).ok()
+    };
+    let offset = int_at(0)?;
+    let len = int_at(offset)?;
+    let start = offset.checked_add(32)?;
+    args.get(start..start.checked_add(len)?).map(<[u8]>::to_vec)
 }
 
 /// Moves RBTC out of the Bridge's own balance.
@@ -563,5 +664,144 @@ mod tests {
         let code = i64::from_be_bytes(out.bytes[24..32].try_into().unwrap());
         assert_eq!(code, UnionResponse::UnauthorizedCaller.code());
         assert_eq!(locking_cap(&mut c, &cfg), one_rbtc(), "unchanged");
+    }
+
+    // -- RSKIP529: the super and base events ------------------------------
+
+    /// The union bridge contract testnet's tests call from.
+    fn union_bridge() -> Address {
+        addr("2c1d1ba63ca24d08a92b309db6729332c4f76834")
+    }
+
+    /// A testnet context whose union bridge contract is `union_bridge()`.
+    fn testnet_ctx() -> impl crate::RskContextTr {
+        let mut c = ctx();
+        let address = rlp_encode_bytes(union_bridge().as_slice());
+        store_long(&mut c, UNION_CONTRACT_ADDRESS_KEY, &address);
+        c
+    }
+
+    /// `bytes` as a lone ABI argument: offset, length, data padded to a word.
+    fn bytes_arg(data: &[u8]) -> Vec<u8> {
+        let mut a = U256::from(32u64).to_be_bytes::<32>().to_vec();
+        a.extend_from_slice(&U256::from(data.len()).to_be_bytes::<32>());
+        a.extend_from_slice(data);
+        a.resize(64 + data.len().div_ceil(32) * 32, 0);
+        a
+    }
+
+    /// `setSuperEvent` / `setBaseEvent` on testnet, called by `from`.
+    fn set_as(
+        c: &mut impl crate::RskContextTr,
+        key: &str,
+        event: &[u8],
+        from: Address,
+    ) -> Result<PrecompileOutput, PrecompileError> {
+        let cfg = RskHardforkConfig::testnet();
+        set_event(c, key, &bytes_arg(event), 8_000, &cfg, from)
+    }
+
+    /// `clearSuperEvent` / `clearBaseEvent` on testnet, called by `from`.
+    fn clear_as(
+        c: &mut impl crate::RskContextTr,
+        key: &str,
+        from: Address,
+    ) -> Result<PrecompileOutput, PrecompileError> {
+        clear_event(c, key, 8_000, &RskHardforkConfig::testnet(), from)
+    }
+
+    /// rskj stores the event as it came, with no RLP around it, and answers
+    /// it ABI-encoded as `bytes`.
+    #[test]
+    fn an_event_is_stored_as_it_came_and_read_back_as_bytes() {
+        let mut c = testnet_ctx();
+        let event = b"a super event".to_vec();
+        set_as(&mut c, SUPER_EVENT_KEY, &event, union_bridge()).unwrap();
+        assert_eq!(load_long(&mut c, SUPER_EVENT_KEY), event, "no RLP");
+
+        let out = get_event(&mut c, SUPER_EVENT_KEY, 3_000).unwrap();
+        assert_eq!(out.bytes.as_ref(), bytes_arg(&event).as_slice());
+        assert_eq!(out.gas_used, 3_000);
+    }
+
+    /// An absent event reads as the empty array, which rskj's `BytesType`
+    /// encodes as 96 bytes: offset 32, length 0, and one zero word of data.
+    #[test]
+    fn an_absent_event_reads_as_empty_bytes() {
+        let mut c = testnet_ctx();
+        let out = get_event(&mut c, BASE_EVENT_KEY, 3_000).unwrap();
+        let mut empty = U256::from(32u64).to_be_bytes::<32>().to_vec();
+        empty.resize(96, 0);
+        assert_eq!(out.bytes.as_ref(), empty.as_slice());
+    }
+
+    /// rskj `setSuperEvent_afterChangingUnionBridgeAddress_newAddressShouldSet_
+    /// oldAddressShouldNot` and its `clear` twin: only the contract the Bridge
+    /// currently names may write, and a refusal is a throw, not a code.
+    #[test]
+    fn only_the_union_bridge_contract_may_set_or_clear_an_event() {
+        let mut c = testnet_ctx();
+        let first = b"first".to_vec();
+        set_as(&mut c, BASE_EVENT_KEY, &first, union_bridge()).unwrap();
+
+        let stranger = Address::repeat_byte(0xAA);
+        assert!(set_as(&mut c, BASE_EVENT_KEY, b"x", stranger).is_err());
+        assert!(clear_as(&mut c, BASE_EVENT_KEY, stranger).is_err());
+        assert_eq!(load_long(&mut c, BASE_EVENT_KEY), first, "untouched");
+
+        // The address moves: the old contract is refused, the new one is not.
+        let moved = Address::repeat_byte(0x11);
+        let address = rlp_encode_bytes(moved.as_slice());
+        store_long(&mut c, UNION_CONTRACT_ADDRESS_KEY, &address);
+        assert!(clear_as(&mut c, BASE_EVENT_KEY, union_bridge()).is_err());
+        clear_as(&mut c, BASE_EVENT_KEY, moved).unwrap();
+        assert_eq!(load_long(&mut c, BASE_EVENT_KEY), Vec::<u8>::new());
+    }
+
+    /// `MAX_EVENT_DATA_LENGTH`: 128 bytes is an event, 129 is a throw.
+    #[test]
+    fn an_event_may_be_128_bytes_and_no_more() {
+        let mut c = testnet_ctx();
+        let longest = vec![0x5A; MAX_EVENT_DATA_LENGTH];
+        set_as(&mut c, SUPER_EVENT_KEY, &longest, union_bridge()).unwrap();
+        assert_eq!(load_long(&mut c, SUPER_EVENT_KEY), longest);
+
+        let too_long = vec![0x5A; MAX_EVENT_DATA_LENGTH + 1];
+        let refused = set_as(&mut c, SUPER_EVENT_KEY, &too_long, union_bridge());
+        assert!(refused.is_err());
+        assert_eq!(load_long(&mut c, SUPER_EVENT_KEY), longest, "unchanged");
+    }
+
+    /// Clearing, or setting the empty array, deletes the cell (rskj's
+    /// `addStorageBytes` stores an empty value as no value), and the two
+    /// events are separate cells.
+    #[test]
+    fn clearing_an_event_deletes_only_its_own_cell() {
+        let mut c = testnet_ctx();
+        let base = b"base".to_vec();
+        set_as(&mut c, SUPER_EVENT_KEY, b"super", union_bridge()).unwrap();
+        set_as(&mut c, BASE_EVENT_KEY, &base, union_bridge()).unwrap();
+
+        clear_as(&mut c, SUPER_EVENT_KEY, union_bridge()).unwrap();
+        let cell = super::super::storage::bridge_load_raw(&mut c, union_key(SUPER_EVENT_KEY));
+        assert_eq!(cell, None, "no value at all, not an empty one");
+        assert_eq!(load_long(&mut c, BASE_EVENT_KEY), base, "its own cell");
+
+        set_as(&mut c, BASE_EVENT_KEY, &[], union_bridge()).unwrap();
+        assert_eq!(load_long(&mut c, BASE_EVENT_KEY), Vec::<u8>::new());
+    }
+
+    /// rskj reads the offset and length words as Java ints, so a word whose
+    /// high bytes are set still says 32. Converting the whole word to a
+    /// `usize` panics on it instead.
+    #[test]
+    fn the_bytes_argument_is_read_as_rskj_reads_it() {
+        let event = b"event".to_vec();
+        let mut args = bytes_arg(&event);
+        args[..28].fill(0xFF);
+        args[32..60].fill(0x01);
+        assert_eq!(abi_bytes(&args), Some(event));
+        assert_eq!(abi_bytes(&[]), None);
+        assert_eq!(abi_bytes(&args[..40]), None, "the length word is cut short");
     }
 }

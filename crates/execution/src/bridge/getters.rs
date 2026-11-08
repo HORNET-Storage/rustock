@@ -1012,7 +1012,7 @@ fn abi_encode_string(s: &str) -> Vec<u8> {
     abi_encode_bytes(s.as_bytes())
 }
 
-fn abi_encode_bytes(data: &[u8]) -> Vec<u8> {
+pub(crate) fn abi_encode_bytes(data: &[u8]) -> Vec<u8> {
     // rskj's `SolidityType.BytesType.encode` sizes the data section as
     // `((len - 1) / 32 + 1) * 32` with Java's truncating division, so an EMPTY
     // `bytes` still emits one 32-byte zero word (-1/32 == 0 → 1 word): empty
