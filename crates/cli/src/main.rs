@@ -1711,10 +1711,21 @@ fn resolve_local_offset() -> Option<time::UtcOffset> {
 fn main() -> Result<()> {
     // Before anything spawns a thread.
     let local_offset = resolve_local_offset();
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?
-        .block_on(run(local_offset))
+    // The node runs on a thread with a stack it sets, the same on every OS.
+    // The process's own main thread has the OS's: 8 MiB on Linux and macOS but
+    // 1 MiB on Windows, which a debug build overflows while clap builds the
+    // parser for this many options.
+    std::thread::Builder::new()
+        .name("main".into())
+        .stack_size(8 << 20)
+        .spawn(move || {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?
+                .block_on(run(local_offset))
+        })?
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
 }
 
 async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
