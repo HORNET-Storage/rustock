@@ -539,12 +539,19 @@ impl Heap {
 /// `fallocate` is Linux-specific and some filesystems refuse it; falling
 /// back to `set_len` leaves a sparse file, which is the behaviour the Java
 /// version has unconditionally.
+#[cfg(unix)]
 fn reserve(file: &std::fs::File, len: u64) -> io::Result<()> {
     match rustix::fs::fallocate(file, rustix::fs::FallocateFlags::empty(), 0, len) {
         Ok(()) => Ok(()),
         Err(rustix::io::Errno::OPNOTSUPP) | Err(rustix::io::Errno::NOSYS) => file.set_len(len),
         Err(e) => Err(io::Error::from(e)),
     }
+}
+
+/// Windows has no `fallocate`: `set_len`, the fallback above, is what it gets.
+#[cfg(not(unix))]
+fn reserve(file: &std::fs::File, len: u64) -> io::Result<()> {
+    file.set_len(len)
 }
 
 #[cfg(test)]
