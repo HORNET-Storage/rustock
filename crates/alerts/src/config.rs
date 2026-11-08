@@ -576,11 +576,13 @@ impl Config {
 /// may be quoted, and a `export ` prefix is tolerated so the same file can be
 /// sourced by a shell.
 fn read_env_file(path: &Path) -> anyhow::Result<std::collections::HashMap<String, String>> {
-    let meta = std::fs::metadata(path)
-        .map_err(|e| anyhow::anyhow!("reading {}: {e}", path.display()))?;
+    // Group and other permissions are Unix mode bits. Windows keeps access in
+    // ACLs, which this does not read, so there the file is not checked.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
+        let meta = std::fs::metadata(path)
+            .map_err(|e| anyhow::anyhow!("reading {}: {e}", path.display()))?;
         let mode = meta.permissions().mode() & 0o077;
         if mode != 0 {
             // Refuse rather than warn: a credential readable by other users on
@@ -801,6 +803,8 @@ mod secret_tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(f.path(), std::fs::Permissions::from_mode(mode)).unwrap();
         }
+        #[cfg(not(unix))]
+        let _ = mode;
         f
     }
 
@@ -825,6 +829,8 @@ mod secret_tests {
         assert_eq!(c.email.password.as_deref(), Some("s3cr3t"));
     }
 
+    /// Unix only: the refusal reads mode bits, which Windows does not have.
+    #[cfg(unix)]
     #[test]
     fn a_world_readable_env_file_is_refused() {
         let f = env_file("SMTP_PASSWORD=s3cr3t\n", 0o644);
