@@ -112,6 +112,7 @@ pub(crate) fn credited_uncles(
         uncle_generation_limit: UNCLE_GENERATION_LIMIT,
         header_rules: verifier.static_rules(),
         parent_rules: verifier.parent_rules(),
+        fork_detection: None,
     }
     .validate(&block)
     .map_err(|e| e.to_string())?;

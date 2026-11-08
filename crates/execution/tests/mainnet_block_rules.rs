@@ -91,6 +91,32 @@ fn rskip179_accepts_every_sampled_mainnet_block() {
     assert!(failures.is_empty(), "RSKIP179 rejects real mainnet blocks: {failures:?}");
 }
 
+/// Whether the store holds the `depth` headers below a block at `number` on
+/// `parent_hash`: what the uncle rule walks for it.
+///
+/// A pruned store, a light node's, lets go of the oldest headers, and a block
+/// just above that edge names uncles whose parents, or whose chain, are gone.
+/// rskj holds the whole chain and would judge them; here they can only be
+/// skipped.
+fn ancestry_held(
+    store: &BlockStore,
+    number: u64,
+    parent_hash: alloy_primitives::B256,
+    depth: u64,
+) -> bool {
+    let floor = number.saturating_sub(depth);
+    let mut cursor = parent_hash;
+    loop {
+        let Some(header) = store.header(cursor).ok().flatten() else {
+            return false;
+        };
+        if header.number <= floor || header.number == 0 {
+            return true;
+        }
+        cursor = header.parent_hash;
+    }
+}
+
 #[test]
 #[ignore = "requires a synced block store (RUSTOCK_BLOCKS_DB)"]
 fn block_rules_accept_every_sampled_mainnet_block() {
@@ -157,10 +183,13 @@ fn block_rules_accept_every_sampled_mainnet_block() {
 
 /// The uncle rules only mean something on blocks that actually carry uncles,
 /// which the uniform sample above mostly misses. Walk a dense range and assert
-/// every uncle-bearing block still passes.
+/// every uncle-bearing block still passes, each uncle held to rskj's rules,
+/// fork detection included: its 449 headers start at its own parent.
 #[test]
 #[ignore = "requires a synced block store (RUSTOCK_BLOCKS_DB)"]
 fn uncle_rules_accept_real_uncle_bearing_blocks() {
+    use rustock_core::validation::{fork_detection::REQUIRED_BLOCKS, uncles::UNCLE_GENERATION_LIMIT};
+
     let Some(path) = db_path() else {
         eprintln!("RUSTOCK_BLOCKS_DB not set; skipping");
         return;
@@ -171,16 +200,25 @@ fn uncle_rules_accept_real_uncle_bearing_blocks() {
         .expect("head")
         .and_then(|h| store.header(h).ok().flatten())
         .expect("head header");
-    let processor = BlockProcessor::new(RskHardforkConfig::mainnet(), store.clone());
+    let processor = BlockProcessor::new(RskHardforkConfig::mainnet(), store.clone())
+        .with_fork_detection_validation(true);
 
     let start = head.number.saturating_sub(20_000);
     let mut with_uncles = 0usize;
+    let mut pruned = 0usize;
     let mut failures: Vec<(u64, String)> = Vec::new();
 
     for number in start..head.number {
         let Some(hash) = store.canonical_hash(number).ok().flatten() else { continue };
         let Some(block) = store.block(hash).ok().flatten() else { continue };
         if block.ommers.is_empty() {
+            continue;
+        }
+        // An uncle's parent sits up to seven generations down, and its fork
+        // detection reads 449 headers from there.
+        let depth = UNCLE_GENERATION_LIMIT + REQUIRED_BLOCKS;
+        if !ancestry_held(&store, number, block.header.parent_hash, depth) {
+            pruned += 1;
             continue;
         }
         with_uncles += 1;
@@ -190,7 +228,10 @@ fn uncle_rules_accept_real_uncle_bearing_blocks() {
         }
     }
 
-    println!("uncle-bearing blocks checked: {with_uncles}, failures {}", failures.len());
+    println!(
+        "uncle-bearing blocks checked: {with_uncles}, failures {}, skipped with their ancestry pruned {pruned}",
+        failures.len()
+    );
     for (number, err) in failures.iter().take(25) {
         println!("  #{number}: {err}");
     }

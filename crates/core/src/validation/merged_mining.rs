@@ -25,6 +25,11 @@ pub const MAX_RSK_TAG_POSITION_IN_TAIL: usize = 64;
 /// RSKIP180 (iris300).
 pub const MAX_MERGED_MINING_MERKLE_PROOF_LENGTH: usize = 960;
 
+/// The length of a Bitcoin block header, and from RSKIP98 (orchid) the only
+/// length rskj accepts for the field that carries one: rskj
+/// `RskMiningConstants.BTC_HEADER_SIZE`, enforced by `BtcHeaderSizeRule`.
+pub const BTC_HEADER_SIZE: usize = 80;
+
 pub struct MergedMiningRule {
     pub config: std::sync::Arc<ChainConfig>,
 }
@@ -39,6 +44,10 @@ pub struct MergedMiningRule {
 /// is invalid outright, as it is in rskj. The rule does not depend on
 /// `skip_pow_validation`: rskj's `miner.server.skipPowValidation` reaches
 /// `ProofOfWorkRule` only.
+///
+/// It is part of rskj's timestamp rule, and goes with it where the chain's
+/// `max_future_block_time` is zero (regtest): rskj's `isValid` returns
+/// before `isBitcoinTimestampValid` when `validPeriodLength` is zero.
 pub struct BitcoinTimestampRule {
     pub config: std::sync::Arc<ChainConfig>,
 }
@@ -68,7 +77,9 @@ impl HeaderValidator for BitcoinTimestampRule {
         use bitcoin::block::Header as BtcHeader;
         use bitcoin::consensus::Decodable;
 
-        if header.number < self.config.activation_heights.iris300 {
+        if self.config.max_future_block_time == 0
+            || header.number < self.config.activation_heights.iris300
+        {
             return Ok(());
         }
         let btc_header_bytes = header
@@ -107,6 +118,12 @@ impl HeaderValidator for MergedMiningRule {
 
         let btc_header_bytes = header.bitcoin_merged_mining_header.as_ref()
             .ok_or(ValidationError::BitcoinHeaderDecodeError)?;
+        // rskj `BtcHeaderSizeRule`, from RSKIP98, which is orchid like the
+        // rest of this rule: exactly a Bitcoin header. The decoder below
+        // reads the first 80 bytes and would let anything after them ride.
+        if btc_header_bytes.len() != BTC_HEADER_SIZE {
+            return Err(ValidationError::BitcoinHeaderDecodeError);
+        }
         let mut reader = &btc_header_bytes[..];
         let btc_header: BtcHeader = Decodable::consensus_decode(&mut reader)
             .map_err(|_| ValidationError::BitcoinHeaderDecodeError)?;

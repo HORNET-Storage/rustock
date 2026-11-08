@@ -169,6 +169,7 @@ impl UncleGuard {
             uncle_generation_limit: UNCLE_GENERATION_LIMIT,
             header_rules: verifier.static_rules(),
             parent_rules: verifier.parent_rules(),
+            fork_detection: None,
         };
         let block = rustock_core::types::block::Block {
             header: header.clone(),

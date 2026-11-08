@@ -2581,10 +2581,13 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         None
     };
 
+    // The same chain configuration the header verifier uses: an uncle is
+    // held to the rules a header is, on this chain's constants.
     let mut block_processor = rustock_execution::BlockProcessor::new(
         hardfork_cfg.clone(),
         store.clone(),
-    );
+    )
+    .with_chain_config(config.clone());
     if let Some(cache) = &btc_block_cache {
         block_processor = block_processor.with_btc_block_cache(cache.clone());
     }

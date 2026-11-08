@@ -138,6 +138,10 @@ pub struct BlockProcessor {
     /// recovered most of this block's transactions when it admitted them.
     /// `None` disables the cache entirely and every sender is recomputed.
     sender_cache: Option<Arc<crate::sender_cache::SenderCache>>,
+    /// The chain's consensus constants, for the rules each uncle must pass:
+    /// proof of work, timestamps, difficulty and gas limit against its own
+    /// parent.
+    chain_config: Arc<rustock_core::config::ChainConfig>,
 }
 
 /// Ancestry lookups backed by the block store, for the uncle and
@@ -183,13 +187,27 @@ impl BlockProcessor {
         block_store: Arc<BlockStore>,
     ) -> Self {
         let executor = RskExecutor::new(hardfork_cfg.clone(), block_store.clone());
+        let chain_config = Arc::new(match hardfork_cfg.chain_id {
+            crate::hardfork::RSK_MAINNET_CHAIN_ID => rustock_core::config::ChainConfig::mainnet(),
+            crate::hardfork::RSK_TESTNET_CHAIN_ID => rustock_core::config::ChainConfig::testnet(),
+            _ => rustock_core::config::ChainConfig::regtest(),
+        });
         Self {
             executor,
             hardfork_cfg,
             block_store,
             validate_fork_detection_data: false,
             sender_cache: None,
+            chain_config,
         }
+    }
+
+    /// The chain's consensus constants, for a node whose chain is not exactly
+    /// the one its chain id names: the configuration the rest of the node
+    /// validates headers with.
+    pub fn with_chain_config(mut self, config: Arc<rustock_core::config::ChainConfig>) -> Self {
+        self.chain_config = config;
+        self
     }
 
     /// Share a sender cache with whoever else recovers senders -- the pool,
@@ -683,7 +701,10 @@ impl BlockProcessor {
         block: &Block,
         parent: Option<&rustock_core::Header>,
     ) -> Result<(), ValidationError> {
-        use rustock_core::validation::{HeaderValidator, ParentHeaderValidator};
+        use rustock_core::validation::uncles::{
+            rsk_header_rules, rsk_parent_rules, UncleForkDetection, UnclesValidationRule,
+            UNCLE_GENERATION_LIMIT, UNCLE_LIST_LIMIT,
+        };
 
         let number = block.header.number;
 
@@ -698,16 +719,27 @@ impl BlockProcessor {
         self.validate_block_body_rules(block, parent)?;
 
         // rskj BlockUnclesValidationRule. The ommers HASH is checked in
-        // process_block; this decides whether the uncles are admissible.
+        // process_block; this decides whether the uncles are admissible, each
+        // put through the rules rskj gives the rule: its own proof of work,
+        // timestamps and gas used, and against its own parent the minimum gas
+        // price, number, timestamp, difficulty and gas limit. An uncle's
+        // difficulty counts toward the chain's work, so one checked less hard
+        // than a trunk block is work credited that nobody did.
         let ancestry = self.ancestry();
-        let header_rules: Vec<Box<dyn HeaderValidator>> = Vec::new();
-        let parent_rules: Vec<Box<dyn ParentHeaderValidator>> = Vec::new();
-        rustock_core::validation::uncles::UnclesValidationRule {
+        let header_rules = rsk_header_rules(self.chain_config.clone());
+        let parent_rules = rsk_parent_rules(self.chain_config.clone());
+        UnclesValidationRule {
             store: &ancestry,
-            uncle_list_limit: rustock_core::validation::uncles::UNCLE_LIST_LIMIT,
-            uncle_generation_limit: rustock_core::validation::uncles::UNCLE_GENERATION_LIMIT,
+            uncle_list_limit: UNCLE_LIST_LIMIT,
+            uncle_generation_limit: UNCLE_GENERATION_LIMIT,
             header_rules: &header_rules,
             parent_rules: &parent_rules,
+            // Under the same switch as the block's own fork-detection check
+            // below, and for the same cost: 449 headers per uncle.
+            fork_detection: self.validate_fork_detection_data.then_some(UncleForkDetection {
+                view: &ancestry,
+                rskip110_height: self.rskip110_height(),
+            }),
         }
         .validate(block)?;
 
@@ -2838,6 +2870,165 @@ mod tests {
         // Full validation should pass
         let validated = processor.process_block(&block, &root, store).unwrap();
         assert_eq!(validated.gas_used, 0);
+    }
+
+    /// Merge-mine `header` as a miner would, committing to `fork_data` after
+    /// its merged-mining hash, beside a Bitcoin header of its own time. Its
+    /// difficulty must be 1, which any Bitcoin hash meets.
+    fn seal(header: &mut Header, fork_data: &[u8]) {
+        use crate::mining::{coinbase, fork_detection, merkle};
+        use rustock_core::validation::merged_mining::compress_coinbase;
+
+        let payload = fork_detection::apply_to_hash(header.hash_for_merged_mining(), fork_data);
+        let cb = coinbase::build_coinbase(&payload, 0);
+        let mut btc = coinbase::build_bitcoin_block(cb.clone(), 0);
+        btc.header.time = header.timestamp as u32;
+        let compressed = compress_coinbase(&coinbase::encode_transaction(&cb), true).unwrap();
+        let proof = merkle::proof_from_txids(&coinbase::txids_display_order(&btc)).unwrap();
+        header.bitcoin_merged_mining_header = Some(coinbase::encode_header(&btc.header).into());
+        header.bitcoin_merged_mining_coinbase_transaction = Some(compressed.into());
+        header.bitcoin_merged_mining_merkle_proof = Some(proof.into());
+        header.cached_hash = None;
+    }
+
+    /// Regtest's constants with rskj's timestamp rule on, so every rule an
+    /// uncle faces runs.
+    fn uncle_config() -> Arc<rustock_core::config::ChainConfig> {
+        let mut config = rustock_core::config::ChainConfig::regtest();
+        config.max_future_block_time = 60;
+        Arc::new(config)
+    }
+
+    /// A header at `number` on `parent`, at `timestamp` and difficulty 1.
+    fn child_of(number: u64, parent: &Header, timestamp: u64) -> Header {
+        let mut header = dummy_header(number);
+        header.parent_hash = parent.hash();
+        header.timestamp = timestamp;
+        header.difficulty = U256::from(1);
+        header
+    }
+
+    /// `parent`'s child at `number` naming `uncle`, its REMASC transaction
+    /// in place, sealed with `fork_data`.
+    fn naming(number: u64, parent: &Header, uncle: &Header, fork_data: &[u8]) -> Block {
+        let mut header = child_of(number, parent, parent.timestamp + 10);
+        header.uncle_count = 1;
+        header.ommers_hash = compute_ommers_hash(std::slice::from_ref(uncle));
+        seal(&mut header, fork_data);
+        Block {
+            header,
+            transactions: vec![crate::mining::remasc_transaction(number)],
+            ommers: vec![uncle.clone()],
+        }
+    }
+
+    /// The import path's uncle rule holds each uncle to rskj's rules. It used
+    /// to check only an uncle's place in the chain, so a block could name one
+    /// that did no work and have its difficulty counted all the same.
+    #[test]
+    fn an_uncle_without_proof_of_work_fails_the_import_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let block_store = Arc::new(BlockStore::open(dir.path()).unwrap());
+        let processor = BlockProcessor::new(test_hardfork_cfg(), block_store.clone())
+            .with_chain_config(uncle_config());
+
+        let mut genesis = dummy_header(0);
+        genesis.difficulty = U256::from(1);
+        let b1 = child_of(1, &genesis, 1_700_000_010);
+        let b2 = child_of(2, &b1, 1_700_000_030);
+        for header in [&genesis, &b1, &b2] {
+            block_store.put_header(header).unwrap();
+        }
+
+        // b2's sibling: a child of b1, ten seconds on, at the difficulty b1
+        // calls for on regtest.
+        let mut uncle = child_of(2, &b1, 1_700_000_020);
+        uncle.beneficiary = Address::repeat_byte(0x0b);
+
+        assert_eq!(
+            processor.validate_block_rules(&naming(3, &b2, &uncle, &[]), Some(&b2)),
+            Err(ValidationError::BitcoinHeaderDecodeError),
+            "an uncle with no proof of work must not pass"
+        );
+
+        // Work done for another header is not its work either: this proof
+        // commits to the uncle as it was before its beneficiary changed.
+        let mut stolen = uncle.clone();
+        seal(&mut stolen, &[]);
+        stolen.beneficiary = Address::repeat_byte(0x0c);
+        assert_eq!(
+            processor.validate_block_rules(&naming(3, &b2, &stolen, &[]), Some(&b2)),
+            Err(ValidationError::BitcoinCoinbaseTagInvalid)
+        );
+
+        seal(&mut uncle, &[]);
+        assert_eq!(processor.validate_block_rules(&naming(3, &b2, &uncle, &[]), Some(&b2)), Ok(()));
+
+        // Proof of work is not all: against its parent it must come later.
+        let mut early = child_of(2, &b1, b1.timestamp);
+        early.beneficiary = Address::repeat_byte(0x0b);
+        seal(&mut early, &[]);
+        assert!(matches!(
+            processor.validate_block_rules(&naming(3, &b2, &early, &[]), Some(&b2)),
+            Err(ValidationError::TimestampOlderThanParent { .. })
+        ));
+    }
+
+    /// With fork detection on, an uncle must carry the fork-detection data of
+    /// its own parent, read from the 449 headers below that parent as rskj's
+    /// `ForkDetectionDataRule` reads them. With it off, as for a bulk replay,
+    /// the data is not looked at.
+    #[test]
+    fn with_fork_detection_on_an_uncle_carries_its_own_parents_data() {
+        use rustock_core::validation::fork_detection::{calculate, REQUIRED_BLOCKS};
+
+        let dir = tempfile::tempdir().unwrap();
+        let block_store = Arc::new(BlockStore::open(dir.path()).unwrap());
+        let processor = |fork_detection: bool| {
+            BlockProcessor::new(test_hardfork_cfg(), block_store.clone())
+                .with_chain_config(uncle_config())
+                .with_fork_detection_validation(fork_detection)
+        };
+
+        // A trunk long enough to read fork-detection data from, each header
+        // merge-mined so the commit-to-parents bytes have hashes to come from.
+        let mut genesis = dummy_header(0);
+        genesis.difficulty = U256::from(1);
+        let mut chain = vec![genesis];
+        for number in 1..=REQUIRED_BLOCKS + 2 {
+            let parent = chain.last().unwrap();
+            let mut header = child_of(number, parent, parent.timestamp + 10);
+            seal(&mut header, &[]);
+            chain.push(header);
+        }
+        for header in &chain {
+            block_store.put_header(header).unwrap();
+        }
+        // Newest first, from `tip` down, as the rule reads them.
+        let data_from = |tip: usize| {
+            let view: Vec<Header> = chain[..=tip].iter().rev().cloned().collect();
+            calculate(&view).expect("449 headers to read")
+        };
+
+        let tip = chain.len() - 1;
+        let parent = &chain[tip];
+        let uncle_parent = &chain[tip - 2];
+        let mut uncle = child_of(uncle_parent.number + 1, uncle_parent, uncle_parent.timestamp + 5);
+        uncle.beneficiary = Address::repeat_byte(0x0b);
+        let mut right = uncle.clone();
+        seal(&mut right, &data_from(tip - 2));
+        // The data its sibling carries: read from one block too high.
+        let mut wrong = uncle;
+        seal(&mut wrong, &data_from(tip - 1));
+
+        let number = parent.number + 1;
+        let block = |uncle: &Header| naming(number, parent, uncle, &data_from(tip));
+        assert_eq!(processor(true).validate_block_rules(&block(&right), Some(parent)), Ok(()));
+        assert!(matches!(
+            processor(true).validate_block_rules(&block(&wrong), Some(parent)),
+            Err(ValidationError::ForkDetectionDataMismatch { .. })
+        ));
+        assert_eq!(processor(false).validate_block_rules(&block(&wrong), Some(parent)), Ok(()));
     }
 }
 

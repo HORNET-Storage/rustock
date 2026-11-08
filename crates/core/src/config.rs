@@ -29,7 +29,8 @@ pub struct ActivationHeights {
     /// Papyrus200 hardfork – enables RSKIP156 (difficulty divisor 50 -> 400).
     pub papyrus200: u64,
     /// Iris300 hardfork – enables RSKIP180 (960-byte merged-mining merkle
-    /// proof cap).
+    /// proof cap) and RSKIP179 (a header's timestamp must sit near that of
+    /// the Bitcoin header that merge-mined it).
     pub iris300: u64,
     /// Fingerroot500 hardfork – enables RSKIP252 (transaction gas price cap).
     pub fingerroot500: u64,
@@ -155,7 +156,8 @@ pub struct ChainConfig {
     /// rskj `Constants.newBlockMaxSecondsInTheFuture`: how far past the
     /// node's clock a header may be timestamped. 60 on mainnet, 540 on
     /// testnet, 0 on regtest, where zero turns the timestamp rule off
-    /// altogether (parent comparison included), as it does in rskj.
+    /// altogether (parent comparison and RSKIP179 included), as it does in
+    /// rskj.
     pub max_future_block_time: u64,
     pub gas_limit_bound_divisor: u64,
     /// rskj `Constants.getMinGasLimit()`: 3,000,000 on every network
@@ -586,6 +588,7 @@ mod tests {
         assert_eq!(heights.wasabi100, 1_591_000);
         assert_eq!(heights.papyrus200, 2_392_700);
         assert_eq!(heights.iris300, 3_614_800);
+        assert_eq!(heights.hop400, 4_598_500);
         assert_eq!(heights.fingerroot500, 5_468_000);
     }
 
@@ -602,6 +605,7 @@ mod tests {
         assert_eq!(heights.wasabi100, 0);
         assert_eq!(heights.papyrus200, 863_000);
         assert_eq!(heights.iris300, 2_060_500);
+        assert_eq!(heights.hop400, 3_103_000);
         assert_eq!(heights.fingerroot500, 4_015_800);
     }
 

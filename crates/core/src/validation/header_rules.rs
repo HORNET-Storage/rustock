@@ -142,21 +142,33 @@ impl HeaderValidator for GasLimitBoundsRule {
     }
 }
 
+/// rskj `BlockParentGasLimitRule`: a header's gas limit may move from its
+/// parent's by at most a `gas_limit_bound_divisor`th, either way.
 pub struct BlockParentGasLimitRule {
     pub config: std::sync::Arc<crate::config::ChainConfig>,
 }
 
 impl ParentHeaderValidator for BlockParentGasLimitRule {
     fn validate_with_parent(&self, header: &Header, parent: &Header) -> Result<(), ValidationError> {
-        let limit = gas_limit_as_u64(header.gas_limit)?;
-        let parent_limit = gas_limit_as_u64(parent.gas_limit)?;
-        let divisor = self.config.gas_limit_bound_divisor;
-        let delta = parent_limit / divisor;
-        
-        if limit < parent_limit - delta || limit > parent_limit + delta {
+        // rskj compares in BigInteger against `parent * (d - 1) / d` and
+        // `parent * (d + 1) / d`. As integers those are
+        // `parent - ceil(parent / d)` and `parent + floor(parent / d)`, so the
+        // lower bound sits one below `parent - parent / d` whenever `d` does
+        // not divide the parent's limit.
+        let divisor = U256::from(self.config.gas_limit_bound_divisor);
+        let parent_limit = parent.gas_limit;
+        let step = parent_limit / divisor;
+        let lower = if (parent_limit % divisor).is_zero() {
+            parent_limit - step
+        } else {
+            parent_limit - step - U256::from(1u8)
+        };
+        let upper = parent_limit.saturating_add(step);
+
+        if header.gas_limit < lower || header.gas_limit > upper {
             return Err(ValidationError::GasLimitInvalid {
                 parent: parent_limit,
-                got: limit,
+                got: header.gas_limit,
             });
         }
         Ok(())

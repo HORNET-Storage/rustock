@@ -5,16 +5,65 @@
 //! header field. That says nothing about whether the uncles themselves are
 //! admissible, which is what this rule decides.
 
-use super::{ValidationError, HeaderValidator, ParentHeaderValidator};
+use super::fork_detection::MainchainView;
+use super::{
+    BitcoinTimestampRule, BlockNumberRule, BlockParentGasLimitRule, DifficultyRule, GasUsedRule,
+    HeaderValidator, MergedMiningRule, ParentHeaderValidator, PrevMinGasPriceRule, TimestampRule,
+    ValidationError,
+};
+use crate::config::ChainConfig;
 use crate::types::block::Block;
 use crate::types::header::Header;
 use alloy_primitives::B256;
 use std::collections::HashSet;
+use std::sync::Arc;
 
 /// rskj `Constants.getUncleListLimit()`.
 pub const UNCLE_LIST_LIMIT: usize = 10;
 /// rskj `Constants.getUncleGenerationLimit()`.
 pub const UNCLE_GENERATION_LIMIT: u64 = 7;
+
+/// The rules rskj puts each uncle through on its own, in
+/// `RskContext.getBlockValidationRule`'s order: proof of work, the timestamp
+/// rule and gas used, its `BlockHeaderCompositeRule`. rskj's timestamp rule
+/// is two here: [`TimestampRule`], the clock, and [`BitcoinTimestampRule`],
+/// RSKIP179. The fourth, fork detection, reads the chain rather than the
+/// header and is [`UnclesValidationRule::fork_detection`].
+///
+/// Not the trunk header rules: rskj holds no uncle to the minimum gas limit
+/// or the 32-byte extra-data cap, so an uncle may carry either and still be
+/// one. `GasUsedRule` reads the gas limit as a `u64` where rskj's
+/// `ValidGasUsedRule` reads Java's `longValue`; the two part only above
+/// 2^63, which the parent rule's bound keeps out of an uncle's reach.
+pub fn rsk_header_rules(config: Arc<ChainConfig>) -> Vec<Box<dyn HeaderValidator>> {
+    vec![
+        Box::new(MergedMiningRule { config: config.clone() }),
+        Box::new(TimestampRule::new(config.max_future_block_time)),
+        Box::new(BitcoinTimestampRule { config }),
+        Box::new(GasUsedRule),
+    ]
+}
+
+/// The rules rskj puts each uncle through against its own parent, in its
+/// `BlockHeaderParentCompositeRule`'s order.
+pub fn rsk_parent_rules(config: Arc<ChainConfig>) -> Vec<Box<dyn ParentHeaderValidator>> {
+    vec![
+        Box::new(PrevMinGasPriceRule),
+        Box::new(BlockNumberRule),
+        Box::new(TimestampRule::new(config.max_future_block_time)),
+        Box::new(DifficultyRule { config: config.clone() }),
+        Box::new(BlockParentGasLimitRule { config }),
+    ]
+}
+
+/// rskj's `ForkDetectionDataRule` run on an uncle: the per-uncle check that
+/// reads the chain, the 449 headers from the uncle's parent down, rather than
+/// the uncle alone.
+pub struct UncleForkDetection<'a> {
+    pub view: &'a dyn MainchainView,
+    /// RSKIP110 (wasabi100).
+    pub rskip110_height: u64,
+}
 
 /// The ancestry lookups `FamilyUtils` performs against rskj's block store.
 /// Implemented by the caller that owns the store.
@@ -79,16 +128,20 @@ pub fn used_uncles<S: AncestorSource + ?Sized>(
 
 /// rskj `BlockUnclesValidationRule.validateUncleList`.
 ///
-/// `header_rules` and `parent_rules` are the same per-uncle checks rskj passes
-/// in: `BlockHeaderCompositeRule(PoW, forkDetection, timestamp, gasUsed)` and
+/// `header_rules` and `parent_rules` are the per-uncle checks rskj passes
+/// in, [`rsk_header_rules`] and [`rsk_parent_rules`]:
+/// `BlockHeaderCompositeRule(PoW, forkDetection, timestamp, gasUsed)` and
 /// `BlockHeaderParentCompositeRule(prevMinGasPrice, parentNumber, timestamp,
-/// difficulty, parentGasLimit)`.
+/// difficulty, parentGasLimit)`, with fork detection in `fork_detection`.
 pub struct UnclesValidationRule<'a, S: AncestorSource + ?Sized> {
     pub store: &'a S,
     pub uncle_list_limit: usize,
     pub uncle_generation_limit: u64,
     pub header_rules: &'a [Box<dyn HeaderValidator>],
     pub parent_rules: &'a [Box<dyn ParentHeaderValidator>],
+    /// rskj's fork-detection check on each uncle. `None` skips it, as the
+    /// block processor does while its own fork-detection check is off.
+    pub fork_detection: Option<UncleForkDetection<'a>>,
 }
 
 impl<S: AncestorSource + ?Sized> UnclesValidationRule<'_, S> {
@@ -123,6 +176,10 @@ impl<S: AncestorSource + ?Sized> UnclesValidationRule<'_, S> {
             // rskj: `this.validations.isValid(uncle)` then validateParentNumber.
             for rule in self.header_rules {
                 rule.validate(uncle)?;
+            }
+            if let Some(check) = &self.fork_detection {
+                let actual = super::merged_mining::extract_fork_detection_data(uncle);
+                super::fork_detection::validate(uncle, actual, check.view, check.rskip110_height)?;
             }
 
             // validateParentNumber: a sibling or descendant is not an uncle,

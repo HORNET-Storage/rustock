@@ -103,14 +103,15 @@ pub fn validate<V: MainchainView + ?Sized>(
         return Ok(());
     }
 
-    // hasForkDetectionDataWhereItShouldNotHave. Unreachable on mainnet and
-    // testnet, where RSKIP110 activates far above block 449, but kept so the
-    // rule reads as rskj's does.
-    if header.number < REQUIRED_BLOCKS {
-        return match actual {
-            Some(_) => Err(ValidationError::ForkDetectionDataUnreadable),
-            None => Ok(()),
-        };
+    // rskj reads no fork-detection data from a header below 449 at all
+    // (`BlockFactory` builds it with `includeForkDetectionData` false), so
+    // its `hasForkDetectionDataWhereItShouldNotHave` branch never fires, and
+    // it compares only above 449, not at 449 itself. Reading the coinbase
+    // here instead would find twelve bytes after the tag and the hash prefix
+    // -- the rest of the hash -- and refuse every early testnet and regtest
+    // block.
+    if header.number <= REQUIRED_BLOCKS {
+        return Ok(());
     }
 
     let got = actual.ok_or(ValidationError::ForkDetectionDataUnreadable)?;

@@ -29,7 +29,7 @@ pub enum ValidationError {
     GasLimitOutOfBounds { min: u64, max: u64, got: u64 },
 
     #[error("Gas limit {got} is invalid compared to parent {parent}")]
-    GasLimitInvalid { parent: u64, got: u64 },
+    GasLimitInvalid { parent: U256, got: U256 },
 
     #[error("Difficulty mismatch: expected {expected}, got {got}")]
     DifficultyMismatch { expected: U256, got: U256 },

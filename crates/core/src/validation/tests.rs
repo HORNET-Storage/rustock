@@ -429,6 +429,15 @@ fn rskip179_rule(config: crate::config::ChainConfig) -> BitcoinTimestampRule {
     BitcoinTimestampRule { config: Arc::new(config) }
 }
 
+/// Regtest's heights, iris300 at genesis, with the timestamp rule's period
+/// on: where it is zero, regtest's own setting, rskj runs none of the rule,
+/// RSKIP179 included.
+fn regtest_with_a_period() -> crate::config::ChainConfig {
+    let mut config = crate::config::ChainConfig::regtest();
+    config.max_future_block_time = 540;
+    config
+}
+
 /// rskj `BlockTimeStampValidationRuleTest.timestampsAreCloseEnough`: equal
 /// times pass; exactly five minutes apart fails (strict); one second inside
 /// the window passes, in either direction.
@@ -436,7 +445,7 @@ fn rskip179_rule(config: crate::config::ChainConfig) -> BitcoinTimestampRule {
 fn timestamps_are_close_enough() {
     let max = BitcoinTimestampRule::DEFAULT_MAX_TIMESTAMPS_DIFF_IN_SECS;
     // regtest activates iris300 at genesis.
-    let rule = rskip179_rule(crate::config::ChainConfig::regtest());
+    let rule = rskip179_rule(regtest_with_a_period());
     let check = |rsk: u64, btc: u64| {
         let mut header = create_dummy_header(10, rsk, B256::ZERO);
         header.bitcoin_merged_mining_header = Some(btc_header_at(btc as u32));
@@ -455,7 +464,7 @@ fn timestamps_are_close_enough() {
 /// Before RSKIP179 the rule is off: no header, any distance.
 #[test]
 fn bitcoin_timestamp_is_not_checked_before_rskip179() {
-    let mut config = crate::config::ChainConfig::regtest();
+    let mut config = regtest_with_a_period();
     config.activation_heights.iris300 = 100;
     let rule = rskip179_rule(config);
 
@@ -472,11 +481,23 @@ fn bitcoin_timestamp_is_not_checked_before_rskip179() {
 /// fails the rule by itself.
 #[test]
 fn a_header_without_a_decodable_bitcoin_header_fails_rskip179() {
-    let rule = rskip179_rule(crate::config::ChainConfig::regtest());
+    let rule = rskip179_rule(regtest_with_a_period());
     let mut header = create_dummy_header(10, 1_000, B256::ZERO);
     assert!(matches!(rule.validate(&header), Err(ValidationError::BitcoinHeaderDecodeError)));
     header.bitcoin_merged_mining_header = Some(Bytes::from_static(&[0x00]));
     assert!(matches!(rule.validate(&header), Err(ValidationError::BitcoinHeaderDecodeError)));
+}
+
+/// rskj `BlockTimeStampValidationRule.isValid` returns before
+/// `isBitcoinTimestampValid` when `validPeriodLength` is zero, regtest's
+/// setting: RSKIP179 goes with the rest of the rule.
+#[test]
+fn a_zero_period_turns_rskip179_off_too() {
+    let rule = rskip179_rule(crate::config::ChainConfig::regtest());
+    let mut header = create_dummy_header(10, 1_000, B256::ZERO);
+    assert!(rule.validate(&header).is_ok(), "no merged-mining header");
+    header.bitcoin_merged_mining_header = Some(btc_header_at(1_000_000));
+    assert!(rule.validate(&header).is_ok(), "a million seconds away");
 }
 
 /// rskj `Constants.getMaxTimestampsDiffInSecs`: testnet widens the window to
@@ -604,4 +625,274 @@ fn gas_limit_less_than_minimum_gas_limit() {
         gas_limit_rule().validate(&with_gas_limit(3_000_000 - 1)),
         Err(ValidationError::GasLimitOutOfBounds { min: 3_000_000, got: 2_999_999, .. })
     ));
+}
+
+// --- rskj's exact parent gas-limit bound, and the rules each uncle must pass
+
+/// rskj bounds a gas limit by `parent * 1023 / 1024` and
+/// `parent * 1025 / 1024` in BigInteger. Where 1024 does not divide the
+/// parent's limit, the lower bound is one below `parent - parent / 1024`.
+#[test]
+fn the_parent_gas_limit_bounds_are_rskjs_when_the_divisor_leaves_a_remainder() {
+    let rule = BlockParentGasLimitRule { config: Arc::new(crate::config::ChainConfig::mainnet()) };
+    let mut parent = create_dummy_header(10, 1000, B256::ZERO);
+    parent.gas_limit = U256::from(6_800_000);
+    let with = |limit: u64| {
+        let mut header = create_dummy_header(11, 1010, parent.hash());
+        header.gas_limit = U256::from(limit);
+        header
+    };
+
+    // 6,800,000 * 1023 / 1024 = 6,793,359.375 and * 1025 / 1024 = 6,806,640.625.
+    assert_eq!(rule.validate_with_parent(&with(6_793_359), &parent), Ok(()));
+    assert!(matches!(
+        rule.validate_with_parent(&with(6_793_358), &parent),
+        Err(ValidationError::GasLimitInvalid { .. })
+    ));
+    assert_eq!(rule.validate_with_parent(&with(6_806_640), &parent), Ok(()));
+    assert!(rule.validate_with_parent(&with(6_806_641), &parent).is_err());
+}
+
+/// rskj `BtcHeaderSizeRule`: from orchid the field holds a Bitcoin header and
+/// nothing else. A byte appended changes neither the proof of work nor the
+/// merkle proof, which is why it needs a check of its own.
+#[test]
+fn merged_mining_wants_exactly_a_bitcoin_header() {
+    let rule = MergedMiningRule { config: Arc::new(crate::config::ChainConfig::regtest()) };
+    let mut header = create_dummy_header(10, 1000, B256::ZERO);
+    header.difficulty = U256::from(1);
+    let (btc_h, btc_cb, btc_m) = build_mm_proof(&header, 0x207fffff, None);
+    header.bitcoin_merged_mining_coinbase_transaction = Some(btc_cb);
+    header.bitcoin_merged_mining_merkle_proof = Some(btc_m);
+
+    let mut longer = btc_h.to_vec();
+    longer.push(0);
+    header.bitcoin_merged_mining_header = Some(Bytes::from(longer));
+    assert_eq!(rule.validate(&header), Err(ValidationError::BitcoinHeaderDecodeError));
+
+    header.bitcoin_merged_mining_header = Some(btc_h);
+    assert_eq!(rule.validate(&header), Ok(()));
+}
+
+/// A view of the chain that holds nothing.
+struct NoChain;
+
+impl fork_detection::MainchainView for NoChain {
+    fn headers_from(&self, _from: B256, _count: u64) -> Vec<Header> {
+        Vec::new()
+    }
+}
+
+/// rskj reads no fork-detection data below block 449 and compares none at
+/// 449, so twelve bytes after the tag -- which every coinbase has, the rest
+/// of the hash -- are no reason to refuse a block there. Above 449, a chain
+/// too short to compute from is.
+#[test]
+fn fork_detection_starts_above_block_449() {
+    for number in [100, 449] {
+        let header = create_dummy_header(number, 1000, B256::ZERO);
+        assert_eq!(fork_detection::validate(&header, Some([7; 12]), &NoChain, 0), Ok(()));
+    }
+    let header = create_dummy_header(450, 1000, B256::ZERO);
+    assert_eq!(
+        fork_detection::validate(&header, Some([7; 12]), &NoChain, 0),
+        Err(ValidationError::ForkDetectionDataUnreadable)
+    );
+}
+
+/// Merge-mine `header` the way a miner does: commit to it in a coinbase, and
+/// roll the Bitcoin header's nonce until its hash meets the RSK difficulty.
+fn seal(header: &mut Header, btc_time: u64) {
+    let (btc, coinbase, proof) = build_mm_proof(header, 0x207fffff, None);
+    let mut btc: BtcHeader = bitcoin::consensus::deserialize(&btc).unwrap();
+    btc.time = btc_time as u32;
+    let target = U256::MAX / header.difficulty;
+    while U256::from_le_slice(btc.block_hash().as_byte_array()) > target {
+        btc.nonce += 1;
+    }
+    header.bitcoin_merged_mining_header = Some(Bytes::from(bitcoin::consensus::serialize(&btc)));
+    header.bitcoin_merged_mining_coinbase_transaction = Some(coinbase);
+    header.bitcoin_merged_mining_merkle_proof = Some(proof);
+}
+
+/// A chain held in memory, for the uncle rule.
+struct Ancestry(std::collections::HashMap<B256, Header>);
+
+impl uncles::AncestorSource for Ancestry {
+    fn header(&self, hash: B256) -> Option<Header> {
+        self.0.get(&hash).cloned()
+    }
+    fn uncles_of(&self, _hash: B256) -> Vec<Header> {
+        Vec::new()
+    }
+}
+
+/// Regtest's constants with rskj's timestamp rule switched on, so that every
+/// rule an uncle faces runs.
+fn uncle_config() -> Arc<crate::config::ChainConfig> {
+    let mut config = crate::config::ChainConfig::regtest();
+    config.max_future_block_time = 60;
+    Arc::new(config)
+}
+
+/// Three trunk blocks from `base` and the block above them, with the middle
+/// one's parent: (ancestry, parent, block).
+fn uncle_chain(base: u64) -> (Ancestry, Header, Header) {
+    let mut root = create_dummy_header(base, 980, B256::ZERO);
+    root.difficulty = U256::from(1);
+    let mut parent = create_dummy_header(base + 1, 1000, root.hash());
+    parent.difficulty = U256::from(1);
+    let mut tip = create_dummy_header(base + 2, 1020, parent.hash());
+    tip.difficulty = U256::from(1);
+    let block = create_dummy_header(base + 3, 1030, tip.hash());
+    let ancestry = [root, parent.clone(), tip]
+        .into_iter()
+        .map(|header| (header.hash(), header))
+        .collect();
+    (Ancestry(ancestry), parent, block)
+}
+
+/// The tip's sibling: a child of `parent` at `timestamp`, with the difficulty
+/// its parent calls for.
+fn uncle_of(parent: &Header, timestamp: u64) -> Header {
+    let mut uncle = create_dummy_header(parent.number + 1, timestamp, parent.hash());
+    uncle.beneficiary = Address::repeat_byte(0x0b);
+    uncle.difficulty = DifficultyRule { config: uncle_config() }
+        .difficulty_for_child(parent, uncle.number, timestamp, 0);
+    uncle
+}
+
+fn judge(
+    ancestry: &Ancestry,
+    block: &Header,
+    uncle: Header,
+    fork_detection: Option<uncles::UncleForkDetection<'_>>,
+) -> Result<(), ValidationError> {
+    let header_rules = uncles::rsk_header_rules(uncle_config());
+    let parent_rules = uncles::rsk_parent_rules(uncle_config());
+    let block = crate::types::block::Block {
+        header: block.clone(),
+        transactions: Vec::new(),
+        ommers: vec![uncle],
+    };
+    uncles::UnclesValidationRule {
+        store: ancestry,
+        uncle_list_limit: uncles::UNCLE_LIST_LIMIT,
+        uncle_generation_limit: uncles::UNCLE_GENERATION_LIMIT,
+        header_rules: &header_rules,
+        parent_rules: &parent_rules,
+        fork_detection,
+    }
+    .validate(&block)
+}
+
+/// An uncle's difficulty counts toward the chain's work, so rskj holds it to
+/// what a block is held to: its own proof of work, and its difficulty and
+/// timestamps against its own parent.
+#[test]
+fn an_uncle_must_pass_rskjs_rules() {
+    let (ancestry, parent, block) = uncle_chain(0);
+
+    let mut uncle = uncle_of(&parent, 1010);
+    seal(&mut uncle, 1010);
+    assert_eq!(judge(&ancestry, &block, uncle, None), Ok(()));
+
+    // Without its proof of work it is work nobody did.
+    let bare = uncle_of(&parent, 1010);
+    assert_eq!(
+        judge(&ancestry, &block, bare, None),
+        Err(ValidationError::BitcoinHeaderDecodeError)
+    );
+    // Nor is work done for another header: this proof commits to the uncle
+    // as it was before its beneficiary changed. Its Bitcoin header is there
+    // and in time, so only proof of work can catch it.
+    let mut stolen = uncle_of(&parent, 1010);
+    seal(&mut stolen, 1010);
+    stolen.beneficiary = Address::repeat_byte(0x0c);
+    assert_eq!(
+        judge(&ancestry, &block, stolen, None),
+        Err(ValidationError::BitcoinCoinbaseTagInvalid)
+    );
+
+    // Its difficulty is the one its parent calls for, proof or no proof.
+    let mut harder = uncle_of(&parent, 1010);
+    harder.difficulty += U256::from(1);
+    seal(&mut harder, 1010);
+    assert!(matches!(
+        judge(&ancestry, &block, harder, None),
+        Err(ValidationError::DifficultyMismatch { .. })
+    ));
+
+    // Its gas limit, minimum gas price and number follow its parent's.
+    let mut grasping = uncle_of(&parent, 1010);
+    grasping.gas_limit = U256::from(9_990_233);
+    seal(&mut grasping, 1010);
+    assert!(matches!(
+        judge(&ancestry, &block, grasping, None),
+        Err(ValidationError::GasLimitInvalid { .. })
+    ));
+    let mut pricey = uncle_of(&parent, 1010);
+    pricey.minimum_gas_price = U256::from(2);
+    seal(&mut pricey, 1010);
+    assert!(matches!(
+        judge(&ancestry, &block, pricey, None),
+        Err(ValidationError::MinGasPriceOutOfRange { .. })
+    ));
+    let mut misnumbered = uncle_of(&parent, 1010);
+    misnumbered.number = parent.number;
+    seal(&mut misnumbered, 1010);
+    assert!(matches!(
+        judge(&ancestry, &block, misnumbered, None),
+        Err(ValidationError::InvalidBlockNumber { .. })
+    ));
+
+    // It comes after its parent.
+    let mut early = uncle_of(&parent, parent.timestamp);
+    seal(&mut early, parent.timestamp);
+    assert!(matches!(
+        judge(&ancestry, &block, early, None),
+        Err(ValidationError::TimestampOlderThanParent { .. })
+    ));
+
+    // And it sits within five minutes of the Bitcoin header that mined it.
+    let mut adrift = uncle_of(&parent, 1010);
+    seal(&mut adrift, 1010 + 300);
+    assert!(matches!(
+        judge(&ancestry, &block, adrift, None),
+        Err(ValidationError::BitcoinTimestampTooFar { .. })
+    ));
+}
+
+/// What rskj does not hold an uncle to: a trunk block's 32-byte extra-data
+/// cap, or `parent - parent / 1024` where its gas-limit bound is a gas lower.
+#[test]
+fn an_uncle_is_not_held_to_more_than_rskj_holds_it_to() {
+    let (ancestry, parent, block) = uncle_chain(0);
+
+    let mut chatty = uncle_of(&parent, 1010);
+    chatty.extra_data = Bytes::from(vec![0xab; 40]);
+    seal(&mut chatty, 1010);
+    assert_eq!(judge(&ancestry, &block, chatty, None), Ok(()));
+
+    // 10,000,000 * 1023 / 1024 = 9,990,234.375.
+    let mut lean = uncle_of(&parent, 1010);
+    lean.gas_limit = U256::from(9_990_234);
+    seal(&mut lean, 1010);
+    assert_eq!(judge(&ancestry, &block, lean, None), Ok(()));
+}
+
+/// Asked to, the rule runs fork detection on each uncle, and an uncle above
+/// block 449 whose chain cannot be read is refused; not asked, it is not.
+#[test]
+fn the_uncle_rule_runs_fork_detection_when_asked() {
+    let (ancestry, parent, block) = uncle_chain(1_000);
+    let mut uncle = uncle_of(&parent, 1010);
+    seal(&mut uncle, 1010);
+
+    let asked = uncles::UncleForkDetection { view: &NoChain, rskip110_height: 0 };
+    assert_eq!(
+        judge(&ancestry, &block, uncle.clone(), Some(asked)),
+        Err(ValidationError::ForkDetectionDataUnreadable)
+    );
+    assert_eq!(judge(&ancestry, &block, uncle, None), Ok(()));
 }
