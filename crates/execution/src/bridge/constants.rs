@@ -360,6 +360,22 @@ impl BridgeConstants {
         }
     }
 
+    /// rskj's `BridgeRegTestConstants`: [`BridgeConstants::regtest`] with
+    /// rskj's default regtest genesis federation, which REMASC pays from the
+    /// first payout block on. rustock's own regtest has no federation; a chain
+    /// started from an rskj genesis file (`--genesis`) is rskj's regtest and
+    /// needs this one, or the federators' accounts are never created.
+    pub fn rskj_regtest() -> Self {
+        Self {
+            genesis_federation_public_keys: &[
+                "0362634ab57dae9cb373a5d536e66a8c4f67468bbcfb063809bab643072d78a124",
+                "03c5946b3fbae03a654237da863c9ed534e0878657175b132b8ca630f245df04db",
+                "02cd53fc53a07f211641a677d250f6de99caf620e8e77071e811a28b3bcddf0be1",
+            ],
+            ..Self::regtest()
+        }
+    }
+
     pub fn regtest() -> Self {
         Self {
             btc_network: BtcNetwork::Regtest,

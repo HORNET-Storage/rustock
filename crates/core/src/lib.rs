@@ -6,6 +6,7 @@ pub mod types;
 pub mod validation;
 pub mod config;
 pub mod rlp_compat;
+pub mod rskj_genesis;
 
 pub use types::block::Block;
 pub use types::header::Header;

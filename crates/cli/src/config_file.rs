@@ -60,6 +60,31 @@ pub struct FileConfig {
     pub checkpoint: CheckpointSection,
     #[serde(default)]
     pub metrics: MetricsSection,
+    #[serde(default)]
+    pub chain: ChainSection,
+}
+
+/// Regtest chain settings, for a chain that has to match one an rskj node
+/// runs: its genesis file, its consensus-rule overrides, its gas-limit
+/// bounds, and whether proof of work is checked.
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChainSection {
+    /// An rskj genesis JSON file, used instead of the built-in regtest genesis.
+    pub genesis: Option<std::path::PathBuf>,
+    /// rskj `miner.server.skipPowValidation`.
+    pub skip_pow_validation: Option<bool>,
+    /// rskj `blockchain.config.consensusRules`, as `name = height`
+    /// (-1 disables).
+    pub consensus_rules: Option<std::collections::BTreeMap<String, i64>>,
+    pub min_gas_limit: Option<u64>,
+    pub max_gas_limit: Option<u64>,
+    /// rskj `blockchain.config.hardforkActivationHeights`, as `name = height`
+    /// (-1 takes the upgrade off the ladder).
+    pub hardforks: Option<std::collections::BTreeMap<String, i64>>,
+    /// Take the settings above on mainnet and testnet too, for a copy of the
+    /// chain run under rules it has not activated. `genesis` stays refused.
+    pub allow_overrides: Option<bool>,
 }
 
 /// Prometheus metrics. Separate from `[rpc]` because the listener is: a
@@ -91,6 +116,7 @@ pub struct NodeSection {
     /// do not each recover the same signature. On by default; `false` turns
     /// it off and every sender is recomputed.
     pub sigcache: Option<bool>,
+    pub account_slots: Option<u64>,
     /// Catch up with new blocks. `false` serves what is held and nothing more.
     pub follow_up: Option<bool>,
     /// Behave as though the canonical chain ends at this height. Requires
@@ -271,6 +297,8 @@ pub struct MiningSection {
     pub min_gas_price: Option<u64>,
     pub submission_rate_limit_ms: Option<u64>,
     pub update_work_on_new_transaction: Option<bool>,
+    pub timed: Option<String>,
+    pub flush_every: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -350,6 +378,12 @@ pub const ONE_SHOT: &[&str] = &[
     "repair_from",
     "repair_to",
     "import_blocks_db",
+    "import_blocks",
+    "export_blocks",
+    "export_from",
+    "export_to",
+    "import_flush_every",
+    "breakdown_log",
     "import_rskj",
     "import_metrics",
     "import_skip_existing",
@@ -438,6 +472,7 @@ pub const CONFIGURABLE: &[&str] = &[
     "checkpoint_bound_work",
     "rpc_logs_max_blocks",
     "sigcache",
+    "account_slots",
     "gas_estimator_binary_search",
     "dev_rpc",
     "mine",
@@ -447,11 +482,15 @@ pub const CONFIGURABLE: &[&str] = &[
     "mining_min_gas_price",
     "mining_submission_rate_limit_ms",
     "mining_update_work_on_new_transaction",
+    "mine_timed",
+    "flush_every",
     "account_tx_rate_limit",
     "account_tx_rate_limit_cleaner_period",
     "account_tx_rate_limit_max_accounts",
     "account_tx_rate_limit_quota_multiplier",
     "account_tx_rate_limit_gas_per_second_percent",
+    "hardfork",
+    "allow_chain_overrides",
     "log_level",
     "log_to_stdout",
     // Read parallelism is read by the snap-sync client and the trie store
@@ -472,6 +511,11 @@ pub const CONFIGURABLE: &[&str] = &[
     "snap_peer_rate",
     "snap_total_rate",
     "alerts_config",
+    "genesis",
+    "skip_pow_validation",
+    "consensus_rule",
+    "min_gas_limit",
+    "max_gas_limit",
 ];
 
 #[cfg(test)]

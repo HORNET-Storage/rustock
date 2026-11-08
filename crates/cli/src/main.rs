@@ -987,6 +987,23 @@ struct Args {
     #[arg(long, default_value_t = 60)]
     mining_refresh_secs: u64,
 
+    /// Mine a block on a clock, as rskj's regtest does with
+    /// `miner.client.timedMine`: each block after an exponentially
+    /// distributed delay with this median (`10s`, `500ms`), floored at
+    /// 100 ms and scaled by the difficulty's drift from the first block's.
+    /// Blocks are mined whether or not the pool holds anything. With
+    /// `--skip-pow-validation` the Bitcoin nonce is 0 and nothing is
+    /// searched, as in rskj. Requires `--mine`; starts with the node, and
+    /// `evm_stopMining` / `evm_startMining` (`--dev-rpc`) pause and resume it.
+    #[arg(long, value_name = "MEDIAN")]
+    mine_timed: Option<String>,
+
+    /// Best blocks between trie flushes for blocks this node mines, like
+    /// rskj's `blockchain.flushNumberOfBlocks`. 1 flushes every block,
+    /// which is what a node mining for a pool wants.
+    #[arg(long, value_name = "N", default_value_t = 10)]
+    flush_every: u64,
+
     /// Blocks of history to keep below the head when pruning.
     ///
     /// Clamped up to 8,000 whatever is given: Rootstock's block-info
@@ -1193,6 +1210,16 @@ struct Args {
     #[arg(long, default_value_t = false)]
     gas_estimator_binary_search: bool,
 
+    /// Transactions one sender may have in the pool ahead of its state nonce
+    /// (rskj `transaction.accountSlots`). A transaction with a nonce at or
+    /// past the state nonce plus this is refused as "nonce too high".
+    ///
+    /// rskj's default too. A load generator that signs bursts per account
+    /// (rsk-perf-lab's k6 suite runs rskj with 500) needs more, or its
+    /// later nonces are refused while the earlier ones wait for a block.
+    #[arg(long, default_value_t = 16)]
+    account_slots: u64,
+
     /// Rate-limit accounts that broadcast transactions consuming large amounts
     /// of shared resources (rskj `transaction.accountTxRateLimit.enabled`).
     ///
@@ -1270,6 +1297,86 @@ struct Args {
     /// be passed straight back in.
     #[arg(long)]
     trie_node: Option<String>,
+
+    /// Regtest: start from this rskj genesis JSON file instead of the
+    /// built-in genesis, so blocks an rskj node mined from it connect here.
+    #[arg(long, value_name = "FILE")]
+    genesis: Option<std::path::PathBuf>,
+
+    /// Regtest: accept headers without checking merged-mining proof of work,
+    /// like rskj's `miner.server.skipPowValidation = true`. For replaying a
+    /// chain mined without real proof of work.
+    #[arg(long, default_value_t = false)]
+    skip_pow_validation: bool,
+
+    /// Regtest: override an rskj consensus rule, as `name=height` (`-1`
+    /// disables it), like rskj's `blockchain.config.consensusRules`.
+    /// Repeatable. Supported: rskip97.
+    #[arg(long, value_name = "NAME=HEIGHT")]
+    consensus_rule: Vec<String>,
+
+    /// Regtest: smallest gas limit a header may declare (rskj: 3,000,000).
+    #[arg(long, value_name = "GAS")]
+    min_gas_limit: Option<u64>,
+
+    /// Regtest: largest gas limit a header may declare (rskj has none).
+    #[arg(long, value_name = "GAS")]
+    max_gas_limit: Option<u64>,
+
+    /// Regtest: schedule an rskj network upgrade, as `name=height` (`-1`
+    /// takes it off the ladder), like rskj's
+    /// `blockchain.config.hardforkActivationHeights`. Repeatable. Names are
+    /// rskj's, orchid to vetiver900. bahamas, afterBridgeSync and hop401 are
+    /// accepted at the height this node already reads them at; orchid060 and
+    /// tbd1000 are accepted and change nothing (tbd1000 only turns on
+    /// RSKIP-559, pegout sorting in the Bridge, which this node does not
+    /// implement).
+    #[arg(long, value_name = "NAME=HEIGHT")]
+    hardfork: Vec<String>,
+
+    /// Take --hardfork, --consensus-rule, --skip-pow-validation and the
+    /// gas-limit bounds on mainnet and testnet too, for replaying blocks
+    /// mined on a copy of the chain under rules it has not activated. Never
+    /// for a node that follows the real network. --genesis stays refused:
+    /// a genesis file would make this another chain.
+    #[arg(long, default_value_t = false)]
+    allow_chain_overrides: bool,
+
+    /// Import the blocks of an rskj `ExportBlocks` file (`number,hash,td,rlp`
+    /// per line, plain or .gz) on top of this node's best block, through the
+    /// validation and execution follow mode uses, then exit. Stops with a
+    /// non-zero status at the first block that fails a check.
+    #[arg(long, value_name = "FILE")]
+    import_blocks: Option<std::path::PathBuf>,
+
+    /// Write the canonical chain, from --export-from to --export-to, to this
+    /// file in rskj's `ExportBlocks` format (`number,hash,td,rlp` per line;
+    /// gzip when the name ends in .gz), then exit. What rskj's
+    /// `ConnectBlocks` and this node's --import-blocks read.
+    #[arg(long, value_name = "FILE")]
+    export_blocks: Option<std::path::PathBuf>,
+
+    /// With --export-blocks: the first block to write (default 1).
+    #[arg(long, value_name = "N", default_value_t = 1)]
+    export_from: u64,
+
+    /// With --export-blocks: the last block to write (default: the best
+    /// block).
+    #[arg(long, value_name = "N")]
+    export_to: Option<u64>,
+
+    /// With --import-blocks: blocks between trie flushes (rskj's
+    /// `blockchain.flushNumberOfBlocks`).
+    #[arg(long, value_name = "N", default_value_t = rustock_sync::import::DEFAULT_IMPORT_FLUSH_EVERY)]
+    import_flush_every: u64,
+
+    /// Write one timing line per block connected as best to this file, in
+    /// the shape of rskj's `block connect breakdown best:` debug line
+    /// (milliseconds, three decimals): with --import-blocks for every
+    /// imported block, with --mine for every block this node mines and
+    /// connects. Off by default, and then no clock is read.
+    #[arg(long, value_name = "FILE")]
+    breakdown_log: Option<std::path::PathBuf>,
 }
 
 /// Apply the file underneath the command line, one setting per line so the
@@ -1285,6 +1392,21 @@ fn apply_file_config(
     use config_file::{apply, apply_opt};
 
     apply(matches, "port", f.node.port.as_ref(), &mut a.port);
+    apply_opt(matches, "genesis", f.chain.genesis.as_ref(), &mut a.genesis);
+    apply(matches, "skip_pow_validation", f.chain.skip_pow_validation.as_ref(),
+        &mut a.skip_pow_validation);
+    let rules = f.chain.consensus_rules.as_ref().map(|r| {
+        r.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>()
+    });
+    apply(matches, "consensus_rule", rules.as_ref(), &mut a.consensus_rule);
+    apply_opt(matches, "min_gas_limit", f.chain.min_gas_limit.as_ref(), &mut a.min_gas_limit);
+    apply_opt(matches, "max_gas_limit", f.chain.max_gas_limit.as_ref(), &mut a.max_gas_limit);
+    let hardforks = f.chain.hardforks.as_ref().map(|r| {
+        r.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>()
+    });
+    apply(matches, "hardfork", hardforks.as_ref(), &mut a.hardfork);
+    apply(matches, "allow_chain_overrides", f.chain.allow_overrides.as_ref(),
+        &mut a.allow_chain_overrides);
     apply(matches, "data_dir", f.node.data_dir.as_ref(), &mut a.data_dir);
     apply(matches, "network_id", f.node.network_id.as_ref(), &mut a.network_id);
     apply_opt(matches, "secret_key", f.node.secret_key.as_ref(), &mut a.secret_key);
@@ -1398,6 +1520,7 @@ fn apply_file_config(
     apply(matches, "freezer", f.prune.freezer.as_ref(), &mut a.freezer);
     apply(matches, "dev_rpc", f.rpc.dev.as_ref(), &mut a.dev_rpc);
     apply(matches, "sigcache", f.node.sigcache.as_ref(), &mut a.sigcache);
+    apply(matches, "account_slots", f.node.account_slots.as_ref(), &mut a.account_slots);
     apply(
         matches,
         "rpc_logs_max_blocks",
@@ -1421,6 +1544,8 @@ fn apply_file_config(
         &mut a.mining_submission_rate_limit_ms);
     apply(matches, "mining_update_work_on_new_transaction",
         f.mining.update_work_on_new_transaction.as_ref(), &mut a.mining_update_work_on_new_transaction);
+    apply_opt(matches, "mine_timed", f.mining.timed.as_ref(), &mut a.mine_timed);
+    apply(matches, "flush_every", f.mining.flush_every.as_ref(), &mut a.flush_every);
 
     apply(matches, "account_tx_rate_limit", f.account_tx_rate_limit.enabled.as_ref(),
         &mut a.account_tx_rate_limit);
@@ -1681,7 +1806,7 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         31 => ChainConfig::testnet(),
         _ => ChainConfig::regtest(),
     };
-    let config = Arc::new(config);
+    let config = Arc::new(apply_chain_options(config, &args)?);
     // Block-hash computation (RSKIP92) needs the activation heights before
     // any header is decoded.
     config.activation_heights.clone().install();
@@ -1704,6 +1829,11 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         rustock_execution::supply::per_transaction_enabled(),
         rustock_execution::supply::per_block_enabled()
     );
+
+    if let Some(path) = &args.export_blocks {
+        let store = BlockStore::open(&args.data_dir)?;
+        return run_export_blocks(&store, path, args.export_from, args.export_to);
+    }
 
     if args.build_bridge_index {
         let store = Arc::new(BlockStore::open(&args.data_dir)?);
@@ -2306,6 +2436,7 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         None => Arc::new(rustock_storage::RocksDbTrieStore::from_db(store.db().clone())),
     };
     let pool_config = rustock_sync::txpool::PoolConfig {
+        account_slots: args.account_slots,
         quota: rustock_sync::quota::QuotaConfig {
             enabled: args.account_tx_rate_limit,
             cleaner_period_minutes: args.account_tx_rate_limit_cleaner_period,
@@ -2434,7 +2565,7 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         tracing::info!("Account tx rate limiting disabled");
     }
 
-    let hardfork_cfg = rustock_execution::RskHardforkConfig::for_network(config.chain_id as u64);
+    let (hardfork_cfg, _) = hardfork_config(&config)?;
     let btc_block_cache = if args.btc_block_cache_entries > 0 {
         let cache = Arc::new(rustock_execution::BtcBlockCache::new(
             args.btc_block_cache_entries,
@@ -2461,6 +2592,13 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         block_processor = block_processor.with_sender_cache(cache.clone());
     }
     block_processor = block_processor.with_execution_threads(args.execution_threads);
+    if config.genesis_spec.is_some() {
+        // A chain from an rskj genesis file is rskj's regtest, Bridge
+        // federation included.
+        block_processor = block_processor.with_bridge_constants(
+            rustock_execution::bridge::constants::BridgeConstants::rskj_regtest(),
+        );
+    }
     info!(
         "Block processor wired (hardfork config: {:?}, execution threads: {})",
         hardfork_cfg,
@@ -2599,6 +2737,19 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
 
     let initial_state_root = load_or_build_state(&store, &config, trie_store_for_exec.as_ref())?;
     info!("Initial state root: {:?}", initial_state_root.compute_hash(trie_store_for_exec.as_ref()));
+
+    if let Some(path) = &args.import_blocks {
+        let importer = rustock_sync::import::BlockImporter::new(
+            store.clone(),
+            HeaderVerifier::default_rsk(config.clone()),
+            block_processor,
+            trie_store_for_exec.clone(),
+            initial_state_root,
+            args.import_flush_every,
+        )?
+        .measure(args.breakdown_log.is_some());
+        return run_import_blocks(path, importer, args.breakdown_log.as_deref());
+    }
 
     let snap_checkpoint = snap_checkpoint_for(args.network_id);
     if checkpoint_defence.any() && snap_checkpoint.is_none() {
@@ -3211,37 +3362,62 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
             min_gas_price_target: args.mining_min_gas_price.map(alloy_primitives::U256::from),
             ..Default::default()
         };
+        // The miner's processor is wired like the node's: the same caches,
+        // threads and, on a chain from an rskj genesis file, rskj's regtest
+        // Bridge constants. A bare processor here ran REMASC against the
+        // built-in federation, so the first payout (block 15 on regtest)
+        // reached a state root no node with the right constants reproduces.
+        let mut miner_processor =
+            rustock_execution::BlockProcessor::new(hardfork_cfg.clone(), store.clone());
+        if let Some(cache) = &btc_block_cache {
+            miner_processor = miner_processor.with_btc_block_cache(cache.clone());
+        }
+        if let Some(cache) = &sender_cache {
+            miner_processor = miner_processor.with_sender_cache(cache.clone());
+        }
+        miner_processor = miner_processor.with_execution_threads(args.execution_threads);
+        if config.genesis_spec.is_some() {
+            miner_processor = miner_processor.with_bridge_constants(
+                rustock_execution::bridge::constants::BridgeConstants::rskj_regtest(),
+            );
+        }
         let builder = rustock_execution::BlockTemplateBuilder::new(
-            Arc::new(rustock_execution::BlockProcessor::new(
-                hardfork_cfg.clone(),
-                store.clone(),
-            )),
+            Arc::new(miner_processor),
             trie_store_for_pool.clone(),
             config.clone(),
             hardfork_cfg.clone(),
             mining_config,
         );
-        let chain = Arc::new(rustock_execution::mining::StoreChainAccess {
-            store: store.clone(),
-            trie_store: trie_store_for_pool.clone(),
+        let chain = Arc::new(rustock_execution::mining::StoreChainAccess::with_flush_every(
+            store.clone(),
+            trie_store_for_pool.clone(),
             // What the sync service's import path does for a block that
             // arrived from a peer, done here for one this node mined.
-            on_committed: Some({
+            Some({
                 let pool = pool.clone();
                 Arc::new(move |block: &rustock_core::Block| {
                     pool.remove_mined(&block.transactions);
                     pool.evict_outdated(block.header.number);
                 })
             }),
-        });
-        let server = Arc::new(rustock_execution::MinerServer::new(
+            args.flush_every,
+        ));
+        let mut server = rustock_execution::MinerServer::new(
             builder,
             chain,
             Arc::new(PoolTxSource(pool.clone())),
             config.clone(),
         )
         .with_sync_gate(PeerSyncGate::spawn(store.clone(), peer_store.clone()))
-        .with_submission_rate_limit(args.mining_submission_rate_limit_ms));
+        .with_submission_rate_limit(args.mining_submission_rate_limit_ms);
+        if let Some(log) = &args.breakdown_log {
+            // One line per block at a block time of seconds: written and
+            // flushed as it comes, so the file is complete whenever the
+            // node is stopped.
+            server = server.with_breakdown_log(open_breakdown_log(log)?);
+            info!("Mined-block timing lines go to {}", log.display());
+        }
+        let server = Arc::new(server);
         info!("Mining enabled; rewards to {coinbase_address}");
 
         // rskj `NewBlockTxListener.onBestBlock`: every block the sync
@@ -3301,6 +3477,32 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         None
     };
 
+    // The timed miner, rskj's `TimedMinerClient`: started here, with the
+    // node, so a harness that never calls `evm_startMining` still gets
+    // blocks. Nonce 0 without a search when proof of work is not validated;
+    // the bounded development search otherwise.
+    let timed_miner: Option<Arc<rustock_execution::mining::TimedMiner>> =
+        match (&miner, args.mine_timed.as_deref()) {
+            (_, None) => None,
+            (None, Some(_)) => anyhow::bail!("--mine-timed requires --mine"),
+            (Some(server), Some(median)) => {
+                let median = parse_block_time(median)
+                    .map_err(|e| anyhow::anyhow!("--mine-timed {median:?}: {e}"))?;
+                let pow = if config.skip_pow_validation {
+                    rustock_execution::mining::Pow::Skip
+                } else {
+                    rustock_execution::mining::Pow::Search { attempts: 1 << 18 }
+                };
+                let timed = Arc::new(rustock_execution::mining::TimedMiner::new(
+                    server.clone(),
+                    median,
+                    pow,
+                ));
+                timed.start();
+                Some(timed)
+            }
+        };
+
     // Loaded before the server starts, so a bad key file stops the node
     // rather than surfacing as a confusing refusal on the first signing
     // call hours later.
@@ -3348,14 +3550,22 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
             // waits for its block; a quarter second is short enough that
             // a harness does not notice and long enough that an idle
             // chain is not spinning.
-            auto_miner: miner.clone().map(|m| {
-                Arc::new(rustock_rpc::evm::AutoMiner::new(
-                    m as Arc<dyn rustock_rpc::mnr::MiningService>,
-                    Some(Arc::new(PoolAdapter(pool.clone()))
-                        as Arc<dyn rustock_rpc::server::TxPoolReader>),
-                    std::time::Duration::from_millis(250),
-                ))
-            }),
+            auto_miner: match &timed_miner {
+                // `--mine-timed`: the loop is the timed one, already
+                // running; `evm_startMining` is then a no-op that answers
+                // true, and `evm_stopMining` pauses it.
+                Some(timed) => {
+                    Some(timed.clone() as Arc<dyn rustock_rpc::evm::BackgroundMiner>)
+                }
+                None => miner.clone().map(|m| {
+                    Arc::new(rustock_rpc::evm::AutoMiner::new(
+                        m as Arc<dyn rustock_rpc::mnr::MiningService>,
+                        Some(Arc::new(PoolAdapter(pool.clone()))
+                            as Arc<dyn rustock_rpc::server::TxPoolReader>),
+                        std::time::Duration::from_millis(250),
+                    )) as Arc<dyn rustock_rpc::evm::BackgroundMiner>
+                }),
+            },
             wallet: wallet.clone(),
             admin_enabled: args.rpc_admin,
             gc_burial: args.gc_burial,
@@ -3418,6 +3628,291 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
     node.start().await?;
 
     Ok(())
+}
+
+/// The `--breakdown-log` file as a sink for the miner's timing lines: each
+/// line written and flushed at once.
+fn open_breakdown_log(log: &std::path::Path) -> Result<rustock_execution::breakdown::BreakdownSink> {
+    use std::io::Write;
+    if let Some(dir) = log.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir)?;
+    }
+    let file = std::fs::File::create(log)
+        .with_context(|| format!("cannot create {}", log.display()))?;
+    let file = std::sync::Mutex::new(std::io::BufWriter::new(file));
+    Ok(Arc::new(move |line: &str| {
+        let mut out = file.lock().unwrap_or_else(|e| e.into_inner());
+        if let Err(e) = writeln!(out, "{line}").and_then(|_| out.flush()) {
+            warn!(target: "rustock::mining", "Could not write the breakdown line: {e}");
+        }
+    }))
+}
+
+/// `--mine-timed`'s median: `10s`, `500ms`, `1.5s`, or a bare number of
+/// seconds.
+fn parse_block_time(raw: &str) -> Result<std::time::Duration, String> {
+    let raw = raw.trim();
+    let (number, unit) = match raw.find(|c: char| c.is_ascii_alphabetic()) {
+        Some(i) => (&raw[..i], raw[i..].trim()),
+        None => (raw, "s"),
+    };
+    let value: f64 = number
+        .trim()
+        .parse()
+        .map_err(|_| format!("'{number}' is not a number"))?;
+    let seconds = match unit {
+        "s" | "sec" | "secs" => value,
+        "ms" => value / 1000.0,
+        "m" | "min" => value * 60.0,
+        other => return Err(format!("unknown unit '{other}' (use ms, s or m)")),
+    };
+    if seconds <= 0.0 || !seconds.is_finite() {
+        return Err("the median must be positive".into());
+    }
+    Ok(std::time::Duration::from_secs_f64(seconds))
+}
+
+/// `--import-blocks`: feed every block of an rskj `ExportBlocks` file to
+/// `importer`, in file order. The first failure ends the process with the
+/// block's number, hash and the check that failed.
+fn run_import_blocks(
+    path: &std::path::Path,
+    mut importer: rustock_sync::import::BlockImporter,
+    breakdown_log: Option<&std::path::Path>,
+) -> Result<()> {
+    use std::io::{BufRead, Write};
+    let mut breakdown = match breakdown_log {
+        Some(log) => {
+            if let Some(dir) = log.parent().filter(|d| !d.as_os_str().is_empty()) {
+                std::fs::create_dir_all(dir)?;
+            }
+            let file = std::fs::File::create(log)
+                .with_context(|| format!("cannot create {}", log.display()))?;
+            Some(std::io::BufWriter::new(file))
+        }
+        None => None,
+    };
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("cannot open {}", path.display()))?;
+    let reader: Box<dyn BufRead> = if path.extension().is_some_and(|e| e == "gz") {
+        Box::new(std::io::BufReader::new(flate2::read::MultiGzDecoder::new(file)))
+    } else {
+        Box::new(std::io::BufReader::new(file))
+    };
+    let (start_number, _) = importer.best();
+    info!("Importing blocks from {} on top of #{start_number}", path.display());
+    let started = std::time::Instant::now();
+    let mut imported = 0u64;
+    for (index, line) in reader.lines().enumerate() {
+        let line = line.with_context(|| format!("reading {}", path.display()))?;
+        let exported = match rustock_sync::import::parse_export_line(&line) {
+            Ok(Some(b)) => b,
+            Ok(None) => continue,
+            Err(e) => anyhow::bail!("{}:{}: {e:#}", path.display(), index + 1),
+        };
+        let (number, hash) = (exported.number, exported.hash);
+        let block = match importer.import(exported.block) {
+            Ok(block) => block,
+            Err(e) => anyhow::bail!(
+                "import failed at block {number} hash {} check {}: {e}",
+                alloy_primitives::hex::encode(hash),
+                e.check()
+            ),
+        };
+        if let (Some(out), Some(t)) = (breakdown.as_mut(), block.timings.as_ref()) {
+            writeln!(
+                out,
+                "{}",
+                t.breakdown_line(block.number, block.hash, block.tx_count, block.gas_used)
+            )?;
+        }
+        imported += 1;
+        if imported.is_multiple_of(1000) {
+            info!("Imported {imported} blocks (#{number})");
+        }
+    }
+    let (number, hash) = importer.best();
+    importer.finish().map_err(|e| anyhow::anyhow!("final flush: {e}"))?;
+    if let Some(mut out) = breakdown {
+        out.flush()?;
+    }
+    info!(
+        "Imported {imported} blocks in {:.1}s; best block #{number} {hash:?}",
+        started.elapsed().as_secs_f64()
+    );
+    Ok(())
+}
+
+/// The execution ladder for `config`: the chain's own, with the operator's
+/// `--hardfork` and `--consensus-rule` overrides applied. Also returns the
+/// names accepted without effect.
+fn hardfork_config(
+    config: &ChainConfig,
+) -> Result<(rustock_execution::RskHardforkConfig, Vec<String>)> {
+    rustock_execution::RskHardforkConfig::for_network(config.chain_id as u64)
+        .with_rskj_overrides(&config.hardfork_overrides, &config.consensus_rule_overrides)
+        .map_err(anyhow::Error::msg)
+}
+
+/// `name=height` as rskj's config writes it, `-1` for never.
+fn parse_rskj_height(flag: &str, spec: &str) -> Result<(String, Option<u64>)> {
+    let (name, height) = spec
+        .split_once('=')
+        .ok_or_else(|| anyhow::anyhow!("{flag} {spec:?}: expected name=height"))?;
+    let height: i64 = height
+        .trim()
+        .parse()
+        .with_context(|| format!("{flag} {spec:?}: height"))?;
+    Ok((name.trim().to_string(), u64::try_from(height).ok()))
+}
+
+/// `--export-blocks`: write the canonical chain from `from` to `to` (the best
+/// block when unset) as rskj's `ExportBlocks` does, one block per line.
+fn run_export_blocks(
+    store: &BlockStore,
+    path: &std::path::Path,
+    from: u64,
+    to: Option<u64>,
+) -> Result<()> {
+    use std::io::Write;
+    let best = match store.head()? {
+        Some(hash) => store
+            .header(hash)?
+            .ok_or_else(|| anyhow::anyhow!("head header {hash} missing"))?
+            .number,
+        None => anyhow::bail!("the store has no head block; nothing to export"),
+    };
+    let to = to.unwrap_or(best);
+    anyhow::ensure!(
+        to <= best,
+        "--export-to {to} is above the best block #{best}"
+    );
+    anyhow::ensure!(from <= to, "--export-from {from} is above --export-to {to}");
+
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir)?;
+    }
+    let file = std::fs::File::create(path)
+        .with_context(|| format!("cannot create {}", path.display()))?;
+    let mut out: Box<dyn Write> = if path.extension().is_some_and(|e| e == "gz") {
+        Box::new(std::io::BufWriter::new(flate2::write::GzEncoder::new(
+            file,
+            flate2::Compression::default(),
+        )))
+    } else {
+        Box::new(std::io::BufWriter::new(file))
+    };
+
+    info!("Exporting blocks #{from} to #{to} to {}", path.display());
+    let started = std::time::Instant::now();
+    for number in from..=to {
+        let hash = store
+            .canonical_hash(number)?
+            .ok_or_else(|| anyhow::anyhow!("no canonical block at #{number}"))?;
+        let block = store
+            .block(hash)?
+            .ok_or_else(|| anyhow::anyhow!("block #{number} {hash} is not in the store"))?;
+        anyhow::ensure!(
+            block.header.number == number,
+            "the canonical index names {hash} at #{number}, but the header says #{}",
+            block.header.number
+        );
+        let td = store
+            .total_difficulty(hash)?
+            .ok_or_else(|| anyhow::anyhow!("block #{number} {hash} has no total difficulty"))?;
+        writeln!(out, "{}", rustock_sync::import::encode_export_line(hash, td, &block))?;
+    }
+    out.flush()?;
+    info!(
+        "Exported {} blocks in {:.1}s",
+        to - from + 1,
+        started.elapsed().as_secs_f64()
+    );
+    Ok(())
+}
+
+/// Apply the regtest chain options (`--genesis`, `--skip-pow-validation`,
+/// `--consensus-rule`, `--hardfork`, `--min-gas-limit`, `--max-gas-limit`).
+/// Refused on mainnet and testnet, whose rules are not the operator's to
+/// change, unless `--allow-chain-overrides` says this is a copy of the
+/// chain; `--genesis` is refused there regardless.
+fn apply_chain_options(mut config: ChainConfig, args: &Args) -> Result<ChainConfig> {
+    let any = args.genesis.is_some()
+        || args.skip_pow_validation
+        || !args.consensus_rule.is_empty()
+        || !args.hardfork.is_empty()
+        || args.min_gas_limit.is_some()
+        || args.max_gas_limit.is_some();
+    if !any {
+        return Ok(config);
+    }
+    let real_chain = matches!(config.chain_id, 30 | 31);
+    anyhow::ensure!(
+        !real_chain || args.allow_chain_overrides,
+        "--genesis, --skip-pow-validation, --consensus-rule, --hardfork and the gas-limit \
+         bounds are regtest options; --allow-chain-overrides takes all but --genesis on \
+         a copy of mainnet or testnet"
+    );
+    anyhow::ensure!(
+        !(real_chain && args.genesis.is_some()),
+        "--genesis is a regtest option: a genesis file would make this another chain"
+    );
+    if real_chain {
+        warn!(
+            "Chain overrides accepted on chain id {}: this node runs a schedule of its own \
+             and must not follow the real network",
+            config.chain_id
+        );
+    }
+    // reference.conf: `rskip97 = orchid`. Where the chain keeps that
+    // (mainnet), moving orchid moves it, unless --consensus-rule says.
+    let orchid_before = config.activation_heights.orchid;
+    for spec in &args.hardfork {
+        let (name, height) = parse_rskj_height("--hardfork", spec)?;
+        config.activation_heights.set_rskj_hardfork(&name, height);
+        config.hardfork_overrides.push((name, height));
+    }
+    if config.activation_heights.rskip97 == Some(orchid_before) {
+        config.activation_heights.rskip97 = Some(config.activation_heights.orchid);
+    }
+    for rule in &args.consensus_rule {
+        let (name, height) = parse_rskj_height("--consensus-rule", rule)?;
+        match name.as_str() {
+            "rskip97" => config.activation_heights.rskip97 = height,
+            _ => config.consensus_rule_overrides.push((name, height)),
+        }
+    }
+    // Judged now, so a name the ladder refuses stops the node here.
+    let (_, unmodelled) = hardfork_config(&config)?;
+    for name in unmodelled {
+        info!("Hardfork {name}: accepted, nothing in this node reads it");
+    }
+    if let Some(gas) = args.min_gas_limit {
+        config.min_gas_limit = gas;
+    }
+    if let Some(gas) = args.max_gas_limit {
+        config.max_gas_limit = gas;
+    }
+    config.skip_pow_validation = args.skip_pow_validation;
+    if let Some(path) = &args.genesis {
+        let spec = rustock_core::rskj_genesis::GenesisSpec::from_file(path)?;
+        config.genesis_spec = Some(spec);
+        // rskj writes the root of the state it built into the genesis header,
+        // so build it once, in memory, to learn the root.
+        let scratch = rustock_trie::MemoryTrieStore::new();
+        let root = build_genesis_state(&config, &scratch)?.compute_hash(&scratch);
+        let spec = config.genesis_spec.take().map(|s| s.with_state_root(root));
+        config.genesis_spec = spec;
+        info!(
+            "Genesis from {}: state root {root:?}, hash {:?}",
+            path.display(),
+            config.known_genesis_hash().unwrap_or_default()
+        );
+    }
+    if config.skip_pow_validation {
+        tracing::warn!("Merged-mining proof of work is NOT validated (--skip-pow-validation)");
+    }
+    Ok(config)
 }
 
 /// Try to resume from persisted state, falling back to genesis if unavailable.
@@ -3509,7 +4004,15 @@ fn build_genesis_state(config: &ChainConfig, trie_store: &dyn TrieStore) -> Resu
         // genesis set above which is only created when absent.
         for (addr, upgrade) in rustock_execution::precompiles::CONSENSUS_ENABLED_PRECOMPILES {
             use rustock_execution::hardfork::RskNetworkUpgrade as U;
+            // A genesis read from an rskj file is rskj's regtest genesis,
+            // where every upgrade in this list is at height 0 (regtest.conf),
+            // so every one of these precompiles is created at genesis. The
+            // execution ladder says the same: it starts at the last upgrade.
+            let (ladder, _) = hardfork_config(config)?;
             let height = match upgrade {
+                _ if config.genesis_spec.is_some() => {
+                    (ladder.active_upgrade(0) >= upgrade).then_some(0)
+                }
                 U::Wasabi100 => Some(config.activation_heights.wasabi100),
                 U::Papyrus200 => Some(config.activation_heights.papyrus200),
                 U::Iris300 => Some(config.activation_heights.iris300),
@@ -4539,6 +5042,16 @@ mod log_timezone_tests {
     }
 
     #[test]
+    fn account_slots_default_to_rskj_s_and_take_a_value() {
+        use clap::Parser;
+        let args = super::Args::try_parse_from(["rustock-cli"]).unwrap();
+        assert_eq!(args.account_slots, 16);
+        let args =
+            super::Args::try_parse_from(["rustock-cli", "--account-slots", "500"]).unwrap();
+        assert_eq!(args.account_slots, 500);
+    }
+
+    #[test]
     fn nonsense_is_rejected_with_a_usable_message() {
         for spec in [
             "America/Argentina/Buenos_Aires",
@@ -4753,9 +5266,173 @@ mod snap_checkpoint_tests {
 }
 
 #[cfg(test)]
+mod block_time_tests {
+    use super::parse_block_time;
+    use std::time::Duration;
+
+    #[test]
+    fn parses_rskj_style_durations() {
+        assert_eq!(parse_block_time("10s").unwrap(), Duration::from_secs(10));
+        assert_eq!(parse_block_time("500ms").unwrap(), Duration::from_millis(500));
+        assert_eq!(parse_block_time("1.5s").unwrap(), Duration::from_millis(1500));
+        assert_eq!(parse_block_time("2m").unwrap(), Duration::from_secs(120));
+        assert_eq!(parse_block_time("7").unwrap(), Duration::from_secs(7));
+        assert!(parse_block_time("0s").is_err());
+        assert!(parse_block_time("-1s").is_err());
+        assert!(parse_block_time("10h").is_err());
+        assert!(parse_block_time("abc").is_err());
+    }
+}
+
+#[cfg(test)]
 mod genesis_tests {
     use super::*;
     use rustock_trie::MemoryTrieStore;
+
+    fn regtest_args(extra: &[&str]) -> Args {
+        let mut argv = vec!["rustock-cli", "--network-id", "33"];
+        argv.extend_from_slice(extra);
+        Args::parse_from(argv)
+    }
+
+    /// The lab's rskj regtest genesis (`tests/fixtures/rskj-regtest-genesis.json`,
+    /// sixteen funded accounts, 25M gas limit). rskj gives it this hash:
+    /// block 1 of every chain mined from it names it as parent. Getting there
+    /// takes the file's difficulty bytes as written and the precompile
+    /// accounts rskj creates at genesis when every upgrade is at height 0.
+    #[test]
+    fn an_rskj_genesis_file_gives_rskjs_genesis_hash() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/rskj-regtest-genesis.json");
+        let args = regtest_args(&["--genesis", path]);
+        let config = apply_chain_options(ChainConfig::regtest(), &args).unwrap();
+        assert_eq!(
+            config.known_genesis_hash(),
+            Some("0x227d8e8d835f5e7290e333f4177e551ef1222dde4704f677ba4a120051c31cc2".parse().unwrap())
+        );
+        let header = config.genesis_header();
+        assert_eq!(header.hash(), config.known_genesis_hash().unwrap());
+        assert_eq!(header.gas_limit, U256::from(25_000_000));
+        assert_eq!(config.genesis_alloc().len(), 16);
+    }
+
+    #[test]
+    fn chain_options_apply_on_regtest_only() {
+        let args = regtest_args(&[
+            "--skip-pow-validation",
+            "--consensus-rule",
+            "rskip97=0",
+            "--min-gas-limit",
+            "3000000",
+            "--max-gas-limit",
+            "18446744073709551615",
+        ]);
+        let config = apply_chain_options(ChainConfig::regtest(), &args).unwrap();
+        assert!(config.skip_pow_validation);
+        assert_eq!(config.activation_heights.rskip97, Some(0));
+        assert_eq!((config.min_gas_limit, config.max_gas_limit), (3_000_000, u64::MAX));
+
+        let disabled = regtest_args(&["--consensus-rule", "rskip97=-1"]);
+        let config = apply_chain_options(ChainConfig::regtest(), &disabled).unwrap();
+        assert_eq!(config.activation_heights.rskip97, None);
+
+        let unknown = regtest_args(&["--consensus-rule", "rskip144=0"]);
+        assert!(apply_chain_options(ChainConfig::regtest(), &unknown).is_err());
+
+        let mainnet = Args::parse_from(["rustock-cli", "--skip-pow-validation"]);
+        assert!(apply_chain_options(ChainConfig::mainnet(), &mainnet).is_err());
+    }
+
+    fn mainnet_args(extra: &[&str]) -> Args {
+        let mut argv = vec!["rustock-cli", "--network-id", "30"];
+        argv.extend_from_slice(extra);
+        Args::parse_from(argv)
+    }
+
+    /// The flags the lab passes for perf-lab's mainnet seed: mainnet's
+    /// schedule, reed810 and its rules moved to #9,002,504, rskip536 at
+    /// vetiver900, no proof of work, 25M gas.
+    const SEED_FLAGS: &[&str] = &[
+        "--allow-chain-overrides",
+        "--hardfork", "bahamas=3397", "--hardfork", "afterBridgeSync=370000",
+        "--hardfork", "orchid=729000", "--hardfork", "orchid060=1052700",
+        "--hardfork", "wasabi100=1591000", "--hardfork", "twoToThree=2018000",
+        "--hardfork", "papyrus200=2392700", "--hardfork", "iris300=3614800",
+        "--hardfork", "hop400=4598500", "--hardfork", "hop401=4976300",
+        "--hardfork", "fingerroot500=5468000", "--hardfork", "arrowhead600=6223700",
+        "--hardfork", "arrowhead631=6549300", "--hardfork", "lovell700=7338024",
+        "--hardfork", "reed800=8052200", "--hardfork", "reed810=9002504",
+        "--hardfork", "vetiver900=8804200", "--hardfork", "tbd1000=9002504",
+        "--consensus-rule", "rskipUMM=2392700", "--consensus-rule", "rskip351=9002504",
+        "--consensus-rule", "rskip535=9002504", "--consensus-rule", "rskip536=8804200",
+        "--skip-pow-validation",
+        "--min-gas-limit", "3000000", "--max-gas-limit", "18446744073709551615",
+    ];
+
+    /// Without the opt-in, mainnet is mainnet: every override refused, and a
+    /// node started with none has mainnet's heights and ladder exactly.
+    #[test]
+    fn mainnet_without_the_opt_in_is_untouched() {
+        let refused = mainnet_args(&["--hardfork", "reed810=9002504"]);
+        assert!(apply_chain_options(ChainConfig::mainnet(), &refused).is_err());
+        let refused = mainnet_args(&["--consensus-rule", "rskip535=9002504"]);
+        assert!(apply_chain_options(ChainConfig::mainnet(), &refused).is_err());
+
+        let plain = apply_chain_options(ChainConfig::mainnet(), &mainnet_args(&[])).unwrap();
+        let mainnet = ChainConfig::mainnet();
+        assert_eq!(plain.activation_heights.orchid, mainnet.activation_heights.orchid);
+        assert_eq!(plain.activation_heights.rskip97, Some(729_000));
+        assert_eq!(plain.activation_heights.rskip144, None);
+        // 3,000,000 since the rskj parity fix (rskj `Constants.getMinGasLimit`);
+        // this asserts mainnet's own defaults, so it tracks them.
+        assert_eq!((plain.min_gas_limit, plain.max_gas_limit), (3_000_000, 1_000_000_000));
+        assert!(!plain.skip_pow_validation);
+        assert!(plain.hardfork_overrides.is_empty());
+        let (ladder, unmodelled) = hardfork_config(&plain).unwrap();
+        assert!(unmodelled.is_empty());
+        assert!(!ladder.has_rskip144(9_003_580));
+        assert!(!ladder.has_rskip351(9_003_580));
+        assert_eq!(
+            ladder.active_upgrade(9_003_580),
+            rustock_execution::hardfork::RskNetworkUpgrade::Vetiver900
+        );
+    }
+
+    #[test]
+    fn the_seed_schedule_applies_on_mainnet_with_the_opt_in() {
+        let config = apply_chain_options(ChainConfig::mainnet(), &mainnet_args(SEED_FLAGS)).unwrap();
+        assert_eq!(config.chain_id, 30);
+        assert_eq!(config.activation_heights.rskip144, Some(9_002_504));
+        assert_eq!(config.activation_heights.orchid, 729_000);
+        assert_eq!(config.activation_heights.rskip97, Some(729_000));
+        assert_eq!(config.activation_heights.papyrus200, 2_392_700);
+        assert!(config.skip_pow_validation);
+        assert_eq!((config.min_gas_limit, config.max_gas_limit), (3_000_000, u64::MAX));
+        assert!(config.genesis_spec.is_none(), "mainnet's genesis stays");
+        let (ladder, unmodelled) = hardfork_config(&config).unwrap();
+        assert_eq!(unmodelled, vec!["orchid060".to_string(), "tbd1000".to_string()]);
+        assert!(!ladder.has_rskip144(9_002_503));
+        assert!(ladder.has_rskip144(9_003_580));
+        assert!(ladder.has_rskip351(9_003_580));
+        assert!(!ladder.has_rskip535(9_002_503));
+        assert!(ladder.has_rskip535(9_003_580));
+        assert!(ladder.has_rskip536(8_804_200));
+        assert_eq!(
+            ladder.active_upgrade(9_003_580),
+            rustock_execution::hardfork::RskNetworkUpgrade::Vetiver900
+        );
+
+        // A genesis file would change the chain: refused even with the opt-in.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/rskj-regtest-genesis.json");
+        let with_genesis = mainnet_args(&["--allow-chain-overrides", "--genesis", path]);
+        assert!(apply_chain_options(ChainConfig::mainnet(), &with_genesis).is_err());
+        // A rung this node reads at one height cannot be moved.
+        let moved = mainnet_args(&["--allow-chain-overrides", "--hardfork", "hop401=1"]);
+        assert!(apply_chain_options(ChainConfig::mainnet(), &moved).is_err());
+        // Moving orchid moves rskip97 with it, as reference.conf ties them.
+        let orchid = mainnet_args(&["--allow-chain-overrides", "--hardfork", "orchid=100"]);
+        let config = apply_chain_options(ChainConfig::mainnet(), &orchid).unwrap();
+        assert_eq!(config.activation_heights.rskip97, Some(100));
+    }
 
     /// Testnet's genesis state root, published in rskj's
     /// `genesis/orchid-testnet.json` and in every testnet block #0.

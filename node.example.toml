@@ -68,6 +68,7 @@
 # Exit once synced, reporting the elapsed time -- an unambiguous end time for
 # a measurement, rather than a log line to scrape.
 # exit_when_synced = false          # default
+# account_slots = 16                # default — transactions one sender may queue past its nonce (rskj transaction.accountSlots)
 
 [rpc]
 # host = "127.0.0.1"                # default
@@ -293,6 +294,8 @@
 # min_gas_price = 0                 # default: unset — wei to steer the block minimum toward, 1% per block (rskj miner.minGasPrice)
 # submission_rate_limit_ms = 0      # default — refuse a second submission inside this window (rskj workSubmissionRateLimitInMills)
 # update_work_on_new_transaction = false  # default — rebuild when arrivals pay a tenth of the candidate's fees (rskj updateWorkOnNewTransaction)
+# timed = "10s"                     # default: unset — mine on rskj's regtest clock (timedMine): exponential delays with this median
+# flush_every = 10                  # default — mined blocks between trie flushes (rskj blockchain.flushNumberOfBlocks)
 
 # Per-account virtual gas quota (rskj TxQuotaChecker). An account accumulates
 # quota while idle and spends it when broadcasting, so one that floods the
@@ -316,3 +319,14 @@
 # timezone = "utc"                  # default — or "local", or a fixed offset like "-03:00"
 [alerts]
 # alerts_config = "/etc/rustock/alerts.toml"# default: unset
+# Regtest: a chain that has to match one an rskj node runs, for example to
+# import blocks rskj mined (--import-blocks). Refused on mainnet and testnet
+# unless allow_overrides says this is a copy of the chain (genesis excepted).
+[chain]
+# genesis = "genesis.json"          # default: unset — an rskj genesis JSON file, instead of rustock's regtest genesis
+# skip_pow_validation = false       # default — rskj's miner.server.skipPowValidation
+# consensus_rules = { rskip97 = 0 } # default: unset — rskj's blockchain.config.consensusRules; -1 disables
+# min_gas_limit = 3000000           # default: unset (regtest: 1) — rskj's regtest minimum
+# max_gas_limit = 1000000000        # default: unset (regtest: 10000000) — rskj has no upper bound
+# hardforks = { reed810 = 9002504 }  # default: unset — rskj's blockchain.config.hardforkActivationHeights; -1 takes an upgrade off
+# allow_overrides = false            # default — take these on a copy of mainnet or testnet too (genesis excepted)

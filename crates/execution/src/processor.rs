@@ -77,6 +77,25 @@ fn orchid_check_interval() -> Option<u64> {
     })
 }
 
+/// Wall time of the stages of [`BlockProcessor::process_block_timed`], in
+/// the order they run. Together they cover the whole call.
+#[derive(Debug, Default, Clone)]
+pub struct ProcessTimings {
+    /// Transactions root and ommers hash checked against the header.
+    pub pre_validation: std::time::Duration,
+    /// `execute_block`: senders recovered, transactions and REMASC executed,
+    /// state changes applied to the trie, state root hashed, trie nodes
+    /// saved, receipts and their root built.
+    pub execute: std::time::Duration,
+    /// The part of `execute` spent in `TrieNode::save`: one batch write of
+    /// the dirty trie nodes into the trie store. Lookups during execution
+    /// stay in `execute`.
+    pub trie_save: std::time::Duration,
+    /// Gas used, paid fees, state root, receipts root and logs bloom checked
+    /// against the header.
+    pub post_validation: std::time::Duration,
+}
+
 /// Result of processing a block.
 #[derive(Debug)]
 pub struct ProcessedBlock {
@@ -190,6 +209,16 @@ impl BlockProcessor {
         self.sender_cache.as_ref()
     }
 
+    /// Use these Bridge constants instead of the network's built-in ones
+    /// ([`RskExecutor::with_bridge_constants`]).
+    pub fn with_bridge_constants(
+        mut self,
+        constants: crate::bridge::constants::BridgeConstants,
+    ) -> Self {
+        self.executor = self.executor.with_bridge_constants(constants);
+        self
+    }
+
     /// Share a BTC stored-block cache across every block this processor runs.
     ///
     /// Latency only: the cache is filled solely from reads consensus already
@@ -253,8 +282,20 @@ impl BlockProcessor {
         state_root: &TrieNode,
         trie_store: Arc<dyn TrieStore>,
     ) -> Result<ProcessedBlock, ProcessError> {
+        self.finish_execute(block, state_root, trie_store, None)
+    }
+
+    /// [`Self::execute_block`], recording how long `TrieNode::save` took when
+    /// `save_out` is set. The clock is not read otherwise.
+    fn finish_execute(
+        &self,
+        block: &Block,
+        state_root: &TrieNode,
+        trie_store: Arc<dyn TrieStore>,
+        save_out: Option<&mut std::time::Duration>,
+    ) -> Result<ProcessedBlock, ProcessError> {
         let started = std::time::Instant::now();
-        let out = self.execute_block_inner(block, state_root, trie_store);
+        let out = self.execute_block_inner(block, state_root, trie_store, save_out);
         // Timed whether or not it succeeded: a block that fails still spent
         // the time, and a measurement that only counts successes reads as a
         // faster node the worse things get.
@@ -272,6 +313,7 @@ impl BlockProcessor {
         block: &Block,
         state_root: &TrieNode,
         trie_store: Arc<dyn TrieStore>,
+        save_out: Option<&mut std::time::Duration>,
     ) -> Result<ProcessedBlock, ProcessError> {
         let header = &block.header;
         let chain_id = self.hardfork_cfg.chain_id;
@@ -451,7 +493,13 @@ impl BlockProcessor {
             ),
         };
         let state_root_hash = new_state_root.compute_hash(trie_store.as_ref());
-        new_state_root.save(trie_store.as_ref(), true);
+        if let Some(slot) = save_out {
+            let started = std::time::Instant::now();
+            new_state_root.save(trie_store.as_ref(), true);
+            *slot += started.elapsed();
+        } else {
+            new_state_root.save(trie_store.as_ref(), true);
+        }
         // Reload the root lazily: children become hash references resolved on
         // demand, so subsequent blocks only walk their dirty paths instead of
         // re-serializing the whole accumulated trie on every state-root
@@ -758,6 +806,38 @@ impl BlockProcessor {
         state_root: &TrieNode,
         trie_store: Arc<dyn TrieStore>,
     ) -> Result<ProcessedBlock, ProcessError> {
+        self.process_block_inner(block, state_root, trie_store, None)
+    }
+
+    /// [`BlockProcessor::process_block`], adding the wall time of each of its
+    /// three stages to `timings`. Instrumentation only: the work is the same.
+    pub fn process_block_timed(
+        &self,
+        block: &Block,
+        state_root: &TrieNode,
+        trie_store: Arc<dyn TrieStore>,
+        timings: &mut ProcessTimings,
+    ) -> Result<ProcessedBlock, ProcessError> {
+        self.process_block_inner(block, state_root, trie_store, Some(timings))
+    }
+
+    fn process_block_inner(
+        &self,
+        block: &Block,
+        state_root: &TrieNode,
+        trie_store: Arc<dyn TrieStore>,
+        mut timings: Option<&mut ProcessTimings>,
+    ) -> Result<ProcessedBlock, ProcessError> {
+        let timed = timings.is_some();
+        // Reads the clock only when timing was asked for.
+        let mut last = timings.is_some().then(std::time::Instant::now);
+        let mut lap = |stage: fn(&mut ProcessTimings) -> &mut std::time::Duration| {
+            if let (Some(t), Some(prev)) = (timings.as_deref_mut(), last) {
+                let now = std::time::Instant::now();
+                *stage(t) += now - prev;
+                last = Some(now);
+            }
+        };
         let header = &block.header;
 
         let computed_tx_root = ordered_tx_trie_root(
@@ -779,7 +859,15 @@ impl BlockProcessor {
             });
         }
 
-        let result = self.execute_block(block, state_root, trie_store.clone())?;
+        lap(|t| &mut t.pre_validation);
+        let mut trie_save = std::time::Duration::ZERO;
+        let result = self.finish_execute(
+            block,
+            state_root,
+            trie_store.clone(),
+            timed.then_some(&mut trie_save),
+        )?;
+        lap(|t| &mut t.execute);
 
         if result.gas_used != header.gas_used {
             for (i, r) in result.receipts.iter().enumerate() {
@@ -876,6 +964,10 @@ impl BlockProcessor {
             tx_count = result.receipts.len(),
             "block processed successfully"
         );
+        lap(|t| &mut t.post_validation);
+        if let Some(t) = timings {
+            t.trie_save += trie_save;
+        }
 
         Ok(result)
     }
@@ -903,6 +995,18 @@ impl BlockProcessor {
         trie_store: Arc<dyn TrieStore>,
     ) -> Result<ProcessedBlock, ProcessError> {
         let result = self.process_block(block, state_root, trie_store)?;
+        self.commit_receipts(block, &result)?;
+        Ok(result)
+    }
+
+    /// The commit half of [`BlockProcessor::process_and_commit`]: store the
+    /// receipts of a processed block and index its transactions and Bridge
+    /// events.
+    pub fn commit_receipts(
+        &self,
+        block: &Block,
+        result: &ProcessedBlock,
+    ) -> Result<(), ProcessError> {
         let hash = block.hash();
         self.block_store
             .put_receipts(hash, &result.receipts)
@@ -929,7 +1033,7 @@ impl BlockProcessor {
                 crate::precompiles::BRIDGE_ADDR,
             )
             .map_err(ProcessError::Storage)?;
-        Ok(result)
+        Ok(())
     }
 
     /// Below this many transactions, recovery stays on the calling thread.

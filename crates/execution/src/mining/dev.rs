@@ -74,10 +74,19 @@ pub fn mine_one(
     server: &crate::MinerServer,
     attempts: u32,
 ) -> Result<crate::mining::server::SubmittedBlockInfo, MineError> {
+    let work = server.build_work().map_err(MineError::Work)?;
+    solve_and_submit(server, &work, attempts)
+}
+
+/// The search half of [`mine_one`], over work already built: find a Bitcoin
+/// nonce that clears `work.target` and submit the block.
+pub fn solve_and_submit(
+    server: &crate::MinerServer,
+    work: &crate::mining::server::MinerWork,
+    attempts: u32,
+) -> Result<crate::mining::server::SubmittedBlockInfo, MineError> {
     use alloy_primitives::U256;
     use bitcoin::hashes::Hash;
-
-    let work = server.build_work().map_err(MineError::Work)?;
 
     // The extra-nonce varies the coinbase, and so the merkle root, and so the
     // header -- without it every attempt at a given nonce would hash the same
@@ -92,15 +101,37 @@ pub fn mine_one(
             // why this is not the byte order the hash prints in.
             let hash = block.header.block_hash();
             if U256::from_le_slice(hash.as_byte_array()) <= work.target {
-                let mut raw = Vec::new();
-                bitcoin::consensus::Encodable::consensus_encode(&block, &mut raw)
-                    .map_err(|e| MineError::Encode(e.to_string()))?;
-                return server.submit_bitcoin_block(&raw).map_err(MineError::Submit);
+                return submit(server, &block);
             }
         }
     }
 
     Err(MineError::NoSolution { attempts })
+}
+
+/// Submit `work` closed with nonce 0 and no search at all: what rskj's
+/// `TimedMinerClient.mineBlock` does under `skipPowValidation` (line 133).
+///
+/// Only meaningful on a chain whose merged-mining rule is off
+/// (`--skip-pow-validation`); anywhere else the block fails the server's own
+/// self-check before it is stored.
+pub fn submit_unsolved(
+    server: &crate::MinerServer,
+    work: &crate::mining::server::MinerWork,
+) -> Result<crate::mining::server::SubmittedBlockInfo, MineError> {
+    let coinbase = super::coinbase::build_coinbase(&work.block_hash_for_merged_mining, 0);
+    let block = super::coinbase::build_bitcoin_block(coinbase, 0);
+    submit(server, &block)
+}
+
+fn submit(
+    server: &crate::MinerServer,
+    block: &bitcoin::Block,
+) -> Result<crate::mining::server::SubmittedBlockInfo, MineError> {
+    let mut raw = Vec::new();
+    bitcoin::consensus::Encodable::consensus_encode(block, &mut raw)
+        .map_err(|e| MineError::Encode(e.to_string()))?;
+    server.submit_bitcoin_block(&raw).map_err(MineError::Submit)
 }
 
 #[derive(Debug)]

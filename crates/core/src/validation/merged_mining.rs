@@ -99,6 +99,11 @@ impl HeaderValidator for MergedMiningRule {
         if header.number < self.config.activation_heights.orchid {
             return Ok(());
         }
+        // rskj `ProofOfWorkRule` with `miner.server.skipPowValidation`: the
+        // whole rule passes, merkle proof and coinbase included.
+        if self.config.skip_pow_validation {
+            return Ok(());
+        }
 
         let btc_header_bytes = header.bitcoin_merged_mining_header.as_ref()
             .ok_or(ValidationError::BitcoinHeaderDecodeError)?;

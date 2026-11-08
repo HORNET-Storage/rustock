@@ -34,6 +34,7 @@ tracing-appender = "0.2.4"
 rocksdb = { workspace = true }
 libc = { workspace = true }
 alloy-rlp = { workspace = true }
+flate2 = "1"
 
 [features]
 # Enable outgoing email for peg-out alerts (pulls in a TLS stack).

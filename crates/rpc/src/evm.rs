@@ -259,6 +259,41 @@ fn rewind_to_height(state: &RpcState, target: u64) -> Result<bool, String> {
     Ok(true)
 }
 
+/// What `evm_startMining` and `evm_stopMining` drive: a miner that runs on
+/// its own once started. The pool-polling [`AutoMiner`] is one; the timed
+/// miner of `rustock_execution::mining::TimedMiner` is the other.
+pub trait BackgroundMiner: Send + Sync {
+    /// Start, or do nothing if already running.
+    fn start(&self);
+    /// Stop after the block in flight, if any.
+    fn stop(&self);
+    fn is_running(&self) -> bool;
+}
+
+impl BackgroundMiner for AutoMiner {
+    fn start(&self) {
+        AutoMiner::start(self)
+    }
+    fn stop(&self) {
+        AutoMiner::stop(self)
+    }
+    fn is_running(&self) -> bool {
+        AutoMiner::is_running(self)
+    }
+}
+
+impl BackgroundMiner for rustock_execution::mining::TimedMiner {
+    fn start(&self) {
+        rustock_execution::mining::TimedMiner::start(self)
+    }
+    fn stop(&self) {
+        rustock_execution::mining::TimedMiner::stop(self)
+    }
+    fn is_running(&self) -> bool {
+        rustock_execution::mining::TimedMiner::is_running(self)
+    }
+}
+
 /// Mines blocks on its own, for `evm_startMining` / `evm_stopMining`.
 ///
 /// rskj's development chain has `miner.client.autoMine`, which mines a

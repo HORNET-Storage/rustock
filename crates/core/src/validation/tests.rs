@@ -251,6 +251,19 @@ fn test_merged_mining_rule_invalid_pow() {
 }
 
 #[test]
+fn test_merged_mining_rule_skip_pow_validation() {
+    // rskj `miner.server.skipPowValidation`: a header with no valid proof of
+    // work, not even a decodable bitcoin header, passes.
+    let mut config = crate::config::ChainConfig::regtest();
+    config.skip_pow_validation = true;
+    let rule = MergedMiningRule { config: Arc::new(config) };
+    let mut header = create_dummy_header(10, 1000, B256::ZERO);
+    header.difficulty = U256::MAX;
+    header.bitcoin_merged_mining_header = Some(Bytes::from_static(&[0x00]));
+    assert!(rule.validate(&header).is_ok());
+}
+
+#[test]
 fn test_merged_mining_rule_invalid_merkle() {
     let config = Arc::new(crate::config::ChainConfig::regtest());
     let rule = MergedMiningRule { config };

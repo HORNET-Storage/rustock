@@ -24,6 +24,7 @@ ripemd = { workspace = true }
 k256 = { workspace = true, features = ["arithmetic"] }
 bitcoin = { workspace = true }
 hex = { workspace = true }
+rand = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

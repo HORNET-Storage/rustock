@@ -61,6 +61,18 @@ each side has that the other does not.
 cargo build --workspace --release
 ```
 
+### Docker
+
+The `Dockerfile` builds `rustock-cli` on Ubuntu 22.04 (glibc 2.35) with the
+toolchain `rust-toolchain.toml` pins, for `linux/amd64` and `linux/arm64`:
+
+```bash
+docker build -t rustock .
+docker run --rm rustock rustock-cli --help
+```
+
+The image has no entrypoint; the binary is `/usr/local/bin/rustock-cli`.
+
 ### Running
 
 Start the full node on RSK Mainnet (default):
@@ -131,6 +143,78 @@ See [`docs/rskj-import.md`](docs/rskj-import.md) for the schema comparison, all
 options, and measured performance. [`tools/dump-index`](tools/dump-index) is a
 companion Java tool for reading rskj's MapDB index directly, used as an
 independent cross-check.
+
+### A regtest chain rskj runs
+
+rustock's regtest is its own chain: its own genesis, no Bridge federation, and
+gas limits of its own. To run the chain an rskj regtest node runs, so that
+blocks rskj mined connect here, start from rskj's genesis file and its rules:
+
+```bash
+rustock --network-id 33 \
+  --genesis genesis.json \
+  --consensus-rule rskip97=0 \
+  --min-gas-limit 3000000 --max-gas-limit 18446744073709551615 \
+  --skip-pow-validation
+```
+
+`--genesis` takes an rskj genesis JSON file and gives the genesis rskj gives
+it, hash included, along with rskj's regtest federation. `--consensus-rule` is
+rskj's `blockchain.config.consensusRules` (today `rskip97`), and
+`--skip-pow-validation` is its `miner.server.skipPowValidation`, for chains
+mined without real merged mining. `--hardfork name=height` is rskj's
+`blockchain.config.hardforkActivationHeights`, by rskj's names. The same
+settings go in a `[chain]` section of the `--config` file. All of them are
+refused on mainnet and testnet.
+
+`--allow-chain-overrides` lifts that refusal for everything but `--genesis`,
+for a copy of mainnet or testnet run under rules the chain has not activated
+(blocks mined on a snapshot of mainnet's state with reed810 scheduled, say):
+
+```bash
+rustock --network-id 30 --allow-chain-overrides \
+  --hardfork reed810=9002504 --hardfork tbd1000=9002504 \
+  --consensus-rule rskip351=9002504 --consensus-rule rskip535=9002504 \
+  --skip-pow-validation ...
+```
+
+The overrides reach everything that reads the schedule: header decoding and
+hashing, difficulty, execution, REMASC and the Bridge. Names the node reads at
+one fixed height per chain (`bahamas`, `afterBridgeSync`, `hop401`) are
+accepted at that height only; `orchid060` and `tbd1000` are accepted and
+change nothing, and the node says so (`tbd1000` only turns on RSKIP-559,
+pegout sorting in the Bridge, which it does not implement). A node started
+this way must not follow the real network.
+
+Blocks rskj exported with its `ExportBlocks` tool (`number,hash,td,rlp` per
+line, plain or gzipped) can then be imported from an empty data directory:
+
+```bash
+rustock --network-id 33 --genesis genesis.json ... \
+  --trie-backend external --trie-dir ./trie --data-dir ./data \
+  --import-blocks blocks.txt --import-flush-every 10
+```
+
+Each block goes through the validation and execution follow mode uses, and
+its state root, receipts root, logs bloom, gas used and paid fees are checked
+against its header. The import stops at the first block that fails, naming
+its number, hash and the check, and exits non-zero. The trie is flushed every
+`--import-flush-every` blocks (10, rskj's `blockchain.flushNumberOfBlocks`
+default).
+
+`--breakdown-log <file>` adds one line per block in the shape of rskj's
+`block connect breakdown best:` debug line, so the two clients' timings can be
+compared phase by phase:
+
+```
+block connect breakdown best: block=15 hash=c06f… totalMs=41.207 preambleMs=0.002
+  initialValidationMs=0.311 executeMs=38.950 postExecuteValidationMs=0.004
+  switchChainMs=0.402 saveReceiptsMs=0.517 onBestBlockMs=1.021 txCount=21 gasUsed=…
+```
+
+(one line in the file). `totalMs` covers the whole import of the block, the
+periodic flush included, as rskj's covers its `onBestBlock` flush. Without the
+flag no clock is read.
 
 ### Dependency Auditing
 

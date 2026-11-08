@@ -48,7 +48,12 @@ fn test_chain_config() -> Arc<ChainConfig> {
             // Active from genesis: this fixture mines blocks back to back,
             // so the ten-minute drop would only add noise.
             rskip97: Some(0),
+            rskip144: None,
         },
+        genesis_spec: None,
+        skip_pow_validation: false,
+        hardfork_overrides: Vec::new(),
+        consensus_rule_overrides: Vec::new(),
     })
 }
 
@@ -85,7 +90,7 @@ fn header_at(number: u64, parent_hash: B256, state_root: B256) -> Header {
 
 /// A node with a short chain already in its store, ready to mine on top.
 struct MiningFixture {
-    server: MinerServer,
+    server: Arc<MinerServer>,
     store: Arc<BlockStore>,
     trie_store: Arc<dyn TrieStore>,
     chain_config: Arc<ChainConfig>,
@@ -145,9 +150,56 @@ fn fixture_with(
     chain_config: Arc<ChainConfig>,
     parent_difficulty: U256,
 ) -> MiningFixture {
+    fixture_on(height, chain_config, parent_difficulty, Arc::new(MemoryTrieStore::new()), 1)
+}
+
+/// A chain that does not validate proof of work, as a regtest replaying
+/// rskj's blocks runs (`--skip-pow-validation`), at a difficulty no nonce
+/// search could meet.
+fn fixture_without_pow(height: u64, flush_every: u64, trie_store: Arc<dyn TrieStore>) -> MiningFixture {
+    let mut config = (*test_chain_config()).clone();
+    config.skip_pow_validation = true;
+    config.min_difficulty = U256::from(1u64 << 28);
+    fixture_on(height, Arc::new(config), U256::from(1u64 << 28), trie_store, flush_every)
+}
+
+/// Counts the flushes asked of the trie store it wraps.
+struct FlushCounter {
+    inner: MemoryTrieStore,
+    flushes: std::sync::atomic::AtomicU64,
+}
+
+impl FlushCounter {
+    fn new() -> Arc<Self> {
+        Arc::new(Self { inner: MemoryTrieStore::new(), flushes: 0.into() })
+    }
+
+    fn flushes(&self) -> u64 {
+        self.flushes.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl TrieStore for FlushCounter {
+    fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+        self.inner.get(key)
+    }
+    fn put(&self, key: &[u8], value: &[u8]) {
+        self.inner.put(key, value)
+    }
+    fn flush(&self) {
+        self.flushes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+fn fixture_on(
+    height: u64,
+    chain_config: Arc<ChainConfig>,
+    parent_difficulty: U256,
+    trie_store: Arc<dyn TrieStore>,
+    flush_every: u64,
+) -> MiningFixture {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(BlockStore::open(dir.path()).unwrap());
-    let trie_store: Arc<dyn TrieStore> = Arc::new(MemoryTrieStore::new());
     let empty_root = TrieNode::empty().compute_hash(trie_store.as_ref());
 
     let mut parent_hash = B256::ZERO;
@@ -180,17 +232,18 @@ fn fixture_with(
             ..Default::default()
         },
     );
-    let chain = Arc::new(StoreChainAccess {
-        on_committed: None,
-        store: store.clone(),
-        trie_store: trie_store.clone(),
-    });
-    let server = MinerServer::new(
+    let chain = Arc::new(StoreChainAccess::with_flush_every(
+        store.clone(),
+        trie_store.clone(),
+        None,
+        flush_every,
+    ));
+    let server = Arc::new(MinerServer::new(
         builder,
         chain,
         Arc::new(NoPendingTransactions),
         chain_config.clone(),
-    );
+    ));
 
     MiningFixture { server, store, trie_store, chain_config, parent, _dir: dir }
 }
@@ -2156,4 +2209,261 @@ mod rskip252_cap {
             "with no minimum there is nothing to be 100x of: {mined:?}"
         );
     }
+}
+
+// ── the timed miner ───────────────────────────────────────────────────
+
+/// Nonce of the Bitcoin header a stored block carries.
+fn bitcoin_nonce_of(fx: &MiningFixture, hash: B256) -> u32 {
+    use bitcoin::consensus::Decodable;
+    let header = fx.store.header(hash).unwrap().unwrap();
+    let raw = header.bitcoin_merged_mining_header.unwrap();
+    let btc: bitcoin::block::Header = Decodable::consensus_decode(&mut &raw[..]).unwrap();
+    btc.nonce
+}
+
+/// rskj under `skipPowValidation` closes the block with nonce 0 and no
+/// search (`TimedMinerClient.mineBlock`, line 133). At a difficulty of 2^28
+/// the bounded development search would fail; the unsolved submission must
+/// still be imported as best.
+#[test]
+fn without_pow_validation_a_block_is_mined_with_nonce_zero() {
+    let fx = fixture_without_pow(20, 1, Arc::new(MemoryTrieStore::new()));
+    let mut schedule = TimedSchedule::new(std::time::Duration::from_secs(10));
+
+    let info = timed::mine_block(&fx.server, Pow::Skip, &mut schedule).unwrap();
+    assert_eq!(info.block_imported_result, ImportResult::ImportedBest);
+    assert_eq!(info.block_included_height, 21);
+    assert_eq!(bitcoin_nonce_of(&fx, info.block_hash), 0);
+    assert_eq!(fx.store.head().unwrap(), Some(info.block_hash));
+
+    // And the search, at this difficulty, would have given up.
+    let err = timed::mine_block(&fx.server, Pow::Search { attempts: 1 << 10 }, &mut schedule)
+        .unwrap_err();
+    assert!(matches!(err, dev::MineError::NoSolution { .. }), "{err}");
+}
+
+/// The same unsolved block on a chain that does validate proof of work is
+/// refused by the server's own self-check, before anything is stored.
+#[test]
+fn with_pow_validation_an_unsolved_block_is_refused() {
+    let fx = fixture_with_difficulty(U256::MAX, 20);
+    let work = fx.server.build_work().unwrap();
+    let head_before = fx.store.head().unwrap();
+
+    let err = dev::submit_unsolved(&fx.server, &work).unwrap_err();
+    assert!(
+        matches!(err, dev::MineError::Submit(SubmitError::SelfCheck(_))),
+        "{err}"
+    );
+    assert_eq!(fx.store.head().unwrap(), head_before);
+}
+
+/// `flush_every` 3: blocks 3 and 6 of seven mined flush the trie, and the
+/// executed head still moves with every block.
+#[test]
+fn mined_blocks_flush_the_trie_every_n_blocks() {
+    let counter = FlushCounter::new();
+    let fx = fixture_without_pow(20, 3, counter.clone());
+    let mut schedule = TimedSchedule::new(std::time::Duration::from_secs(10));
+
+    let mut seen = Vec::new();
+    for _ in 0..7 {
+        let info = timed::mine_block(&fx.server, Pow::Skip, &mut schedule).unwrap();
+        assert_eq!(info.block_imported_result, ImportResult::ImportedBest);
+        seen.push(counter.flushes());
+        let (exec_head, _) = fx.store.exec_head().unwrap().unwrap();
+        assert_eq!(exec_head, info.block_hash, "the executed head follows every block");
+    }
+    assert_eq!(seen, vec![0, 0, 1, 1, 1, 2, 2]);
+
+    // The miner's schedule saw the chain's difficulty: the baseline is the
+    // first block's, and seven blocks mined back to back move the difficulty
+    // rule by well under a percent, so the median is scaled by about 1.
+    let median = schedule.scaled_median().as_secs_f64();
+    assert!((median - 10.0).abs() < 0.5, "scaled median {median}s");
+}
+
+/// The default cadence is a flush per block, as before.
+#[test]
+fn by_default_every_mined_block_flushes() {
+    let counter = FlushCounter::new();
+    let fx = fixture_without_pow(20, 1, counter.clone());
+    let mut schedule = TimedSchedule::new(std::time::Duration::from_secs(10));
+    for n in 1..=3 {
+        timed::mine_block(&fx.server, Pow::Skip, &mut schedule).unwrap();
+        assert_eq!(counter.flushes(), n);
+    }
+}
+
+/// The thread mines on its clock: at a 100 ms median (the floor), a second
+/// of running yields several blocks, and stopping ends it.
+#[test]
+fn a_timed_miner_mines_blocks_on_its_own() {
+    let fx = fixture_without_pow(20, 10, Arc::new(MemoryTrieStore::new()));
+    let miner = TimedMiner::new(
+        fx.server.clone(),
+        std::time::Duration::from_millis(100),
+        Pow::Skip,
+    );
+    assert!(!miner.is_running());
+    miner.start();
+    miner.start(); // idempotent: one thread, not two
+    assert!(miner.is_running());
+    std::thread::sleep(std::time::Duration::from_millis(1_500));
+    miner.stop();
+    assert!(!miner.is_running());
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    let mined = miner.mined();
+    assert!(mined >= 3, "only {mined} blocks in 1.5 s at a 100 ms median");
+    let head = fx.store.header(fx.store.head().unwrap().unwrap()).unwrap().unwrap();
+    assert_eq!(head.number, 20 + mined);
+    let after = miner.mined();
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    assert_eq!(miner.mined(), after, "still mining after stop");
+}
+
+/// A header whose recomputed hash is not the hash it is stored under: what a
+/// genesis built from an rskj JSON file looks like once decoded from the
+/// store (rskj hashes the file's difficulty bytes as written). The template
+/// must name the parent by the stored hash, or the first block names a
+/// parent no other node knows.
+#[test]
+fn the_template_names_its_parent_by_the_stored_hash() {
+    let fx = fixture_without_pow(20, 1, Arc::new(MemoryTrieStore::new()));
+    let stored_under = B256::repeat_byte(0x66);
+    let mut odd = header_at(21, fx.parent.hash(), fx.parent.state_root);
+    odd.difficulty = U256::from(1u64 << 28);
+    assert_ne!(odd.hash(), stored_under);
+    fx.store.put_header_with_hash(stored_under, &odd).unwrap();
+    fx.store.put_canonical_hash(21, stored_under).unwrap();
+    fx.store.put_total_difficulty(stored_under, U256::from(22)).unwrap();
+    fx.store.set_head(stored_under).unwrap();
+    fx.store.set_exec_head(stored_under, fx.parent.state_root).unwrap();
+
+    let work = fx.server.build_work().unwrap();
+    assert_eq!(work.parent_block_hash, stored_under);
+
+    let mut schedule = TimedSchedule::new(std::time::Duration::from_secs(10));
+    let info = timed::mine_block(&fx.server, Pow::Skip, &mut schedule).unwrap();
+    assert_eq!(info.block_imported_result, ImportResult::ImportedBest);
+    let mined = fx.store.header(info.block_hash).unwrap().unwrap();
+    assert_eq!(mined.parent_hash, stored_under);
+    assert_eq!(mined.number, 22);
+}
+
+// ── the breakdown line on the mined path ──────────────────────────────
+
+/// The keys of the import path's line, in order: the mined path must write
+/// the same set so one analyzer reads both.
+const BREAKDOWN_KEYS: [&str; 13] = [
+    "block", "hash", "totalMs", "preambleMs", "initialValidationMs", "executeMs", "trieSaveMs",
+    "postExecuteValidationMs", "switchChainMs", "saveReceiptsMs", "onBestBlockMs",
+    "txCount", "gasUsed",
+];
+
+fn breakdown_fixture() -> (MiningFixture, Arc<std::sync::Mutex<Vec<String>>>) {
+    let lines = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = lines.clone();
+    let mut fx = fixture_without_pow(20, 2, Arc::new(MemoryTrieStore::new()));
+    let server = Arc::try_unwrap(std::mem::replace(
+        &mut fx.server,
+        Arc::new(MinerServer::new(
+            BlockTemplateBuilder::new(
+                Arc::new(BlockProcessor::new(RskHardforkConfig::all_active(33), fx.store.clone())),
+                fx.trie_store.clone(),
+                fx.chain_config.clone(),
+                RskHardforkConfig::all_active(33),
+                MiningConfig::default(),
+            ),
+            Arc::new(StoreChainAccess::new(fx.store.clone(), fx.trie_store.clone(), None)),
+            Arc::new(NoPendingTransactions),
+            fx.chain_config.clone(),
+        )),
+    ))
+    .unwrap_or_else(|_| panic!("the fixture's server is not shared"));
+    fx.server = Arc::new(server.with_breakdown_log(Arc::new(move |line: &str| {
+        sink.lock().unwrap().push(line.to_string());
+    })));
+    (fx, lines)
+}
+
+/// One line per block connected as best, with the import path's keys in
+/// the import path's order, and a total that bounds its phases.
+#[test]
+fn a_mined_block_writes_the_breakdown_line() {
+    let (fx, lines) = breakdown_fixture();
+    let mut schedule = TimedSchedule::new(std::time::Duration::from_secs(10));
+    let mut hashes = Vec::new();
+    for _ in 0..3 {
+        let info = timed::mine_block(&fx.server, Pow::Skip, &mut schedule).unwrap();
+        assert_eq!(info.block_imported_result, ImportResult::ImportedBest);
+        hashes.push(info.block_hash);
+    }
+
+    let lines = lines.lock().unwrap().clone();
+    assert_eq!(lines.len(), 3, "{lines:?}");
+    for (i, line) in lines.iter().enumerate() {
+        let prefix = format!(
+            "block connect breakdown best: block={} hash={} totalMs=",
+            21 + i,
+            alloy_primitives::hex::encode(hashes[i])
+        );
+        assert!(line.starts_with(&prefix), "{line}");
+        let pairs: Vec<(&str, &str)> = line["block connect breakdown best: ".len()..]
+            .split(' ')
+            .map(|kv| kv.split_once('=').unwrap())
+            .collect();
+        let keys: Vec<&str> = pairs.iter().map(|(k, _)| *k).collect();
+        assert_eq!(keys, BREAKDOWN_KEYS, "{line}");
+        let ms = |key: &str| -> f64 {
+            pairs.iter().find(|(k, _)| *k == key).unwrap().1.parse().unwrap()
+        };
+        let phases = ["preambleMs", "initialValidationMs", "executeMs",
+            "postExecuteValidationMs", "switchChainMs", "saveReceiptsMs", "onBestBlockMs"];
+        let sum: f64 = phases.iter().map(|k| ms(k)).sum();
+        assert!(ms("totalMs") >= sum - 0.001, "total {} < phases {sum}: {line}", ms("totalMs"));
+        assert!(ms("totalMs") > 0.0, "{line}");
+        assert!(ms("executeMs") > 0.0, "{line}");
+        // trieSaveMs is the part of executeMs spent in TrieNode::save.
+        assert!(ms("trieSaveMs") <= ms("executeMs"), "{line}");
+        // Only REMASC: the template has no pending transactions to pick.
+        assert_eq!(ms("txCount"), 1.0, "{line}");
+    }
+    // flush_every is 1 on this fixture's chain access, so every block pays
+    // the flush inside onBestBlockMs; a memory store makes it near zero but
+    // the phase is still there.
+}
+
+/// Without a sink nothing is written, and the block is still mined.
+#[test]
+fn without_a_breakdown_sink_nothing_is_written_and_mining_is_unchanged() {
+    let fx = fixture_without_pow(20, 1, Arc::new(MemoryTrieStore::new()));
+    let mut schedule = TimedSchedule::new(std::time::Duration::from_secs(10));
+    let info = timed::mine_block(&fx.server, Pow::Skip, &mut schedule).unwrap();
+    assert_eq!(info.block_imported_result, ImportResult::ImportedBest);
+    assert_eq!(info.block_included_height, 21);
+}
+
+/// A block's contribution to the total difficulty counts its uncles, as
+/// rskj's `getCumulativeDifficulty` does; the stored totals, and so an
+/// export, go wrong at the first block with one otherwise.
+#[test]
+fn cumulative_difficulty_counts_the_uncles() {
+    let parent = B256::repeat_byte(0x01);
+    let mut header = header_at(5, parent, B256::ZERO);
+    header.difficulty = U256::from(1_000);
+    let mut uncle_a = header_at(4, parent, B256::ZERO);
+    uncle_a.difficulty = U256::from(300);
+    let mut uncle_b = header_at(4, parent, B256::ZERO);
+    uncle_b.difficulty = U256::from(20);
+    let block = rustock_core::Block {
+        header: header.clone(),
+        transactions: Vec::new(),
+        ommers: vec![uncle_a, uncle_b],
+    };
+    assert_eq!(cumulative_difficulty(&block), U256::from(1_320));
+    let alone = rustock_core::Block { header, transactions: Vec::new(), ommers: Vec::new() };
+    assert_eq!(cumulative_difficulty(&alone), U256::from(1_000));
 }

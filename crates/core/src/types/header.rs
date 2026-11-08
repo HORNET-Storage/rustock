@@ -301,7 +301,22 @@ impl Encodable for Header {
 }
 
 impl alloy_rlp::Decodable for Header {
+    /// Decodes under the process-wide activation heights
+    /// ([`ActivationHeights::current`](crate::config::ActivationHeights::current)).
     fn decode(buf: &mut &[u8]) -> alloy_rlp::Result<Self> {
+        Self::decode_with_activations(buf, crate::config::ActivationHeights::current())
+    }
+}
+
+impl Header {
+    /// Decode a header under explicit activation heights. Only RSKIP-144's
+    /// height is consulted: it decides what a lone item after a V2 version
+    /// byte is (see below).
+    pub fn decode_with_activations(
+        buf: &mut &[u8],
+        activations: &crate::config::ActivationHeights,
+    ) -> alloy_rlp::Result<Self> {
+        use alloy_rlp::Decodable;
         let h = alloy_rlp::Header::decode(buf)?;
         if !h.list { return Err(alloy_rlp::Error::UnexpectedString); }
         let mut body = &buf[..h.payload_length];
@@ -407,11 +422,21 @@ impl alloy_rlp::Decodable for Header {
             // for it and hashes the header wrong.
             let mut edges = None;
             let mut base_event = None;
-            if extras >= 1 {
-                edges = Some(rlp_to_shorts(&Bytes::decode(&mut body)?));
-            }
-            if version >= 2 && extras >= 2 {
+            //
+            // Where RSKIP-144 is not active there are no edges, and a V2
+            // header's one trailing item is its base event (rskj's regtest:
+            // rskip144 = -1, rskip535 = 1). rskj tells the cases apart by
+            // activation, and so does this.
+            let rskip144 = activations.rskip144.is_some_and(|h| header.number >= h);
+            if version >= 2 && extras == 1 && !rskip144 {
                 base_event = Some(Bytes::decode(&mut body)?);
+            } else {
+                if extras >= 1 {
+                    edges = Some(rlp_to_shorts(&Bytes::decode(&mut body)?));
+                }
+                if version >= 2 && extras >= 2 {
+                    base_event = Some(Bytes::decode(&mut body)?);
+                }
             }
             header.version_fields = Some(HeaderVersionFields { version, edges, base_event });
         }
@@ -1106,7 +1131,9 @@ mod versioned_wire_header_tests {
     fn decode(hex: &str) -> Header {
         let bytes = alloy_primitives::hex::decode(hex).unwrap();
         let mut slice = bytes.as_slice();
-        let mut h = Header::decode(&mut slice).unwrap();
+        // Testnet headers, so testnet's RSKIP-144 height.
+        let testnet = crate::config::ActivationHeights::testnet();
+        let mut h = Header::decode_with_activations(&mut slice, &testnet).unwrap();
         // The decoder caches the hash of the bytes it was handed; clearing it
         // forces `hash()` to re-derive, which is the thing under test.
         h.cached_hash = None;
@@ -1217,6 +1244,46 @@ mod versioned_wire_header_tests {
         "d50308ca8a1200741eb600000000",
     );
 
+    /// Block 1 of a chain rskj's regtest mined (regtest.conf: rskip144 = -1,
+    /// rskip351 = 1, rskip535 = 1), in rskj's full encoding as `ExportBlocks`
+    /// writes it. Its one trailing item after the version byte is an empty
+    /// base event, not edges: there are no edges without RSKIP-144.
+    const RSKJ_REGTEST_V2_FULL: &str = concat!(
+        "f902b1a0227d8e8d835f5e7290e333f4177e551ef1222dde4704f677ba4a120051c31cc2a01dcc4de8dec75d7aab85b5",
+        "67b6ccd41ad312451b948a7413f0a142fd40d4934794916d3652976d82540412b561bf674f72cf5174f7a095f20004ac",
+        "91b058db01cac465f2bee87bae91843d454d578422a0346296b349a05c993f19d5d0ce9a0575e4913550d1587be7adbd",
+        "4343d82641f000cd48fa36dfa09cc84f42988b259d422bf9d9689c5d19440453c1f5ec60b7c97b85e88bf6ad58b90100",
+        "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+        "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+        "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+        "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+        "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+        "00000000000000000000000000000000840ffe00000184017d7840830393b8846ad918ef95d40192534e415053484f54",
+        "2d333932616535353036800080800280b850711101000000000000000000000000000000000000000000000000000000",
+        "0000000000006e8e9b9f5085479cb2c000d55a1fef80a1113178f6fa983d2b71fb8c02ab5e3efd18d96affff7f210000",
+        "000080b86f00000000000001007d81c84537d4c647fe4c852f3013ebc7ecd9bb197b87be6c2e5fb1f26af9ffd7e2d050",
+        "014ad8faf650ba1fdf18e8fd47e9e7034abdd27633792952534b424c4f434b3a766b7c6c7a3ba90d710c30e44d81ccd2",
+        "a0fab6e1939acd3e8cd8feda1568dc8600000000",
+    );
+
+    #[test]
+    fn a_v2_header_without_rskip144_carries_a_base_event_not_edges() {
+        let bytes = alloy_primitives::hex::decode(RSKJ_REGTEST_V2_FULL).unwrap();
+        let regtest = crate::config::ActivationHeights::regtest();
+        let h = Header::decode_with_activations(&mut bytes.as_slice(), &regtest).unwrap();
+        let v = h.version_fields.as_ref().unwrap();
+        assert_eq!(v.version, 2);
+        assert_eq!(v.edges, None, "no RSKIP-144, no edges");
+        assert_eq!(v.base_event.as_ref().map(|b| b.len()), Some(0));
+        // Its hash (rskj's 0x5cfa0726...) depends on RSKIP-92 being active,
+        // which `hash()` reads from the process-wide heights; the import test
+        // in rustock-cli checks it under regtest's.
+        // And the full encoding round-trips.
+        let mut again = Vec::new();
+        h.encode(&mut again);
+        assert_eq!(again, bytes);
+    }
+
     #[test]
     fn a_v2_header_without_a_base_event_element_still_hashes_right() {
         let h = decode(V2_SHORT_WIRE);
@@ -1241,6 +1308,38 @@ mod versioned_wire_header_tests {
         let mut buf = Vec::new();
         original.encode(&mut buf);
         assert_eq!(alloy_primitives::hex::encode(&buf), V2_SHORT_WIRE);
+    }
+
+    /// The schedule perf-lab's mainnet seed runs under puts RSKIP-144 at
+    /// #9,002,504. Above it, a V2 header with one trailing item carries
+    /// edges (rskj in the base-event recovery window); under mainnet's own
+    /// schedule the same bytes carry a base event. The override reaches the
+    /// decoder through `rskip144`, the way regtest's does.
+    #[test]
+    fn a_reed810_override_turns_a_lone_trailing_item_into_edges() {
+        let mut h = decode(V2_SHORT_WIRE);
+        h.number = 9_003_580;
+        h.cached_hash = None;
+        let v = h.version_fields.as_mut().unwrap();
+        assert_eq!((v.version, v.base_event.as_ref()), (2, None));
+        v.edges = Some(vec![]);
+        let mut buf = Vec::new();
+        h.encode(&mut buf);
+
+        let mut seed = crate::config::ActivationHeights::mainnet();
+        seed.set_rskj_hardfork("reed810", Some(9_002_504));
+        assert_eq!(seed.rskip144, Some(9_002_504));
+        let under_seed = Header::decode_with_activations(&mut buf.as_slice(), &seed).unwrap();
+        let v = under_seed.version_fields.as_ref().unwrap();
+        assert_eq!(v.edges.as_deref(), Some(&[][..]));
+        assert_eq!(v.base_event, None);
+
+        let mainnet = crate::config::ActivationHeights::mainnet();
+        assert_eq!(mainnet.rskip144, None);
+        let under_mainnet = Header::decode_with_activations(&mut buf.as_slice(), &mainnet).unwrap();
+        let v = under_mainnet.version_fields.as_ref().unwrap();
+        assert_eq!(v.edges, None);
+        assert_eq!(v.base_event.as_ref().map(|b| b.len()), Some(0));
     }
 
     /// A version-0 header must stay untouched by any of this: mainnet is
