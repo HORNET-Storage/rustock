@@ -6055,6 +6055,121 @@ fn assert_hangs_from(nodes: &Value, state_root: B256, trie_store: &dyn rustock_t
     }
 }
 
+/// What a light client makes of one slot's nodes, with nothing else in hand
+/// but the state root of a header it trusts: the nodes, each filed under its
+/// own hash, must start at that root and walk along the slot's key to its
+/// value, or to where the key leaves the trie. A node the answer leaves out
+/// fails the walk rather than reading as "not there".
+fn read_slot_as_a_light_client(
+    nodes: &Value,
+    state_root: B256,
+    key: &[u8],
+) -> Result<Option<Vec<u8>>, String> {
+    use rustock_trie::{MemoryTrieStore, TrieKeySlice, TrieNode, TrieStore};
+
+    let nodes: Vec<Vec<u8>> = nodes
+        .as_array()
+        .ok_or("no nodes")?
+        .iter()
+        .map(|n| {
+            hex::decode(n.as_str().unwrap_or_default().trim_start_matches("0x"))
+                .map_err(|e| e.to_string())
+        })
+        .collect::<Result<_, _>>()?;
+    let root = nodes.last().ok_or("no nodes")?;
+    if alloy_primitives::keccak256(root) != state_root {
+        return Err("the top node is not the header's state root".into());
+    }
+    let proof = MemoryTrieStore::new();
+    for node in &nodes {
+        TrieStore::put(&proof, alloy_primitives::keccak256(node).as_slice(), node);
+    }
+    let root = TrieNode::try_from_message(root, &proof).ok_or("the root does not parse")?;
+    root.try_get(&TrieKeySlice::from_key(key), &proof)
+        .map_err(|missing| format!("the answer leaves out node {missing:#x}"))
+}
+
+/// **A contract's current storage, read as a light client reads it.** The
+/// client trusts a block's hash and nothing the node says: it decodes the raw
+/// header the node sends, checks that it hashes to that block, takes the
+/// state root from it, and reads each slot from `rsk_getStorageNodes`'s nodes
+/// alone. The storage changes in the next block -- a slot rewritten, one
+/// cleared, one written for the first time -- and each block's answer proves
+/// that block's values. An answer missing a node proves nothing, and the
+/// earlier block's answer does not pass against the later block's root.
+#[tokio::test]
+async fn a_light_client_reads_a_contracts_storage_from_the_answer_alone() {
+    use rustock_trie::{storage_key, TrieKeySlice, TrieNode, TrieStore};
+
+    let (state, _tmp, addr, root_42) = setup_proof_state();
+    let trie_store = state.trie_store.clone().unwrap();
+    let key = |slot: u8| storage_key(&addr, &B256::with_last_byte(slot));
+    let hash_42 = state.store.head().unwrap().unwrap();
+
+    // Block 43: slot 1 rewritten (42 -> 43), slot 2 cleared, slot 3 written.
+    let at_42 = trie_store.get(root_42.as_slice()).unwrap();
+    let mut root = TrieNode::from_message(&at_42, &*trie_store)
+        .put(&TrieKeySlice::from_key(&key(1)), &[43], &*trie_store)
+        .delete(&TrieKeySlice::from_key(&key(2)), &*trie_store)
+        .put(&TrieKeySlice::from_key(&key(3)), &[7], &*trie_store);
+    root.save(&*trie_store, true);
+    let root_43 = root.compute_hash(&*trie_store);
+    TrieStore::put(&*trie_store, root_43.as_slice(), &root.to_message(&*trie_store));
+    let header = Header { parent_hash: hash_42, state_root: root_43, ..test_header(43) };
+    let hash_43 = header.hash();
+    state.store.put_header(&header).unwrap();
+    state.store.put_canonical_hash(43, hash_43).unwrap();
+    state.store.set_head(hash_43).unwrap();
+
+    let mut answers = Vec::new();
+    for (block, trusted, want) in [
+        ("0x2a", hash_42, [Some(42u8), Some(99), None]),
+        ("0x2b", hash_43, [Some(43), None, Some(7)]),
+    ] {
+        let raw = dispatch_for_test(&state, make_request("rsk_getRawBlockHeaderByNumber", json!([block])))
+            .await
+            .result
+            .unwrap();
+        let raw = hex::decode(raw.as_str().unwrap().trim_start_matches("0x")).unwrap();
+        let header = Header::decode_with_hash(&mut raw.as_slice()).unwrap();
+        assert_eq!(header.hash(), trusted, "block {block}: the header is the trusted block's");
+
+        let req = make_request(
+            "rsk_getStorageNodes",
+            json!([format!("{addr:#x}"), ["0x1", "0x2", "0x3"], block]),
+        );
+        let r = dispatch_for_test(&state, req).await.result.unwrap();
+        for (i, want) in want.iter().enumerate() {
+            let slot = i as u8 + 1;
+            assert_eq!(
+                read_slot_as_a_light_client(&r["storage"][i]["nodes"], header.state_root, &key(slot)),
+                Ok(want.map(|v| vec![v])),
+                "block {block}, slot {slot}"
+            );
+        }
+        answers.push((header.state_root, r));
+    }
+
+    let (root_43, now) = &answers[1];
+    // The node under the root: an interior node, so the root holds its hash
+    // rather than the node itself, as a small leaf's parent may.
+    let mut short = now["storage"][0]["nodes"].clone();
+    let nodes = short.as_array_mut().unwrap();
+    nodes.remove(nodes.len() - 2);
+    let missing = read_slot_as_a_light_client(&short, *root_43, &key(1));
+    assert!(
+        matches!(&missing, Err(why) if why.starts_with("the answer leaves out node")),
+        "an answer missing a node on the slot's path proves nothing, not absence: {missing:?}"
+    );
+    let before = &answers[0].1;
+    let stale = read_slot_as_a_light_client(&before["storage"][0]["nodes"], *root_43, &key(1));
+    assert_eq!(
+        stale,
+        Err("the top node is not the header's state root".to_string()),
+        "block 42's answer is not block 43's state"
+    );
+}
+
 /// A slot the state holds: present, its value, and its path.
 #[tokio::test]
 async fn storage_nodes_prove_a_slot_that_is_there() {
