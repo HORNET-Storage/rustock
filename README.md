@@ -146,15 +146,14 @@ independent cross-check.
 
 ### A regtest chain rskj runs
 
-rustock's regtest is its own chain: its own genesis, no Bridge federation, and
-gas limits of its own. To run the chain an rskj regtest node runs, so that
-blocks rskj mined connect here, start from rskj's genesis file and its rules:
+rustock's regtest is its own chain: its own genesis and no Bridge federation.
+To run the chain an rskj regtest node runs, so that blocks rskj mined connect
+here, start from rskj's genesis file and its rules:
 
 ```bash
 rustock --network-id 33 \
   --genesis genesis.json \
   --consensus-rule rskip97=0 \
-  --min-gas-limit 3000000 --max-gas-limit 18446744073709551615 \
   --skip-pow-validation
 ```
 

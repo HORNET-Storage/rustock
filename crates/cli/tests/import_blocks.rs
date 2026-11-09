@@ -27,12 +27,7 @@ fn import_command(blocks: &Path, dir: &Path) -> Command {
         .arg("--genesis")
         .arg(Path::new(DATA).join("rskj-regtest-genesis.json"))
         .args(["--skip-pow-validation", "--consensus-rule", "rskip97=0"])
-        .args([
-            "--min-gas-limit",
-            "3000000",
-            "--max-gas-limit",
-            "18446744073709551615",
-        ])
+        .args(["--min-gas-limit", "3000000"])
         .arg("--import-blocks")
         .arg(blocks);
     cmd

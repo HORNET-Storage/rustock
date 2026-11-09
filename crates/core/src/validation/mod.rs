@@ -1,6 +1,7 @@
 use crate::types::header::Header;
 use thiserror::Error;
 use alloy_primitives::{B256, U256};
+use num_bigint::BigUint;
 
 #[derive(Error, Debug, PartialEq, Eq)]
 pub enum ValidationError {
@@ -23,14 +24,12 @@ pub enum ValidationError {
     #[error("Gas used {used} exceeds gas limit {limit}")]
     GasUsedExceedsLimit { used: u64, limit: i64 },
 
-    #[error("Gas limit overflows u64")]
-    GasLimitOverflow,
+    #[error("Gas limit {got} is below the minimum {min}")]
+    GasLimitBelowMinimum { min: u64, got: BigUint },
 
-    #[error("Gas limit {got} out of bounds: [{min}, {max}]")]
-    GasLimitOutOfBounds { min: u64, max: u64, got: u64 },
-
+    /// Both read whole, as rskj's BigIntegers.
     #[error("Gas limit {got} is invalid compared to parent {parent}")]
-    GasLimitInvalid { parent: U256, got: U256 },
+    GasLimitInvalid { parent: BigUint, got: BigUint },
 
     #[error("Difficulty mismatch: expected {expected}, got {got}")]
     DifficultyMismatch { expected: U256, got: U256 },
@@ -227,9 +226,8 @@ impl HeaderVerifier {
             // First, as rskj reads a header with these fields or not at all.
             .with_static_rule(HeaderLayoutRule { config: config.clone() })
             .with_static_rule(GasUsedRule)
-            .with_static_rule(GasLimitBoundsRule { 
-                min_gas_limit: config.min_gas_limit, 
-                max_gas_limit: config.max_gas_limit 
+            .with_static_rule(GasLimitRule {
+                min_gas_limit: config.min_gas_limit,
             })
             .with_static_rule(MergedMiningRule { config: config.clone() })
             .with_static_rule(BitcoinTimestampRule { config: config.clone() })
@@ -339,7 +337,7 @@ pub mod header_rules;
 pub mod difficulty;
 pub mod merged_mining;
 
-pub use header_rules::{BlockNumberRule, ParentHashRule, TimestampRule, GasUsedRule, GasLimitBoundsRule, BlockParentGasLimitRule, HeaderLayoutRule};
+pub use header_rules::{BlockNumberRule, ParentHashRule, TimestampRule, GasUsedRule, GasLimitRule, BlockParentGasLimitRule, HeaderLayoutRule};
 pub use difficulty::DifficultyRule;
 pub use merged_mining::{BitcoinTimestampRule, MergedMiningRule};
 pub use block_rules::{

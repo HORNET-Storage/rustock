@@ -1319,10 +1319,6 @@ struct Args {
     #[arg(long, value_name = "GAS")]
     min_gas_limit: Option<u64>,
 
-    /// Regtest: largest gas limit a header may declare (rskj has none).
-    #[arg(long, value_name = "GAS")]
-    max_gas_limit: Option<u64>,
-
     /// Regtest: schedule an rskj network upgrade, as `name=height` (`-1`
     /// takes it off the ladder), like rskj's
     /// `blockchain.config.hardforkActivationHeights`. Repeatable. Names are
@@ -1334,8 +1330,8 @@ struct Args {
     #[arg(long, value_name = "NAME=HEIGHT")]
     hardfork: Vec<String>,
 
-    /// Take --hardfork, --consensus-rule, --skip-pow-validation and the
-    /// gas-limit bounds on mainnet and testnet too, for replaying blocks
+    /// Take --hardfork, --consensus-rule, --skip-pow-validation and
+    /// --min-gas-limit on mainnet and testnet too, for replaying blocks
     /// mined on a copy of the chain under rules it has not activated. Never
     /// for a node that follows the real network. --genesis stays refused:
     /// a genesis file would make this another chain.
@@ -1400,7 +1396,6 @@ fn apply_file_config(
     });
     apply(matches, "consensus_rule", rules.as_ref(), &mut a.consensus_rule);
     apply_opt(matches, "min_gas_limit", f.chain.min_gas_limit.as_ref(), &mut a.min_gas_limit);
-    apply_opt(matches, "max_gas_limit", f.chain.max_gas_limit.as_ref(), &mut a.max_gas_limit);
     let hardforks = f.chain.hardforks.as_ref().map(|r| {
         r.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>()
     });
@@ -3856,7 +3851,7 @@ fn run_export_blocks(
 }
 
 /// Apply the regtest chain options (`--genesis`, `--skip-pow-validation`,
-/// `--consensus-rule`, `--hardfork`, `--min-gas-limit`, `--max-gas-limit`).
+/// `--consensus-rule`, `--hardfork`, `--min-gas-limit`).
 /// Refused on mainnet and testnet, whose rules are not the operator's to
 /// change, unless `--allow-chain-overrides` says this is a copy of the
 /// chain; `--genesis` is refused there regardless.
@@ -3865,17 +3860,16 @@ fn apply_chain_options(mut config: ChainConfig, args: &Args) -> Result<ChainConf
         || args.skip_pow_validation
         || !args.consensus_rule.is_empty()
         || !args.hardfork.is_empty()
-        || args.min_gas_limit.is_some()
-        || args.max_gas_limit.is_some();
+        || args.min_gas_limit.is_some();
     if !any {
         return Ok(config);
     }
     let real_chain = matches!(config.chain_id, 30 | 31);
     anyhow::ensure!(
         !real_chain || args.allow_chain_overrides,
-        "--genesis, --skip-pow-validation, --consensus-rule, --hardfork and the gas-limit \
-         bounds are regtest options; --allow-chain-overrides takes all but --genesis on \
-         a copy of mainnet or testnet"
+        "--genesis, --skip-pow-validation, --consensus-rule, --hardfork and \
+         --min-gas-limit are regtest options; --allow-chain-overrides takes all but \
+         --genesis on a copy of mainnet or testnet"
     );
     anyhow::ensure!(
         !(real_chain && args.genesis.is_some()),
@@ -3919,9 +3913,6 @@ fn apply_chain_options(mut config: ChainConfig, args: &Args) -> Result<ChainConf
     }
     if let Some(gas) = args.min_gas_limit {
         config.min_gas_limit = gas;
-    }
-    if let Some(gas) = args.max_gas_limit {
-        config.max_gas_limit = gas;
     }
     config.skip_pow_validation = args.skip_pow_validation;
     if let Some(path) = &args.genesis {
@@ -5352,14 +5343,12 @@ mod genesis_tests {
             "--consensus-rule",
             "rskip97=0",
             "--min-gas-limit",
-            "3000000",
-            "--max-gas-limit",
-            "18446744073709551615",
+            "5000000",
         ]);
         let config = apply_chain_options(ChainConfig::regtest(), &args).unwrap();
         assert!(config.skip_pow_validation);
         assert_eq!(config.activation_heights.rskip97, Some(0));
-        assert_eq!((config.min_gas_limit, config.max_gas_limit), (3_000_000, u64::MAX));
+        assert_eq!(config.min_gas_limit, 5_000_000);
 
         let disabled = regtest_args(&["--consensus-rule", "rskip97=-1"]);
         let config = apply_chain_options(ChainConfig::regtest(), &disabled).unwrap();
@@ -5395,7 +5384,7 @@ mod genesis_tests {
         "--consensus-rule", "rskipUMM=2392700", "--consensus-rule", "rskip351=9002504",
         "--consensus-rule", "rskip535=9002504", "--consensus-rule", "rskip536=8804200",
         "--skip-pow-validation",
-        "--min-gas-limit", "3000000", "--max-gas-limit", "18446744073709551615",
+        "--min-gas-limit", "3000000",
     ];
 
     /// Without the opt-in, mainnet is mainnet: every override refused, and a
@@ -5414,7 +5403,7 @@ mod genesis_tests {
         assert_eq!(plain.activation_heights.rskip144, None);
         // 3,000,000 since the rskj parity fix (rskj `Constants.getMinGasLimit`);
         // this asserts mainnet's own defaults, so it tracks them.
-        assert_eq!((plain.min_gas_limit, plain.max_gas_limit), (3_000_000, 1_000_000_000));
+        assert_eq!(plain.min_gas_limit, 3_000_000);
         assert!(!plain.skip_pow_validation);
         assert!(plain.hardfork_overrides.is_empty());
         let (ladder, unmodelled) = hardfork_config(&plain).unwrap();
@@ -5438,7 +5427,7 @@ mod genesis_tests {
         assert_eq!(config.activation_heights.rskip97, Some(729_000));
         assert_eq!(config.activation_heights.papyrus200, 2_392_700);
         assert!(config.skip_pow_validation);
-        assert_eq!((config.min_gas_limit, config.max_gas_limit), (3_000_000, u64::MAX));
+        assert_eq!(config.min_gas_limit, 3_000_000);
         assert!(config.genesis_spec.is_none(), "mainnet's genesis stays");
         let (ladder, unmodelled) = hardfork_config(&config).unwrap();
         assert_eq!(unmodelled, vec!["orchid060".to_string(), "tbd1000".to_string()]);

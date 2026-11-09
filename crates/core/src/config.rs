@@ -195,7 +195,6 @@ pub struct ChainConfig {
     /// rskj `Constants.getMinGasLimit()`: 3,000,000 on every network
     /// (`GasLimitRule`). Every rskj genesis declares more.
     pub min_gas_limit: u64,
-    pub max_gas_limit: u64,
     /// The gas the sequential sublist is guaranteed under RSKIP-144
     /// (rskj `Constants.getMinSequentialSetGasLimit`). Absent from the
     /// RSKIP, which says every sublist gets `block gas limit / (N + 1)`;
@@ -235,7 +234,6 @@ impl ChainConfig {
             max_future_block_time: 60,
             gas_limit_bound_divisor: 1024,
             min_gas_limit: 3_000_000,
-            max_gas_limit: 1_000_000_000,
             min_sequential_set_gas_limit: 10_000_000,
             activation_heights: ActivationHeights::mainnet(),
             genesis_spec: None,
@@ -256,7 +254,6 @@ impl ChainConfig {
             max_future_block_time: 540,
             gas_limit_bound_divisor: 1024,
             min_gas_limit: 3_000_000,
-            max_gas_limit: 1_000_000_000,
             min_sequential_set_gas_limit: 10_000_000,
             activation_heights: ActivationHeights::testnet(),
             genesis_spec: None,
@@ -277,7 +274,6 @@ impl ChainConfig {
             max_future_block_time: 0,
             gas_limit_bound_divisor: 1024,
             min_gas_limit: 3_000_000,
-            max_gas_limit: 10_000_000,
             min_sequential_set_gas_limit: 6_800_000,
             activation_heights: ActivationHeights::regtest(),
             genesis_spec: None,

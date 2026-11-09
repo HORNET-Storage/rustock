@@ -65,8 +65,8 @@ pub struct FileConfig {
 }
 
 /// Regtest chain settings, for a chain that has to match one an rskj node
-/// runs: its genesis file, its consensus-rule overrides, its gas-limit
-/// bounds, and whether proof of work is checked.
+/// runs: its genesis file, its consensus-rule overrides, its minimum gas
+/// limit, and whether proof of work is checked.
 #[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChainSection {
@@ -78,7 +78,6 @@ pub struct ChainSection {
     /// (-1 disables).
     pub consensus_rules: Option<std::collections::BTreeMap<String, i64>>,
     pub min_gas_limit: Option<u64>,
-    pub max_gas_limit: Option<u64>,
     /// rskj `blockchain.config.hardforkActivationHeights`, as `name = height`
     /// (-1 takes the upgrade off the ladder).
     pub hardforks: Option<std::collections::BTreeMap<String, i64>>,
@@ -515,7 +514,6 @@ pub const CONFIGURABLE: &[&str] = &[
     "skip_pow_validation",
     "consensus_rule",
     "min_gas_limit",
-    "max_gas_limit",
 ];
 
 #[cfg(test)]

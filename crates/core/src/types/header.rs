@@ -1,5 +1,6 @@
 use alloy_primitives::{Address, Bloom, B256, U256, Bytes};
 use alloy_rlp::Encodable;
+use num_bigint::BigUint;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 
@@ -237,6 +238,21 @@ fn low_long(bytes: &[u8]) -> i64 {
     let mut word = [0u8; 8];
     word[8 - low.len()..].copy_from_slice(low);
     i64::from_be_bytes(word)
+}
+
+/// A gas limit's bytes as the typed field holds them: the value, or
+/// `U256::MAX` past 256 bits, with the bytes themselves where they aren't how
+/// rskj's miner writes that value (`KeptFields::gas_limit`).
+fn read_gas_limit(bytes: &[u8]) -> (U256, Option<Bytes>) {
+    let value = significant(Some(bytes));
+    let gas_limit = if value.len() > 32 {
+        U256::MAX
+    } else {
+        U256::from_be_slice(value)
+    };
+    let kept = (value.len() > 32 || bytes != java_signed_bytes(&gas_limit).as_slice())
+        .then(|| Bytes::copy_from_slice(bytes));
+    (gas_limit, kept)
 }
 
 impl Header {
@@ -605,15 +621,8 @@ impl Header {
         // `GasLimitRule` and an uncle's `ValidGasUsedRule`, for two.
         let gas_limit = {
             let bytes = field(9)?.ok_or(refused("no gas limit"))?;
-            let value = significant(Some(bytes));
-            let gas_limit = if value.len() > 32 {
-                U256::MAX
-            } else {
-                U256::from_be_slice(value)
-            };
-            if value.len() > 32 || bytes != java_signed_bytes(&gas_limit).as_slice() {
-                kept.gas_limit = Some(Bytes::copy_from_slice(bytes));
-            }
+            let (gas_limit, bytes) = read_gas_limit(bytes);
+            kept.gas_limit = bytes;
             gas_limit
         };
         let gas_used = java_long(field(10)?)?;
@@ -812,7 +821,7 @@ impl Header {
     /// differently: the BlockHeader contract returns them, `GasCost.toGas`
     /// and `ValidGasUsedRule` read them as below, a program's invocation
     /// can't hold more than 32 (`DataWord.valueOf`), and the rules that
-    /// compare it with the parent's read the whole value.
+    /// bound it read the whole value.
     pub fn gas_limit_bytes(&self) -> Cow<'_, [u8]> {
         match self.kept().and_then(|kept| kept.gas_limit.as_ref()) {
             Some(bytes) => Cow::Borrowed(bytes),
@@ -837,6 +846,30 @@ impl Header {
     /// two's-complement `long`.
     pub fn gas_limit_low_long(&self) -> i64 {
         low_long(&self.gas_limit_bytes())
+    }
+
+    /// The gas limit's whole value, `new BigInteger(1, getGasLimit())`, as
+    /// rskj's `GasLimitRule` and `BlockParentGasLimitRule` read it: of any
+    /// size, and whatever leading zeros its bytes have.
+    pub fn gas_limit_value(&self) -> BigUint {
+        BigUint::from_bytes_be(&self.gas_limit_bytes())
+    }
+
+    /// Sets the gas limit as rskj's miner writes it, `toByteArray()`: the
+    /// fewest bytes, with a sign byte where the top bit is set. Past 256
+    /// bits, which the typed field can't hold, the bytes are kept.
+    pub fn set_gas_limit(&mut self, value: &BigUint) {
+        let mut bytes = value.to_bytes_be();
+        if bytes[0] & 0x80 != 0 {
+            bytes.insert(0, 0);
+        }
+        let (gas_limit, written) = read_gas_limit(&bytes);
+        self.gas_limit = gas_limit;
+        let mut kept = self.kept.take().map(|kept| *kept).unwrap_or_default();
+        kept.gas_limit = written;
+        self.kept = (kept != KeptFields::default()).then(|| Box::new(kept));
+        self.cached_hash = None;
+        self.cached_hash_for_merged_mining = None;
     }
 
     /// Whether this header's uncles hash is `hash`. rskj compares the bytes
@@ -1245,32 +1278,93 @@ mod tests {
 
     /// Each of rskj's readers reads the gas limit's bytes its own way:
     /// `GasCost.toGas` takes more than eight as `Long.MAX_VALUE` and throws
-    /// on eight with the top bit set, and `ValidGasUsedRule` keeps the low
-    /// 64 bits as a `long`.
+    /// on eight with the top bit set, `ValidGasUsedRule` keeps the low 64
+    /// bits as a `long`, and the rules that bound it read the whole value.
     #[test]
     fn the_gas_limit_reads_as_each_of_rskjs_readers_reads_it() {
         const LONG_MAX: u64 = i64::MAX as u64;
+        let two = BigUint::from(2u8);
+        let ten_million = BigUint::from(10_000_000u32);
         let past = [&[1][..], &[0; 31], &[1]].concat();
-        for (bytes, gas, long) in [
+        for (bytes, gas, long, value) in [
             // As rskj's miner writes 10,000,000.
-            (&[0x00, 0x98, 0x96, 0x80][..], Some(10_000_000), 10_000_000),
+            (
+                &[0x00, 0x98, 0x96, 0x80][..],
+                Some(10_000_000),
+                10_000_000,
+                ten_million.clone(),
+            ),
             // The same value in nine bytes.
             (
                 &[0, 0, 0, 0, 0, 0, 0x98, 0x96, 0x80],
                 Some(LONG_MAX),
                 10_000_000,
+                ten_million,
             ),
             // 2^63 in eight bytes, and as rskj's miner writes it.
-            (&[0x80, 0, 0, 0, 0, 0, 0, 0], None, i64::MIN),
-            (&[0, 0x80, 0, 0, 0, 0, 0, 0, 0], Some(LONG_MAX), i64::MIN),
+            (&[0x80, 0, 0, 0, 0, 0, 0, 0], None, i64::MIN, two.pow(63)),
+            (
+                &[0, 0x80, 0, 0, 0, 0, 0, 0, 0],
+                Some(LONG_MAX),
+                i64::MIN,
+                two.pow(63),
+            ),
             // Past 256 bits, held only as bytes.
-            (&past, Some(LONG_MAX), 1),
+            (&past, Some(LONG_MAX), 1, two.pow(256) + 1u8),
         ] {
             let header = respelled(9, element(bytes)).1.unwrap();
             assert_eq!(&header.gas_limit_bytes()[..], bytes);
             assert_eq!(header.gas_limit_as_gas(), gas, "{bytes:02x?}");
             assert_eq!(header.gas_limit_low_long(), long, "{bytes:02x?}");
+            assert_eq!(header.gas_limit_value(), value, "{bytes:02x?}");
         }
+    }
+
+    /// rskj's miner writes a gas limit's value with `toByteArray`, and the
+    /// header holds what it wrote: past 256 bits as its bytes, and under
+    /// that in the typed field alone, leaving whatever else was kept.
+    #[test]
+    fn a_gas_limit_is_set_as_rskjs_miner_writes_it() {
+        let two = BigUint::from(2u8);
+        let (mut items, header) = respelled(2, element(&[]));
+        let mut header = header.unwrap();
+        for (value, bytes, typed) in [
+            (
+                two.pow(256) + 5u8,
+                [&[1][..], &[0; 31], &[5]].concat(),
+                U256::MAX,
+            ),
+            (
+                two.pow(255),
+                [&[0, 0x80][..], &[0; 31]].concat(),
+                U256::from(1) << 255,
+            ),
+            (
+                BigUint::from(12_000_000u32),
+                vec![0x00, 0xb7, 0x1b, 0x00],
+                U256::from(12_000_000),
+            ),
+        ] {
+            header.set_gas_limit(&value);
+            assert_eq!(&header.gas_limit_bytes()[..], bytes, "{value}");
+            assert_eq!(header.gas_limit, typed, "{value}");
+            assert_eq!(header.gas_limit_value(), value);
+            assert!(header.kept().unwrap().null_coinbase, "the rest kept stays");
+            items[9] = element(&bytes);
+            let mut written = Vec::new();
+            header.encode(&mut written);
+            assert_eq!(written, list_of(&items));
+            assert_eq!(header.hash(), keccak256(&written), "no stale hash");
+            let read = Header::decode_with_hash(&mut written.as_slice()).unwrap();
+            assert_eq!(read.gas_limit_value(), value);
+        }
+        assert!(header.kept().unwrap().gas_limit.is_none());
+        // With nothing else kept, a gas limit under 256 bits keeps nothing.
+        let mut plain = standard_test_header();
+        plain.set_gas_limit(&two.pow(300));
+        assert!(plain.kept().is_some());
+        plain.set_gas_limit(&BigUint::from(3_000_000u32));
+        assert!(plain.kept().is_none());
     }
 
     /// rskj reads an empty coinbase as its null address, and anything but

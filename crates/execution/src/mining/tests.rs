@@ -36,7 +36,6 @@ fn test_chain_config() -> Arc<ChainConfig> {
         max_future_block_time: 0,
         gas_limit_bound_divisor: 1024,
         min_gas_limit: 1,
-        max_gas_limit: 10_000_000,
         // regtest's, as rskj's own partitioner tests use.
         min_sequential_set_gas_limit: 6_800_000,
         activation_heights: ActivationHeights {
@@ -995,29 +994,59 @@ fn cant_get_mgp_to_be_negative() {
 }
 
 /// rskj `GasLimitCalculator`: one step towards the target, at most a 1024th
-/// of the parent's, which near the top of 256 bits stops there rather than
-/// wrapping round to a gas limit no parent allows.
+/// of the parent's gas limit, read whole: past 256 bits, where the typed
+/// field holds `U256::MAX`, the step is as exact, and with no target the
+/// parent's value is kept.
 #[test]
-fn the_gas_limit_steps_a_1024th_and_stops_at_the_top() {
+fn the_gas_limit_steps_a_1024th_at_any_size() {
     use super::template::next_gas_limit;
-    let parent = |gas_limit: U256| Header {
-        gas_limit,
-        ..header_at(1, B256::ZERO, B256::ZERO)
+    use num_bigint::BigUint;
+    let step_by = |gas_limit: &BigUint, target: Option<U256>, divisor: u64| {
+        let mut parent = header_at(1, B256::ZERO, B256::ZERO);
+        parent.set_gas_limit(gas_limit);
+        next_gas_limit(&parent, target, divisor)
     };
-    let start = U256::from(1_024_000);
+    let step = |gas_limit: &BigUint, target: Option<U256>| step_by(gas_limit, target, 1024);
+    let start = BigUint::from(1_024_000u32);
+    assert_eq!(step(&start, Some(U256::MAX)), BigUint::from(1_025_000u32));
+    assert_eq!(step(&start, Some(U256::ZERO)), BigUint::from(1_023_000u32));
     assert_eq!(
-        next_gas_limit(&parent(start), Some(U256::MAX)),
-        U256::from(1_025_000)
+        step(&start, Some(U256::from(1_024_500))),
+        BigUint::from(1_024_500u32)
     );
+    assert_eq!(step(&start, None), start);
+    // The chain's own divisor: a 2048th steps half as far.
     assert_eq!(
-        next_gas_limit(&parent(start), Some(U256::ZERO)),
-        U256::from(1_023_000)
+        step_by(&start, Some(U256::MAX), 2048),
+        BigUint::from(1_024_500u32)
     );
-    assert_eq!(next_gas_limit(&parent(start), None), start);
-    assert_eq!(
-        next_gas_limit(&parent(U256::MAX - U256::from(1)), Some(U256::MAX)),
-        U256::MAX
-    );
+
+    let two = BigUint::from(2u8);
+    let past = two.pow(300);
+    assert_eq!(step(&past, Some(U256::MAX)), &past - two.pow(290));
+    assert_eq!(step(&past, None), past);
+    // A target no further than the top of 256 bits is as far as it goes.
+    let top = two.pow(256) - 1u8;
+    assert_eq!(step(&(&top - 1u8), Some(U256::MAX)), top);
+}
+
+/// On a parent whose gas limit is past 256 bits, a template keeps the
+/// parent's value, as rskj's miner writes it, which the parent rule takes.
+/// The `U256::MAX` the typed field holds is no gas limit the chain allows
+/// there.
+#[test]
+fn a_template_on_a_gas_limit_past_256_bits_keeps_its_value() {
+    use rustock_core::validation::{BlockParentGasLimitRule, ParentHeaderValidator};
+    let mut fx = fixture(20);
+    let value = num_bigint::BigUint::from(2u8).pow(300);
+    fx.parent.set_gas_limit(&value);
+    let header = fx.build_on(&fx.parent).unwrap().block.header;
+    assert_eq!(header.gas_limit_value(), value);
+    assert_eq!(header.gas_limit, U256::MAX);
+    let rule = BlockParentGasLimitRule {
+        config: fx.chain_config.clone(),
+    };
+    assert_eq!(rule.validate_with_parent(&header, &fx.parent), Ok(()));
 }
 
 /// A coinbase tagged with a hash this node never handed out cannot be matched

@@ -8,6 +8,7 @@
 //! that will later re-execute it on the way in.
 
 use alloy_primitives::{Address, B256, Bloom, Bytes, U256};
+use num_bigint::BigUint;
 use rustock_core::config::ChainConfig;
 use rustock_core::validation::{DifficultyRule, ValidationError};
 use rustock_core::{Block, Header, Transaction, ordered_tx_trie_root};
@@ -206,7 +207,11 @@ impl BlockTemplateBuilder {
         let timestamp = timestamp_for_child(parent.timestamp);
         let difficulty = DifficultyRule { config: self.chain_config.clone() }
             .difficulty_for_child(parent, number, timestamp, ommers.len() as u64);
-        let gas_limit = next_gas_limit(parent, self.mining_config.gas_limit_target);
+        let gas_limit = next_gas_limit(
+            parent,
+            self.mining_config.gas_limit_target,
+            self.chain_config.gas_limit_bound_divisor,
+        );
         let minimum_gas_price =
             next_minimum_gas_price(parent.minimum_gas_price, self.mining_config.min_gas_price_target);
 
@@ -259,7 +264,8 @@ impl BlockTemplateBuilder {
             version_fields: None,
             difficulty,
             number,
-            gas_limit,
+            // Written below, as rskj's miner writes it.
+            gas_limit: U256::ZERO,
             gas_used: 0,
             timestamp,
             extra_data: self.mining_config.extra_data.clone(),
@@ -274,6 +280,7 @@ impl BlockTemplateBuilder {
             cached_hash_for_merged_mining: None,
             kept: None,
         };
+        header.set_gas_limit(&gas_limit);
 
         // The probe: execute the candidates once, in selection order, to
         // learn two things only execution can tell.
@@ -758,21 +765,24 @@ fn timestamp_for_child(parent_timestamp: u64) -> u64 {
     now.max(parent_timestamp + 1)
 }
 
-/// One step towards `target`, bounded by what the parent allows.
+/// One step towards `target`, bounded by what the parent allows: a
+/// `divisor`th of its gas limit, which this reads whole, as the parent rule
+/// does, and of any size.
 ///
 /// The consensus rule is only that a child's gas limit stays within
-/// `parent / 1024` of the parent's, so inheriting it unchanged -- which is
+/// `parent / divisor` of the parent's, so inheriting it unchanged -- which is
 /// what `None` does -- is always valid. rskj `GasLimitCalculator`.
-pub(super) fn next_gas_limit(parent: &Header, target: Option<U256>) -> U256 {
-    let parent_limit = parent.gas_limit;
+pub(super) fn next_gas_limit(parent: &Header, target: Option<U256>, divisor: u64) -> BigUint {
+    let parent_limit = parent.gas_limit_value();
     let Some(target) = target else {
         return parent_limit;
     };
-    let delta = parent_limit / U256::from(1024);
+    let target = BigUint::from_bytes_be(&target.to_be_bytes::<32>());
+    let delta = &parent_limit / divisor;
     if target > parent_limit {
-        target.min(parent_limit.saturating_add(delta))
+        target.min(parent_limit + delta)
     } else {
-        target.max(parent_limit.saturating_sub(delta))
+        target.max(parent_limit - delta)
     }
 }
 

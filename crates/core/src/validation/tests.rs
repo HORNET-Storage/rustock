@@ -7,6 +7,7 @@ use bitcoin::transaction::{Transaction as BtcTransaction, TxOut, TxIn, OutPoint,
 use bitcoin::hashes::Hash;
 use bitcoin::script::PushBytes;
 use bitcoin::ScriptBuf;
+use num_bigint::BigUint;
 use sha2::{Sha256, Digest};
 use std::sync::Arc;
 
@@ -1302,8 +1303,10 @@ fn the_chain_configs_carry_rskj_constants() {
 
 // ── rskj GasLimitRuleTests ────────────────────────────────────────────
 
-fn gas_limit_rule() -> GasLimitBoundsRule {
-    GasLimitBoundsRule { min_gas_limit: 3_000_000, max_gas_limit: u64::MAX }
+fn gas_limit_rule() -> GasLimitRule {
+    GasLimitRule {
+        min_gas_limit: 3_000_000,
+    }
 }
 
 fn with_gas_limit(gas_limit: u64) -> Header {
@@ -1327,10 +1330,25 @@ fn gas_limit_equal_minimum_gas_limit() {
 /// rskj `gasLimitLessThanMinimumGasLimit`.
 #[test]
 fn gas_limit_less_than_minimum_gas_limit() {
-    assert!(matches!(
+    assert_eq!(
         gas_limit_rule().validate(&with_gas_limit(3_000_000 - 1)),
-        Err(ValidationError::GasLimitOutOfBounds { min: 3_000_000, got: 2_999_999, .. })
-    ));
+        Err(ValidationError::GasLimitBelowMinimum {
+            min: 3_000_000,
+            got: BigUint::from(2_999_999u32),
+        })
+    );
+}
+
+/// rskj has no maximum gas limit: `GasLimitRule` holds a block to the
+/// minimum alone, and reads its gas limit whole, of any size.
+#[test]
+fn no_gas_limit_is_too_large() {
+    let two = BigUint::from(2u8);
+    let mut header = with_gas_limit(3_000_000);
+    for value in [BigUint::from(1_000_000_001u32), two.pow(64), two.pow(300)] {
+        header.set_gas_limit(&value);
+        assert_eq!(gas_limit_rule().validate(&header), Ok(()), "{value}");
+    }
 }
 
 // --- rskj's exact parent gas-limit bound, and the rules each uncle must pass
@@ -1357,6 +1375,62 @@ fn the_parent_gas_limit_bounds_are_rskjs_when_the_divisor_leaves_a_remainder() {
     ));
     assert_eq!(rule.validate_with_parent(&with(6_806_640), &parent), Ok(()));
     assert!(rule.validate_with_parent(&with(6_806_641), &parent).is_err());
+}
+
+/// Past 256 bits, where the typed field holds `U256::MAX`, rskj still reads
+/// both gas limits whole, leading zeros and all, and bounds the child's as
+/// it bounds any other.
+#[test]
+fn the_parent_gas_limit_bounds_hold_past_256_bits() {
+    let rule = BlockParentGasLimitRule {
+        config: Arc::new(crate::config::ChainConfig::mainnet()),
+    };
+    let two = BigUint::from(2u8);
+    let with = |parent: &Header, value: &BigUint| {
+        let mut header = create_dummy_header(11, 1010, parent.hash());
+        header.set_gas_limit(value);
+        header
+    };
+
+    // 2^300 + 12,345: a 1,024th of it is 2^290 + 12.06.
+    let mut parent = create_dummy_header(10, 1000, B256::ZERO);
+    let value = two.pow(300) + 12_345u32;
+    parent.set_gas_limit(&value);
+    let lower = two.pow(300) - two.pow(290) + 12_332u32;
+    let upper = two.pow(300) + two.pow(290) + 12_357u32;
+    for ok in [&lower, &value, &upper] {
+        assert_eq!(
+            rule.validate_with_parent(&with(&parent, ok), &parent),
+            Ok(())
+        );
+    }
+    assert_eq!(
+        rule.validate_with_parent(&with(&parent, &(&lower - 1u8)), &parent),
+        Err(ValidationError::GasLimitInvalid {
+            parent: value.clone(),
+            got: &lower - 1u8
+        })
+    );
+    assert!(rule
+        .validate_with_parent(&with(&parent, &(&upper + 1u8)), &parent)
+        .is_err());
+    // The parent's value with ten more leading zeros is the parent's value.
+    let mut padded = with(&parent, &value);
+    let bytes = [&[0u8; 10][..], &padded.gas_limit_bytes()[..]].concat();
+    padded.kept.as_mut().unwrap().gas_limit = Some(Bytes::from(bytes));
+    assert_eq!(rule.validate_with_parent(&padded, &parent), Ok(()));
+
+    // A parent of 2^256 - 1, the most the typed field holds, may have a
+    // child past it, up to 2^256 + 2^246 - 2.
+    parent.set_gas_limit(&(two.pow(256) - 1u8));
+    let upper = two.pow(256) + two.pow(246) - 2u8;
+    assert_eq!(
+        rule.validate_with_parent(&with(&parent, &upper), &parent),
+        Ok(())
+    );
+    assert!(rule
+        .validate_with_parent(&with(&parent, &(upper + 1u8)), &parent)
+        .is_err());
 }
 
 /// rskj `BtcHeaderSizeRule`: from orchid the field holds a Bitcoin header and
@@ -1719,7 +1793,10 @@ fn default_rsk_holds_uncles_to_rskjs_uncle_rules() {
     assert_eq!(verifier.verify_uncle(&thin), Ok(()));
     assert_eq!(
         verifier.verify(&thin, None),
-        Err(ValidationError::GasLimitOutOfBounds { min: 3_000_000, max: 10_000_000, got: 2_999_999 })
+        Err(ValidationError::GasLimitBelowMinimum {
+            min: 3_000_000,
+            got: BigUint::from(2_999_999u32)
+        })
     );
 
     let mut adrift = uncle_of(&parent, 1010);

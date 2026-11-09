@@ -1,12 +1,7 @@
 use super::{HeaderValidator, ParentHeaderValidator, ValidationError};
 use crate::types::header::Header;
-use alloy_primitives::U256;
+use num_bigint::BigUint;
 use std::time::{SystemTime, UNIX_EPOCH};
-
-/// Converts a U256 gas limit to u64, returning an error on overflow.
-fn gas_limit_as_u64(gas_limit: U256) -> Result<u64, ValidationError> {
-    gas_limit.try_into().map_err(|_| ValidationError::GasLimitOverflow)
-}
 
 pub struct BlockNumberRule;
 impl ParentHeaderValidator for BlockNumberRule {
@@ -137,21 +132,20 @@ impl HeaderValidator for GasUsedRule {
     }
 }
 
-/// rskj `GasLimitRule` (`Constants.getMinGasLimit()`, 3,000,000 on every
-/// network) and the upper bound rustock adds for its own arithmetic.
-pub struct GasLimitBoundsRule {
+/// rskj `GasLimitRule`: a block's gas limit, read whole, may not be below
+/// `Constants.getMinGasLimit()`, 3,000,000 on every network. Nothing bounds
+/// it from above but its parent's (`BlockParentGasLimitRule`).
+pub struct GasLimitRule {
     pub min_gas_limit: u64,
-    pub max_gas_limit: u64,
 }
 
-impl HeaderValidator for GasLimitBoundsRule {
+impl HeaderValidator for GasLimitRule {
     fn validate(&self, header: &Header) -> Result<(), ValidationError> {
-        let gas_limit = gas_limit_as_u64(header.gas_limit)?;
-        if gas_limit < self.min_gas_limit || gas_limit > self.max_gas_limit {
-            return Err(ValidationError::GasLimitOutOfBounds {
+        let got = header.gas_limit_value();
+        if got < BigUint::from(self.min_gas_limit) {
+            return Err(ValidationError::GasLimitBelowMinimum {
                 min: self.min_gas_limit,
-                max: self.max_gas_limit,
-                got: gas_limit,
+                got,
             });
         }
         Ok(())
@@ -210,25 +204,17 @@ pub struct BlockParentGasLimitRule {
 
 impl ParentHeaderValidator for BlockParentGasLimitRule {
     fn validate_with_parent(&self, header: &Header, parent: &Header) -> Result<(), ValidationError> {
-        // rskj compares in BigInteger against `parent * (d - 1) / d` and
-        // `parent * (d + 1) / d`. As integers those are
-        // `parent - ceil(parent / d)` and `parent + floor(parent / d)`, so the
-        // lower bound sits one below `parent - parent / d` whenever `d` does
-        // not divide the parent's limit.
-        let divisor = U256::from(self.config.gas_limit_bound_divisor);
-        let parent_limit = parent.gas_limit;
-        let step = parent_limit / divisor;
-        let lower = if (parent_limit % divisor).is_zero() {
-            parent_limit - step
-        } else {
-            parent_limit - step - U256::from(1u8)
-        };
-        let upper = parent_limit.saturating_add(step);
-
-        if header.gas_limit < lower || header.gas_limit > upper {
+        // rskj reads both whole, of any size, and compares in BigInteger
+        // against `parent * (d - 1) / d` and `parent * (d + 1) / d`.
+        let got = header.gas_limit_value();
+        let parent_limit = parent.gas_limit_value();
+        let divisor = self.config.gas_limit_bound_divisor;
+        let lower = &parent_limit * (divisor - 1) / divisor;
+        let upper = &parent_limit * (divisor + 1) / divisor;
+        if got < lower || got > upper {
             return Err(ValidationError::GasLimitInvalid {
                 parent: parent_limit,
-                got: header.gas_limit,
+                got,
             });
         }
         Ok(())

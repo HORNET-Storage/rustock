@@ -331,7 +331,6 @@ index_history = false               # light: this index exists to answer RPC abo
 # genesis = "genesis.json"          # default: unset — an rskj genesis JSON file, instead of rustock's regtest genesis
 # skip_pow_validation = false       # default — rskj's miner.server.skipPowValidation
 # consensus_rules = { rskip97 = 0 } # default: unset — rskj's blockchain.config.consensusRules; -1 disables
-# min_gas_limit = 3000000           # default: unset (regtest: 1) — rskj's regtest minimum
-# max_gas_limit = 1000000000        # default: unset (regtest: 10000000) — rskj has no upper bound
+# min_gas_limit = 3000000           # default: unset (3000000) — rskj's minimum, on every network; it has no maximum
 # hardforks = { reed810 = 9002504 }  # default: unset — rskj's blockchain.config.hardforkActivationHeights; -1 takes an upgrade off
 # allow_overrides = false            # default — take these on a copy of mainnet or testnet too (genesis excepted)

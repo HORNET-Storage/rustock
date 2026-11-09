@@ -218,11 +218,7 @@ fn main() -> Result<()> {
     // Regtest's activation heights are all zero, so every rule -- orchid,
     // wasabi100, iris300 -- is live from block one. On mainnet's heights a
     // 40-block run would skip merged mining entirely and measure nothing.
-    // Regtest's bounds, with the gas limit raised to the one the
-    // benchmark's headers have always carried. Changing the header
-    // instead would move every figure already recorded, and the bound is
-    // not what is being measured.
-    let chain = Arc::new(ChainConfig { max_gas_limit: 100_000_000, ..ChainConfig::regtest() });
+    let chain = Arc::new(ChainConfig::regtest());
     let header_verifier = HeaderVerifier::default_rsk(chain.clone());
     let block_verifier = BlockVerifier::default_rsk(&chain);
 

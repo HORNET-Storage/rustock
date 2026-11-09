@@ -578,7 +578,6 @@ impl Workload {
         let mut chain_config = rustock_core::config::ChainConfig::testnet();
         chain_config.chain_id = self.chain_id as u8;
         chain_config.min_difficulty = U256::from(1);
-        chain_config.max_gas_limit = block_gas_limit.max(1);
         // The miner and the validator on the same constants: the sequential
         // sublist's minimum sets every sublist's gas limit, which the
         // validator holds the miner's partition to.
