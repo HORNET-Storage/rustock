@@ -42,6 +42,15 @@ pub(crate) enum Method {
     CumulativeWork,
 }
 
+/// Every method's selector, for tests that call each.
+#[cfg(test)]
+pub(crate) fn every_selector() -> Vec<[u8; 4]> {
+    METHODS
+        .iter()
+        .map(|(signature, _)| crate::abi::selector(signature))
+        .collect()
+}
+
 /// `BlockHeaderContract.getMethods`, by signature.
 const METHODS: [(&str, Method); 11] = [
     ("getCoinbaseAddress(int256)", Method::CoinbaseAddress),

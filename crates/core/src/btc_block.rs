@@ -317,4 +317,22 @@ mod tests {
         assert!(bitcoinj_reads(&block(&[1], &[&script(0x0200_0000)])));
         assert!(!bitcoinj_reads(&block(&[1], &[&script(0x0200_0001)])));
     }
+
+    /// No variation on a block's bytes makes reading it panic: below orchid a
+    /// merge-mined header's Bitcoin field can carry any bytes at all.
+    #[test]
+    fn no_variation_on_a_bitcoin_block_panics() {
+        let two = transaction(&[2], &[3]);
+        let seeds = [
+            genesis(),
+            block(&[2], &[&two, &two]),
+            genesis()[..HEADER_SIZE].to_vec(),
+        ];
+        for (i, seed) in seeds.iter().enumerate() {
+            assert!(bitcoinj_reads(seed));
+            for bytes in crate::mutate::mutants(seed, 3_000, 600 + i as u64) {
+                let _ = bitcoinj_reads(&bytes);
+            }
+        }
+    }
 }

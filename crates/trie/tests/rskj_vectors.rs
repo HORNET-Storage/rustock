@@ -295,6 +295,59 @@ fn no_junk_blob_can_panic_the_rebuild() {
     }
 }
 
+/// Nor may any variation on a chunk an rskj node really sent, rebuilt
+/// against the root it really belongs to. Random bytes seldom decode at all,
+/// so these are what reach the rebuild.
+#[test]
+fn no_variation_on_an_rskj_chunk_can_panic_the_rebuild() {
+    use rustock_trie::snapshot_legacy::{decode_blob, rebuild};
+
+    let mut seed = 0x2545F4914F6CDD1Du64;
+    let mut next = move |below: usize| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        (seed % below.max(1) as u64) as usize
+    };
+    let text = include_str!("rskj-vectors/chunks.txt");
+    let mut keys = 0usize;
+    let mut seeds = 0;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("KEYS ") {
+            keys = rest.split_whitespace().next().unwrap().parse().unwrap();
+            continue;
+        }
+        let Some(rest) = line.strip_prefix("BLOB ") else {
+            continue;
+        };
+        let (root, store) = trie(keys);
+        let root_hash = root.compute_hash(&store);
+        let blob = unhex(rest.trim());
+        seeds += 1;
+        for _ in 0..800 {
+            let mut bytes = blob.clone();
+            for _ in 0..1 + next(3) {
+                let at = next(bytes.len());
+                match next(6) {
+                    0 if !bytes.is_empty() => bytes[at] ^= 1 << next(8),
+                    1 if !bytes.is_empty() => bytes[at] = [0x00, 0x7f, 0x80, 0xff][next(4)],
+                    2 if !bytes.is_empty() => bytes[at] = next(256) as u8,
+                    3 => bytes.insert(at, next(256) as u8),
+                    4 if !bytes.is_empty() => {
+                        let n = 1 + next(8.min(bytes.len() - at));
+                        bytes.drain(at..at + n);
+                    }
+                    _ => bytes.truncate(at),
+                }
+            }
+            if let Some(chunk) = decode_blob(&bytes) {
+                let _ = rebuild(&chunk, root_hash);
+            }
+        }
+    }
+    assert!(seeds >= 6, "only {seeds} chunks to vary");
+}
+
 fn unhex(text: &str) -> Vec<u8> {
     (0..text.len())
         .step_by(2)

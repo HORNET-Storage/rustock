@@ -116,7 +116,10 @@ impl OutboundConnector {
 
         let mut last_starved: Option<(usize, usize, usize, usize)> = None;
 
-        let mut last_starved_at = Instant::now() - STARVED_REPEAT;
+        // `None` until the first warning. Subtracting a minute from `now` would
+        // panic on a machine booted less than a minute ago, since the clock
+        // `Instant` reads starts at boot.
+        let mut last_starved_at: Option<Instant> = None;
 
 
         loop {
@@ -244,14 +247,14 @@ impl OutboundConnector {
                     backoff_snapshot.len(),
                 );
                 let changed = last_starved != Some(now);
-                if changed || last_starved_at.elapsed() >= STARVED_REPEAT {
+                if changed || last_starved_at.is_none_or(|at| at.elapsed() >= STARVED_REPEAT) {
                     warn!(
                         target: "rustock::net",
                         "Below target ({}/{}) but no dialable candidates ({} nodes, {} pending, {} backed off)",
                         now.0, self.max_outbound, now.1, now.2, now.3
                     );
                     last_starved = Some(now);
-                    last_starved_at = Instant::now();
+                    last_starved_at = Some(Instant::now());
                 }
             } else {
                 // Out of the condition: say so next time it happens.

@@ -34,6 +34,15 @@ enum Method {
     GetMultisigScriptHash,
 }
 
+/// Every method's selector, for tests that call each.
+#[cfg(test)]
+pub(crate) fn every_selector() -> Vec<[u8; 4]> {
+    METHODS
+        .iter()
+        .map(|(signature, _)| crate::abi::selector(signature))
+        .collect()
+}
+
 /// `HDWalletUtils.getMethods`, by signature.
 const METHODS: [(&str, Method); 4] = [
     ("toBase58Check(bytes,int256)", Method::ToBase58Check),

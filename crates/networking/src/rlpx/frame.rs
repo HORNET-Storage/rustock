@@ -276,7 +276,10 @@ impl FrameCodec {
             (1 + ll, len)
         };
 
-        let list_data = &data[list_start..data.len().min(list_start + list_len)];
+        // A long-form length is any 8 bytes the peer chose, so the end is added
+        // without overflowing, and the list stops where the 13 bytes do.
+        let list_end = list_start.saturating_add(list_len).min(data.len());
+        let list_data = &data[list_start..list_end];
 
         // Decode individual elements from the list
         let mut elems: Vec<usize> = Vec::new();
@@ -434,6 +437,26 @@ mod tests {
         // A string prefix instead of a list — should fall back to Normal
         let data = [0x83, 0x01, 0x02, 0x03, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         assert!(matches!(FrameCodec::parse_header_data(&data), FrameType::Normal));
+    }
+
+    /// A long-form list length is up to 8 bytes the peer chose; one that runs
+    /// past the 13 header-data bytes, or past `usize::MAX`, reads what is there.
+    #[test]
+    fn a_list_length_past_the_header_data_reads_what_is_there() {
+        for prefix in 0xf8..=0xffu8 {
+            for fill in [0x00, 0x01, 0x80, 0xff] {
+                let mut data = [fill; 13];
+                data[0] = prefix;
+                let _ = FrameCodec::parse_header_data(&data);
+            }
+        }
+        // A length of usize::MAX before three chunked-frame elements.
+        let mut data = [0xff; 13];
+        data[9..12].copy_from_slice(&[0x80, 0x01, 0x05]);
+        assert!(matches!(
+            FrameCodec::parse_header_data(&data),
+            FrameType::ChunkedFirst { total_size: 5, .. }
+        ));
     }
 
     // ---- Normal single-frame roundtrip ----

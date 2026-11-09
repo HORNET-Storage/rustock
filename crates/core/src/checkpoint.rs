@@ -185,29 +185,58 @@ pub fn max_work_between(
     // out *below* a flat chain's real work for short spans, and would have
     // rejected honest peers.
     //
-    // `cap[i]` is the ceiling for the i-th block after `from`, built backwards
-    // from `to`: each step back multiplies by `divisor / (divisor - 1)`, the
-    // inverse of a maximal fall. It saturates, which only loosens the bound.
-    let mut cap = vec![U256::ZERO; span as usize + 1];
-    cap[span as usize] = to;
-    for i in (0..span as usize).rev() {
-        let next = cap[i + 1];
-        cap[i] = next
+    // `ceilings[k]` is the ceiling for the block `k` before the span's last,
+    // built backwards from `to`: each step back multiplies by
+    // `divisor / (divisor - 1)`, the inverse of a maximal fall. It saturates,
+    // which only loosens the bound. Grown back far enough it stops changing
+    // -- at `U256::MAX`, or below `divisor - 1`, where the growth rounds away
+    // -- and every block before that has the ceiling it stopped at. So only
+    // the ceilings that differ are kept, a few thousand at most. The span is
+    // the distance to a height a peer names, and a cell for every block let
+    // a peer naming a distant one make this node allocate without limit.
+    let mut ceilings = vec![to];
+    while (ceilings.len() as u64) <= span {
+        let last = ceilings[ceilings.len() - 1];
+        let grown = last
             .checked_mul(div)
             .map(|v| v / (div - U256::from(1u64)))
             .unwrap_or(U256::MAX);
+        if grown == last {
+            break;
+        }
+        ceilings.push(grown);
     }
+    let settled = ceilings.len() as u64 - 1;
+    // Blocks up to this one all have the settled ceiling.
+    let flat_until = span - settled;
 
     let mut total = U256::ZERO;
     let mut d = from;
-    #[allow(clippy::needless_range_loop)] // `step` is the step number, not just an index
-    for step in 1..=span as usize {
-        let risen = d.saturating_add(d / div);
-        d = risen.min(cap[step]);
-        if d < min_difficulty {
-            d = min_difficulty;
+    let mut step = 1;
+    loop {
+        let ceiling = ceilings[(span - step).min(settled) as usize];
+        let next = d.saturating_add(d / div).min(ceiling).max(min_difficulty);
+        total = total.saturating_add(next);
+        if total == U256::MAX {
+            // Nothing added after it can take it below the most there is.
+            return total;
         }
-        total = total.saturating_add(d);
+        // Under the settled ceiling every block is worked out alike, so one
+        // whose difficulty is its parent's leaves every block after it
+        // there too, up to where the ceilings begin to differ. They are
+        // counted at once rather than one by one, which a span a peer names
+        // could make last for ever.
+        if next == d && step < flat_until {
+            total = total.saturating_add(next.saturating_mul(U256::from(flat_until - step)));
+            step = flat_until;
+        }
+        d = next;
+        // Stopping at the last block rather than past it: the span can be
+        // `u64::MAX`, and there is no step after that.
+        if step == span {
+            break;
+        }
+        step += 1;
     }
     total
 }
@@ -512,6 +541,98 @@ mod tests {
         assert!(
             (1.12..1.14).contains(&ratio),
             "expected about 1.13x the flat sum, got {ratio}"
+        );
+    }
+
+    /// `max_work_between` as it was written first, a cell for every block,
+    /// kept to hold the bounded one to the same answers.
+    fn max_work_cell_by_cell(from: U256, to: U256, span: u64, divisor: u64, min: U256) -> U256 {
+        if span == 0 || divisor < 2 {
+            return U256::ZERO;
+        }
+        let div = U256::from(divisor);
+        let mut cap = vec![U256::ZERO; span as usize + 1];
+        cap[span as usize] = to;
+        for i in (0..span as usize).rev() {
+            cap[i] = cap[i + 1]
+                .checked_mul(div)
+                .map(|v| v / (div - U256::from(1u64)))
+                .unwrap_or(U256::MAX);
+        }
+        let mut total = U256::ZERO;
+        let mut d = from;
+        for ceiling in &cap[1..] {
+            d = d.saturating_add(d / div).min(*ceiling).max(min);
+            total = total.saturating_add(d);
+        }
+        total
+    }
+
+    /// Keeping only the ceilings that differ, and counting a settled run at
+    /// once, changes no answer.
+    #[test]
+    fn the_bound_is_the_one_worked_out_block_by_block() {
+        let big = U256::from(10u64).pow(U256::from(25u64));
+        let froms = [
+            U256::ZERO,
+            U256::from(1u64),
+            U256::from(48u64),
+            U256::from(50u64),
+            MIN,
+            MIN * U256::from(3u64),
+            big,
+            U256::MAX,
+        ];
+        let tos = [
+            U256::ZERO,
+            U256::from(1u64),
+            U256::from(49u64),
+            MIN,
+            MIN * U256::from(2u64),
+            big,
+            U256::MAX,
+        ];
+        let mins = [U256::ZERO, U256::from(1u64), MIN];
+        for divisor in [2u64, 3, 50, 400] {
+            for span in [1u64, 2, 3, 191, 768, 2_500] {
+                for &from in &froms {
+                    for &to in &tos {
+                        for &min in &mins {
+                            assert_eq!(
+                                max_work_between(from, to, span, divisor, min),
+                                max_work_cell_by_cell(from, to, span, divisor, min),
+                                "from {from}, to {to}, span {span}, divisor {divisor}, min {min}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A span no cell-by-cell table could hold is answered, and at once: a
+    /// peer names the height it runs to.
+    #[test]
+    fn a_span_a_peer_names_is_answered_at_once() {
+        let started = std::time::Instant::now();
+        // Rising without limit, the work passes the most there is.
+        assert_eq!(
+            max_work_between(MIN, U256::MAX, u64::MAX, 50, MIN),
+            U256::MAX
+        );
+        assert_eq!(max_work_between(MIN, MIN, u64::MAX, 400, MIN), U256::MAX);
+        // Held flat, it is the span's blocks at the one difficulty, exactly.
+        let span = 1_000_000_000_000_000u64;
+        let one = U256::from(1u64);
+        assert_eq!(max_work_between(one, one, span, 50, one), U256::from(span));
+        assert_eq!(
+            max_work_between(one, one, u64::MAX, 2048, one),
+            U256::from(u64::MAX)
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "took {:?}",
+            started.elapsed()
         );
     }
 

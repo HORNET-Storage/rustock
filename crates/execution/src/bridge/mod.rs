@@ -437,6 +437,12 @@ static BRIDGE_SELECTOR_MAP: LazyLock<HashMap<[u8; 4], usize>> = LazyLock::new(||
         .collect()
 });
 
+/// Every Bridge method's selector, enabled or not, for tests that call each.
+#[cfg(test)]
+pub(crate) fn every_selector() -> Vec<[u8; 4]> {
+    BRIDGE_METHODS.iter().map(|m| m.selector).collect()
+}
+
 /// Look up a Bridge method by its 4-byte ABI selector.
 pub fn find_bridge_method(selector: &[u8; 4]) -> Option<&'static BridgeMethodInfo> {
     BRIDGE_SELECTOR_MAP.get(selector).map(|&i| &BRIDGE_METHODS[i])

@@ -1,5 +1,5 @@
 use std::num::NonZeroUsize;
-use std::sync::Mutex;
+use std::sync::{Mutex, PoisonError};
 
 use alloy_primitives::{B256, B512, Bytes};
 use lru::LruCache;
@@ -80,7 +80,7 @@ impl TxRelay {
     }
 
     fn filter_and_validate(&self, txs: &[Bytes], from: Option<B512>) -> Vec<Bytes> {
-        let mut seen = self.seen.lock().expect("seen cache lock poisoned");
+        let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
         let mut valid_txs = Vec::new();
         for tx_bytes in txs {
             let hash = Self::tx_hash(tx_bytes);
@@ -132,7 +132,7 @@ impl TxRelay {
         };
 
         {
-            let mut seen = self.seen.lock().expect("seen cache lock poisoned");
+            let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
             seen.put(hash, ());
         }
         self.announce_pending(hash);

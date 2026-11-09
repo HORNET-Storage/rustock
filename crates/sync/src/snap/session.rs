@@ -113,6 +113,11 @@ pub enum SnapFailure {
     OverstatedDifficulty { claimed: U256, ceiling: U256 },
     #[error("the peer would not substantiate its claimed difficulty: {why}")]
     UnsubstantiatedClaim { why: String },
+    #[error(
+        "the peer offered a state {window} blocks above the checkpoint, more than the {most} \
+         a chain this build can follow has grown"
+    )]
+    ImplausibleHeight { window: u64, most: u64 },
     #[error("block #{number}: the {what} are not the ones its header commits to")]
     BadBody { number: u64, what: &'static str },
 }
@@ -361,7 +366,9 @@ impl SnapSession {
             self.phase_started = Instant::now();
             // Report the new phase promptly rather than up to five seconds
             // later: the first line is the one that says what is happening.
-            self.last_report = Instant::now() - Duration::from_secs(5);
+            // (`Instant` counts from boot, so this can't go below it.)
+            let now = Instant::now();
+            self.last_report = now.checked_sub(Duration::from_secs(5)).unwrap_or(now);
         }
         self.phase = phase;
     }
@@ -676,6 +683,12 @@ impl SnapSession {
                 );
             }
             if header.number > checkpoint.number && !walk_is_cheaper {
+                if window > crate::sampler::MAX_SAMPLED_WINDOW {
+                    return self.fail(SnapFailure::ImplausibleHeight {
+                        window,
+                        most: crate::sampler::MAX_SAMPLED_WINDOW,
+                    });
+                }
                 self.gate = Some(crate::sampler::SamplingGate::new(
                     checkpoint,
                     self.checkpoint_td,

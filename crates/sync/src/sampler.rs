@@ -94,6 +94,18 @@ pub const RANDOM_SAMPLES: usize = 340;
 pub const WALK_INSTEAD_BELOW: u64 =
     RANDOM_SAMPLES as u64 * crate::snap::headers::HEADER_CHUNK;
 
+/// The widest window above the checkpoint the gate takes on: about nine and
+/// a half years of mainnet's blocks at their thirty-odd seconds, more than
+/// any chain a build of this age can follow through the upgrades between.
+///
+/// What the gate costs grows with the window -- the skeletons it asks for,
+/// the heights they name, the samples drawn among them -- and the window runs
+/// to the height the peer's offered header names. That header's proof of
+/// work is checked against the difficulty it states itself, so a peer can
+/// name a height of 2^62 for next to nothing, and then answer for ever. Here
+/// it costs at most some thirteen thousand samples and a few seconds' work.
+pub const MAX_SAMPLED_WINDOW: u64 = 10_000_000;
+
 /// Choose which of `available` heights to sample.
 ///
 /// Two properties, and they want opposite things:
@@ -170,15 +182,40 @@ pub fn fill_gaps(available: &[u64], chosen: Vec<u64>, max_gap: u64) -> Vec<u64> 
     for &at in chosen.iter().chain(std::iter::once(&highest)) {
         let gap = at.saturating_sub(previous);
         if gap > max_gap {
-            // `ceil(gap / max_gap) - 1` interior points, evenly spaced.
+            // `ceil(gap / max_gap) - 1` interior points, evenly spaced, each
+            // rounded to the nearest height the peer named. In u128, since
+            // `gap * piece` passes u64 for a gap a peer names. And a run of
+            // points rounding to the same height is stepped over at once, so
+            // the work is the heights in the gap rather than the gap: two
+            // heights far enough apart otherwise made this loop for ever.
             let pieces = gap.div_ceil(max_gap);
-            for piece in 1..pieces {
-                let want_at = previous + (gap * piece) / pieces;
-                if let Some(&nearest) = nearest_available(available, want_at) {
-                    if nearest > previous && nearest < at {
-                        filled.push(nearest);
-                    }
+            let mut piece = 1;
+            while piece < pieces {
+                let want_at =
+                    previous + (u128::from(gap) * u128::from(piece) / u128::from(pieces)) as u64;
+                let Some(&nearest) = nearest_available(available, want_at) else {
+                    break;
+                };
+                if nearest > previous && nearest < at {
+                    filled.push(nearest);
                 }
+                // Every point up to halfway to the next height rounds to
+                // `nearest` again, ties going to the lower.
+                let next = available
+                    .binary_search(&nearest)
+                    .ok()
+                    .and_then(|i| available.get(i + 1));
+                let Some(&next) = next else { break };
+                let halfway = nearest + (next - nearest) / 2;
+                let past_halfway = match halfway.checked_sub(previous) {
+                    // The first piece whose point lies beyond it.
+                    Some(offset) => {
+                        let piece = (u128::from(offset) + 1) * u128::from(pieces);
+                        u64::try_from(piece.div_ceil(u128::from(gap))).unwrap_or(u64::MAX)
+                    }
+                    None => 0,
+                };
+                piece = past_halfway.max(piece + 1);
             }
         }
         filled.push(at);
@@ -1280,5 +1317,89 @@ mod choose_samples_tests {
         for at in &picked {
             assert!(a.contains(at), "#{at} is not in the skeleton");
         }
+    }
+
+    /// `fill_gaps` as it was written first, a point for every piece of every
+    /// gap, kept to hold the one that steps over runs to the same answers.
+    fn fill_gaps_piece_by_piece(available: &[u64], chosen: Vec<u64>, max_gap: u64) -> Vec<u64> {
+        if available.is_empty() {
+            return Vec::new();
+        }
+        if max_gap == 0 {
+            return chosen;
+        }
+        let highest = *available.last().unwrap();
+        let mut filled = Vec::new();
+        let mut previous = available[0].saturating_sub(1);
+        for &at in chosen.iter().chain(std::iter::once(&highest)) {
+            let gap = at.saturating_sub(previous);
+            if gap > max_gap {
+                let pieces = gap.div_ceil(max_gap);
+                for piece in 1..pieces {
+                    let want_at = previous + (gap * piece) / pieces;
+                    if let Some(&nearest) = nearest_available(available, want_at) {
+                        if nearest > previous && nearest < at {
+                            filled.push(nearest);
+                        }
+                    }
+                }
+            }
+            filled.push(at);
+            previous = at;
+        }
+        filled.sort_unstable();
+        filled.dedup();
+        filled
+    }
+
+    /// Stepping over the points that round to one height changes no choice,
+    /// over skeletons evenly spaced, clustered and sparse.
+    #[test]
+    fn gaps_are_filled_as_they_were_point_by_point() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move |below: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % below
+        };
+        for round in 0..600 {
+            let spread = [50, 5_000, 200_000, 3_000_000][round % 4];
+            let mut heights: Vec<u64> = (0..1 + next(60)).map(|_| 1 + next(spread)).collect();
+            heights.sort_unstable();
+            heights.dedup();
+            let chosen: Vec<u64> = heights.iter().copied().filter(|_| next(3) == 0).collect();
+            // The reference visits every piece, so only gaps it can finish.
+            for max_gap in [1, 7, 768, 40_000]
+                .into_iter()
+                .filter(|g| spread / g <= 20_000)
+            {
+                assert_eq!(
+                    fill_gaps(&heights, chosen.clone(), max_gap),
+                    fill_gaps_piece_by_piece(&heights, chosen.clone(), max_gap),
+                    "heights {heights:?}, chosen {chosen:?}, max gap {max_gap}"
+                );
+            }
+        }
+    }
+
+    /// Two heights as far apart as a peer cares to name them: the gap
+    /// between has nothing to offer, and that takes no time to find out.
+    #[test]
+    fn a_gap_a_peer_names_is_filled_at_once() {
+        let started = std::time::Instant::now();
+        let far = [1u64, 1 << 62, u64::MAX];
+        assert_eq!(fill_gaps(&far, far.to_vec(), 768), far.to_vec());
+        assert_eq!(fill_gaps(&far, Vec::new(), 1), far.to_vec());
+        let both_ends = [9_020_001u64, 9_020_193, u64::MAX - 1];
+        assert_eq!(
+            fill_gaps(&both_ends, vec![9_020_001], 768),
+            both_ends.to_vec()
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "took {:?}",
+            started.elapsed()
+        );
     }
 }

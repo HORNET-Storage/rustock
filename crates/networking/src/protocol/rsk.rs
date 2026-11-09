@@ -2030,6 +2030,254 @@ mod headers_with_uncles_tests {
         .encode(&mut buf);
         assert!(RskMessage::decode(&mut buf.as_slice()).is_err());
     }
+
+    /// **No message a peer sends panics the decoder.**
+    ///
+    /// Each RSK message is built as a peer would send it, with content of
+    /// each kind in its body, and then varied byte by byte. Every type number
+    /// is also sent with a random tree of RLP for its body, so that each
+    /// message's field reads meet strings and lists of every shape. Only that
+    /// each decode returns is asserted.
+    #[test]
+    fn no_variation_on_a_message_panics_the_decoder() {
+        use rustock_core::Transaction;
+
+        struct Rng(u64);
+        impl Rng {
+            fn next(&mut self) -> u64 {
+                self.0 ^= self.0 << 13;
+                self.0 ^= self.0 >> 7;
+                self.0 ^= self.0 << 17;
+                self.0
+            }
+            fn below(&mut self, n: usize) -> usize {
+                (self.next() % n.max(1) as u64) as usize
+            }
+        }
+
+        // The bytes that start RLP's items, at the edges of each form.
+        const EDGES: [u8; 12] = [
+            0x00, 0x7f, 0x80, 0x81, 0x9f, 0xa0, 0xb7, 0xb8, 0xbf, 0xc0, 0xf7, 0xff,
+        ];
+
+        fn vary(bytes: &mut Vec<u8>, rng: &mut Rng) {
+            for _ in 0..1 + rng.below(3) {
+                let at = rng.below(bytes.len() + 1);
+                match rng.below(6) {
+                    0 if at < bytes.len() => bytes[at] ^= 1 << rng.below(8),
+                    1 if at < bytes.len() => bytes[at] = EDGES[rng.below(EDGES.len())],
+                    2 => bytes.insert(at, EDGES[rng.below(EDGES.len())]),
+                    3 if at < bytes.len() => {
+                        let n = 1 + rng.below(8.min(bytes.len() - at));
+                        bytes.drain(at..at + n);
+                    }
+                    4 => bytes.truncate(at),
+                    _ => bytes.insert(at, rng.next() as u8),
+                }
+            }
+        }
+
+        /// A random RLP item: a string of a size fields come in, or a list of
+        /// up to five more items.
+        fn tree(rng: &mut Rng, depth: u32, out: &mut Vec<u8>) {
+            if depth == 0 || rng.below(3) == 0 {
+                let len = [0, 1, 1, 2, 8, 20, 32, 33, 65, 100][rng.below(10)];
+                let bytes: Vec<u8> = (0..len).map(|_| rng.next() as u8).collect();
+                bytes.as_slice().encode(out);
+            } else {
+                let mut body = Vec::new();
+                for _ in 0..rng.below(6) {
+                    tree(rng, depth - 1, &mut body);
+                }
+                RlpHeader {
+                    list: true,
+                    payload_length: body.len(),
+                }
+                .encode(out);
+                out.extend_from_slice(&body);
+            }
+        }
+
+        /// `params` in the envelope `RskMessage::encode` writes: a list of a
+        /// list of the type and the parameters as a string.
+        fn envelope(kind: u8, params: &[u8]) -> Vec<u8> {
+            let mut message = Vec::new();
+            kind.encode(&mut message);
+            RlpHeader {
+                list: false,
+                payload_length: params.len(),
+            }
+            .encode(&mut message);
+            message.extend_from_slice(params);
+            let mut wrapped = Vec::new();
+            RlpHeader {
+                list: true,
+                payload_length: message.len(),
+            }
+            .encode(&mut wrapped);
+            wrapped.extend_from_slice(&message);
+            let mut out = Vec::new();
+            RlpHeader {
+                list: true,
+                payload_length: wrapped.len(),
+            }
+            .encode(&mut out);
+            out.extend_from_slice(&wrapped);
+            out
+        }
+
+        let tx = Transaction {
+            nonce: 1,
+            gas_price: U256::from(10),
+            gas_limit: U256::from(21000),
+            to: Bytes::from(vec![0x12; 20]),
+            value: U256::from(1000),
+            input: Bytes::from(vec![1, 2, 3]),
+            v: 27,
+            r: U256::from(88),
+            s: U256::from(99),
+            cached_rlp: None,
+        };
+        let identifier = |n: u8| BlockIdentifier {
+            hash: B256::repeat_byte(n),
+            number: 192 * n as u64,
+        };
+        let seeds = vec![
+            RskSubMessage::Status(RskStatus {
+                best_block_number: 9,
+                best_block_hash: B256::repeat_byte(1),
+                best_block_parent_hash: Some(B256::repeat_byte(2)),
+                total_difficulty: Some(U256::from(1u64 << 63)),
+                earliest_block: Some(3),
+            }),
+            RskSubMessage::BlockHashRequest(BlockHashRequest { id: 1, height: 192 }),
+            RskSubMessage::BlockHashResponse(BlockHashResponse {
+                id: 1,
+                hash: B256::repeat_byte(4),
+            }),
+            RskSubMessage::BlockHeadersRequest(BlockHeadersRequest {
+                id: 2,
+                query: BlockHeadersQuery {
+                    hash: B256::repeat_byte(5),
+                    count: 192,
+                },
+            }),
+            RskSubMessage::BlockHeadersResponse(BlockHeadersResponse {
+                id: 2,
+                headers: vec![plain(10, 1000), plain(9, 900)],
+            }),
+            RskSubMessage::SkeletonRequest(SkeletonRequest {
+                id: 3,
+                start_number: 5000,
+            }),
+            RskSubMessage::SkeletonResponse(SkeletonResponse {
+                id: 3,
+                block_identifiers: vec![identifier(1), identifier(2)],
+            }),
+            RskSubMessage::BodyRequest(BodyRequest {
+                id: 4,
+                hash: B256::repeat_byte(7),
+            }),
+            RskSubMessage::BodyResponse(BodyResponse {
+                id: 4,
+                transactions: vec![tx.clone()],
+                uncles: vec![plain(8, 800)],
+                extension: None,
+            }),
+            RskSubMessage::Transactions(vec![Bytes::from(alloy_rlp::encode(&tx))]),
+            RskSubMessage::BlockRangeUpdate(BlockRange {
+                earliest_block: 1,
+                latest_block: 2,
+                latest_block_hash: B256::repeat_byte(8),
+            }),
+            RskSubMessage::BlockHeadersWithUnclesRequest(BlockHeadersWithUnclesRequest {
+                id: 5,
+                query: BlockHeadersQuery {
+                    hash: B256::repeat_byte(9),
+                    count: 3,
+                },
+            }),
+            RskSubMessage::BlockHeadersWithUnclesResponse(BlockHeadersWithUnclesResponse {
+                id: 5,
+                entries: vec![with_uncles(10, 1000, vec![plain(9, 700)])],
+            }),
+        ];
+
+        let mut messages: Vec<(String, Vec<u8>)> = seeds
+            .into_iter()
+            .map(|seed| {
+                let kind = format!("{:?}", seed.message_type());
+                let mut bytes = Vec::new();
+                RskMessage::new(seed).encode(&mut bytes);
+                (kind, bytes)
+            })
+            .collect();
+        // rustock never sends NewBlockHashes, so its encoder writes nothing for
+        // it; this is the list of [hash, number] pairs an rskj node sends.
+        let mut pairs = Vec::new();
+        for n in 1..=3u8 {
+            let mut pair = Vec::new();
+            B256::repeat_byte(n).encode(&mut pair);
+            (192 * n as u64).encode(&mut pair);
+            RlpHeader {
+                list: true,
+                payload_length: pair.len(),
+            }
+            .encode(&mut pairs);
+            pairs.extend_from_slice(&pair);
+        }
+        let mut params = Vec::new();
+        RlpHeader {
+            list: true,
+            payload_length: pairs.len(),
+        }
+        .encode(&mut params);
+        params.extend_from_slice(&pairs);
+        messages.push(("NewBlockHashes".into(), envelope(6, &params)));
+
+        // As the session reads them: the P2P message id, then the message.
+        let rsk_id = {
+            let mut framed = Vec::new();
+            let probe = RskSubMessage::BodyRequest(BodyRequest {
+                id: 0,
+                hash: B256::ZERO,
+            });
+            crate::protocol::p2p::P2pMessage::RskMessage(RskMessage::new(probe))
+                .encode(&mut framed);
+            framed[0]
+        };
+        let mut rng = Rng(0x6A09_E667_F3BC_C908);
+        for (kind, message) in messages {
+            let mut honest = vec![rsk_id];
+            honest.extend_from_slice(&message);
+            let decoded = crate::protocol::p2p::P2pMessage::decode(&mut honest.as_slice());
+            assert!(
+                decoded.is_ok(),
+                "the {kind} seed does not decode, so varying it tests nothing: {decoded:?}"
+            );
+            for _ in 0..1_500 {
+                let mut bytes = honest.clone();
+                vary(&mut bytes, &mut rng);
+                let _ = crate::protocol::p2p::P2pMessage::decode(&mut bytes.as_slice());
+                let _ = RskMessage::decode(&mut bytes.get(1..).unwrap_or_default());
+            }
+        }
+        for kind in 0..=30u8 {
+            for _ in 0..300 {
+                let mut params = Vec::new();
+                tree(&mut rng, 4, &mut params);
+                let _ = RskMessage::decode(&mut envelope(kind, &params).as_slice());
+            }
+        }
+        // Every P2P message id, each with a random body.
+        for id in 0..=u8::MAX {
+            for _ in 0..40 {
+                let mut framed = vec![id];
+                tree(&mut rng, 4, &mut framed);
+                let _ = crate::protocol::p2p::P2pMessage::decode(&mut framed.as_slice());
+            }
+        }
+    }
 }
 
 #[cfg(test)]

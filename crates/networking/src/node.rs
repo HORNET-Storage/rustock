@@ -480,7 +480,21 @@ pub(crate) async fn register_and_run_session(
     // Request peer list immediately after connecting
     peer_store.send_to_peer(&peer_id, P2pMessage::GetPeers).await;
 
-    let res = session.run().await;
+    // A panic in the session -- a decoder or handler meeting input nothing
+    // anticipated -- ends this peer's session and no more, so the peer is
+    // still removed below. Unwinding past here instead would leave it
+    // registered, holding a peer slot for good. rskj likewise closes the
+    // channel on an exception (`exceptionCaught`) without scoring the peer.
+    let res = match futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(session.run()))
+        .await
+    {
+        Ok(res) => res,
+        Err(panic) => {
+            let what = panic_message(panic.as_ref());
+            error!(target: "rustock::net", "Session with {:?} panicked, disconnecting: {}", &peer_id.0[..4], what);
+            Err(anyhow::anyhow!("session panicked: {what}"))
+        }
+    };
     peer_store.remove_peer(&peer_id).await;
     if let Some(scoring) = &scoring {
         // rskj records DISCONNECTION on every session end, clean or not. It
@@ -495,6 +509,15 @@ pub(crate) async fn register_and_run_session(
         scoring.forget_address(&peer_id);
     }
     res
+}
+
+/// What a caught panic said, for the log.
+pub(crate) fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
+    panic
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "a panic with no message".to_string())
 }
 
 /// Maximum time allowed for a connection handshake (RLPx + p2p Hello + status)
@@ -759,5 +782,68 @@ mod isolation_tests {
             "a read-only node wrote beside a database it was told only to read"
         );
         assert!(should_persist_table(false), "an ordinary node still saves what it learned");
+    }
+}
+
+#[cfg(test)]
+mod session_panic_tests {
+    use super::*;
+    use crate::codec::P2pCodec;
+    use crate::handshake::{HandshakeCodec, PeerCapabilities};
+    use futures::SinkExt;
+    use tokio_util::codec::Framed;
+
+    /// A handler that meets a message it never expected.
+    struct Panics;
+
+    impl P2pHandler for Panics {
+        fn handle_message(&self, _id: B512, _msg: &P2pMessage) -> Option<P2pMessage> {
+            panic!("a handler met input it did not expect")
+        }
+    }
+
+    /// A panicking session ends, and its peer is still removed, so it can't
+    /// hold a peer slot after it is gone.
+    #[tokio::test]
+    async fn a_session_that_panics_ends_and_its_peer_is_removed() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let store = Arc::new(PeerStore::new());
+        let peer = B512::repeat_byte(7);
+        let server = tokio::spawn({
+            let store = store.clone();
+            async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let status = RskStatus {
+                    best_block_number: 1,
+                    best_block_hash: B256::ZERO,
+                    best_block_parent_hash: None,
+                    total_difficulty: None,
+                    earliest_block: None,
+                };
+                register_and_run_session(
+                    peer,
+                    status,
+                    PeerCapabilities::default(),
+                    Framed::new(stream, HandshakeCodec::Plain(P2pCodec)),
+                    vec![Arc::new(Panics)],
+                    store,
+                    None,
+                    None,
+                )
+                .await
+            }
+        });
+        let mut client = Framed::new(
+            TcpStream::connect(address).await.unwrap(),
+            HandshakeCodec::Plain(P2pCodec),
+        );
+        client.send(P2pMessage::GetPeers).await.unwrap();
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(10), server)
+            .await
+            .expect("the session ends")
+            .expect("the task does not unwind");
+        assert!(ended.is_err(), "the panic is reported");
+        assert_eq!(store.count().await, 0, "the peer is removed");
     }
 }

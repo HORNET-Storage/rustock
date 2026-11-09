@@ -8,7 +8,7 @@ use rustock_networking::protocol::{
 use alloy_primitives::{B256, B512, U256};
 use anyhow::Result;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 use tracing::{debug, trace, warn};
 
@@ -87,7 +87,7 @@ impl SyncManager {
     /// match the trunk header's `ommers_hash`, so these figures are as sound
     /// as the header's own proof of work.
     pub fn note_proven_difficulties(&self, entries: Vec<HeaderWithUncles>) -> Vec<Header> {
-        let mut proven = self.proven.lock().unwrap();
+        let mut proven = self.proven.lock().unwrap_or_else(PoisonError::into_inner);
         if proven.len() + entries.len() > MAX_PROVEN {
             // Everything in here is re-derivable from a later request, so
             // dropping the lot is cheaper than tracking an eviction order.
@@ -148,13 +148,13 @@ impl SyncManager {
         // several of its own blocks and have the work counted each time --
         // capped only by `uncleListLimit`, so up to eleven times the trunk
         // work actually performed.
-        let mut guard = self.uncle_guard.lock().unwrap();
-        if let Err(why) = guard.uncles_are_admissible(
-            &self.store,
-            &self.verifier,
-            &entry.header,
-            &entry.uncles,
-        ) {
+        let mut guard = self
+            .uncle_guard
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Err(why) =
+            guard.uncles_are_admissible(&self.store, &self.verifier, &entry.header, &entry.uncles)
+        {
             warn!(
                 target: "rustock::sync",
                 "Block #{}: uncles not admissible ({why}); ignoring the \
@@ -297,7 +297,12 @@ impl SyncManager {
             // `rsk/62` peer, which is every rskj node -- the header difficulty
             // alone. That is a lower bound, and `crate::total_difficulty`
             // settles it once the body is in.
-            let proven = self.proven.lock().unwrap().get(&hash).copied();
+            let proven = self
+                .proven
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(&hash)
+                .copied();
             let contribution = proven.unwrap_or_else(|| self.held_contribution(hash, header));
 
             // The parent is the block named by `parent_hash`, and nothing else.
@@ -354,7 +359,10 @@ impl SyncManager {
                         // search is verified normally.
                         unlinked_here += 1;
                         if let Some(p) = peer {
-                            self.unlinked.lock().unwrap().record(p, hash, header.number, now);
+                            self.unlinked
+                                .lock()
+                                .unwrap_or_else(PoisonError::into_inner)
+                                .record(p, hash, header.number, now);
                         }
                         // Deliberately leave `prev_in_chunk` alone. A refused
                         // header must not seed a total difficulty for the next
@@ -432,14 +440,20 @@ impl SyncManager {
     ///
     /// Marks the search as taken, so the caller cannot forget to.
     pub fn consider_fork_search(&self, peer: &B512) -> Verdict {
-        self.unlinked.lock().unwrap().consider(peer, Instant::now())
+        self.unlinked
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .consider(peer, Instant::now())
     }
 
     /// Whether this peer is still sending headers we cannot connect to after a
     /// search already resolved where its chain diverges — a peer not serving
     /// the chain it agreed on.
     pub fn unlinked_persisted_after_search(&self, peer: &B512) -> bool {
-        self.unlinked.lock().unwrap().persisted_after_search(peer)
+        self.unlinked
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .persisted_after_search(peer)
     }
 
     /// See [`UnlinkedHeaders::backdate`].
@@ -450,7 +464,10 @@ impl SyncManager {
 
     /// Releases a disconnected peer's evidence.
     pub fn forget_peer(&self, peer: &B512) {
-        self.unlinked.lock().unwrap().clear_peer(peer);
+        self.unlinked
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear_peer(peer);
     }
 
     /// Helper to create a headers request message.

@@ -152,6 +152,8 @@ fn blame_for(failure: &SnapFailure) -> Option<EventType> {
         // the chain, not a malformed message, and the peer is answerable for
         // it.
         SnapFailure::OverstatedDifficulty { .. } => Some(EventType::InvalidBlock),
+        // So is offering a height no chain this build can follow has reached.
+        SnapFailure::ImplausibleHeight { .. } => Some(EventType::InvalidBlock),
         // Not answering is the peer's choice and its problem. Treating
         // silence as blameless would make stalling a free way past the gate.
         SnapFailure::UnsubstantiatedClaim { .. } => Some(EventType::InvalidMessage),
@@ -579,6 +581,11 @@ impl SnapDriver {
     }
 
     /// Block identifiers: where to ask, nothing more.
+    ///
+    /// Only as many as an answer to the request can hold, and only where it
+    /// can hold them ([`as_rskj_answers`]): the walk, the ascent and the
+    /// sampling gate each keep what they are given, so how much that is is
+    /// not the peer's to choose.
     pub fn on_skeleton<'p>(
         &mut self,
         id: u64,
@@ -586,9 +593,14 @@ impl SnapDriver {
         identifiers: &[BlockIdentifier],
         peers: impl Into<Peers<'p>>,
     ) -> Vec<Outbound> {
+        let start = match self.in_flight.get(&id).map(|r| r.what) {
+            Some(Pending::Skeleton { start }) => start,
+            _ => 0,
+        };
         if !self.answers(id, sender, |p| matches!(p, Pending::Skeleton { .. })) {
             return Vec::new();
         }
+        let identifiers = as_rskj_answers(start, identifiers);
         trace!(
             target: "rustock::snap",
             "skeleton of {} point(s) from {:?}, #{:?}..#{:?} (request {id})",
@@ -599,7 +611,7 @@ impl SnapDriver {
         );
         let peers = peers.into();
         self.note(peers);
-        let actions = self.session.on_skeleton(identifiers);
+        let actions = self.session.on_skeleton(&identifiers);
         self.charge_for_failure(sender);
         self.dispatch(actions, peers)
     }
@@ -724,5 +736,74 @@ impl SnapDriver {
     /// The state root being downloaded, once one has been offered.
     pub fn state_root(&self) -> Option<B256> {
         self.session.checkpoint().map(|h| h.state_root)
+    }
+}
+
+/// What an answer to a skeleton request from `start` can hold, as rskj's
+/// `processSkeletonRequest` and this node's own server build one: the grid
+/// points from `start`'s chunk on, [`SKELETON_POINTS`] at most, then the
+/// best block, no further on than the next of them would have been. So no
+/// more than `SKELETON_POINTS + 1` identifiers, and none outside that
+/// stretch; anything else is dropped.
+///
+/// [`SKELETON_POINTS`]: super::headers::SKELETON_POINTS
+fn as_rskj_answers(start: u64, identifiers: &[BlockIdentifier]) -> Vec<BlockIdentifier> {
+    use super::headers::{HEADER_CHUNK, SKELETON_POINTS};
+    let first = start - start % HEADER_CHUNK;
+    let last = first.saturating_add(HEADER_CHUNK * SKELETON_POINTS);
+    identifiers
+        .iter()
+        .filter(|i| (first..=last).contains(&i.number))
+        .take(SKELETON_POINTS as usize + 1)
+        .cloned()
+        .collect()
+}
+
+#[cfg(test)]
+mod skeleton_answer_tests {
+    use super::super::headers::{HEADER_CHUNK, SKELETON_POINTS};
+    use super::*;
+
+    fn at(number: u64) -> BlockIdentifier {
+        BlockIdentifier {
+            hash: B256::with_last_byte(number as u8),
+            number,
+        }
+    }
+
+    /// What rskj sends for a request from #9,020,000 to a peer at #9,030,000:
+    /// twenty grid points from #9,019,968, then its best block's stand-in at
+    /// the end of the stretch. All of it passes.
+    #[test]
+    fn an_answer_as_rskj_builds_one_is_taken_whole() {
+        let first = 9_020_000 - 9_020_000 % HEADER_CHUNK;
+        let mut sent: Vec<BlockIdentifier> = (0..SKELETON_POINTS)
+            .map(|k| at(first + k * HEADER_CHUNK))
+            .collect();
+        sent.push(at(first + SKELETON_POINTS * HEADER_CHUNK));
+        assert_eq!(as_rskj_answers(9_020_000, &sent), sent);
+        // A peer whose best block falls inside the stretch ends there.
+        let short = vec![
+            at(first),
+            at(first + HEADER_CHUNK),
+            at(first + HEADER_CHUNK + 77),
+        ];
+        assert_eq!(as_rskj_answers(9_020_000, &short), short);
+    }
+
+    /// Identifiers outside the stretch, and any past the most an answer
+    /// holds, are not passed on to keep.
+    #[test]
+    fn an_answer_holds_no_more_than_rskj_would_send() {
+        let first = 9_020_000 - 9_020_000 % HEADER_CHUNK;
+        let flood: Vec<BlockIdentifier> = (0..100_000).map(|k| at(first + k)).collect();
+        let kept = as_rskj_answers(9_020_000, &flood);
+        assert_eq!(kept.len() as u64, SKELETON_POINTS + 1);
+        let far = vec![at(first - 1), at(first), at(1 << 62), at(u64::MAX)];
+        assert_eq!(as_rskj_answers(9_020_000, &far), vec![at(first)]);
+        assert_eq!(
+            as_rskj_answers(u64::MAX, &[at(u64::MAX)]),
+            vec![at(u64::MAX)]
+        );
     }
 }

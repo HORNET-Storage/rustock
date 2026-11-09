@@ -195,4 +195,44 @@ mod tests {
         assert_eq!(items(&[0xf9, 0x00]), Err(RlpError));
         assert_eq!(items(&[0x01, 0x82, 0xaa]), Err(RlpError));
     }
+
+    /// No variation on nested lists makes reading them, at any depth, panic:
+    /// rskj's decoder reads a fallback-mined header's signature from bytes
+    /// its miner wrote.
+    #[test]
+    fn no_variation_on_rlp_panics() {
+        fn walk(element: &Element<'_>) {
+            let _ = element.data();
+            if let Ok(inner) = element.elements() {
+                inner.iter().for_each(walk);
+            }
+        }
+        let signature = [
+            &[0xf8, 0x43, 0x1b, 0xa0][..],
+            &[0x7c; 32],
+            &[0xa0],
+            &[0x5c; 32],
+        ]
+        .concat();
+        let long = [
+            &[0xf9, 0x01, 0x06, 0xb9, 0x01, 0x00][..],
+            &[0xab; 256],
+            &[0xc2, 0x80, 0x01],
+        ]
+        .concat();
+        let seeds = [
+            signature,
+            long,
+            vec![0xc3, 0x1b, 0x81, 0x80],
+            vec![0xc5, 0xc4, 0xc3, 0xc2, 0xc1, 0xc0],
+        ];
+        for (i, seed) in seeds.iter().enumerate() {
+            assert!(decode2(seed).is_ok());
+            for bytes in crate::mutate::mutants(seed, 3_000, 700 + i as u64) {
+                if let Ok(elements) = decode2(&bytes) {
+                    elements.iter().for_each(walk);
+                }
+            }
+        }
+    }
 }

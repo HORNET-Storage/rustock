@@ -198,7 +198,10 @@ pub fn trace_filter(id: Value, params: &Value, state: &RpcState) -> JsonRpcRespo
     let mut seen = 0usize;
     let wanted = after.saturating_add(count);
 
-    for number in from..=to {
+    // rskj walks from `fromBlock` while `getBlockByNumber` finds a block, so it
+    // stops at the head whatever `toBlock` says. Walking every number up to a
+    // `toBlock` of 2^64 - 1 instead would never end.
+    for number in from..=to.min(head) {
         let Some(hash) = state.store.canonical_hash(number).ok().flatten() else {
             continue;
         };

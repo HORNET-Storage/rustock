@@ -2096,3 +2096,61 @@ fn a_passed_gate_hands_over_to_the_ascent_not_the_walk() {
         "and hands over to the ascent, not the walk"
     );
 }
+
+/// An offered header's proof of work is checked against the difficulty it
+/// states, so a peer can name any height for next to nothing. The gate takes
+/// on a window of [`crate::sampler::MAX_SAMPLED_WINDOW`] above the checkpoint
+/// and refuses one wider, rather than ask for skeletons up to it for ever.
+#[test]
+fn a_state_further_above_the_checkpoint_than_a_chain_can_be_is_refused() {
+    use crate::sampler::MAX_SAMPLED_WINDOW;
+    use rustock_core::checkpoint::MAINNET_CHECKPOINT;
+
+    let cp = MAINNET_CHECKPOINT;
+    for (window, refused) in [
+        (MAX_SAMPLED_WINDOW, false),
+        (MAX_SAMPLED_WINDOW + 1, true),
+        (1 << 62, true),
+    ] {
+        let f = fixture(4);
+        let genesis = f.with_genesis();
+        f.store.set_head(genesis).expect("head");
+        let mut session = SnapSession::new(
+            SnapConfig {
+                client_enabled: true,
+                checkpoint: Some(cp),
+                checkpoint_defence: rustock_core::checkpoint::CheckpointDefence {
+                    verify_hash: false,
+                    bound_work: true,
+                },
+                ..SnapConfig::default()
+            },
+            f.store.clone(),
+            Arc::new(MemoryTrieStore::new()) as Arc<dyn TrieStore>,
+            Arc::new(rustock_core::validation::HeaderVerifier::new()),
+        );
+        let offered = block(header(cp.number + window, B256::ZERO, f.state_root, 100));
+        let _ = session.on_status(
+            std::slice::from_ref(&offered),
+            &[cp.cumulative_difficulty],
+            1024,
+            0,
+        );
+        if refused {
+            assert_eq!(
+                session.failure(),
+                Some(&SnapFailure::ImplausibleHeight {
+                    window,
+                    most: MAX_SAMPLED_WINDOW
+                })
+            );
+        } else {
+            assert_eq!(
+                session.phase(),
+                Phase::SamplingClaim,
+                "{:?}",
+                session.failure()
+            );
+        }
+    }
+}

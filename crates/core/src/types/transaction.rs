@@ -312,8 +312,11 @@ impl Transaction {
         let hash = self.signing_hash(chain_id);
 
         let recovery_id = if self.is_eip155(chain_id) {
-            let rid = self.v as i64 - chain_id as i64 * 2 - 35;
-            if !(0..=1).contains(&rid) {
+            // `is_eip155` holds `v` at `chain_id * 2 + 35` or more, so this is
+            // the id, or past 1. Unsigned: in an `i64`, a `v` of 2^63 or more
+            // went negative, and the subtraction overflowed.
+            let rid = self.v - (chain_id * 2 + 35);
+            if rid > 1 {
                 anyhow::bail!("invalid EIP-155 v value: {} for chain_id {}", self.v, chain_id);
             }
             rid as u8
@@ -848,5 +851,74 @@ mod remasc_derivation_tests {
 
     fn hex_of(bytes: &[u8]) -> String {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+}
+
+#[cfg(test)]
+mod untrusted_input_tests {
+    use super::*;
+    use alloy_primitives::U256;
+    use alloy_rlp::Decodable;
+
+    /// No variation on a signed transaction's bytes makes decoding it, or
+    /// working out who sent it, panic; and no `v` at all does.
+    #[test]
+    fn no_variation_on_a_transaction_panics() {
+        use k256::ecdsa::SigningKey;
+        let key = SigningKey::from_slice(&[1u8; 32]).unwrap();
+        let mut seeds = Vec::new();
+        for (chain_id, eip155) in [(33u64, true), (30, true), (31, false)] {
+            let mut tx = Transaction {
+                nonce: 7,
+                gas_price: U256::from(60_000_000u64),
+                gas_limit: U256::from(21_000u64),
+                to: Bytes::from(vec![0xbb; 20]),
+                value: U256::from(100u64),
+                input: Bytes::from(vec![0xa9, 0x05, 0x9c, 0xbb]),
+                ..Default::default()
+            };
+            let hash = if eip155 {
+                tx.signing_hash_eip155(chain_id)
+            } else {
+                tx.signing_hash_legacy()
+            };
+            let (signature, id) = key.sign_prehash_recoverable(hash.as_slice()).unwrap();
+            let rs = signature.to_bytes();
+            tx.r = U256::from_be_slice(&rs[..32]);
+            tx.s = U256::from_be_slice(&rs[32..]);
+            tx.v = if eip155 { chain_id * 2 + 35 } else { 27 } + u64::from(id.to_byte());
+            assert!(tx.recover_sender(chain_id).is_ok());
+            seeds.push(alloy_rlp::encode(&tx));
+        }
+        for (i, seed) in seeds.iter().enumerate() {
+            for bytes in crate::mutate::mutants(seed, 1_000, 300 + i as u64) {
+                let Ok(tx) = Transaction::decode(&mut bytes.as_slice()) else {
+                    continue;
+                };
+                for chain_id in [30, 31, 33] {
+                    let _ = tx.recover_sender(chain_id);
+                    let _ = tx.recover_compressed_pubkey(chain_id);
+                    let _ = tx.btc_sender_hash160(chain_id);
+                }
+                let _ = tx.tx_hash();
+                let _ = tx.rlp_for_trie();
+            }
+        }
+        // None of these is a recovery id on any network; 2^63 and up once
+        // overflowed the sum that finds it.
+        for v in [0, 26, 29, 34, 94, 99, 100, 103, 1 << 31, 1 << 63, u64::MAX] {
+            let tx = Transaction {
+                v,
+                r: U256::from(1u64),
+                s: U256::from(1u64),
+                ..Default::default()
+            };
+            for chain_id in [30, 31, 33] {
+                assert!(
+                    tx.recover_sender(chain_id).is_err(),
+                    "v {v} on chain {chain_id}"
+                );
+            }
+        }
     }
 }

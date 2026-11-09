@@ -7299,6 +7299,207 @@ mod tests {
         );
     }
 
+    /// **No Bitcoin transaction a peg-in can carry panics the Bridge.**
+    ///
+    /// Anyone can have a transaction of their own making mined into a Bitcoin
+    /// block and register it with a proof of inclusion, so every script,
+    /// witness push and output in it is theirs to choose: Bitcoin's consensus
+    /// asks for an input and leaves scripts free. A panic in reading one would
+    /// stop every node at the block that registers it. Each seed shape is varied
+    /// script by script and push by push, and each variation given to
+    /// everything that reads a peg-in or a federator's signature.
+    #[test]
+    fn no_variation_on_a_pegin_panics_the_bridge() {
+        use super::super::release_tx;
+
+        struct Rng(u64);
+        impl Rng {
+            fn next(&mut self) -> u64 {
+                self.0 ^= self.0 << 13;
+                self.0 ^= self.0 >> 7;
+                self.0 ^= self.0 << 17;
+                self.0
+            }
+            fn below(&mut self, n: usize) -> usize {
+                (self.next() % n.max(1) as u64) as usize
+            }
+        }
+
+        // Bytes that mean something to a script reader: pushes of each size
+        // and their limits, small numbers, and the opcodes multisig, ERP,
+        // flyover and OP_RETURN scripts are built from.
+        const OPCODES: [u8; 26] = [
+            0x00, 0x01, 0x02, 0x14, 0x20, 0x21, 0x41, 0x47, 0x48, 0x4b, 0x4c, 0x4d, 0x4e, 0x4f,
+            0x51, 0x52, 0x60, 0x63, 0x67, 0x68, 0x6a, 0x75, 0x87, 0xa9, 0xae, 0xb2,
+        ];
+
+        fn vary(bytes: &mut Vec<u8>, rng: &mut Rng) {
+            for _ in 0..1 + rng.below(3) {
+                let at = rng.below(bytes.len() + 1);
+                match rng.below(7) {
+                    0 if at < bytes.len() => bytes[at] ^= 1 << rng.below(8),
+                    1 if at < bytes.len() => bytes[at] = OPCODES[rng.below(OPCODES.len())],
+                    2 => bytes.insert(at, OPCODES[rng.below(OPCODES.len())]),
+                    3 => bytes.insert(at, rng.next() as u8),
+                    4 if at < bytes.len() => {
+                        let n = 1 + rng.below(8.min(bytes.len() - at));
+                        bytes.drain(at..at + n);
+                    }
+                    5 => bytes.truncate(at),
+                    _ => {
+                        let n = rng.below(80);
+                        let fill = rng.next() as u8;
+                        bytes.splice(at..at, std::iter::repeat_n(fill, n));
+                    }
+                }
+            }
+        }
+
+        fn read_like_the_bridge(tx: &BtcTransaction) {
+            if let Ok(Some(sender)) = classify_pegin_sender(tx) {
+                let _ = sender_refund_target(&sender);
+                let _ = sender_type_name(Some(&sender));
+            }
+            let _ = undetermined_input_shape(tx);
+            let _ = super::super::pegin_instructions::build_pegin_instructions(tx);
+            let _ = btc_txid_event_bytes(tx);
+            let _ = multisig_txid_without_signatures(tx);
+            let _ = release_tx::has_enough_signatures(tx);
+            let raw = bitcoin::consensus::serialize(tx);
+            let _ = has_inputs(&raw, true);
+            let _ = has_inputs(&raw, false);
+            let _ = super::super::tx::calculate_btc_tx_hash(&raw);
+            let mut scripts: Vec<&[u8]> = Vec::new();
+            for input in &tx.input {
+                scripts.push(input.script_sig.as_bytes());
+                scripts.extend(input.witness.iter());
+            }
+            scripts.extend(
+                tx.output
+                    .iter()
+                    .map(|output| output.script_pubkey.as_bytes()),
+            );
+            for script in scripts {
+                let _ = release_tx::parse_chunks(script);
+                let _ = p2sh_script_hash160(script);
+                let _ = is_der_signature(script);
+                let _ = is_btc_public_key(script);
+                let _ = compress_pubkey(script);
+                let _ = super::super::rskj_sender_compat::is_sent_to_multisig(script);
+                if let Some(redeem) = release_tx::extract_redeem_script(script) {
+                    let _ = super::super::rskj_sender_compat::is_sent_to_multisig(&redeem);
+                    let _ = release_tx::is_erp_redeem(&redeem);
+                }
+            }
+        }
+
+        // A peg-in with outputs: an RSKT OP_RETURN carrying instructions with a
+        // refund address, a P2SH output and a P2PKH one.
+        let mut with_outputs = p2pkh_tx();
+        let mut payload = vec![0x52, 0x53, 0x4b, 0x54, 0x01];
+        payload.extend_from_slice(&[0x11; 20]);
+        payload.push(0x02);
+        payload.extend_from_slice(&[0x22; 20]);
+        let mut op_return = vec![0x6a, payload.len() as u8];
+        op_return.extend_from_slice(&payload);
+        for script in [
+            op_return,
+            p2sh_output_script_program(&[0x33; 20]),
+            p2pkh_output_script(&[0x44; 20]).to_bytes(),
+        ] {
+            with_outputs.output.push(bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat(1_000_000),
+                script_pubkey: bitcoin::ScriptBuf::from_bytes(script),
+            });
+        }
+        // A flyover peg-in: its redeem is the derivation hash, OP_DROP and
+        // the federation's multisig.
+        let flyover = {
+            let redeem = flyover_redeem_script(&[0x55; 32], &multisig_redeem());
+            let mut script = vec![0x00, 71];
+            script.extend_from_slice(&[0x30; 71]);
+            script.push(0x4c);
+            script.push(redeem.len() as u8);
+            script.extend_from_slice(&redeem);
+            tx_with(script, vec![])
+        };
+        let seeds = [
+            p2pkh_tx(),
+            p2sh_p2wpkh_tx(),
+            p2sh_multisig_tx(),
+            p2sh_p2wsh_tx(),
+            with_outputs,
+            flyover,
+        ];
+
+        let mut rng = Rng(0xA076_1D64_78BD_642F);
+        let mut varied = 0;
+        for seed in &seeds {
+            read_like_the_bridge(seed);
+            for _ in 0..1_500 {
+                let mut tx = seed.clone();
+                for _ in 0..1 + rng.below(3) {
+                    match rng.below(6) {
+                        0 => {
+                            let i = rng.below(tx.input.len());
+                            let mut script = tx.input[i].script_sig.to_bytes();
+                            vary(&mut script, &mut rng);
+                            tx.input[i].script_sig = bitcoin::ScriptBuf::from_bytes(script);
+                        }
+                        1 => {
+                            let i = rng.below(tx.input.len());
+                            let mut pushes: Vec<Vec<u8>> =
+                                tx.input[i].witness.iter().map(<[u8]>::to_vec).collect();
+                            match rng.below(3) {
+                                0 if !pushes.is_empty() => {
+                                    let p = rng.below(pushes.len());
+                                    vary(&mut pushes[p], &mut rng);
+                                }
+                                1 if !pushes.is_empty() => {
+                                    pushes.remove(rng.below(pushes.len()));
+                                }
+                                _ => {
+                                    let mut push = multisig_redeem();
+                                    vary(&mut push, &mut rng);
+                                    let at = rng.below(pushes.len() + 1);
+                                    pushes.insert(at, push);
+                                }
+                            }
+                            tx.input[i].witness = bitcoin::Witness::from_slice(&pushes);
+                        }
+                        2 if !tx.output.is_empty() => {
+                            let o = rng.below(tx.output.len());
+                            let mut script = tx.output[o].script_pubkey.to_bytes();
+                            vary(&mut script, &mut rng);
+                            tx.output[o].script_pubkey = bitcoin::ScriptBuf::from_bytes(script);
+                        }
+                        3 => {
+                            let copy = tx.input[rng.below(tx.input.len())].clone();
+                            tx.input.push(copy);
+                        }
+                        4 if tx.input.len() > 1 => {
+                            tx.input.remove(rng.below(tx.input.len()));
+                        }
+                        _ => {
+                            let mut script = vec![0x6a];
+                            let mut data = payload.clone();
+                            vary(&mut data, &mut rng);
+                            script.push(data.len().min(75) as u8);
+                            script.extend_from_slice(&data);
+                            tx.output.push(bitcoin::TxOut {
+                                value: bitcoin::Amount::ZERO,
+                                script_pubkey: bitcoin::ScriptBuf::from_bytes(script),
+                            });
+                        }
+                    }
+                }
+                read_like_the_bridge(&tx);
+                varied += 1;
+            }
+        }
+        assert_eq!(varied, seeds.len() * 1_500);
+    }
+
     /// The P2PKH branch accepts only a real curve point. rskj gets this from
     /// BtcECKey.fromPublicOnly throwing; rustock from `compress_pubkey`
     /// returning None. Without it a two-chunk scriptSig whose second push is

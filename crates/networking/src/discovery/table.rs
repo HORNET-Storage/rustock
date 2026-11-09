@@ -1,5 +1,5 @@
-use alloy_primitives::B512;
 use crate::discovery::message::DiscoveryNode;
+use alloy_primitives::{keccak256, B256, B512};
 use std::time::{Duration, Instant};
 
 pub const BUCKET_SIZE: usize = 16;
@@ -25,6 +25,8 @@ struct BucketEntry {
 
 pub struct NodeTable {
     local_id: B512,
+    /// `local_id`'s [`table_key`], which every distance is measured from.
+    local_key: B256,
     buckets: Vec<Vec<BucketEntry>>,
 }
 
@@ -32,6 +34,7 @@ impl NodeTable {
     pub fn new(local_id: B512) -> Self {
         Self {
             local_id,
+            local_key: table_key(&local_id),
             // `BucketEntry` is intentionally not `Clone`, so build the buckets
             // with an iterator instead of the `vec![_; N]` (clone) macro.
             buckets: (0..NUM_BUCKETS).map(|_| Vec::new()).collect(),
@@ -43,11 +46,14 @@ impl NodeTable {
             return false;
         }
 
-        let distance = self.xor_distance(&node.id);
-        let bucket_idx = self.distance_to_bucket(distance);
+        // rskj `NodeDistanceTable.getNodeBucket`: the distance less one, so
+        // 0 to 255, and a node's ID is whatever a peer said it was.
+        let bucket_idx = distance(&self.local_key, &table_key(&node.id)).saturating_sub(1);
         let now = Instant::now();
 
-        let bucket = &mut self.buckets[bucket_idx];
+        let Some(bucket) = self.buckets.get_mut(bucket_idx) else {
+            return false;
+        };
 
         if let Some(pos) = bucket.iter().position(|e| e.node.id == node.id) {
             // Known node: refresh recency (move to end) and last-seen time.
@@ -75,8 +81,14 @@ impl NodeTable {
     }
 
     pub fn closest_nodes(&self, target: &B512, count: usize) -> Vec<DiscoveryNode> {
-        let mut nodes: Vec<_> = self.buckets.iter().flat_map(|b| b.iter().map(|e| e.node.clone())).collect();
-        nodes.sort_by_cached_key(|n| self.xor_distance_between(&n.id, target));
+        let mut nodes: Vec<_> = self
+            .buckets
+            .iter()
+            .flat_map(|b| b.iter().map(|e| e.node.clone()))
+            .collect();
+        // rskj `getClosestNodes`, sorted by `NodeDistanceComparator`.
+        let target = table_key(target);
+        nodes.sort_by_cached_key(|n| distance(&table_key(&n.id), &target));
         nodes.truncate(count);
         nodes
     }
@@ -180,29 +192,6 @@ impl NodeTable {
         Ok(self.add_node(node))
     }
 
-    fn xor_distance(&self, other: &B512) -> [u8; 64] {
-        self.xor_distance_between(&self.local_id, other)
-    }
-
-    fn xor_distance_between(&self, a: &B512, b: &B512) -> [u8; 64] {
-        let mut res = [0u8; 64];
-        let a_bytes = a.as_slice();
-        let b_bytes = b.as_slice();
-        for i in 0..64 {
-            res[i] = a_bytes[i] ^ b_bytes[i];
-        }
-        res
-    }
-
-    fn distance_to_bucket(&self, distance: [u8; 64]) -> usize {
-        for (i, byte) in distance.iter().enumerate() {
-            if *byte != 0 {
-                return (i * 8) + (7 - byte.leading_zeros() as usize);
-            }
-        }
-        0
-    }
-
     /// Test helper: age every entry past the eviction threshold so the next
     /// `add_node` into a full bucket treats the oldest entry as dead.
     #[cfg(test)]
@@ -218,23 +207,56 @@ impl NodeTable {
     }
 }
 
+/// The key rskj's Kademlia table orders a node by: `keccak256(keccak256(id))`
+/// (`DistanceCalculator.calculateDistance`).
+fn table_key(id: &B512) -> B256 {
+    keccak256(keccak256(id))
+}
+
+/// rskj's distance between two [`table_key`]s: 256 less the leading zero bits
+/// of their XOR, so 0 for the same node and 256 for keys whose first bits
+/// differ (`DistanceCalculator.msbPosition`).
+fn distance(a: &B256, b: &B256) -> usize {
+    let mut leading_zeros = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        let byte = x ^ y;
+        if byte != 0 {
+            return 256 - leading_zeros - byte.leading_zeros() as usize;
+        }
+        leading_zeros += 8;
+    }
+    0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use alloy_primitives::Bytes;
 
-    /// All these IDs share the top bit set (byte 0 = 0x80) and differ only in
-    /// the last byte, so they collide in the same bucket — letting us fill one.
-    fn node_in_shared_bucket(tag: u8) -> DiscoveryNode {
-        let mut id = [0u8; 64];
-        id[0] = 0x80;
-        id[63] = tag;
+    fn node(id: B512) -> DiscoveryNode {
         DiscoveryNode {
             ip: Bytes::from(vec![10, 0, 0, 1]),
             udp_port: 5050,
             tcp_port: 5050,
-            id: B512::from_slice(&id),
+            id,
         }
+    }
+
+    /// The `tag`-th ID, counting by its last two bytes, whose table key differs
+    /// from the zero ID's in its first bit: all of them fall in bucket 255, so
+    /// a test can fill one bucket.
+    fn node_in_shared_bucket(tag: u8) -> DiscoveryNode {
+        let local = table_key(&B512::ZERO);
+        let id = (0..=u16::MAX)
+            .map(|n| {
+                let mut id = [0u8; 64];
+                id[62..].copy_from_slice(&n.to_be_bytes());
+                B512::from(id)
+            })
+            .filter(|id| distance(&local, &table_key(id)) == 256)
+            .nth(usize::from(tag))
+            .expect("half of all IDs fall in bucket 255");
+        node(id)
     }
 
     #[test]
@@ -286,5 +308,61 @@ mod tests {
         assert!(table.add_node(newcomer));
         assert!(table.all_nodes().iter().any(|n| n.id == node_in_shared_bucket(0).id));
         assert!(!table.all_nodes().iter().any(|n| n.id == node_in_shared_bucket(1).id));
+    }
+
+    /// rskj's `DistanceCalculatorTest` (a node is at distance 0 from itself, and
+    /// distance is symmetric), and the edges of `msbPosition`.
+    #[test]
+    fn distance_is_rskjs() {
+        let (a, b) = (B512::from([0x82; 64]), B512::with_last_byte(1));
+        assert_eq!(distance(&table_key(&a), &table_key(&a)), 0);
+        assert_eq!(
+            distance(&table_key(&a), &table_key(&b)),
+            distance(&table_key(&b), &table_key(&a))
+        );
+        assert_eq!(distance(&B256::ZERO, &B256::with_last_byte(1)), 1);
+        assert_eq!(distance(&B256::ZERO, &B256::with_last_byte(0x80)), 8);
+        let mut first = [0u8; 32];
+        first[0] = 0x01;
+        assert_eq!(distance(&B256::ZERO, &B256::from(first)), 249);
+        first[0] = 0x80;
+        assert_eq!(distance(&B256::ZERO, &B256::from(first)), 256);
+    }
+
+    /// A peer names nodes by any 64 bytes it likes, among them IDs that match
+    /// ours in all but one bit, and each has a bucket.
+    #[test]
+    fn every_id_a_peer_can_name_has_a_bucket() {
+        let local = B512::from([0x5A; 64]);
+        let mut table = NodeTable::new(local);
+        for byte in 0..64 {
+            for bit in 0..8 {
+                let mut id = local.0;
+                id[byte] ^= 1 << bit;
+                table.add_node(node(B512::from(id)));
+            }
+        }
+        assert!(!table.is_empty());
+    }
+
+    /// rskj's `getClosestNodes`: the nodes nearest the target by rskj's distance.
+    #[test]
+    fn closest_nodes_are_nearest_by_rskjs_distance() {
+        let mut table = NodeTable::new(B512::ZERO);
+        for tag in 1..=40 {
+            table.add_node(node(B512::with_last_byte(tag)));
+        }
+        let target = table_key(&B512::with_last_byte(77));
+        let distance_to = |n: &DiscoveryNode| distance(&table_key(&n.id), &target);
+        let closest = table.closest_nodes(&B512::with_last_byte(77), 10);
+        assert_eq!(closest.len(), 10);
+        assert!(closest
+            .windows(2)
+            .all(|w| distance_to(&w[0]) <= distance_to(&w[1])));
+        let farthest = distance_to(&closest[9]);
+        assert!(table
+            .all_nodes()
+            .iter()
+            .all(|n| closest.iter().any(|c| c.id == n.id) || distance_to(n) >= farthest));
     }
 }

@@ -9,7 +9,7 @@
 //! last being the same fullness signal rskj's `GasPriceTracker` uses to decide
 //! whether the fee market is working (see issue #52).
 
-use std::sync::RwLock;
+use std::sync::{PoisonError, RwLock};
 use std::time::Duration;
 
 /// CPU time consumed by the calling thread.
@@ -117,7 +117,7 @@ impl ChainActivity {
         cpu: Duration,
         wall: Duration,
     ) {
-        let mut c = self.inner.write().unwrap();
+        let mut c = self.inner.write().unwrap_or_else(PoisonError::into_inner);
         c.blocks += 1;
         c.transactions += transactions as u64;
         c.gas_used += gas_used as u128;
@@ -131,7 +131,7 @@ impl ChainActivity {
     /// The window since the previous call, clearing the counters so each
     /// report covers exactly one window.
     pub fn take(&self) -> ChainActivitySummary {
-        let mut c = self.inner.write().unwrap();
+        let mut c = self.inner.write().unwrap_or_else(PoisonError::into_inner);
         let summary = ChainActivitySummary {
             blocks: c.blocks,
             transactions: c.transactions,

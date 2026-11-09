@@ -1275,6 +1275,79 @@ async fn the_get_logs_range_cap_is_configurable() {
     assert_eq!(resp.result.unwrap().as_array().unwrap().len(), 3);
 }
 
+/// Runs `request` on a thread of its own and fails if no answer comes within a
+/// minute. The regressions the tests below guard against are loops that never
+/// end, and a test that hangs with one says less than a test that fails.
+fn answered_within_a_minute(state: &RpcState, request: JsonRpcRequest) -> JsonRpcResponse {
+    let state = state.clone();
+    let (answer, answered) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        let _ = answer.send(runtime.block_on(dispatch_for_test(&state, request)));
+    });
+    answered
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("no answer within a minute: the request walks a range that never ends")
+}
+
+/// **A log range is walked no further than the head.**
+///
+/// A client may name any block up to 2^64 - 1. `eth_getLogs` measures its span
+/// against the cap, and that measurement must not overflow; an installed
+/// filter's range is never measured at all. Either way nothing above the head
+/// holds a block, and walking those numbers one by one would be a request
+/// that never ends.
+#[tokio::test]
+async fn a_log_range_reaching_the_top_of_the_number_space_stops_at_the_head() {
+    let (state, _tmp) = setup_state_with_logs();
+    let top = "0xffffffffffffffff";
+
+    let at_the_top = answered_within_a_minute(
+        &state,
+        make_request("eth_getLogs", json!([{"fromBlock": top, "toBlock": top}])),
+    );
+    assert!(at_the_top
+        .result
+        .expect("an answer")
+        .as_array()
+        .unwrap()
+        .is_empty());
+
+    let to_the_head = dispatch_for_test(
+        &state,
+        make_request(
+            "eth_getLogs",
+            json!([{"fromBlock": "0x1", "toBlock": "latest"}]),
+        ),
+    )
+    .await
+    .result
+    .expect("logs to the head");
+    assert!(
+        !to_the_head.as_array().unwrap().is_empty(),
+        "nothing to compare"
+    );
+
+    let installed = dispatch_for_test(
+        &state,
+        make_request(
+            "eth_newFilter",
+            json!([{"fromBlock": "0x1", "toBlock": top}]),
+        ),
+    )
+    .await
+    .result
+    .expect("a filter id");
+    let to_the_top = answered_within_a_minute(
+        &state,
+        make_request("eth_getFilterLogs", json!([installed])),
+    );
+    assert_eq!(to_the_top.result.expect("an answer"), to_the_head);
+}
+
 #[tokio::test]
 async fn test_eth_get_logs_by_address() {
     let (state, _tmp) = setup_state_with_logs();
@@ -3949,6 +4022,55 @@ async fn trace_filter_returns_the_range_and_enforces_its_limits() {
     )
     .await;
     assert!(too_many.error.unwrap().message.contains("Count value too big"));
+}
+
+/// **`trace_filter` stops at the head, as rskj's does, whatever `toBlock` says.**
+///
+/// rskj walks while `getBlockByNumber` finds a block. Walking every number up
+/// to a `toBlock` of 2^64 - 1 instead would be a request that never ends.
+#[tokio::test]
+async fn a_trace_range_reaching_the_top_of_the_number_space_stops_at_the_head() {
+    let (state, _tmp, _tx, _sender, _caller, _callee) = setup_state_for_tracing();
+    let top = "0xffffffffffffffff";
+
+    let to_the_head = dispatch_for_test(
+        &state,
+        make_request(
+            "trace_filter",
+            json!([{"fromBlock": "0x2a", "toBlock": "latest"}]),
+        ),
+    )
+    .await
+    .result
+    .expect("traces to the head");
+    assert!(
+        !to_the_head.as_array().unwrap().is_empty(),
+        "nothing to compare"
+    );
+
+    let to_the_top = answered_within_a_minute(
+        &state,
+        make_request(
+            "trace_filter",
+            json!([{"fromBlock": "0x2a", "toBlock": top}]),
+        ),
+    );
+    assert_eq!(to_the_top.result.expect("an answer"), to_the_head);
+
+    // Above the head there is nothing to trace: rskj finds no `fromBlock`.
+    let above = answered_within_a_minute(
+        &state,
+        make_request(
+            "trace_filter",
+            json!([{"fromBlock": "0xfffffffffffffff0", "toBlock": top}]),
+        ),
+    );
+    assert!(above
+        .result
+        .expect("an answer")
+        .as_array()
+        .unwrap()
+        .is_empty());
 }
 
 /// An unknown transaction is `null`, and the `trace_*` methods no longer

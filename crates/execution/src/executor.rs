@@ -7662,6 +7662,285 @@ mod tests {
         assert_eq!(result.tx_results[0].gas_used, enough);
     }
 
+    /// **No call to a precompile panics the node.**
+    ///
+    /// Anyone can send a transaction, or ask for an `eth_call`, that calls a
+    /// precompile with any bytes at all. Each precompile is called here by a
+    /// transaction of its own, from a contract (CALL, STATICCALL and
+    /// DELEGATECALL) and as a local call, with random payloads, with words at
+    /// the edges of ABI decoding, and with each of its methods' selectors
+    /// followed by such words. The callers are a stranger and the federators
+    /// and authorizers of every network, so the Bridge's guarded methods read
+    /// their arguments too, and the rules are genesis's, mainnet's between
+    /// Papyrus and Iris, and everything on. What each call answers is the
+    /// other tests' business; that the node answers is this one's.
+    #[test]
+    fn no_call_to_a_precompile_panics() {
+        use crate::bridge::constants::BridgeConstants;
+        use crate::precompiles as p;
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        struct Rng(u64);
+        impl Rng {
+            fn next(&mut self) -> u64 {
+                self.0 ^= self.0 << 13;
+                self.0 ^= self.0 >> 7;
+                self.0 ^= self.0 << 17;
+                self.0
+            }
+            fn below(&mut self, n: usize) -> usize {
+                (self.next() % n.max(1) as u64) as usize
+            }
+            fn bytes(&mut self, n: usize) -> Vec<u8> {
+                (0..n).map(|_| self.next() as u8).collect()
+            }
+            /// An ABI word: an offset, a length, a limit of an integer type, an
+            /// address, a block number, or noise.
+            fn word(&mut self) -> [u8; 32] {
+                let small = |v: u64| U256::from(v).to_be_bytes::<32>();
+                match self.below(11) {
+                    0 => [0; 32],
+                    1 => small([0x20, 0x40, 0x60, 0x80, 0xa0, 0xc0][self.below(6)]),
+                    2 => small(
+                        [1, 2, 20, 31, 32, 33, 64, 65, 100, 255, 256, 1 << 20][self.below(12)],
+                    ),
+                    3 => small(
+                        [
+                            i32::MAX as u64,
+                            1 << 31,
+                            u32::MAX as u64,
+                            1 << 32,
+                            i64::MAX as u64,
+                            1 << 63,
+                            u64::MAX,
+                        ][self.below(7)],
+                    ),
+                    4 => [0xff; 32],
+                    5 => {
+                        let mut word = [0u8; 32];
+                        word[0] = 0x80;
+                        word
+                    }
+                    6 => {
+                        let mut word = [0xff; 32];
+                        word[0] = 0x7f;
+                        word
+                    }
+                    7 => {
+                        let mut word = [0u8; 32];
+                        word[12..].copy_from_slice(&self.bytes(20));
+                        word
+                    }
+                    8 => small(self.next() % 10_000_000),
+                    _ => {
+                        let mut word = [0u8; 32];
+                        word.copy_from_slice(&self.bytes(32));
+                        word
+                    }
+                }
+            }
+        }
+
+        /// A contract that passes its calldata on to `target` with `opcode`
+        /// and returns whatever comes back.
+        fn forwarder(target: Address, opcode: u8) -> Vec<u8> {
+            let mut code = vec![0x36, 0x60, 0x00, 0x60, 0x00, 0x37]; // calldatacopy(0, 0, size)
+            code.extend([0x60, 0x00, 0x60, 0x00, 0x36, 0x60, 0x00]); // out 0,0; in 0,size
+            if opcode == 0xf1 {
+                code.extend([0x60, 0x00]); // no value
+            }
+            code.push(0x73);
+            code.extend_from_slice(target.as_slice());
+            code.extend([0x5a, opcode, 0x50]); // gas, call, drop the flag
+            code.extend([0x3d, 0x60, 0x00, 0x60, 0x00, 0x3e]); // returndatacopy(0, 0, size)
+            code.extend([0x3d, 0x60, 0x00, 0xf3]); // return(0, size)
+            code
+        }
+
+        let numbered = |n: u8| {
+            let mut bytes = [0u8; 20];
+            bytes[19] = n;
+            Address::from(bytes)
+        };
+        let mut targets: Vec<(Address, Vec<[u8; 4]>)> =
+            (1..=9).map(|n| (numbered(n), Vec::new())).collect();
+        targets.extend([
+            (p::BRIDGE_ADDR, crate::bridge::every_selector()),
+            (
+                p::REMASC_ADDR,
+                vec![crate::abi::selector("processMinersFees()")],
+            ),
+            (
+                p::HD_WALLET_UTILS_ADDR,
+                crate::native::hd_wallet::every_selector(),
+            ),
+            (
+                p::BLOCK_HEADER_ADDR,
+                crate::native::block_header::every_selector(),
+            ),
+            (
+                p::ENVIRONMENT_ADDR,
+                vec![crate::abi::selector("getCallStackDepth()")],
+            ),
+            (p::SECP256K1_ADD_ADDR, Vec::new()),
+            (p::SECP256K1_MUL_ADDR, Vec::new()),
+        ]);
+
+        let mut senders = vec![Address::repeat_byte(0xAA)];
+        for constants in [
+            BridgeConstants::mainnet(),
+            BridgeConstants::testnet(),
+            BridgeConstants::regtest(),
+        ] {
+            for keys in [
+                constants.genesis_federation_public_keys,
+                constants.authorized_free_tx_keys,
+                constants.whitelist_authorizer_keys,
+                constants.fee_per_kb_authorizer_keys,
+                constants.increase_locking_cap_authorizer_keys,
+                constants.federation_change_authorizer_keys,
+            ] {
+                senders.extend(keys.iter().take(2).filter_map(|key| {
+                    let key = alloy_primitives::hex::decode(key).ok()?;
+                    crate::bridge::federation::rsk_address_from_public_key(&key)
+                }));
+            }
+        }
+        senders.sort();
+        senders.dedup();
+
+        let store = Arc::new(MemoryTrieStore::new());
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let mut root = TrieNode::empty();
+        for sender in &senders {
+            root = put_account(&root, store.as_ref(), sender, 0, one_rbtc);
+        }
+        const VIA: [(&str, u8); 3] = [("CALL", 0xf1), ("STATICCALL", 0xfa), ("DELEGATECALL", 0xf4)];
+        let mut forwarders = Vec::new();
+        for (i, (target, _)) in targets.iter().enumerate() {
+            let mut at = [Address::ZERO; 3];
+            for (j, (_, opcode)) in VIA.iter().enumerate() {
+                let mut bytes = [0xEE; 20];
+                bytes[0] = j as u8;
+                bytes[1] = i as u8;
+                at[j] = Address::from(bytes);
+                let code = forwarder(*target, *opcode);
+                root = put_account_with_code(&root, store.as_ref(), &at[j], 1, U256::ZERO, &code);
+            }
+            forwarders.push(at);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let block_store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+        let mut rng = Rng(0x2545_F491_4F6C_DD1D);
+        let mut calls = 0usize;
+        let mut outcomes = [0usize; 4];
+        for (rules, height) in [
+            (RskHardforkConfig::mainnet(), 1u64),
+            (RskHardforkConfig::mainnet(), 3_000_000),
+            (RskHardforkConfig::testnet(), 5_000_000),
+            (RskHardforkConfig::all_active_parallel(33), 8_000_000),
+        ] {
+            let executor = RskExecutor::new(rules, block_store.clone());
+            let header = dummy_header(height);
+            for (i, (target, selectors)) in targets.iter().enumerate() {
+                let mut payloads = vec![Vec::new()];
+                for _ in 0..40 {
+                    let n = rng.below(300);
+                    payloads.push(rng.bytes(n));
+                }
+                for _ in 0..40 {
+                    let words = rng.below(8);
+                    payloads.push((0..words).flat_map(|_| rng.word()).collect());
+                }
+                // Blake2F's exact 213 bytes, with few enough rounds to run.
+                let mut blake = rng.bytes(213);
+                blake[..4].copy_from_slice(&(rng.below(16) as u32).to_be_bytes());
+                blake[212] = rng.below(3) as u8;
+                payloads.push(blake);
+                for selector in selectors {
+                    payloads.push(selector.to_vec());
+                    for _ in 0..20 {
+                        let mut payload = selector.to_vec();
+                        for _ in 0..rng.below(7) {
+                            payload.extend(rng.word());
+                        }
+                        if rng.below(3) == 0 {
+                            let n = rng.below(70);
+                            payload.extend(rng.bytes(n));
+                        }
+                        payloads.push(payload);
+                    }
+                }
+
+                for payload in payloads {
+                    let sender = senders[rng.below(senders.len())];
+                    let value = if rng.below(4) == 0 {
+                        U256::from(rng.below(3))
+                    } else {
+                        U256::ZERO
+                    };
+                    let local = rng.below(4) == 0;
+                    let via = rng.below(VIA.len() + 1);
+                    let (to, how) = match via {
+                        0 => (*target, "directly"),
+                        _ => (forwarders[i][via - 1], VIA[via - 1].0),
+                    };
+                    let tx = rustock_core::Transaction {
+                        nonce: 0,
+                        gas_price: U256::from(60_000_000u64),
+                        gas_limit: U256::from(2_000_000u64),
+                        to: Bytes::copy_from_slice(to.as_slice()),
+                        value,
+                        input: Bytes::copy_from_slice(&payload),
+                        v: 0,
+                        r: U256::ZERO,
+                        s: U256::ZERO,
+                        cached_rlp: None,
+                    };
+                    let answered = catch_unwind(AssertUnwindSafe(|| {
+                        let shape = |tx: &TxExecutionResult| (tx.success, !tx.output.is_empty());
+                        if local {
+                            executor
+                                .execute_local_call(&header, &tx, sender, &root, store.clone())
+                                .map(|tx| shape(&tx))
+                        } else {
+                            executor
+                                .execute_block(
+                                    &header,
+                                    &[(tx.clone(), sender)],
+                                    &root,
+                                    store.clone(),
+                                )
+                                .map(|block| shape(&block.tx_results[0]))
+                        }
+                    }));
+                    assert!(
+                        answered.is_ok(),
+                        "{target} panicked at #{height}, called {how} by {sender}{} with 0x{}",
+                        if local { " as a local call" } else { "" },
+                        alloy_primitives::hex::encode(&payload)
+                    );
+                    match answered.unwrap() {
+                        Ok((true, true)) => outcomes[0] += 1,
+                        Ok((true, false)) => outcomes[1] += 1,
+                        Ok((false, _)) => outcomes[2] += 1,
+                        Err(_) => outcomes[3] += 1,
+                    }
+                    calls += 1;
+                }
+            }
+        }
+        // A fuzz whose calls never got past their own parsing would pass
+        // without testing anything, so some must have run to an answer.
+        let [returned, ..] = outcomes;
+        assert!(calls > 10_000, "only {calls} calls");
+        assert!(
+            returned > calls / 10,
+            "only {returned} of {calls} calls returned anything: {outcomes:?}"
+        );
+    }
+
     /// BN128 refusing a point (`BN128PrecompiledContract`): before RSKIP197 it
     /// answers with no bytes, a plain success; from RSKIP197 it throws, which
     /// in a transaction's own call is the invisible exception.

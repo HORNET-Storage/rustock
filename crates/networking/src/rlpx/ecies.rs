@@ -65,6 +65,11 @@ impl AuthInitiate {
     }
 
     pub fn recover_ephemeral_public_key(&self, my_sk: &SecretKey) -> Result<B512> {
+        // The signature is whatever the initiator sent, so it is held to its
+        // 65 bytes before its parts are read.
+        let signature: &[u8; 65] = self.signature.as_ref().try_into().map_err(|_| {
+            anyhow::anyhow!("auth signature is {} bytes, not 65", self.signature.len())
+        })?;
         let mut pub_bytes = [0u8; 65];
         pub_bytes[0] = 0x04;
         pub_bytes[1..].copy_from_slice(self.public_key.as_slice());
@@ -83,9 +88,9 @@ impl AuthInitiate {
         }
 
         // Recover ephemeral public key from signature
-        let signature_bytes = k256::ecdsa::Signature::from_slice(&self.signature[..64])
+        let signature_bytes = k256::ecdsa::Signature::from_slice(&signature[..64])
             .map_err(|e| anyhow::anyhow!("Invalid signature format: {:?}", e))?;
-        let recovery_id = k256::ecdsa::RecoveryId::from_byte(self.signature[64])
+        let recovery_id = k256::ecdsa::RecoveryId::from_byte(signature[64])
             .ok_or_else(|| anyhow::anyhow!("Invalid recovery ID"))?;
             
         let vk = k256::ecdsa::VerifyingKey::recover_from_prehash(&signed_data, &signature_bytes, recovery_id)
@@ -388,5 +393,26 @@ mod tests {
         
         let auth_resp = AuthResponse::new(&my_ephemeral_pk, nonce);
         assert_eq!(auth_resp.public_key, my_ephemeral_pk);
+    }
+
+    /// The responder reads the initiator's signature before it knows anything
+    /// about the peer, so a signature of the wrong length is an error.
+    #[test]
+    fn an_auth_signature_of_the_wrong_length_is_refused() {
+        let mut rng = k256::elliptic_curve::rand_core::OsRng;
+        let (my_sk, remote_sk) = (SecretKey::random(&mut rng), SecretKey::random(&mut rng));
+        let encoded = remote_sk.public_key().to_encoded_point(false);
+        let remote_pk = B512::from_slice(&encoded.as_bytes()[1..]);
+        let mut auth =
+            AuthInitiate::new(&my_sk, &remote_pk, &SecretKey::random(&mut rng), B256::ZERO)
+                .unwrap();
+        assert!(auth.recover_ephemeral_public_key(&remote_sk).is_ok());
+        for length in [0, 1, 64, 66, 200] {
+            auth.signature = vec![0x11; length].into();
+            assert!(
+                auth.recover_ephemeral_public_key(&remote_sk).is_err(),
+                "{length} bytes"
+            );
+        }
     }
 }

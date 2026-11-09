@@ -6,7 +6,7 @@ use alloy_primitives::{Address, B256};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, PoisonError, RwLock};
 
 /// Block range an `eth_getLogs` may span when the operator has set no limit.
 ///
@@ -43,16 +43,28 @@ impl FilterStore {
 
     fn insert(&self, filter: Filter) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        self.filters.write().unwrap().insert(id, filter);
+        self.filters
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(id, filter);
         id
     }
 
     fn get(&self, id: u64) -> Option<Filter> {
-        self.filters.read().unwrap().get(&id).cloned()
+        self.filters
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&id)
+            .cloned()
     }
 
     fn update_last_polled(&self, id: u64, block: u64) {
-        if let Some(f) = self.filters.write().unwrap().get_mut(&id) {
+        if let Some(f) = self
+            .filters
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_mut(&id)
+        {
             f.last_polled_block = block;
         }
     }
@@ -61,7 +73,12 @@ impl FilterStore {
     /// now. Called straight after the difference has been handed to the
     /// caller.
     fn replace_reported(&self, id: u64, now: std::collections::HashSet<B256>) {
-        if let Some(f) = self.filters.write().unwrap().get_mut(&id) {
+        if let Some(f) = self
+            .filters
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_mut(&id)
+        {
             if let FilterKind::PendingTransaction { reported } = &mut f.kind {
                 *reported = now;
             }
@@ -69,7 +86,11 @@ impl FilterStore {
     }
 
     fn remove(&self, id: u64) -> bool {
-        self.filters.write().unwrap().remove(&id).is_some()
+        self.filters
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&id)
+            .is_some()
     }
 }
 
@@ -111,7 +132,9 @@ pub fn eth_get_logs(id: Value, params: &Value, state: &RpcState) -> JsonRpcRespo
     let to = filter.to_block.unwrap_or(head_num);
 
     let max_range = state.logs_max_blocks.max(1);
-    if to > from + max_range {
+    // Measured as a difference, which cannot overflow: a `fromBlock` near 2^64
+    // would carry `from + max_range` past the top.
+    if to.saturating_sub(from) > max_range {
         return JsonRpcResponse::error(
             id,
             INVALID_PARAMS,
@@ -274,6 +297,11 @@ fn collect_logs(from: u64, to: u64, filter: &LogFilter, state: &RpcState) -> Vec
     // nothing.
     let use_bloom = filter_constrains_anything(filter);
 
+    // Nothing above the head has a block to read, and a range a client names
+    // may end anywhere up to 2^64 - 1 (an installed filter's is never checked
+    // against the cap). Walked number by number, the rest would be a request
+    // that never ends, holding a worker thread for good.
+    let to = to.min(head_number(&state.store).unwrap_or(0));
     for num in from..=to {
         let Some(block_hash) = state.store.canonical_hash(num).ok().flatten() else {
             continue;

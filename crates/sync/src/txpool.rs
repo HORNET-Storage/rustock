@@ -6,7 +6,7 @@ use rustock_trie::{account_key, code_key, AccountState, TrieKeySlice, TrieNode, 
 use sha3::{Digest, Keccak256};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Instant;
 use tracing::debug;
 
@@ -369,7 +369,10 @@ impl TransactionPool {
 
     /// Call `listener` with every transaction admitted from now on.
     pub fn set_on_added(&self, listener: Arc<dyn Fn(&Transaction) + Send + Sync>) {
-        *self.on_added.write().unwrap() = Some(listener);
+        *self
+            .on_added
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Some(listener);
     }
 
     /// Apply the checks that depend on the chain's activations and
@@ -410,7 +413,7 @@ impl TransactionPool {
     /// Intended for a periodic reporter that stays silent when nothing
     /// happened, so a line in the log always means something did.
     pub fn take_activity(&self) -> PoolActivity {
-        let mut stats = self.stats.write().unwrap();
+        let mut stats = self.stats.write().unwrap_or_else(PoisonError::into_inner);
         let mut rejections: Vec<(&'static str, u64)> =
             stats.rejections.iter().map(|(k, v)| (*k, *v)).collect();
         rejections.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
@@ -437,22 +440,34 @@ impl TransactionPool {
     /// than spawned internally so the caller owns the task; returns how many
     /// accounts were dropped.
     pub fn clean_quotas(&self) -> usize {
-        self.quota.write().unwrap().clean_max_quotas(Instant::now())
+        self.quota
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clean_max_quotas(Instant::now())
     }
 
     /// The cleaner interval, or `None` when the clean is disabled.
     pub fn quota_cleaner_period(&self) -> Option<std::time::Duration> {
-        self.quota.read().unwrap().cleaner_period()
+        self.quota
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .cleaner_period()
     }
 
     /// Virtual gas currently available to `address`, for diagnostics and tests.
     pub fn quota_of(&self, address: &Address) -> Option<f64> {
-        self.quota.read().unwrap().quota_of(address)
+        self.quota
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .quota_of(address)
     }
 
     /// An address's quota as `debug_accountTransactionQuota` reports it.
     pub fn quota_report_of(&self, address: &Address) -> Option<(f64, u64)> {
-        self.quota.read().unwrap().quota_report_of(address, Instant::now())
+        self.quota
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .quota_report_of(address, Instant::now())
     }
 
     /// Add a raw RLP-encoded transaction to the pool.
@@ -460,7 +475,7 @@ impl TransactionPool {
     pub fn add_transaction(&self, raw: &[u8]) -> Result<B256, PoolError> {
         let result = self.add_transaction_inner(raw);
         {
-            let mut stats = self.stats.write().unwrap();
+            let mut stats = self.stats.write().unwrap_or_else(PoisonError::into_inner);
             stats.offered += 1;
             match &result {
                 Ok(_) => stats.accepted += 1,
@@ -527,7 +542,7 @@ impl TransactionPool {
             encoded_size,
         };
 
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.write().unwrap_or_else(PoisonError::into_inner);
 
         if inner.by_hash.contains_key(&hash) {
             return Err(PoolError::AlreadyKnown);
@@ -628,21 +643,31 @@ impl TransactionPool {
                 }),
             };
             let receiver = (tx.to.len() == 20).then(|| Address::from_slice(tx.to.as_ref()));
-            let accepted = self.quota.write().unwrap().accept_tx(
-                sender,
-                receiver,
-                &tx_facts(&tx, encoded_size),
-                replaced_facts.as_ref(),
-                &ctx,
-                &accounts,
-                Instant::now(),
-            );
+            let accepted = self
+                .quota
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .accept_tx(
+                    sender,
+                    receiver,
+                    &tx_facts(&tx, encoded_size),
+                    replaced_facts.as_ref(),
+                    &ctx,
+                    &accounts,
+                    Instant::now(),
+                );
             if !accepted {
                 debug!(
                     tx_hash = %hash, sender = %sender, nonce = tx.nonce,
                     "Transaction refused: account exceeds virtual gas quota"
                 );
-                *self.stats.write().unwrap().quota_by_sender.entry(sender).or_insert(0) += 1;
+                *self
+                    .stats
+                    .write()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .quota_by_sender
+                    .entry(sender)
+                    .or_insert(0) += 1;
                 return Err(PoolError::AccountExceedsQuota);
             }
         }
@@ -666,7 +691,11 @@ impl TransactionPool {
 
         debug!(tx_hash = %hash, sender = %sender, nonce = tx.nonce, "Transaction added to pool");
         drop(inner);
-        let listener = self.on_added.read().unwrap().clone();
+        let listener = self
+            .on_added
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
         if let Some(listener) = listener {
             listener(&tx);
         }
@@ -774,7 +803,7 @@ impl TransactionPool {
 
     pub fn remove_mined(&self, transactions: &[Transaction]) {
         let mut removed = 0u64;
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.write().unwrap_or_else(PoisonError::into_inner);
         for tx in transactions {
             let mut buf = Vec::new();
             tx.encode(&mut buf);
@@ -785,7 +814,10 @@ impl TransactionPool {
         }
         drop(inner);
         if removed > 0 {
-            self.stats.write().unwrap().mined += removed;
+            self.stats
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .mined += removed;
         }
     }
 
@@ -793,7 +825,7 @@ impl TransactionPool {
     /// template: rskj `BlockToMineBuilder.removePendingTransactions` on
     /// `BlockResult.getInvalidTransactions()`. Returns how many were there.
     pub fn remove_by_hashes(&self, hashes: &[B256]) -> usize {
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.write().unwrap_or_else(PoisonError::into_inner);
         let mut removed = 0;
         for hash in hashes {
             let nonce = inner
@@ -835,7 +867,7 @@ impl TransactionPool {
 
     /// Evict transactions older than the configured thresholds.
     pub fn evict_outdated(&self, current_block: u64) {
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.write().unwrap_or_else(PoisonError::into_inner);
         let threshold = self.config.outdated_threshold;
         let timeout = std::time::Duration::from_secs(self.config.outdated_timeout_secs);
         let now = Instant::now();
@@ -894,7 +926,7 @@ impl TransactionPool {
 
     /// Get a transaction from the pool by hash.
     pub fn get(&self, hash: &B256) -> Option<PooledTx> {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read().unwrap_or_else(PoisonError::into_inner);
         let sender = inner.by_hash.get(hash)?;
         for map in [&inner.pending, &inner.queued] {
             if let Some(nonce_map) = map.get(sender) {
@@ -910,7 +942,7 @@ impl TransactionPool {
 
     /// Return all pending transactions ordered by gas price (desc), nonce (asc) per sender.
     pub fn pending_transactions(&self) -> Vec<PooledTx> {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read().unwrap_or_else(PoisonError::into_inner);
         let mut result = Vec::new();
         for nonce_map in inner.pending.values() {
             for ptx in nonce_map.values() {
@@ -931,7 +963,7 @@ impl TransactionPool {
     /// would otherwise appear twice, or vanish.
     #[allow(clippy::type_complexity)]
     pub fn content(&self) -> (PoolGroups, PoolGroups) {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read().unwrap_or_else(PoisonError::into_inner);
         let collect = |side: &HashMap<Address, BTreeMap<u64, PooledTx>>| -> PoolGroups {
             let mut out: Vec<(Address, Vec<(u64, Transaction)>)> = side
                 .iter()
@@ -955,7 +987,7 @@ impl TransactionPool {
 
     /// Return counts of pending and queued transactions.
     pub fn status(&self) -> (usize, usize) {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read().unwrap_or_else(PoisonError::into_inner);
         let pending: usize = inner.pending.values().map(|m| m.len()).sum();
         let queued: usize = inner.queued.values().map(|m| m.len()).sum();
         (pending, queued)
@@ -963,7 +995,7 @@ impl TransactionPool {
 
     /// Return the pending nonce for an address (state nonce + pending count).
     pub fn pending_nonce(&self, addr: &Address) -> Option<u64> {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read().unwrap_or_else(PoisonError::into_inner);
         inner
             .pending
             .get(addr)

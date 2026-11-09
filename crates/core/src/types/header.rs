@@ -1905,4 +1905,44 @@ mod versioned_wire_header_tests {
         // each of two UMM roots.
         assert_eq!(layouts, 2 * (4 + 6 * 2));
     }
+
+    /// No variation on a versioned header's bytes, as testnet's peers send
+    /// them, makes decoding, hashing or checking it panic; nor on the
+    /// extensions they carry, as a body sends one apart from its header.
+    #[test]
+    fn no_variation_on_a_versioned_header_or_its_extension_panics() {
+        use crate::types::header_extension::BlockHeaderExtension;
+        let seeds = [
+            V1_WIRE,
+            V2_WIRE,
+            V2_FULL,
+            V2_COMPRESSED,
+            V2_FROM_PEERS,
+            V2_SHORT_WIRE,
+            RSKJ_REGTEST_V2_FULL,
+        ];
+        let compressed = from_the_network(V2_COMPRESSED);
+        for (i, seed) in seeds.iter().enumerate() {
+            let seed = alloy_primitives::hex::decode(seed).unwrap();
+            crate::mutate::decode_and_check_header(&seed);
+            for bytes in crate::mutate::mutants(&seed, 300, 100 + i as u64) {
+                crate::mutate::decode_and_check_header(&bytes);
+            }
+            let testnet = crate::config::ActivationHeights::testnet();
+            let Ok(header) = Header::decode_with_activations(&mut &seed[..], &testnet) else {
+                continue;
+            };
+            let Some(extension) = header.extension() else {
+                continue;
+            };
+            for bytes in crate::mutate::mutants(&extension.to_encoded(), 300, 200 + i as u64) {
+                if let Ok(extension) = BlockHeaderExtension::from_encoded(&bytes) {
+                    let _ = extension.hash();
+                    let _ = compressed.accepts_extension(&extension);
+                    let _ = compressed.with_extension(&extension);
+                    let _ = header.with_extension(&extension);
+                }
+            }
+        }
+    }
 }

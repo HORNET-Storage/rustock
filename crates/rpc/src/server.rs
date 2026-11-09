@@ -204,7 +204,40 @@ async fn handle_rpc(
     }
 }
 
+/// One request, answered whatever happens inside it.
+///
+/// rskj's `RskErrorResolver` answers an exception it has no specific answer
+/// for with -32603 "Internal server error", logs it, and goes on serving. A
+/// panic here is the same failure, so it gets the same answer. Uncaught, it
+/// would unwind the connection's task instead, and the client, with every
+/// other request in its batch, would get a dropped connection, not a reply.
 async fn dispatch(state: &RpcState, req: JsonRpcRequest) -> JsonRpcResponse {
+    let id = req.id.clone().unwrap_or(Value::Null);
+    let method = req.method.clone();
+    answered(id, &method, route(state, req)).await
+}
+
+/// `answer`'s response, or rskj's internal error if it panics.
+async fn answered(
+    id: Value,
+    method: &str,
+    answer: impl std::future::Future<Output = JsonRpcResponse>,
+) -> JsonRpcResponse {
+    match futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(answer)).await {
+        Ok(response) => response,
+        Err(panic) => {
+            let message = panic
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+                .unwrap_or("no message");
+            tracing::error!("JSON-RPC method {method} panicked: {message}");
+            JsonRpcResponse::error(id, INTERNAL_ERROR, "Internal server error")
+        }
+    }
+}
+
+async fn route(state: &RpcState, req: JsonRpcRequest) -> JsonRpcResponse {
     let id = req.id.unwrap_or(Value::Null);
     let params = &req.params;
 
@@ -445,4 +478,34 @@ pub async fn dispatch_rpc(state: &RpcState, req: JsonRpcRequest) -> JsonRpcRespo
 #[cfg(test)]
 pub(crate) async fn dispatch_for_test(state: &RpcState, req: JsonRpcRequest) -> JsonRpcResponse {
     dispatch(state, req).await
+}
+
+#[cfg(test)]
+mod panic_boundary_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_method_that_panics_is_answered_as_rskj_answers_an_exception() {
+        let response = answered(json!(7), "eth_example", async { panic!("a bug") }).await;
+        let error = response.error.expect("an error, not a dropped connection");
+        assert_eq!(error.code, INTERNAL_ERROR);
+        assert_eq!(error.message, "Internal server error");
+        assert_eq!(response.id, json!(7));
+        assert!(response.result.is_none());
+
+        // A panic carrying a formatted message is caught the same way.
+        let response = answered(Value::Null, "eth_example", async { panic!("{} bugs", 2) }).await;
+        assert_eq!(response.error.expect("an error").code, INTERNAL_ERROR);
+    }
+
+    #[tokio::test]
+    async fn an_answer_passes_the_boundary_untouched() {
+        let response = answered(json!("a"), "eth_example", async {
+            JsonRpcResponse::success(json!("a"), json!("0x1"))
+        })
+        .await;
+        assert!(response.error.is_none());
+        assert_eq!(response.result, Some(json!("0x1")));
+        assert_eq!(response.id, json!("a"));
+    }
 }

@@ -106,7 +106,11 @@ impl Decodable for Receipt {
         } else {
             // rskj can encode shorter blooms; pad with leading zeros
             let mut full = [0u8; 256];
-            let start = 256 - bloom_bytes.len();
+            let start = 256usize
+                .checked_sub(bloom_bytes.len())
+                .ok_or(alloy_rlp::Error::Custom(
+                    "a receipt's bloom is over 256 bytes",
+                ))?;
             full[start..].copy_from_slice(bloom_bytes);
             Bloom::from_slice(&full)
         };
@@ -515,5 +519,63 @@ mod tests {
         assert_eq!(rlp_encode_int(128), vec![0x81, 0x80]);
         // RLP.encodeInt(256) = 0x820100
         assert_eq!(rlp_encode_int(256), vec![0x82, 0x01, 0x00]);
+    }
+
+    /// No variation on a receipt's bytes makes decoding it panic, and a bloom
+    /// longer than a bloom is refused rather than overrunning the one it fills.
+    #[test]
+    fn no_variation_on_a_receipt_panics() {
+        use alloy_rlp::Encodable;
+        let log = Log {
+            address: Address::repeat_byte(0x11),
+            topics: vec![B256::repeat_byte(0x22), B256::repeat_byte(0x33)],
+            data: Bytes::from(vec![0x44; 40]),
+        };
+        let receipts = [
+            Receipt {
+                post_tx_state: vec![1],
+                cumulative_gas_used: 42_000,
+                gas_used: 21_000,
+                logs_bloom: Bloom::repeat_byte(0x05),
+                logs: vec![log.clone(), log],
+                status: true,
+            },
+            Receipt {
+                post_tx_state: Vec::new(),
+                cumulative_gas_used: 21_000,
+                gas_used: 21_000,
+                logs_bloom: Bloom::ZERO,
+                logs: Vec::new(),
+                status: false,
+            },
+        ];
+        for (i, receipt) in receipts.iter().enumerate() {
+            let mut seed = Vec::new();
+            receipt.encode(&mut seed);
+            assert!(Receipt::decode(&mut seed.as_slice()).is_ok());
+            for bytes in crate::mutate::mutants(&seed, 2_000, 400 + i as u64) {
+                let _ = Receipt::decode(&mut bytes.as_slice());
+            }
+        }
+
+        let mut payload = Vec::new();
+        [1u8].as_slice().encode(&mut payload);
+        21_000u64.encode(&mut payload);
+        [0u8; 300].as_slice().encode(&mut payload);
+        RlpHeader {
+            list: true,
+            payload_length: 0,
+        }
+        .encode(&mut payload);
+        21_000u64.encode(&mut payload);
+        [1u8].as_slice().encode(&mut payload);
+        let mut long_bloom = Vec::new();
+        RlpHeader {
+            list: true,
+            payload_length: payload.len(),
+        }
+        .encode(&mut long_bloom);
+        long_bloom.extend(payload);
+        assert!(Receipt::decode(&mut long_bloom.as_slice()).is_err());
     }
 }

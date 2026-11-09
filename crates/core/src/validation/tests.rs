@@ -2143,3 +2143,29 @@ fn fork_detection_data_joins_the_hash_from_wasabi100_and_block_449() {
         }
     }
 }
+
+/// No variation on a real header's bytes makes decoding, hashing or checking
+/// it panic: mainnet's first fallback-mined blocks, its last whose coinbase a
+/// partial merkle tree proves, and a merge-mined block of difficulty 1, whose
+/// proof of work most variations still meet, so the rest of the rule runs.
+#[test]
+fn no_variation_on_a_real_header_panics() {
+    let mut mined = create_dummy_header(10, 1000, B256::ZERO);
+    mined.difficulty = U256::from(1);
+    let (btc, coinbase, proof) = build_mm_proof(&mined, 0x207fffff, None);
+    mined.bitcoin_merged_mining_header = Some(btc);
+    mined.bitcoin_merged_mining_coinbase_transaction = Some(coinbase);
+    mined.bitcoin_merged_mining_merkle_proof = Some(proof);
+    let seeds = [
+        mainnet_rlp(1),
+        mainnet_rlp(2),
+        hex::decode(MAINNET_728999).unwrap(),
+        alloy_rlp::encode(&mined),
+    ];
+    for (i, seed) in seeds.iter().enumerate() {
+        crate::mutate::decode_and_check_header(seed);
+        for bytes in crate::mutate::mutants(seed, 500, 1 + i as u64) {
+            crate::mutate::decode_and_check_header(&bytes);
+        }
+    }
+}

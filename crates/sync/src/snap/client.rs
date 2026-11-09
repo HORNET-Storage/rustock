@@ -52,7 +52,7 @@ use rustock_trie::snapshot_proof::{verify_chunk, ChunkProof, Entry, VerifyError}
 use rustock_trie::{TrieNode, TrieStore};
 use std::sync::Arc;
 
-use std::sync::Mutex;
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, trace};
 
@@ -371,7 +371,9 @@ impl StateDownload {
         let mut advanced = 0;
         if let Some(i) = self.slice_for(from) {
             let slice = &mut self.slices[i];
-            advanced = reached.saturating_sub(slice.cursor).min(slice.end - slice.cursor);
+            advanced = reached
+                .saturating_sub(slice.cursor)
+                .min(slice.end.saturating_sub(slice.cursor));
             // A cell can begin before the cursor, so it never moves backwards:
             // the nodes before the cursor were already stored, and storing them
             // again is harmless but must not un-advance the slice.
@@ -628,7 +630,7 @@ impl StateDownload {
         // percentage -- honest about what is knowable.
         let last_report = Mutex::new(Instant::now());
         let report = move |seen: u64| {
-            let mut last = last_report.lock().unwrap();
+            let mut last = last_report.lock().unwrap_or_else(PoisonError::into_inner);
             if last.elapsed() < REPORT_EVERY {
                 return;
             }

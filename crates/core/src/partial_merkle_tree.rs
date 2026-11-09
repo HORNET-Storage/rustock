@@ -660,4 +660,23 @@ mod tests {
         assert!(!has_expected_size(&[]));
         assert!(!has_expected_size(&count));
     }
+
+    /// No variation on a tree's bytes makes reading, sizing or walking it
+    /// panic: a peer's merge-mined header carries one below orchid, and a
+    /// peg-in carries one to the Bridge.
+    #[test]
+    fn no_variation_on_a_tree_panics() {
+        let leaves: Vec<[u8; 32]> = (0..33).map(leaf).collect();
+        let shapes: [(usize, &[usize]); 4] =
+            [(1, &[0]), (7, &[2, 5]), (16, &[15]), (33, &[0, 17, 32])];
+        for (i, (count, matched)) in shapes.into_iter().enumerate() {
+            let include: Vec<bool> = (0..count).map(|n| matched.contains(&n)).collect();
+            let seed = build(&leaves[..count], &include);
+            assert!(walked(&seed).is_ok());
+            for bytes in crate::mutate::mutants(&seed, 2_000, 500 + i as u64) {
+                let _ = has_expected_size(&bytes);
+                let _ = walked(&bytes);
+            }
+        }
+    }
 }
