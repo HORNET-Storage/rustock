@@ -95,6 +95,141 @@ fn pegin_below_minimum(live_output_values: &[u64], min: u64, rskip293: bool) -> 
     }
 }
 
+/// How rskj's `validationsForRegisterBtcTransaction` turns a transaction
+/// down. `registerBtcTransaction` swallows a false and fails the transaction
+/// on a throw; `registerFlyoverBtcTransaction` answers a false with its
+/// validations code and a throw with GENERIC_ERROR.
+enum Invalid {
+    /// `return false`.
+    Swallowed(&'static str),
+    /// A throw: `BridgeIllegalArgumentException`, `VerificationException`,
+    /// `BlockStoreException`, or the `NullPointerException` of a block the
+    /// store does not have.
+    Thrown(&'static str),
+}
+
+/// rskj `BridgeSupport.validationsForRegisterBtcTransaction`. Its order is
+/// load-bearing: a transaction that fails more than one check gets the answer
+/// of the first, so one with too few confirmations and a malformed tree is
+/// turned down quietly and never reaches the throw.
+#[allow(clippy::too_many_arguments)]
+fn validations_for_register_btc_transaction<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    config: &BridgeConstants,
+    hardfork_cfg: &RskHardforkConfig,
+    btc_tx_hash: &[u8; 32],
+    height: i32,
+    pmt_data: &[u8],
+    btc_tx_data: &[u8],
+) -> Result<(), Invalid> {
+    let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
+    let rskip143 = hardfork_cfg.has_rskip143(block_number);
+
+    // validateHeightAndConfirmations: a negative height throws, which this
+    // catches and answers false. The block itself counts as one confirmation,
+    // and the caller's height is the one checked.
+    if height < 0 {
+        return Err(Invalid::Swallowed("negative height"));
+    }
+    let best_height = load_chain_head(ctx).map(|h| h.height).unwrap_or(0);
+    let confirmations = best_height as i64 - i64::from(height) + 1;
+    if confirmations < config.btc2rsk_minimum_acceptable_confirmations as i64 {
+        return Err(Invalid::Swallowed("insufficient confirmations"));
+    }
+
+    // A tree of the wrong size throws.
+    if !PartialMerkleTree::has_expected_size(pmt_data) {
+        return Err(Invalid::Thrown(
+            "PartialMerkleTree doesn't have expected size",
+        ));
+    }
+    // `BridgeUtils.calculateMerkleRoot` builds the tree and walks it, and
+    // rethrows a VerificationException from either. A transaction that is not
+    // among its matches gets null back, which is false.
+    let pmt = PartialMerkleTree::parse(pmt_data).ok_or(Invalid::Thrown("failed to parse PMT"))?;
+    let pmt_result = pmt
+        .extract_matches()
+        .ok_or(Invalid::Thrown("PMT verification failed"))?;
+    if !pmt_result.matched_hashes.contains(btc_tx_hash) {
+        return Err(Invalid::Swallowed("tx not in PMT"));
+    }
+
+    // `BridgeUtils.validateInputsCount` throws for a transaction with no
+    // inputs. It runs before any block is looked at, and a one-leaf tree
+    // proves any bytes at all, so a crafted transaction reaches it.
+    if !has_inputs(btc_tx_data, rskip143) {
+        return Err(Invalid::Thrown("the transaction has no inputs"));
+    }
+
+    // `getStoredBlockAtMainChainHeight(height).getHeader()`: the store throws
+    // below RSKIP199's search limit, and where its walk runs out it answers
+    // null, on which `getHeader()` throws.
+    let rskip199 = hardfork_cfg.has_rskip199(block_number);
+    let lookup =
+        super::btc_chain::main_chain_block_at_height(ctx, height as u32, rskip199, Some(config));
+    let stored_block = match lookup {
+        super::btc_chain::MainChainLookup::Found(block) => block,
+        super::btc_chain::MainChainLookup::Absent => {
+            return Err(Invalid::Thrown("no stored block at the height"))
+        }
+        super::btc_chain::MainChainLookup::StoreError => {
+            return Err(Invalid::Thrown("the block store refused the height"))
+        }
+    };
+
+    // isBlockMerkleRootValid: the block's merkle root, or from RSKIP143 the
+    // witness merkle root registered with its coinbase. The coinbase
+    // information is keyed by the block hash in DISPLAY byte order (rskj
+    // `Sha256Hash.toString()`; see set_coinbase_information), and holds the
+    // witness root in display order too (rskj registerBtcCoinbaseTransaction
+    // wraps the ABI argument, BridgeSupport l.2574), while the tree's root is
+    // in internal order -- so both are reversed.
+    let block_merkle_root = *stored_block
+        .header
+        .merkle_root
+        .to_raw_hash()
+        .as_byte_array();
+    let root_valid = pmt_result.merkle_root == block_merkle_root
+        || (rskip143 && {
+            let mut block_hash = *stored_block
+                .header
+                .block_hash()
+                .to_raw_hash()
+                .as_byte_array();
+            block_hash.reverse();
+            get_coinbase_information(ctx, &block_hash).is_some_and(|mut witness_root| {
+                witness_root.reverse();
+                pmt_result.merkle_root == witness_root
+            })
+        });
+    if !root_valid {
+        return Err(Invalid::Swallowed("merkle root mismatch"));
+    }
+    Ok(())
+}
+
+/// rskj `BridgeUtils.validateInputsCount`, false where it throws: for a
+/// transaction whose input count reads zero and, from RSKIP143, is not a
+/// segwit transaction with inputs, and for one too short for bitcoinj's
+/// `VarInt` to read, which throws `ArrayIndexOutOfBoundsException` instead.
+fn has_inputs(tx: &[u8], rskip143: bool) -> bool {
+    // `getInputsCount` reads the count after the version. A segwit
+    // transaction has its zero marker there, then its flag, then its count,
+    // which `getInputsCountForSegwit` reads when the flag is 1.
+    let count =
+        |offset| rustock_core::partial_merkle_tree::var_int(tx, offset).map(|(value, _)| value);
+    match count(4) {
+        None => false,
+        Some(0) if rskip143 => match count(5) {
+            None => false,
+            Some(1) => count(6).is_some_and(|inputs| inputs != 0),
+            Some(_) => true,
+        },
+        Some(0) => false,
+        Some(_) => true,
+    }
+}
+
 pub fn register_btc_transaction<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     args: &[u8],
@@ -103,26 +238,18 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
     hardfork_cfg: &RskHardforkConfig,
     tx_ctx: &BridgeTxContext,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    if args.len() < 96 {
+    // rskj `Bridge.registerBtcTransaction`: the transaction, the height as
+    // `intValue()`, the partial merkle tree, all as its decoder reads them.
+    let decoded = super::abi::Args::new(args);
+    let (Some(btc_tx_data), Some(height), Some(pmt_data)) =
+        (decoded.bytes(0), decoded.int(1), decoded.bytes(2))
+    else {
         return Err(PrecompileError::other(
-            "registerBtcTransaction: args too short",
+            "registerBtcTransaction: malformed arguments",
         ));
-    }
-
-    // Parse ABI arguments:
-    // arg0: bytes btcTxSerialized (dynamic)
-    // arg1: int256 height
-    // arg2: bytes pmtSerialized (dynamic)
-
-    let btc_tx_offset = U256::from_be_slice(&args[0..32]).to::<usize>();
-    let btc_block_height = {
-        let raw = U256::from_be_slice(&args[32..64]);
-        raw.to::<u64>()
     };
-    let pmt_offset = U256::from_be_slice(&args[64..96]).to::<usize>();
-
-    let btc_tx_data = read_dynamic_bytes(args, btc_tx_offset)?;
-    let pmt_data = read_dynamic_bytes(args, pmt_offset)?;
+    let (btc_tx_data, pmt_data) = (btc_tx_data.to_vec(), pmt_data.to_vec());
+    let btc_block_height = height.int_value();
 
     // Compute BTC tx hash
     let btc_tx_hash = calculate_btc_tx_hash(&btc_tx_data);
@@ -136,111 +263,30 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
 
     // rskj wraps the registerBtcTransaction body in
     // `try { ... } catch (RegisterBtcTransactionException e) { log }`: an
-    // already-processed tx or any failed validation
-    // (validationsForRegisterBtcTransaction → "Could not validate
-    // transaction") is logged and the call returns SUCCESSFULLY without
-    // registering anything. Mirror that — these are a no-op success, not a
-    // failed tx. Only a malformed BTC tx (parsed below, a separate
-    // exception) propagates and fails the tx.
-    // rskj's validation failures are NOT all equivalent, and treating them as
-    // if they were diverged mainnet #9,227,292.
+    // already-processed transaction, or validations that answer false, are
+    // logged and the call succeeds without registering anything. A throw from
+    // the validations is not that exception: it escapes the catch, reaches
+    // `Bridge.execute`'s outer handler, becomes a `VMException`, and charges
+    // the sender the full gas limit (quirks-frozen-bugs.md §9d). Treating the
+    // two alike diverged mainnet #9,227,292.
     //
-    // `BridgeSupport.registerBtcTransaction` wraps its body in
-    // `catch (RegisterBtcTransactionException e) { log }`, so a validation that
-    // *returns false* is a silent no-op success. But
-    // `validationsForRegisterBtcTransaction` also **throws**
-    // `BridgeIllegalArgumentException` for a malformed partial merkle tree, and
-    // that is not a `RegisterBtcTransactionException` -- it escapes the catch,
-    // reaches `Bridge.execute`'s outer handler, becomes a `VMException`, and
-    // charges the sender the full gas limit (quirks-frozen-bugs.md §9d).
-    //
-    // Order is load-bearing too: rskj validates height and confirmations FIRST
-    // and returns false there, so a transaction with bad confirmations *and* a
-    // malformed PMT is swallowed, never reaching the throw.
-    enum Invalid {
-        /// `return false` in rskj: logged, call succeeds, nothing registered.
-        Swallowed(&'static str),
-        /// `throw BridgeIllegalArgumentException`: escapes the catch and fails
-        /// the transaction with the full gas limit charged.
-        Thrown(&'static str),
-    }
-
-    let validation = (|| -> Result<(), Invalid> {
-        // Check if already processed (rskj: RegisterBtcTransactionException).
-        if is_btc_tx_processed(ctx, &btc_tx_hash) {
-            return Err(Invalid::Swallowed("transaction already processed"));
-        }
-
-        // Height and confirmations come first, and are swallowed
-        // (BridgeUtils.validateHeightAndConfirmations -> return false). The
-        // block itself counts as one confirmation, and the CALLER-supplied
-        // height is what gets validated.
-        let best_height = load_chain_head(ctx).map(|h| h.height).unwrap_or(0);
-        let confirmations = best_height as i64 - btc_block_height as i64 + 1;
-        if confirmations < config.btc2rsk_minimum_acceptable_confirmations as i64 {
-            return Err(Invalid::Swallowed("insufficient confirmations"));
-        }
-
-        // PMT size: rskj THROWS BridgeIllegalArgumentException here.
-        if !PartialMerkleTree::has_expected_size(&pmt_data) {
-            return Err(Invalid::Thrown("PartialMerkleTree doesn't have expected size"));
-        }
-        // `BridgeUtils.calculateMerkleRoot` constructs the PMT and walks it;
-        // a VerificationException from either is rethrown as
-        // BridgeIllegalArgumentException, so both of these throw.
-        let pmt = PartialMerkleTree::parse(&pmt_data)
-            .ok_or(Invalid::Thrown("failed to parse PMT"))?;
-        let pmt_result = pmt
-            .extract_matches()
-            .ok_or(Invalid::Thrown("PMT verification failed"))?;
-
-        // Tx not among the matched hashes: `calculateMerkleRoot` returns null,
-        // so the caller returns false -- swallowed.
-        if !pmt_result.matched_hashes.contains(&btc_tx_hash) {
-            return Err(Invalid::Swallowed("tx not in PMT"));
-        }
-
-        // Look up the BTC block on the main chain at the caller-supplied
-        // height (walks the chain pre-RSKIP199, indexed lookup afterwards).
-        let stored_block =
-            super::btc_chain::stored_block_at_main_chain_height(ctx, btc_block_height as u32, rskip199)
-                .ok_or(Invalid::Swallowed("BTC block not found at height"))?;
-        let block_hash = stored_block.header.block_hash();
-
-        // Verify merkle root matches
-        let block_merkle_root = {
-            let raw = stored_block.header.merkle_root.to_raw_hash();
-            *raw.as_byte_array()
-        };
-        let root_valid = if pmt_result.merkle_root == block_merkle_root {
-            true
-        } else {
-            // Post-RSKIP143: also accept witness merkle root. The coinbase
-            // information is keyed by the block hash in DISPLAY byte order
-            // (rskj `Sha256Hash.toString()`; see set_coinbase_information),
-            // the reverse of rust-bitcoin's internal order.
-            let block_hash_bytes = {
-                let mut raw = *block_hash.to_raw_hash().as_byte_array();
-                raw.reverse();
-                raw
-            };
-            match get_coinbase_information(ctx, &block_hash_bytes) {
-                // The stored witness merkle root is in DISPLAY byte order
-                // (rskj registerBtcCoinbaseTransaction wraps the ABI arg and
-                // reverses it for the commitment, BridgeSupport l.2574), while
-                // the PMT merkle root is internal order — compare reversed.
-                Some(mut witness_root) => {
-                    witness_root.reverse();
-                    pmt_result.merkle_root == witness_root
-                }
-                None => false,
-            }
-        };
-        if !root_valid {
-            return Err(Invalid::Swallowed("merkle root mismatch"));
-        }
-        Ok(())
-    })();
+    // rskj then parses the transaction and runs bitcoinj's `verify()` on it,
+    // whose throw fails the transaction too. Only a transaction committed in a
+    // stored block's merkle tree gets that far, and a block's transactions
+    // pass `verify()`, so that check is not repeated here.
+    let validation = if is_btc_tx_processed(ctx, &btc_tx_hash) {
+        Err(Invalid::Swallowed("transaction already processed"))
+    } else {
+        validations_for_register_btc_transaction(
+            ctx,
+            config,
+            hardfork_cfg,
+            &btc_tx_hash,
+            btc_block_height,
+            &pmt_data,
+            &btc_tx_data,
+        )
+    };
     match validation {
         Ok(()) => {}
         Err(Invalid::Swallowed(m)) => {
@@ -1415,14 +1461,14 @@ fn whitelist_allows_and_consume<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     sender_hash160: &[u8; 20],
     amount: u64,
-    height: u64,
+    height: i32,
     rskip87: bool,
 ) -> bool {
     // rskj `getLockWhitelist()` deserializes BOTH cells together, so reaching
     // this function reads both even where the decision needs only one.
     let (mut one_off, disable_h) = load_one_off_whitelist(ctx);
     let unlimited = load_unlimited_whitelist(ctx);
-    let disabled = (height as i64) > (disable_h as i64);
+    let disabled = i64::from(height) > (disable_h as i64);
 
     let allowed = if let Some(pos) = one_off.iter().position(|(h, _)| h == sender_hash160) {
         let allowed = disabled || amount <= one_off[pos].1;
@@ -1561,9 +1607,9 @@ fn flyover_redeem_script(flyover_derivation_hash: &[u8; 32], federation_redeem: 
 /// Flyover (RSKIP176, iris300) peg-in. Full port of rskj
 /// `BridgeSupport.registerFlyoverBtcTransaction`. Returns an int256:
 /// the locked amount in wei on success, or a negative `FlyoverTxResponseCodes`
-/// value on every rejection / unprocessable path. The method only ever fails
-/// the tx for a malformed BTC transaction or PMT (mirrors rskj's outer
-/// try/catch returning GENERIC_ERROR for those).
+/// value on every rejection / unprocessable path. It never fails the
+/// transaction: rskj's `Bridge.registerFlyoverBtcTransaction` catches every
+/// exception and answers GENERIC_ERROR.
 #[allow(clippy::too_many_arguments)]
 pub fn register_fast_bridge_btc_transaction<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
@@ -1585,29 +1631,41 @@ pub fn register_fast_bridge_btc_transaction<CTX: crate::RskContextTr>(
 
     // rskj wraps the whole body in try/catch → GENERIC_ERROR. Any malformed
     // ABI / arg shape returns GENERIC_ERROR (NOT a failed tx).
-    let parse = (|| -> Option<(usize, u64, usize, [u8; 32], Vec<u8>, RskAddress, Vec<u8>, bool)> {
-        if args.len() < 256 {
-            return None;
-        }
-        let btc_tx_offset = U256::from_be_slice(args.get(0..32)?).to::<usize>();
-        let btc_block_height = U256::from_be_slice(args.get(32..64)?).to::<u64>();
-        let pmt_offset = U256::from_be_slice(args.get(64..96)?).to::<usize>();
-        let derivation_args_hash: [u8; 32] = args.get(96..128)?.try_into().ok()?;
-        let user_refund_offset = U256::from_be_slice(args.get(128..160)?).to::<usize>();
-        // arg5: address (right-aligned in 32 bytes → low 20 bytes).
-        let lbc_address = RskAddress::from_slice(args.get(172..192)?);
-        let lp_offset = U256::from_be_slice(args.get(192..224)?).to::<usize>();
-        let should_transfer_to_contract = U256::from_be_slice(args.get(224..256)?) != U256::ZERO;
-        let user_refund_addr = read_dynamic_bytes(args, user_refund_offset).ok()?;
-        let lp_btc_addr = read_dynamic_bytes(args, lp_offset).ok()?;
+    // The arguments as rskj's decoder reads them: the height is `intValue()`,
+    // the LBC address `new RskAddress((DataWord) args[5])` and the flag
+    // `BoolType`'s `intValue() != 0`.
+    type Parsed = (
+        Vec<u8>,
+        i32,
+        Vec<u8>,
+        [u8; 32],
+        Vec<u8>,
+        RskAddress,
+        Vec<u8>,
+        bool,
+    );
+    let parse = (|| -> Option<Parsed> {
+        let args = super::abi::Args::new(args);
         Some((
-            btc_tx_offset, btc_block_height, pmt_offset, derivation_args_hash,
-            user_refund_addr, lbc_address, lp_btc_addr, should_transfer_to_contract,
+            args.bytes(0)?.to_vec(),
+            args.int(1)?.int_value(),
+            args.bytes(2)?.to_vec(),
+            args.bytes32(3)?,
+            args.bytes(4)?.to_vec(),
+            args.address(5)?,
+            args.bytes(6)?.to_vec(),
+            args.bool(7)?,
         ))
     })();
     let Some((
-        btc_tx_offset, btc_block_height, pmt_offset, derivation_args_hash,
-        user_refund_addr, lbc_address, lp_btc_addr, should_transfer_to_contract,
+        btc_tx_data,
+        btc_block_height,
+        pmt_data,
+        derivation_args_hash,
+        user_refund_addr,
+        lbc_address,
+        lp_btc_addr,
+        should_transfer_to_contract,
     )) = parse
     else {
         return ok(flyover_code_output(flyover_codes::GENERIC_ERROR));
@@ -1642,9 +1700,6 @@ pub fn register_fast_bridge_btc_transaction<CTX: crate::RskContextTr>(
         return ok(flyover_code_output(flyover_codes::UNPROCESSABLE_INVALID_SENDER));
     }
 
-    let btc_tx_data = read_dynamic_bytes(args, btc_tx_offset)?;
-    let pmt_data = read_dynamic_bytes(args, pmt_offset)?;
-
     // wtxid (calculateBtcTxHash over the raw bytes) — the first already-used key.
     let btc_tx_hash = calculate_btc_tx_hash(&btc_tx_data);
 
@@ -1666,51 +1721,32 @@ pub fn register_fast_bridge_btc_transaction<CTX: crate::RskContextTr>(
         return ok(flyover_code_output(flyover_codes::UNPROCESSABLE_ALREADY_PROCESSED));
     }
 
-    // validationsForRegisterBtcTransaction: PMT + merkle root + confirmations.
-    let validations = (|| -> bool {
-        if !PartialMerkleTree::has_expected_size(&pmt_data) {
-            return false;
+    // validationsForRegisterBtcTransaction: a false is the validations code,
+    // and a throw reaches `Bridge.registerFlyoverBtcTransaction`'s catch, which
+    // answers GENERIC_ERROR.
+    match validations_for_register_btc_transaction(
+        ctx,
+        config,
+        hardfork_cfg,
+        &btc_tx_hash,
+        btc_block_height,
+        &pmt_data,
+        &btc_tx_data,
+    ) {
+        Ok(()) => {}
+        Err(Invalid::Swallowed(_)) => {
+            return ok(flyover_code_output(
+                flyover_codes::UNPROCESSABLE_VALIDATIONS,
+            ))
         }
-        let Some(pmt) = PartialMerkleTree::parse(&pmt_data) else { return false };
-        let Some(pmt_result) = pmt.extract_matches() else { return false };
-        if !pmt_result.matched_hashes.contains(&btc_tx_hash) {
-            return false;
-        }
-        let Some(stored_block) =
-            super::btc_chain::stored_block_at_main_chain_height(ctx, btc_block_height as u32, rskip199)
-        else {
-            return false;
-        };
-        let block_hash = stored_block.header.block_hash();
-        let block_merkle_root = *stored_block.header.merkle_root.to_raw_hash().as_byte_array();
-        let root_valid = pmt_result.merkle_root == block_merkle_root || {
-            let block_hash_bytes = {
-                let mut raw = *block_hash.to_raw_hash().as_byte_array();
-                raw.reverse();
-                raw
-            };
-            match get_coinbase_information(ctx, &block_hash_bytes) {
-                Some(mut wr) => {
-                    wr.reverse();
-                    pmt_result.merkle_root == wr
-                }
-                None => false,
-            }
-        };
-        if !root_valid {
-            return false;
-        }
-        let best_height = load_chain_head(ctx).map(|h| h.height).unwrap_or(0);
-        let confirmations = best_height as i64 - btc_block_height as i64 + 1;
-        confirmations >= config.btc2rsk_minimum_acceptable_confirmations as i64
-    })();
-    if !validations {
-        return ok(flyover_code_output(flyover_codes::UNPROCESSABLE_VALIDATIONS));
+        Err(Invalid::Thrown(_)) => return ok(flyover_code_output(flyover_codes::GENERIC_ERROR)),
     }
 
     // Parse the BTC tx and compute the witness-stripped txid (getHash(false)).
-    let btc_tx: BtcTransaction = deserialize(&btc_tx_data)
-        .map_err(|_| PrecompileError::other("registerFastBridgeBtcTransaction: invalid BTC transaction"))?;
+    // A transaction bitcoinj cannot parse throws, which the same catch answers.
+    let Ok(btc_tx) = deserialize::<BtcTransaction>(&btc_tx_data) else {
+        return ok(flyover_code_output(flyover_codes::GENERIC_ERROR));
+    };
     let btc_tx_hash_no_witness = legacy_btc_txid(&btc_tx);
 
     // Second already-used check, keyed by the legacy txid (only when it differs
@@ -2397,7 +2433,14 @@ pub fn release_btc<CTX: crate::RskContextTr>(
     // Convert Wei to satoshis: 1 satoshi = 10^10 wei
     let satoshis_per_wei = U256::from(10_000_000_000u64);
     let amount_satoshis_u256 = call_value_wei / satoshis_per_wei;
-    let amount_satoshis = amount_satoshis_u256.to::<u64>();
+    // rskj `co.rsk.core.Coin.toBitcoin()` takes the satoshis' `longValue()`,
+    // their low 64 bits, and the minimum, the event and the refund before
+    // RSKIP427 all use that long. No mainnet or testnet balance comes near
+    // 2^63 satoshis, but regtest's genesis funds accounts with 10^30 wei,
+    // which wrap. A long that wraps negative is below every minimum; rskj
+    // would then log it negative and refund a negative amount, which this
+    // reads as zero (a regtest-only difference).
+    let amount_satoshis = u64::try_from(amount_satoshis_u256.as_limbs()[0] as i64).unwrap_or(0);
 
     // rskj `BridgeSupport.releaseBtc` (BridgeSupport.java:891) rejects a peg-out
     // requested by a CONTRACT before any min-value check, because a BTC address
@@ -2457,7 +2500,7 @@ pub fn release_btc<CTX: crate::RskContextTr>(
         } else {
             None
         }
-    } else if amount_satoshis_u256 <= U256::from(config.legacy_minimum_pegout_tx_value) {
+    } else if amount_satoshis <= config.legacy_minimum_pegout_tx_value {
         Some(1) // legacy: always LOW_AMOUNT
     } else {
         None
@@ -2477,7 +2520,7 @@ pub fn release_btc<CTX: crate::RskContextTr>(
             let refund_wei = if hardfork_cfg.has_rskip427(block_number) {
                 call_value_wei
             } else {
-                amount_satoshis_u256 * U256::from(10_000_000_000u64)
+                U256::from(amount_satoshis) * satoshis_per_wei
             };
             let _ = ctx
                 .journal_mut()
@@ -4283,6 +4326,14 @@ fn is_der_signature(sig: &[u8]) -> bool {
     true
 }
 
+/// Does `key` parse the way rskj's `BtcECKey.fromPublicOnly` requires?
+/// That is BouncyCastle's `decodePoint`: a compressed, uncompressed or hybrid
+/// encoding of a point on the curve, as libsecp256k1 parses them, and also
+/// the single byte 0x00, the point at infinity, which libsecp256k1 refuses.
+fn is_btc_public_key(key: &[u8]) -> bool {
+    key == [0x00] || bitcoin::secp256k1::PublicKey::from_slice(key).is_ok()
+}
+
 pub fn add_signature<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     args: &[u8],
@@ -4290,51 +4341,14 @@ pub fn add_signature<CTX: crate::RskContextTr>(
     config: &BridgeConstants,
     hardfork_cfg: &RskHardforkConfig,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    if args.len() < 96 {
-        return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
-    }
-
-    // ABI layout: bytes federatorPublicKey, bytes[] signatures, bytes rskTxHash.
-    // An out-of-range (oversized) ABI offset cannot index this calldata; treat
-    // it as a parse failure (empty output) rather than panicking — rskj's
-    // Solidity decoder likewise rejects such inputs. Mainnet #6,223,783 tx[3]
-    // forwards malformed calldata whose `signatures` offset points into the
-    // middle of the federator key, yielding an absurd array count.
-    let (Ok(fed_key_offset), Ok(sigs_offset), Ok(rsk_hash_offset)) = (
-        usize::try_from(U256::from_be_slice(&args[0..32])),
-        usize::try_from(U256::from_be_slice(&args[32..64])),
-        usize::try_from(U256::from_be_slice(&args[64..96])),
-    ) else {
-        return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
-    };
-
-    // Parse federator public key
-    let fed_key = match read_dynamic_bytes(args, fed_key_offset) {
-        Ok(k) => k,
-        Err(_) => return Ok(PrecompileOutput::new(gas_cost, Bytes::new())),
-    };
-    if fed_key.len() != 33 && fed_key.len() != 65 {
-        return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
-    }
-
-    // Parse RSK tx hash (32 bytes)
-    let rsk_tx_hash_bytes = match read_dynamic_bytes(args, rsk_hash_offset) {
-        Ok(h) if h.len() == 32 => h,
-        _ => return Ok(PrecompileOutput::new(gas_cost, Bytes::new())),
-    };
-    let mut rsk_tx_hash = [0u8; 32];
-    rsk_tx_hash.copy_from_slice(&rsk_tx_hash_bytes);
-
-    // Parse signatures array
-    let sigs = parse_bytes_array(args, sigs_offset);
-    if sigs.is_empty() {
-        return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
-    }
-
-    // rskj `Bridge.addSignature` (Bridge.java:632) runs every signature through
-    // `BtcECKey.ECDSASignature.decodeFromDER` before `bridgeSupport` sees it,
-    // and a parse failure throws `BridgeIllegalArgumentException`. `Bridge.execute`
-    // wraps that in a `VMException`, which `TransactionExecutor` records as
+    // rskj `Bridge.addSignature` (Bridge.java:615) parses the federator key
+    // (`BtcECKey.fromPublicOnly`), refuses an empty signature list, runs every
+    // signature through `BtcECKey.ECDSASignature.decodeFromDER` and wraps the
+    // RSK transaction hash in a `Keccak256`, all before `bridgeSupport` sees
+    // them, and each failure is a `BridgeIllegalArgumentException`. Before
+    // RSKIP88 `Bridge.execute` answers that with null, a success with no
+    // output. From RSKIP88 it throws, and `Bridge.execute` wraps it in a
+    // `VMException`, which `TransactionExecutor` records as
     // `result.setException` -- marking the execution summary failed, so the
     // sender is charged the FULL gas limit with no leftover refund, while the
     // receipt still reports SUCCESS because its status comes from
@@ -4343,16 +4357,38 @@ pub fn add_signature<CTX: crate::RskContextTr>(
     // it into exactly those semantics.
     //
     // Mainnet #9,217,796 tx[1] submits a 71-byte signature beginning 0x9f
-    // rather than a DER SEQUENCE. Without this check rustock reached the
+    // rather than a DER SEQUENCE. Without the DER check rustock reached the
     // pegouts-waiting-for-signatures lookup, missed, returned quietly and
     // refunded 104,512 gas the chain had charged -- diverging the state root.
-    for sig in &sigs {
-        if !is_der_signature(sig) {
-            return Err(PrecompileError::other(
-                "addSignature: signature could not be parsed as DER",
-            ));
+    let rskip88 =
+        hardfork_cfg.has_rskip88(revm::context_interface::Block::number(ctx.block()).to::<u64>());
+    let refuse = |why: &'static str| -> Result<PrecompileOutput, PrecompileError> {
+        if rskip88 {
+            Err(PrecompileError::other(why))
+        } else {
+            Ok(PrecompileOutput::new(gas_cost, Bytes::new()))
         }
+    };
+    let decoded = super::abi::Args::new(args);
+    let (Some(fed_key), Some(sigs), Some(rsk_tx_hash)) =
+        (decoded.bytes(0), decoded.bytes_array(1), decoded.bytes(2))
+    else {
+        return refuse("addSignature: malformed arguments");
+    };
+    if !is_btc_public_key(fed_key) {
+        return refuse("addSignature: public key could not be parsed");
     }
+    if sigs.is_empty() {
+        return refuse("addSignature: signatures array is empty");
+    }
+    if !sigs.iter().all(|sig| is_der_signature(sig)) {
+        return refuse("addSignature: signature could not be parsed as DER");
+    }
+    let Ok(rsk_tx_hash) = <[u8; 32]>::try_from(rsk_tx_hash) else {
+        return refuse("addSignature: invalid rsk tx hash");
+    };
+    let fed_key = fed_key.to_vec();
+    let sigs: Vec<Vec<u8>> = sigs.into_iter().map(<[u8]>::to_vec).collect();
 
     // RSKIP419: if the SVP is ongoing and this RSK tx hash is the one that
     // created the SVP spend transaction, sign that (with the PROPOSED
@@ -5350,54 +5386,6 @@ fn apply_signatures_to_tx(
     signed
 }
 
-/// Parse an array of dynamic bytes from ABI-encoded `bytes[]` argument.
-fn parse_bytes_array(args: &[u8], array_offset: usize) -> Vec<Vec<u8>> {
-    if array_offset + 32 > args.len() {
-        return Vec::new();
-    }
-    // Any ABI length/offset that does not fit in a usize is necessarily out of
-    // range for this calldata, so treat it as unparseable (an empty/short
-    // result) rather than panicking — rskj's Solidity decoder likewise rejects
-    // such inputs (the count guard runs after the read, so the conversion must
-    // never overflow). Mainnet #6,223,783 tx[3] feeds a count of ~uint256::MAX.
-    let Ok(count) = usize::try_from(U256::from_be_slice(&args[array_offset..array_offset + 32]))
-    else {
-        return Vec::new();
-    };
-    if count == 0 || count > 1000 {
-        return Vec::new();
-    }
-
-    let offsets_start = array_offset + 32;
-    let mut result = Vec::with_capacity(count);
-
-    for i in 0..count {
-        let off_pos = offsets_start + i * 32;
-        if off_pos + 32 > args.len() {
-            break;
-        }
-        let Ok(elem_rel_offset) =
-            usize::try_from(U256::from_be_slice(&args[off_pos..off_pos + 32]))
-        else {
-            break;
-        };
-        let elem_abs = offsets_start + elem_rel_offset;
-        if elem_abs + 32 > args.len() {
-            break;
-        }
-        let Ok(elem_len) = usize::try_from(U256::from_be_slice(&args[elem_abs..elem_abs + 32]))
-        else {
-            break;
-        };
-        let data_start = elem_abs + 32;
-        if data_start + elem_len > args.len() {
-            break;
-        }
-        result.push(args[data_start..data_start + elem_len].to_vec());
-    }
-    result
-}
-
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -5406,22 +5394,6 @@ fn parse_bytes_array(args: &[u8], array_offset: usize) -> Vec<Vec<u8>> {
 /// 1 BTC = 10^8 satoshis = 10^18 wei RBTC, so 1 satoshi = 10^10 wei.
 fn btc_satoshi_to_rbtc_wei(satoshis: u64) -> U256 {
     U256::from(satoshis) * U256::from(10_000_000_000u64) // 10^10
-}
-
-fn read_dynamic_bytes(args: &[u8], offset: usize) -> Result<Vec<u8>, PrecompileError> {
-    if offset + 32 > args.len() {
-        return Err(PrecompileError::other("ABI: offset out of bounds"));
-    }
-    // An oversized length can never fit this calldata: reject it (rskj's
-    // decoder does the same) instead of panicking on the usize conversion.
-    let Ok(len) = usize::try_from(U256::from_be_slice(&args[offset..offset + 32])) else {
-        return Err(PrecompileError::other("ABI: length out of bounds"));
-    };
-    let data_start = offset + 32;
-    if data_start + len > args.len() {
-        return Err(PrecompileError::other("ABI: data out of bounds"));
-    }
-    Ok(args[data_start..data_start + len].to_vec())
 }
 
 // ---------------------------------------------------------------------------
@@ -5716,16 +5688,22 @@ pub fn get_estimated_fees_for_pegout_amount<CTX: crate::RskContextTr>(
             "getEstimatedFeesForPegOutAmount: method not enabled",
         ));
     }
-    if args.len() < 32 {
-        return Err(PrecompileError::other(
-            "getEstimatedFeesForPegOutAmount: args too short",
-        ));
-    }
-
-    // co.rsk.core.Coin (wei) -> bitcoin Coin (satoshi): / 10^10
-    let wei = U256::from_be_slice(&args[0..32]);
-    let satoshis = wei / U256::from(10_000_000_000u64);
-    if satoshis < U256::from(config.minimum_pegout_tx_value) {
+    // rskj `new co.rsk.core.Coin((BigInteger) args[0]).toBitcoin()`: the wei
+    // as a signed number, divided by 10^10 toward zero, then `longValue()`,
+    // its low 64 bits. A negative amount is below the minimum like any other.
+    let wei = super::abi::Args::new(args)
+        .int(0)
+        .ok_or_else(|| PrecompileError::other("getEstimatedFeesForPegOutAmount: no amount"))?;
+    let negative = wei.0[0] & 0x80 != 0;
+    let raw = U256::from_be_bytes(wei.0);
+    let magnitude = if negative {
+        (!raw).wrapping_add(U256::from(1))
+    } else {
+        raw
+    };
+    let low = (magnitude / U256::from(10_000_000_000u64)).as_limbs()[0] as i64;
+    let satoshis = if negative { low.wrapping_neg() } else { low };
+    if satoshis < config.minimum_pegout_tx_value as i64 {
         return Err(PrecompileError::other(
             "getEstimatedFeesForPegOutAmount: peg-out amount is below the minimum peg-out value",
         ));
@@ -7849,28 +7827,215 @@ mod tests {
         );
     }
 
-    /// Regression: an ABI `bytes[]` whose declared count does not fit in a
-    /// usize must be rejected (empty result), never panic on the U256->usize
-    /// conversion. Mainnet #6,223,783 tx[3] forwarded malformed addSignature
-    /// calldata whose `signatures` offset landed mid-key, yielding an absurd
-    /// (~uint256::MAX) array count.
-    #[test]
-    fn parse_bytes_array_rejects_oversized_count_without_panic() {
-        // 32-byte count word = uint256::MAX (left of any plausible calldata).
-        let args = vec![0xFFu8; 32];
-        assert!(parse_bytes_array(&args, 0).is_empty());
+    use crate::bridge::abi::encode::{self, Arg};
 
-        // A within-range but too-large count (> 1000 guard) is also rejected.
-        let mut over = [0u8; 32];
-        over[30] = 0x10; // 0x1000 = 4096 > 1000
-        assert!(parse_bytes_array(&over, 0).is_empty());
+    /// A tree of one transaction, the one given, matched. Its root is the
+    /// transaction's hash, so it proves any bytes at all.
+    fn one_leaf_tree(tx: &[u8]) -> Vec<u8> {
+        let mut pmt = 1u32.to_le_bytes().to_vec();
+        pmt.push(1);
+        pmt.extend_from_slice(&calculate_btc_tx_hash(tx));
+        pmt.extend_from_slice(&[1, 0x01]);
+        pmt
     }
 
-    /// Regression: `read_dynamic_bytes` must reject an oversized ABI length
-    /// rather than panic converting it to usize (same malformed-calldata path).
+    /// What a crafted transaction needs for `validateInputsCount`: the version,
+    /// then an input count of one, or from RSKIP143 a segwit marker and flag
+    /// with a count of zero.
+    const ONE_INPUT: [u8; 5] = [1, 0, 0, 0, 1];
+    const NO_INPUTS: [u8; 7] = [1, 0, 0, 0, 0, 1, 0];
+
+    /// rskj `validateInputsCount`: what counts as no inputs, before and after
+    /// RSKIP143, and the transactions too short for bitcoinj to read.
     #[test]
-    fn read_dynamic_bytes_rejects_oversized_length() {
-        let args = vec![0xFFu8; 64]; // offset 0 -> length word = uint256::MAX
-        assert!(read_dynamic_bytes(&args, 0).is_err());
+    fn a_transaction_without_inputs_is_what_rskj_counts() {
+        assert!(has_inputs(&ONE_INPUT, false));
+        // Zero, also when bitcoinj reads it from a longer encoding.
+        assert!(!has_inputs(&[1, 0, 0, 0, 0], false));
+        assert!(!has_inputs(&[1, 0, 0, 0, 0xFD, 0, 0], false));
+        // From RSKIP143 a zero may be a segwit marker: with flag 1 the count
+        // after it decides, and any other flag is not refused.
+        assert!(!has_inputs(&NO_INPUTS, true));
+        assert!(has_inputs(&[1, 0, 0, 0, 0, 1, 2], true));
+        assert!(has_inputs(&[1, 0, 0, 0, 0, 2], true));
+        // Too short to read throws too.
+        assert!(!has_inputs(&[1, 0, 0, 0], false));
+        assert!(!has_inputs(&[1, 0, 0, 0, 0], true));
+        assert!(!has_inputs(&[1, 0, 0, 0, 0, 1], true));
+        assert!(!has_inputs(&[1, 0, 0, 0, 0xFD, 0], false));
+    }
+
+    /// rskj's `validationsForRegisterBtcTransaction`, check by check, in its
+    /// order. Regtest needs one confirmation, so height 0 passes with no chain
+    /// head stored, and with none stored the block store refuses the lookup.
+    #[test]
+    fn pegin_validations_answer_as_rskj_in_its_order() {
+        let config = BridgeConstants::regtest();
+        let cfg = RskHardforkConfig::regtest();
+        let run = |height: i32, pmt: &[u8], tx: &[u8]| {
+            let mut ctx = queue_ctx();
+            let hash = calculate_btc_tx_hash(tx);
+            match validations_for_register_btc_transaction(
+                &mut ctx, &config, &cfg, &hash, height, pmt, tx,
+            ) {
+                Ok(()) => ("valid", ""),
+                Err(Invalid::Swallowed(why)) => ("false", why),
+                Err(Invalid::Thrown(why)) => ("throws", why),
+            }
+        };
+        let garbage = [0xFF; 3];
+        // Too few confirmations comes first, even with a tree that would throw.
+        assert_eq!(
+            run(5, &garbage, &ONE_INPUT),
+            ("false", "insufficient confirmations")
+        );
+        assert_eq!(run(-1, &garbage, &ONE_INPUT), ("false", "negative height"));
+        // Then the tree: the wrong size throws, and a tree without the
+        // transaction is false.
+        assert_eq!(run(0, &garbage, &ONE_INPUT).0, "throws");
+        assert_eq!(
+            run(0, &one_leaf_tree(&NO_INPUTS), &ONE_INPUT),
+            ("false", "tx not in PMT")
+        );
+        // A transaction without inputs throws before any block is looked at.
+        assert_eq!(
+            run(0, &one_leaf_tree(&NO_INPUTS), &NO_INPUTS),
+            ("throws", "the transaction has no inputs")
+        );
+        // With inputs it reaches the store, which throws.
+        assert_eq!(
+            run(0, &one_leaf_tree(&ONE_INPUT), &ONE_INPUT),
+            ("throws", "the block store refused the height")
+        );
+    }
+
+    /// The divergence the validations fix closes: since RSKIP199 anyone may
+    /// call registerBtcTransaction, and a crafted transaction without inputs,
+    /// proved by a one-leaf tree, makes rskj throw and fail the transaction.
+    /// Answered with a quiet success instead, the sender would pay a
+    /// different fee and the block's state root would differ.
+    #[test]
+    fn a_crafted_pegin_without_inputs_fails_the_transaction() {
+        let tree = one_leaf_tree(&NO_INPUTS);
+        let args = encode::args(&[
+            Arg::Bytes(&NO_INPUTS),
+            Arg::Word(encode::int(0)),
+            Arg::Bytes(&tree),
+        ]);
+        let mut ctx = queue_ctx();
+        let result = register_btc_transaction(
+            &mut ctx,
+            &args,
+            0,
+            &BridgeConstants::regtest(),
+            &RskHardforkConfig::regtest(),
+            &BridgeTxContext::default(),
+        );
+        assert!(result.is_err());
+    }
+
+    /// rskj's `Bridge.registerFlyoverBtcTransaction` catches whatever its
+    /// validations throw and answers GENERIC_ERROR, and answers their false
+    /// with the validations code, the checks running in rskj's order.
+    #[test]
+    fn a_flyover_throw_is_a_generic_error_and_a_false_the_validations_code() {
+        let config = BridgeConstants::regtest();
+        let cfg = RskHardforkConfig::regtest();
+        let lbc = RskAddress::repeat_byte(0x42);
+        let mut lbc_word = [0u8; 32];
+        lbc_word[12..].copy_from_slice(lbc.as_slice());
+        let code = |tx: &[u8], height: i64, pmt: &[u8]| {
+            let args = encode::args(&[
+                Arg::Bytes(tx),
+                Arg::Word(encode::int(height)),
+                Arg::Bytes(pmt),
+                Arg::Word([0x11; 32]),
+                Arg::Bytes(&[0x6F; 21]),
+                Arg::Word(lbc_word),
+                Arg::Bytes(&[0x6F; 21]),
+                Arg::Word([0; 32]),
+            ]);
+            let mut ctx = queue_ctx();
+            let ctx_tx = BridgeTxContext::default();
+            register_fast_bridge_btc_transaction(&mut ctx, &args, 0, &config, &cfg, &ctx_tx, lbc, 2)
+                .unwrap()
+                .bytes
+        };
+        let generic = flyover_code_output(flyover_codes::GENERIC_ERROR);
+        let validations = flyover_code_output(flyover_codes::UNPROCESSABLE_VALIDATIONS);
+        assert_eq!(
+            code(&NO_INPUTS, 0, &one_leaf_tree(&NO_INPUTS)),
+            generic,
+            "no inputs"
+        );
+        assert_eq!(
+            code(&ONE_INPUT, 0, &[0xFF; 3]),
+            generic,
+            "a tree of the wrong size"
+        );
+        assert_eq!(
+            code(&ONE_INPUT, i64::from(i32::MAX), &[0xFF; 3]),
+            validations,
+            "confirmations first"
+        );
+        assert_eq!(
+            code(&ONE_INPUT, -1, &[0xFF; 3]),
+            validations,
+            "a negative height"
+        );
+    }
+
+    /// rskj's `Bridge.addSignature` turns down a key bitcoinj cannot parse, an
+    /// empty list of signatures, a signature that is not DER and a hash that is
+    /// not 32 bytes, each with a `BridgeIllegalArgumentException`: before
+    /// RSKIP88 a success with no output, from it a throw. The single byte 0,
+    /// the point at infinity, is a key bitcoinj parses.
+    #[test]
+    fn add_signature_refuses_what_rskj_cannot_parse() {
+        let der: &[u8] = &[0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01];
+        let not_der: &[u8] = &[0x9f, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01];
+        let key = real_pubkey();
+        let run = |cfg: &RskHardforkConfig, key: &[u8], sigs: &[&[u8]], hash: &[u8]| {
+            let args = encode::args(&[Arg::Bytes(key), Arg::BytesArray(sigs), Arg::Bytes(hash)]);
+            let mut ctx = queue_ctx();
+            add_signature(&mut ctx, &args, 0, &BridgeConstants::regtest(), cfg).map(|out| out.bytes)
+        };
+        let rskip88 = RskHardforkConfig::regtest();
+        assert!(
+            run(&rskip88, &[0x05; 33], &[der], &[0x11; 32]).is_err(),
+            "not a key"
+        );
+        assert!(
+            run(&rskip88, &key, &[], &[0x11; 32]).is_err(),
+            "no signatures"
+        );
+        assert!(
+            run(&rskip88, &key, &[der, not_der], &[0x11; 32]).is_err(),
+            "not DER"
+        );
+        assert!(
+            run(&rskip88, &key, &[der], &[0x11; 31]).is_err(),
+            "not a hash"
+        );
+        assert_eq!(
+            run(&rskip88, &key, &[der], &[0x11; 32]).unwrap(),
+            Bytes::new(),
+            "not a member"
+        );
+        assert_eq!(
+            run(&rskip88, &[0x00], &[der], &[0x11; 32]).unwrap(),
+            Bytes::new(),
+            "infinity"
+        );
+        // Mainnet's block 0 is before RSKIP88.
+        let before = RskHardforkConfig::mainnet();
+        assert_eq!(
+            run(&before, &[0x05; 33], &[der], &[0x11; 32]).unwrap(),
+            Bytes::new()
+        );
+        assert_eq!(
+            run(&before, &key, &[not_der], &[0x11; 32]).unwrap(),
+            Bytes::new()
+        );
     }
 }

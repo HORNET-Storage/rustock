@@ -174,29 +174,29 @@ pub fn register_btc_coinbase_transaction<CTX: crate::RskContextTr>(
     args: &[u8],
     gas_cost: u64,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    // Decode 5 ABI arguments
-    if args.len() < 160 {
+    // The five arguments, as rskj's decoder reads them: the transaction, the
+    // block hash, the partial merkle tree, the witness merkle root and the
+    // witness reserved value.
+    let decoded = super::abi::Args::new(args);
+    let (
+        Some(btc_tx_data),
+        Some(block_hash),
+        Some(pmt_data),
+        Some(witness_merkle_root),
+        Some(witness_reserved_value),
+    ) = (
+        decoded.bytes(0),
+        decoded.bytes32(1),
+        decoded.bytes(2),
+        decoded.bytes32(3),
+        decoded.bytes32(4),
+    )
+    else {
         return Err(PrecompileError::other(
-            "registerBtcCoinbaseTransaction: args too short",
+            "registerBtcCoinbaseTransaction: malformed arguments",
         ));
-    }
-
-    // Parse the 5 ABI-encoded arguments:
-    // arg0: bytes btcTx (dynamic)
-    // arg1: bytes32 blockHash
-    // arg2: bytes pmtSerialized (dynamic)
-    // arg3: bytes32 witnessMerkleRoot
-    // arg4: bytes32 witnessReservedValue
-
-    let btc_tx_offset = U256::from_be_slice(&args[0..32]).to::<usize>();
-    let block_hash: [u8; 32] = args[32..64].try_into().unwrap();
-    let pmt_offset = U256::from_be_slice(&args[64..96]).to::<usize>();
-    let witness_merkle_root: [u8; 32] = args[96..128].try_into().unwrap();
-    let witness_reserved_value: [u8; 32] = args[128..160].try_into().unwrap();
-
-    // Read dynamic bytes
-    let btc_tx_data = read_abi_dynamic_bytes(args, btc_tx_offset)?;
-    let pmt_data = read_abi_dynamic_bytes(args, pmt_offset)?;
+    };
+    let (btc_tx_data, pmt_data) = (btc_tx_data.to_vec(), pmt_data.to_vec());
 
     // Compute BTC tx hash (double-SHA256)
     let btc_tx_hash = calculate_btc_tx_hash(&btc_tx_data);
@@ -293,13 +293,9 @@ pub fn has_btc_block_coinbase_info<CTX: crate::RskContextTr>(
     args: &[u8],
     gas_cost: u64,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    if args.len() < 32 {
-        return Err(PrecompileError::other(
-            "hasBtcBlockCoinbaseTransactionInformation: args too short",
-        ));
-    }
-
-    let block_hash: [u8; 32] = args[..32].try_into().unwrap();
+    let block_hash = super::abi::Args::new(args).bytes32(0).ok_or_else(|| {
+        PrecompileError::other("hasBtcBlockCoinbaseTransactionInformation: no block hash")
+    })?;
     let has_info = has_coinbase_information(ctx, &block_hash);
 
     let mut output = [0u8; 32];
@@ -495,18 +491,6 @@ fn find_witness_commitment(tx: &bitcoin::Transaction) -> Option<[u8; 32]> {
             && spk[2..6] == WITNESS_COMMITMENT_HEADER)
             .then(|| spk[6..MINIMUM_WITNESS_COMMITMENT_SIZE].try_into().unwrap())
     })
-}
-
-fn read_abi_dynamic_bytes(args: &[u8], offset: usize) -> Result<Vec<u8>, PrecompileError> {
-    if offset + 32 > args.len() {
-        return Err(PrecompileError::other("ABI: offset out of bounds"));
-    }
-    let len = U256::from_be_slice(&args[offset..offset + 32]).to::<usize>();
-    let data_start = offset + 32;
-    if data_start + len > args.len() {
-        return Err(PrecompileError::other("ABI: data out of bounds"));
-    }
-    Ok(args[data_start..data_start + len].to_vec())
 }
 
 fn encode_int_output(gas_cost: u64, value: i64) -> PrecompileOutput {

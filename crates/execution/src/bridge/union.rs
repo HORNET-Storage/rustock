@@ -245,7 +245,9 @@ pub fn set_contract_address_for_testnet<CTX: crate::RskContextTr>(
     if sender != constants.change_address_authorizer {
         return int_result(gas_cost, UnionResponse::UnauthorizedCaller.code());
     }
-    let Some(new_address) = abi_address(args, 0) else {
+    // rskj `new RskAddress((DataWord) args[0])`: the address as its decoder
+    // reads it, an empty argument list being the zero address.
+    let Some(new_address) = super::abi::Args::new(args).address(0) else {
         return int_result(gas_cost, UnionResponse::GenericError.code());
     };
     store_long(ctx, UNION_CONTRACT_ADDRESS_KEY, &rlp_encode_bytes(new_address.as_slice()));
@@ -289,11 +291,15 @@ pub fn increase_locking_cap<CTX: crate::RskContextTr>(
     if sender != constants.change_locking_cap_authorizer {
         return int_result(gas_cost, UnionResponse::UnauthorizedCaller.code());
     }
-    let Some(new_cap) = abi_uint(args, 0) else {
+    let Some(new_cap) = super::abi::Args::new(args).int(0) else {
         return int_result(gas_cost, UnionResponse::GenericError.code());
     };
     let current = locking_cap(ctx, hardfork_cfg);
     let max_allowed = current * U256::from(constants.locking_cap_increments_multiplier);
+    // A negative cap never increases the current one.
+    let Some(new_cap) = coin(&new_cap) else {
+        return int_result(gas_cost, UnionResponse::InvalidValue.code());
+    };
     if new_cap <= current || new_cap > max_allowed {
         return int_result(gas_cost, UnionResponse::InvalidValue.code());
     }
@@ -321,12 +327,15 @@ pub fn request_rbtc<CTX: crate::RskContextTr>(
     if !request_enabled(ctx) {
         return int_result(gas_cost, UnionResponse::TransferDisabled.code());
     }
-    let Some(amount) = abi_uint(args, 0) else {
+    let Some(amount) = super::abi::Args::new(args).int(0) else {
         return int_result(gas_cost, UnionResponse::GenericError.code());
     };
-    if amount.is_zero() {
+    // rskj `isAmountRequestedValid` refuses an amount that is not positive,
+    // and the amount is signed: a negative one would otherwise wrap the total
+    // below the cap.
+    let Some(amount) = coin(&amount).filter(|amount| !amount.is_zero()) else {
         return int_result(gas_cost, UnionResponse::InvalidValue.code());
-    }
+    };
     let previous = weis_transferred(ctx);
     let new_total = previous + amount;
     if new_total > locking_cap(ctx, hardfork_cfg) {
@@ -411,7 +420,10 @@ pub fn set_transfer_permissions<CTX: crate::RskContextTr>(
     if sender != constants.change_transfer_permissions_authorizer {
         return int_result(gas_cost, UnionResponse::UnauthorizedCaller.code());
     }
-    let (Some(request), Some(release)) = (abi_bool(args, 0), abi_bool(args, 1)) else {
+    // rskj's `BoolType` looks at its word's low 32 bits only, and an empty
+    // argument list reads as two falses.
+    let args = super::abi::Args::new(args);
+    let (Some(request), Some(release)) = (args.bool(0), args.bool(1)) else {
         return int_result(gas_cost, UnionResponse::GenericError.code());
     };
 
@@ -457,9 +469,12 @@ pub fn set_event<CTX: crate::RskContextTr>(
     hardfork_cfg: &RskHardforkConfig,
     sender: Address,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    let event = abi_bytes(args).ok_or_else(|| {
-        PrecompileError::other("union bridge event: the bytes argument does not decode")
-    })?;
+    let event = super::abi::Args::new(args)
+        .bytes(0)
+        .map(<[u8]>::to_vec)
+        .ok_or_else(|| {
+            PrecompileError::other("union bridge event: the bytes argument does not decode")
+        })?;
     require_union_bridge_caller(ctx, hardfork_cfg, sender)?;
     if event.len() > MAX_EVENT_DATA_LENGTH {
         return Err(PrecompileError::other(format!(
@@ -504,36 +519,11 @@ fn require_union_bridge_caller<CTX: crate::RskContextTr>(
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn abi_word(args: &[u8], index: usize) -> Option<&[u8]> {
-    args.get(index * 32..index * 32 + 32)
-}
-
-fn abi_address(args: &[u8], index: usize) -> Option<Address> {
-    abi_word(args, index).map(|w| Address::from_slice(&w[12..]))
-}
-
-fn abi_uint(args: &[u8], index: usize) -> Option<U256> {
-    abi_word(args, index).map(U256::from_be_slice)
-}
-
-fn abi_bool(args: &[u8], index: usize) -> Option<bool> {
-    abi_word(args, index).map(|w| w.iter().any(|b| *b != 0))
-}
-
-/// The single `bytes` argument, read as rskj's `BytesType.decode` reads it:
-/// the offset and the length are each the low 32 bits of their word as a
-/// Java int (`IntType.decodeInt(..).intValue()`), so high bits are ignored
-/// where `U256::to::<usize>` would panic. The dispatcher has already checked
-/// that the arguments decode (`abi_args_decode_ok`); `None` is a backstop.
-fn abi_bytes(args: &[u8]) -> Option<Vec<u8>> {
-    let int_at = |at: usize| -> Option<usize> {
-        let word = args.get(at..at.checked_add(32)?)?;
-        usize::try_from(i32::from_be_bytes(word[28..32].try_into().ok()?)).ok()
-    };
-    let offset = int_at(0)?;
-    let len = int_at(offset)?;
-    let start = offset.checked_add(32)?;
-    args.get(start..start.checked_add(len)?).map(<[u8]>::to_vec)
+/// rskj `new co.rsk.core.Coin((BigInteger) arg)`: the word as a signed
+/// number, `None` where it is negative.
+fn coin(value: &super::abi::Int) -> Option<U256> {
+    let value = value.signed();
+    (!value.is_negative()).then(|| value.into_raw())
 }
 
 /// Moves RBTC out of the Bridge's own balance.
@@ -800,8 +790,93 @@ mod tests {
         let mut args = bytes_arg(&event);
         args[..28].fill(0xFF);
         args[32..60].fill(0x01);
-        assert_eq!(abi_bytes(&args), Some(event));
-        assert_eq!(abi_bytes(&[]), None);
-        assert_eq!(abi_bytes(&args[..40]), None, "the length word is cut short");
+        let cfg = RskHardforkConfig::testnet();
+        let mut c = testnet_ctx();
+        set_event(&mut c, SUPER_EVENT_KEY, &args, 8_000, &cfg, union_bridge()).unwrap();
+        assert_eq!(load_long(&mut c, SUPER_EVENT_KEY), event);
+        assert!(set_event(&mut c, SUPER_EVENT_KEY, &[], 8_000, &cfg, union_bridge()).is_err());
+        assert!(
+            set_event(
+                &mut c,
+                SUPER_EVENT_KEY,
+                &args[..40],
+                8_000,
+                &cfg,
+                union_bridge()
+            )
+            .is_err(),
+            "the length word is cut short"
+        );
+    }
+
+    fn code(out: PrecompileOutput) -> i64 {
+        i64::from_be_bytes(out.bytes[24..32].try_into().unwrap())
+    }
+
+    /// rskj's amounts are signed: a word with its top bit set is a negative
+    /// cap or request, refused as INVALID_VALUE, where read unsigned it was a
+    /// huge one that wrapped the running total back under the cap.
+    #[test]
+    fn a_negative_cap_or_amount_is_an_invalid_value() {
+        let cfg = RskHardforkConfig::testnet();
+        let minus_one = [0xFF; 32];
+        let authorizer = union_constants(&cfg).change_locking_cap_authorizer;
+        let mut c = ctx();
+        let out = increase_locking_cap(&mut c, &minus_one, 0, &cfg, authorizer).unwrap();
+        assert_eq!(code(out), UnionResponse::InvalidValue.code());
+
+        let mut c = testnet_ctx();
+        store_coin(&mut c, WEIS_TRANSFERRED_KEY, U256::from(5u64));
+        let out = request_rbtc(&mut c, &minus_one, 0, &cfg, union_bridge()).unwrap();
+        assert_eq!(code(out), UnionResponse::InvalidValue.code());
+        assert_eq!(
+            weis_transferred(&mut c),
+            U256::from(5u64),
+            "the total is untouched"
+        );
+    }
+
+    /// An empty argument list reads as zeros: two falses for the permissions,
+    /// and a zero cap, which is no increase.
+    #[test]
+    fn an_empty_argument_list_reads_as_zeros() {
+        let cfg = RskHardforkConfig::testnet();
+        let constants = union_constants(&cfg);
+        let mut c = ctx();
+        let out = set_transfer_permissions(
+            &mut c,
+            &[],
+            0,
+            &cfg,
+            constants.change_transfer_permissions_authorizer,
+        )
+        .unwrap();
+        assert_eq!(code(out), UnionResponse::Success.code());
+        assert!(!request_enabled(&mut c) && !release_enabled(&mut c));
+
+        let out = increase_locking_cap(
+            &mut c,
+            &[],
+            0,
+            &cfg,
+            constants.change_locking_cap_authorizer,
+        )
+        .unwrap();
+        assert_eq!(code(out), UnionResponse::InvalidValue.code());
+    }
+
+    /// rskj's `BoolType` is `intValue() != 0`: a word whose only set bits are
+    /// above its low 32 is false.
+    #[test]
+    fn a_flag_looks_only_at_its_low_32_bits() {
+        let cfg = RskHardforkConfig::testnet();
+        let authorizer = union_constants(&cfg).change_transfer_permissions_authorizer;
+        let mut args = [0u8; 64];
+        args[0] = 1;
+        args[63] = 1;
+        let mut c = ctx();
+        set_transfer_permissions(&mut c, &args, 0, &cfg, authorizer).unwrap();
+        assert!(!request_enabled(&mut c), "only a high bit set");
+        assert!(release_enabled(&mut c));
     }
 }

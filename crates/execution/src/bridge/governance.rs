@@ -39,53 +39,49 @@ use super::storage::*;
 // BTC address ABI decoding helpers
 // ---------------------------------------------------------------------------
 
-/// ABI-decode a `string` argument at the given parameter slot.
-/// Returns the decoded UTF-8 string or an error.
+/// The `string` argument at parameter slot `slot`, read as rskj's decoder
+/// reads it: UTF-8 with bad sequences replaced, never refused for its
+/// content. A payload that reaches a method has already decoded, so this
+/// only fails for a caller that skipped the Bridge's argument check.
 fn abi_decode_string_arg(args: &[u8], slot: usize) -> Result<String, PrecompileError> {
-    if args.len() < (slot + 1) * 32 {
-        return Err(PrecompileError::other("governance: args too short for string param"));
-    }
-    let offset = U256::from_be_slice(&args[slot * 32..(slot + 1) * 32]).to::<usize>();
-    if offset + 32 > args.len() {
-        return Err(PrecompileError::other("governance: string offset out of bounds"));
-    }
-    let len = U256::from_be_slice(&args[offset..offset + 32]).to::<usize>();
-    let data_start = offset + 32;
-    if data_start + len > args.len() {
-        return Err(PrecompileError::other("governance: string data out of bounds"));
-    }
-    String::from_utf8(args[data_start..data_start + len].to_vec())
-        .map_err(|_| PrecompileError::other("governance: invalid UTF-8 in string"))
+    super::abi::Args::new(args)
+        .string(slot)
+        .ok_or_else(|| PrecompileError::other("governance: malformed string argument"))
 }
 
-/// Decode a BTC address string (Base58Check) to its 20-byte hash160.
+/// Decode a BTC address string (Base58Check) to its 20-byte hash160, as
+/// rskj's `Address.fromBase58(networkParameters, s)`: this network's P2PKH
+/// or P2SH version byte, and nothing else.
+fn btc_address_to_hash160(
+    addr_str: &str,
+    config: &super::constants::BridgeConstants,
+) -> Result<[u8; 20], PrecompileError> {
+    super::getters::parse_network_address_hash160(addr_str, config)
+        .ok_or_else(|| PrecompileError::other("governance: not a BTC address of this network"))
+}
+
+/// The satoshis a one-off whitelist entry stores for `maxTransferValue`.
 ///
-/// Matches rskj's `BridgeUtils.parseBtcAddressFromHex` / Address.fromBase58:
-/// Base58Check decode → version byte + 20-byte hash160 + 4-byte checksum.
-fn btc_address_to_hash160(addr_str: &str) -> Result<[u8; 20], PrecompileError> {
-    let decoded = bitcoin::base58::decode_check(addr_str)
-        .map_err(|_| PrecompileError::other("governance: invalid BTC address (bad Base58Check)"))?;
-    if decoded.len() != 21 {
-        return Err(PrecompileError::other("governance: BTC address decoded to wrong length"));
+/// rskj takes `Coin.valueOf(maxTransferValue.longValueExact())`, which
+/// throws for a value no long holds and keeps a negative one, and stores it
+/// with `RLP.encodeBigInteger`, whose `asUnsignedByteArray` writes a negative
+/// number's shortest two's-complement bytes. What the entry reads back as,
+/// in rskj and here, is those bytes taken unsigned: -5 becomes 251.
+fn one_off_max_transfer_value(max: &super::abi::Int) -> Option<u64> {
+    let value = max.long_value_exact()?;
+    if value >= 0 {
+        return Some(value as u64);
     }
-    let mut hash160 = [0u8; 20];
-    hash160.copy_from_slice(&decoded[1..21]);
-    Ok(hash160)
-}
-
-/// ABI-decode an `int256` argument at the given parameter slot as a u64.
-fn abi_decode_int256_as_u64(args: &[u8], slot: usize) -> Option<u64> {
-    if args.len() < (slot + 1) * 32 {
-        return None;
+    let bytes = value.to_be_bytes();
+    let mut start = 0;
+    while start < 7 && bytes[start] == 0xFF && bytes[start + 1] & 0x80 != 0 {
+        start += 1;
     }
-    let word = &args[slot * 32..(slot + 1) * 32];
-    // Only accept non-negative values that fit in u64 (leading bytes must be 0x00)
-    if word[..24].iter().any(|&b| b != 0) {
-        return None;
-    }
-    let mut buf = [0u8; 8];
-    buf.copy_from_slice(&word[24..32]);
-    Some(u64::from_be_bytes(buf))
+    Some(
+        bytes[start..]
+            .iter()
+            .fold(0u64, |n, b| n << 8 | u64::from(*b)),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -785,9 +781,15 @@ pub fn vote_fee_per_kb_change<CTX: crate::RskContextTr>(
     config: &super::constants::BridgeConstants,
     tx_ctx: &crate::precompiles::BridgeTxContext,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    if args.len() < 32 {
-        return Err(PrecompileError::other("voteFeePerKbChange: args too short"));
-    }
+    // rskj `Bridge.voteFeePerKbChange` takes `Coin.valueOf(longValueExact())`
+    // before anything else, and a value no long holds is GENERIC_ERROR: -10,
+    // the same code an unauthorized caller gets.
+    let Some(fee) = super::abi::Args::new(args)
+        .int(0)
+        .and_then(|fee| fee.long_value_exact())
+    else {
+        return Ok(encode_int_result(gas_cost, -10));
+    };
 
     let authorizers: Vec<alloy_primitives::Address> = config
         .fee_per_kb_authorizer_keys
@@ -803,18 +805,17 @@ pub fn vote_fee_per_kb_change<CTX: crate::RskContextTr>(
         return Ok(encode_int_result(gas_cost, -10));
     }
 
-    // Negative (int256 sign bit) or zero is not a positive coin.
-    if args[0] & 0x80 != 0 {
+    // FeePerKbSupportImpl: `!feePerKb.isPositive()` is NEGATIVE_FEE_VOTED (-1),
+    // and a fee above the maximum EXCESSIVE_FEE_VOTED (-2).
+    let Ok(fee_satoshis) = u64::try_from(fee) else {
+        return Ok(encode_int_result(gas_cost, -1));
+    };
+    if fee_satoshis == 0 {
         return Ok(encode_int_result(gas_cost, -1));
     }
-    let fee_value = U256::from_be_slice(&args[..32]);
-    if fee_value.is_zero() {
-        return Ok(encode_int_result(gas_cost, -1));
-    }
-    if fee_value > U256::from(config.max_fee_per_kb) {
+    if fee_satoshis > config.max_fee_per_kb {
         return Ok(encode_int_result(gas_cost, -2));
     }
-    let fee_satoshis = fee_value.to::<u64>();
 
     // MAJORITY of the authorizer set must vote the same value. Entries are
     // keyed by the RLP-ENCODED coin (serializeCoin) bytes, like rskj's
@@ -949,17 +950,15 @@ pub fn increase_locking_cap<CTX: crate::RskContextTr>(
     config: &super::constants::BridgeConstants,
     tx_ctx: &crate::precompiles::BridgeTxContext,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    if args.len() < 32 {
-        return Err(PrecompileError::other("increaseLockingCap: args too short"));
-    }
-
     // int256 satoshis; rskj getCoinFromBigInteger (longValueExact) and the
-    // <= 0 check both end in BridgeIllegalArgumentException.
-    let raw = U256::from_be_slice(&args[..32]);
-    if raw.is_zero() || raw > U256::from(i64::MAX as u64) {
-        return Err(PrecompileError::other("increaseLockingCap: invalid value"));
-    }
-    let new_cap = raw.to::<u64>();
+    // <= 0 check both end in BridgeIllegalArgumentException, before the
+    // authorizer is looked at.
+    let new_cap = super::abi::Args::new(args)
+        .int(0)
+        .and_then(|cap| cap.long_value_exact())
+        .and_then(|cap| u64::try_from(cap).ok())
+        .filter(|cap| *cap > 0)
+        .ok_or_else(|| PrecompileError::other("increaseLockingCap: invalid value"))?;
 
     let authorized = config.increase_locking_cap_authorizer_keys.iter().any(|hex| {
         alloy_primitives::hex::decode(hex)
@@ -1044,15 +1043,21 @@ pub fn add_one_off_lock_whitelist_address<CTX: crate::RskContextTr>(
         Err(_) => return Ok(encode_int_result(gas_cost, -2)),
     };
 
-    let hash160 = match btc_address_to_hash160(&addr_str) {
+    // WhitelistSupportImpl.addOneOffLockWhitelistAddress parses the address
+    // (INVALID_ADDRESS_FORMAT, -2), then the value, whose `longValueExact`
+    // throws, and only then asks whether the caller may change the list.
+    let hash160 = match btc_address_to_hash160(&addr_str, config) {
         Ok(h) => h,
         Err(_) => return Ok(encode_int_result(gas_cost, -2)),
     };
 
-    let max_val = match abi_decode_int256_as_u64(args, 1) {
-        Some(v) => v,
-        None => return Ok(encode_int_result(gas_cost, -2)),
-    };
+    let max_val = super::abi::Args::new(args)
+        .int(1)
+        .as_ref()
+        .and_then(one_off_max_transfer_value)
+        .ok_or_else(|| {
+            PrecompileError::other("addOneOffLockWhitelistAddress: the value is not a long")
+        })?;
 
     if !is_whitelist_change_authorized(config, tx_ctx.rsk_sender) {
         return Ok(encode_int_result(gas_cost, -10));
@@ -1094,7 +1099,7 @@ pub fn add_unlimited_lock_whitelist_address<CTX: crate::RskContextTr>(
         Err(_) => return Ok(encode_int_result(gas_cost, -2)),
     };
 
-    let hash160 = match btc_address_to_hash160(&addr_str) {
+    let hash160 = match btc_address_to_hash160(&addr_str, config) {
         Ok(h) => h,
         Err(_) => return Ok(encode_int_result(gas_cost, -2)),
     };
@@ -1142,7 +1147,7 @@ pub fn remove_lock_whitelist_address<CTX: crate::RskContextTr>(
         Err(_) => return Ok(encode_int_result(gas_cost, -2)),
     };
 
-    let hash160 = match btc_address_to_hash160(&addr_str) {
+    let hash160 = match btc_address_to_hash160(&addr_str, config) {
         Ok(h) => h,
         Err(_) => return Ok(encode_int_result(gas_cost, -2)),
     };
@@ -1181,12 +1186,6 @@ pub fn set_lock_whitelist_disable_block_delay<CTX: crate::RskContextTr>(
     config: &super::constants::BridgeConstants,
     tx_ctx: &crate::precompiles::BridgeTxContext,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    if args.len() < 32 {
-        return Err(PrecompileError::other(
-            "setLockWhitelistDisableBlockDelay: args too short",
-        ));
-    }
-
     if !is_whitelist_change_authorized(config, tx_ctx.rsk_sender) {
         return Ok(encode_int_result(gas_cost, -10));
     }
@@ -1196,15 +1195,23 @@ pub fn set_lock_whitelist_disable_block_delay<CTX: crate::RskContextTr>(
         return Ok(encode_int_result(gas_cost, -1)); // delay already set
     }
 
-    let delay = U256::from_be_slice(&args[..32]).to::<u64>() as i64;
+    // rskj `disableBlockDelayBI.intValueExact()`: a delay no int holds
+    // throws. The sum is Java int arithmetic, so one that wraps is not above
+    // the height either.
+    let delay = super::abi::Args::new(args)
+        .int(0)
+        .and_then(|delay| delay.int_value_exact())
+        .ok_or_else(|| {
+            PrecompileError::other("setLockWhitelistDisableBlockDelay: the delay is not an int")
+        })?;
     let best_height = super::btc_store::load_chain_head(ctx)
-        .map(|h| h.height as i64)
+        .map(|h| h.height as i32)
         .unwrap_or(0);
-    if delay + best_height <= best_height {
+    if delay.wrapping_add(best_height) <= best_height {
         return Ok(encode_int_result(gas_cost, -2)); // invalid delay
     }
 
-    store_one_off_whitelist(ctx, &entries, (best_height + delay) as i32);
+    store_one_off_whitelist(ctx, &entries, best_height.wrapping_add(delay));
 
     Ok(encode_int_result(gas_cost, 1))
 }
@@ -1312,23 +1319,12 @@ fn decode_bytes_arg(args: &[u8]) -> Result<Vec<u8>, PrecompileError> {
     decode_bytes_arg_at(args, 0)
 }
 
-/// Decode the `index`-th `bytes` ABI argument (head word `index` holds the
-/// payload offset).
+/// Decode the `index`-th `bytes` ABI argument, as rskj's decoder does.
 fn decode_bytes_arg_at(args: &[u8], index: usize) -> Result<Vec<u8>, PrecompileError> {
-    let head = index * 32;
-    if args.len() < head + 32 {
-        return Err(PrecompileError::other("bytes arg: too short"));
-    }
-    let offset = U256::from_be_slice(&args[head..head + 32]).to::<usize>();
-    if offset + 32 > args.len() {
-        return Err(PrecompileError::other("bytes arg: offset out of bounds"));
-    }
-    let len = U256::from_be_slice(&args[offset..offset + 32]).to::<usize>();
-    let start = offset + 32;
-    if start + len > args.len() {
-        return Err(PrecompileError::other("bytes arg: data out of bounds"));
-    }
-    Ok(args[start..start + len].to_vec())
+    super::abi::Args::new(args)
+        .bytes(index)
+        .map(<[u8]>::to_vec)
+        .ok_or_else(|| PrecompileError::other("bytes arg: malformed"))
 }
 
 pub(crate) fn encode_int_result(gas_cost: u64, value: i64) -> PrecompileOutput {
@@ -1486,5 +1482,33 @@ mod tests {
 
         // The promoted active-height cell encodes as serializeLong = RLP bigint.
         assert_eq!(serialization::rlp_encode_u64(next_creation), vec![0x83, 0x46, 0xfe, 0xed]);
+    }
+
+    /// rskj `addOneOffLockWhitelistAddress` parses the address first, -2 where
+    /// it does not parse, then reads the value with `longValueExact`, which
+    /// throws for one beyond a Java long -- all before the sender is checked.
+    #[test]
+    fn a_one_off_value_beyond_a_long_throws_before_the_sender_check() {
+        use crate::bridge::abi::encode::{self, Arg};
+        use revm::MainContext;
+        let config = super::super::constants::BridgeConstants::mainnet();
+        let tx_ctx = crate::precompiles::BridgeTxContext::default();
+        let mut ctx =
+            revm::Context::mainnet().with_chain(crate::raw_storage::RskChainExt::default());
+        let mut call = |address: &str, value: [u8; 32]| {
+            let args = encode::args(&[Arg::Bytes(address.as_bytes()), Arg::Word(value)]);
+            add_one_off_lock_whitelist_address(&mut ctx, &args, 0, &config, &tx_ctx)
+                .map(|out| i64::from_be_bytes(out.bytes[24..32].try_into().unwrap()))
+        };
+        let address = "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2";
+        let mut beyond = [0u8; 32];
+        beyond[23] = 1; // 2^64
+        assert!(call(address, beyond).is_err());
+        assert_eq!(call("not an address", beyond).unwrap(), -2);
+        assert_eq!(
+            call(address, encode::int(1_000)).unwrap(),
+            -10,
+            "then the sender"
+        );
     }
 }

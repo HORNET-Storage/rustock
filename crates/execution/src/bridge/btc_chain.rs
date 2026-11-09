@@ -75,10 +75,9 @@ pub fn receive_header<CTX: crate::RskContextTr>(
     let rskip199 = hardfork_cfg.has_rskip199(block_number);
     ensure_btc_chain_seeded(ctx, config, use_v2, rskip199);
 
-    // Decode ABI-encoded `bytes` argument
-    let header_bytes = decode_abi_bytes(args).ok_or_else(|| {
-        PrecompileError::other("receiveHeader: invalid ABI encoding")
-    })?;
+    let header_bytes = super::abi::Args::new(args)
+        .bytes(0)
+        .ok_or_else(|| PrecompileError::other("receiveHeader: invalid ABI encoding"))?;
 
     // Deserialize BTC header (80 bytes). rskj has already parsed the header
     // (Bridge.receiveHeader takes a BtcBlock) by this point, so the order of
@@ -466,15 +465,28 @@ pub fn receive_headers<CTX: crate::RskContextTr>(
     use_v2: bool,
     hardfork_cfg: &RskHardforkConfig,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    let headers = decode_abi_bytes_array(args).ok_or_else(|| {
-        PrecompileError::other("receiveHeaders: invalid ABI encoding")
-    })?;
+    let headers = super::abi::Args::new(args)
+        .bytes_array(0)
+        .ok_or_else(|| PrecompileError::other("receiveHeaders: invalid ABI encoding"))?;
 
     // NOTE: rskj's receiveHeaders has NO rate limiting — the
     // minSecondsBetweenCallsToReceiveHeader window only applies to the
     // singular receiveHeader (RSKIP200). The federation calls this every
     // few blocks.
     let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
+
+    // rskj `Bridge.receiveHeaders` refuses the whole call when any header is
+    // not a header's size, before it parses one (Bridge.java:537-542).
+    let rskip124 = hardfork_cfg.has_rskip124(block_number);
+    if headers
+        .iter()
+        .any(|header| !is_block_header_size(header.len(), rskip124))
+    {
+        return Err(PrecompileError::other(
+            "receiveHeaders: a header is not a header's size",
+        ));
+    }
+
     let rskip434 = hardfork_cfg.has_rskip434(block_number);
     let rskip199 = hardfork_cfg.has_rskip199(block_number);
 
@@ -485,10 +497,6 @@ pub fn receive_headers<CTX: crate::RskContextTr>(
     let count = headers.len().min(max_headers);
 
     for header_bytes in headers.iter().take(count) {
-        if header_bytes.len() < 80 {
-            continue;
-        }
-
         let btc_header: BtcHeader = match deserialize(&header_bytes[..80]) {
             Ok(h) => h,
             Err(_) => continue,
@@ -656,16 +664,15 @@ pub fn get_block_hash_at_depth<CTX: crate::RskContextTr>(
     config: &BridgeConstants,
     hardfork_cfg: &crate::hardfork::RskHardforkConfig,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    if args.len() < 32 {
-        return Err(PrecompileError::other(
-            "getBtcBlockchainBlockHashAtDepth: args too short",
-        ));
-    }
-    // rskj reads the argument as `((BigInteger) args[0]).intValue()`, so a
-    // value that does not fit an int wraps rather than failing -- but any
-    // wrapped value then fails the `depth < 0` check below.
-    let depth_word = alloy_primitives::U256::from_be_slice(&args[..32]);
-    let depth: i64 = depth_word.try_into().unwrap_or(i64::MAX);
+    // rskj reads the argument as `((BigInteger) args[0]).intValue()`: its low
+    // 32 bits, so 2^32 + 5 is depth 5, and a negative int fails the bound
+    // check below.
+    let depth = i64::from(
+        super::abi::Args::new(args)
+            .int(0)
+            .ok_or_else(|| PrecompileError::other("getBtcBlockchainBlockHashAtDepth: no depth"))?
+            .int_value(),
+    );
 
     let head = load_chain_head(ctx).ok_or_else(|| {
         PrecompileError::other("getBtcBlockchainBlockHashAtDepth: no BTC chain head")
@@ -733,49 +740,60 @@ pub fn get_block_header_by_hash<CTX: crate::RskContextTr>(
     args: &[u8],
     gas_cost: u64,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    if args.len() < 32 {
-        return Err(PrecompileError::other("getBlockHeaderByHash: args too short"));
-    }
+    let hash = super::abi::Args::new(args)
+        .bytes32(0)
+        .ok_or_else(|| PrecompileError::other("getBlockHeaderByHash: no hash"))?;
+    let hash = b256_to_bitcoin_hash(&alloy_primitives::B256::from(hash));
 
-    let hash = b256_to_bitcoin_hash(&alloy_primitives::B256::from_slice(&args[..32]));
-
-    match get_stored_block(ctx, &hash) {
-        Some(block) => {
-            let header_bytes = serialize(&block.header);
-            Ok(PrecompileOutput::new(gas_cost, encode_abi_bytes(&header_bytes).into()))
-        }
-        None => Ok(PrecompileOutput::new(gas_cost, Bytes::new())),
-    }
+    // rskj's `serializeBlockHeader` answers a block it does not hold with
+    // `EMPTY_BYTE_ARRAY`, which `Bridge.execute` ABI-encodes like any other
+    // `byte[]`: an encoded empty `bytes`, not zero-length return data.
+    let header_bytes = get_stored_block(ctx, &hash)
+        .map(|block| serialize(&block.header))
+        .unwrap_or_default();
+    Ok(PrecompileOutput::new(
+        gas_cost,
+        encode_abi_bytes(&header_bytes).into(),
+    ))
 }
 
 /// `getBtcBlockchainBlockHeaderByHeight(uint256)` → bytes
+///
+/// rskj reads the height with `intValue()` and looks it up with
+/// `getStoredBlockAtMainChainHeight`, catching whatever that throws: a
+/// height above the head, one below RSKIP199's search limit, or a walk that
+/// finds the wrong block all answer `EMPTY_BYTE_ARRAY`. `Bridge.execute`
+/// always ABI-encodes the `byte[]` result via `encodeOutputs`
+/// (Bridge.java:418), so an empty result is returned as the ABI encoding of
+/// an empty `bytes`, NOT as zero-length return data.
 pub fn get_block_header_by_height<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     args: &[u8],
     gas_cost: u64,
+    config: &BridgeConstants,
+    hardfork_cfg: &RskHardforkConfig,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    if args.len() < 32 {
-        return Err(PrecompileError::other("getBlockHeaderByHeight: args too short"));
-    }
-
-    let height_u256 = U256::from_be_slice(&args[..32]);
-    let height = height_u256.to::<u32>();
-
-    // Look up hash by height, then get the block.
-    //
-    // rskj returns `EMPTY_BYTE_ARRAY` when the block is absent (or
-    // `getStoredBlockAtMainChainHeight` throws and `Bridge` catches it), but
-    // `Bridge.execute` always ABI-encodes the `byte[]` result via
-    // `encodeOutputs` (Bridge.java:418), so an empty result is returned as the
-    // ABI encoding of an empty `bytes` (offset `0x20` + length `0x00` = 64
-    // bytes), NOT as zero-length return data.
-    let hash_b256 = super::storage::bridge_load_btc_block_hash_by_height(ctx, height);
-    let header_bytes = hash_b256
-        .map(|h| b256_to_bitcoin_hash(&h))
-        .and_then(|hash| get_stored_block(ctx, &hash))
-        .map(|block| serialize(&block.header))
+    let height = super::abi::Args::new(args)
+        .int(0)
+        .ok_or_else(|| PrecompileError::other("getBlockHeaderByHeight: no height"))?
+        .int_value();
+    let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
+    let rskip199 = hardfork_cfg.has_rskip199(block_number);
+    // A negative height is below every search limit, or walks off the stored
+    // chain where there is none: not found either way.
+    let header_bytes = u32::try_from(height)
+        .ok()
+        .and_then(
+            |height| match main_chain_block_at_height(ctx, height, rskip199, Some(config)) {
+                MainChainLookup::Found(block) => Some(serialize(&block.header)),
+                MainChainLookup::Absent | MainChainLookup::StoreError => None,
+            },
+        )
         .unwrap_or_default();
-    Ok(PrecompileOutput::new(gas_cost, encode_abi_bytes(&header_bytes).into()))
+    Ok(PrecompileOutput::new(
+        gas_cost,
+        encode_abi_bytes(&header_bytes).into(),
+    ))
 }
 
 /// `getBtcBlockchainParentBlockHeaderByHash(bytes32)` → bytes
@@ -784,15 +802,14 @@ pub fn get_parent_block_header_by_hash<CTX: crate::RskContextTr>(
     args: &[u8],
     gas_cost: u64,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    if args.len() < 32 {
-        return Err(PrecompileError::other("getParentBlockHeaderByHash: args too short"));
-    }
-
-    let hash = b256_to_bitcoin_hash(&alloy_primitives::B256::from_slice(&args[..32]));
+    let hash = super::abi::Args::new(args)
+        .bytes32(0)
+        .ok_or_else(|| PrecompileError::other("getParentBlockHeaderByHash: no hash"))?;
+    let hash = b256_to_bitcoin_hash(&alloy_primitives::B256::from(hash));
 
     // As in `get_block_header_by_height`, an absent block yields rskj's
     // `EMPTY_BYTE_ARRAY`, which `Bridge.execute` still ABI-encodes as an empty
-    // `bytes` (64 bytes), not zero-length return data.
+    // `bytes` (96 bytes, see `encode_abi_bytes`), not zero-length return data.
     let header_bytes = get_stored_block(ctx, &hash)
         .and_then(|block| get_stored_block(ctx, &block.header.prev_blockhash))
         .map(|parent| serialize(&parent.header))
@@ -801,67 +818,8 @@ pub fn get_parent_block_header_by_hash<CTX: crate::RskContextTr>(
 }
 
 // ---------------------------------------------------------------------------
-// ABI encoding/decoding helpers
+// ABI encoding helpers (arguments are read through `super::abi`)
 // ---------------------------------------------------------------------------
-
-/// Decode a single ABI-encoded `bytes` argument.
-fn decode_abi_bytes(data: &[u8]) -> Option<Vec<u8>> {
-    if data.len() < 64 {
-        return None;
-    }
-    // First 32 bytes: offset (should be 0x20 = 32)
-    let offset = U256::from_be_slice(&data[..32]).to::<usize>();
-    if offset + 32 > data.len() {
-        return None;
-    }
-    // At the offset: length, then the data
-    let len = U256::from_be_slice(&data[offset..offset + 32]).to::<usize>();
-    let data_start = offset + 32;
-    if data_start + len > data.len() {
-        return None;
-    }
-    Some(data[data_start..data_start + len].to_vec())
-}
-
-/// Decode an ABI-encoded `bytes[]` argument (dynamic array of dynamic bytes).
-fn decode_abi_bytes_array(data: &[u8]) -> Option<Vec<Vec<u8>>> {
-    if data.len() < 64 {
-        return None;
-    }
-    // First 32 bytes: offset to the array
-    let array_offset = U256::from_be_slice(&data[..32]).to::<usize>();
-    if array_offset + 32 > data.len() {
-        return None;
-    }
-    // At array_offset: number of elements
-    let count = U256::from_be_slice(&data[array_offset..array_offset + 32]).to::<usize>();
-    if count == 0 {
-        return Some(Vec::new());
-    }
-
-    let offsets_start = array_offset + 32;
-    let mut result = Vec::with_capacity(count);
-
-    for i in 0..count {
-        let offset_pos = offsets_start + i * 32;
-        if offset_pos + 32 > data.len() {
-            return None;
-        }
-        let elem_offset = U256::from_be_slice(&data[offset_pos..offset_pos + 32]).to::<usize>();
-        let abs_offset = array_offset + 32 + elem_offset;
-        if abs_offset + 32 > data.len() {
-            return None;
-        }
-        let elem_len = U256::from_be_slice(&data[abs_offset..abs_offset + 32]).to::<usize>();
-        let elem_start = abs_offset + 32;
-        if elem_start + elem_len > data.len() {
-            return None;
-        }
-        result.push(data[elem_start..elem_start + elem_len].to_vec());
-    }
-
-    Some(result)
-}
 
 /// ABI-encode a `bytes` return value.
 fn encode_abi_bytes(data: &[u8]) -> Vec<u8> {
@@ -1077,7 +1035,7 @@ mod tests {
     fn abi_bytes_roundtrip() {
         let original = vec![1u8, 2, 3, 4, 5];
         let encoded = encode_abi_bytes(&original);
-        let decoded = decode_abi_bytes(&encoded).unwrap();
+        let decoded = crate::bridge::abi::Args::new(&encoded).bytes(0).unwrap();
         assert_eq!(decoded, original);
     }
 
@@ -1085,7 +1043,7 @@ mod tests {
     fn abi_bytes_80_byte_header() {
         let data = vec![0xABu8; 80];
         let encoded = encode_abi_bytes(&data);
-        let decoded = decode_abi_bytes(&encoded).unwrap();
+        let decoded = crate::bridge::abi::Args::new(&encoded).bytes(0).unwrap();
         assert_eq!(decoded, data);
         // 80 bytes → offset + length + ceil(80/32)*32 = 32 + 32 + 96 = 160.
         assert_eq!(encoded.len(), 160);
@@ -1106,7 +1064,10 @@ mod tests {
         // offset 0x20, length 0, one zero word.
         assert_eq!(encoded[31], 0x20);
         assert!(encoded[32..].iter().all(|&b| b == 0));
-        assert_eq!(decode_abi_bytes(&encoded).unwrap(), Vec::<u8>::new());
+        assert_eq!(
+            crate::bridge::abi::Args::new(&encoded).bytes(0),
+            Some(&[][..])
+        );
     }
 
     #[test]
@@ -1154,5 +1115,28 @@ mod tests {
         }
 
         assert_eq!(ERR_SIZE_MISMATCH, -20); // Bridge.RECEIVE_HEADER_ERROR_SIZE_MISTMATCH
+    }
+
+    fn empty_ctx() -> impl crate::RskContextTr {
+        use revm::MainContext;
+        revm::Context::mainnet().with_chain(crate::raw_storage::RskChainExt::default())
+    }
+
+    /// rskj's `getBtcBlockchainBlockHeaderByHash` serializes a block it does
+    /// not have as the empty byte array, which encodes to 96 bytes.
+    #[test]
+    fn an_unknown_block_hash_answers_the_empty_bytes() {
+        let out = get_block_header_by_hash(&mut empty_ctx(), &[0x11; 32], 0).unwrap();
+        assert_eq!(out.bytes.to_vec(), encode_abi_bytes(&[]));
+    }
+
+    /// rskj's `receiveHeaders` checks every header's size before it takes any,
+    /// and refuses the whole call for one of the wrong size.
+    #[test]
+    fn receive_headers_refuses_them_all_for_one_of_the_wrong_size() {
+        use crate::bridge::abi::encode::{self, Arg};
+        let args = encode::args(&[Arg::BytesArray(&[&[0u8; 80], &[0u8; 79]])]);
+        let (config, cfg) = (BridgeConstants::mainnet(), RskHardforkConfig::mainnet());
+        assert!(receive_headers(&mut empty_ctx(), &args, 0, &config, false, &cfg).is_err());
     }
 }

@@ -7898,6 +7898,108 @@ mod tests {
         assert_eq!(result.tx_results[0].gas_used, 0, "all of the zero gas limit consumed");
     }
 
+    /// rskj reads every ABI offset, length and count with `intValue()`: the
+    /// word's low 32 bits, the rest ignored. A call with 2^64 added to one of
+    /// those words is therefore the same call. Converting the whole word
+    /// instead panicked the node, for every one of these: the call's gas is
+    /// worked out, or its arguments read, before anything checks the sender.
+    #[test]
+    fn bridge_offsets_are_read_from_their_low_32_bits() {
+        use crate::bridge::abi::encode::{self, Arg};
+        let run = |input: &[u8]| {
+            let store = Arc::new(MemoryTrieStore::new());
+            let sender = Address::repeat_byte(0xAA);
+            let one_rbtc = U256::from(10u64).pow(U256::from(18));
+            let root = put_account(&TrieNode::empty(), store.as_ref(), &sender, 0, one_rbtc);
+            let block_store =
+                Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+            let header = dummy_header(7_000_000);
+            let tx = rustock_core::Transaction {
+                nonce: 0,
+                gas_price: U256::ZERO,
+                gas_limit: U256::from(200_000),
+                to: Bytes::copy_from_slice(crate::precompiles::BRIDGE_ADDR.as_slice()),
+                value: U256::ZERO,
+                input: Bytes::copy_from_slice(input),
+                v: 28,
+                r: U256::from(1),
+                s: U256::from(1),
+                cached_rlp: None,
+            };
+            let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+            let result = executor
+                .execute_tx(&header, &tx, sender, &root, store)
+                .unwrap();
+            (result.success, result.gas_used)
+        };
+        // Each input ends in a word nothing reads, so that the same call can
+        // carry one more nonzero byte without reading differently: 2^64 added
+        // to its `word`th word, or a 1 in that last word. Both pay the same
+        // calldata gas.
+        let call = |signature: &str, args: &[Arg]| {
+            [
+                block_header_selector(signature).to_vec(),
+                encode::args(args),
+                vec![0; 32],
+            ]
+            .concat()
+        };
+        let high = |input: &[u8], word: usize| {
+            let mut input = input.to_vec();
+            input[4 + 32 * word + 23] = 1;
+            input
+        };
+        let unread = |input: &[u8]| {
+            let mut input = input.to_vec();
+            *input.last_mut().unwrap() = 1;
+            input
+        };
+        let header = [0u8; 80];
+        let one_header = call("receiveHeader(bytes)", &[Arg::Bytes(&header)]);
+        let headers = call("receiveHeaders(bytes[])", &[Arg::BytesArray(&[&header])]);
+        let confirmations = call(
+            "getBtcTransactionConfirmations(bytes32,bytes32,uint256,bytes32[])",
+            &[
+                Arg::Word([1; 32]),
+                Arg::Word([2; 32]),
+                Arg::Word([0; 32]),
+                Arg::Words(&[[3; 32]]),
+            ],
+        );
+        let flyover = call(
+            "registerFastBridgeBtcTransaction(bytes,uint256,bytes,bytes32,bytes,address,bytes,bool)",
+            &[
+                Arg::Bytes(&[1, 0, 0, 0, 1]),
+                Arg::Word([0; 32]),
+                Arg::Bytes(&[0; 3]),
+                Arg::Word([0x11; 32]),
+                Arg::Bytes(&[0; 21]),
+                Arg::Word([0; 32]),
+                Arg::Bytes(&[0; 21]),
+                Arg::Word([0; 32]),
+            ],
+        );
+        // Each call's offsets, then: the header array's count and its element's
+        // offset; the merkle path and the hashes' count; the flyover height.
+        for (name, input, word) in [
+            ("receiveHeader", &one_header, 0),
+            ("receiveHeaders", &headers, 0),
+            ("receiveHeaders", &headers, 1),
+            ("receiveHeaders", &headers, 2),
+            ("getBtcTransactionConfirmations", &confirmations, 2),
+            ("getBtcTransactionConfirmations", &confirmations, 3),
+            ("getBtcTransactionConfirmations", &confirmations, 4),
+            ("registerFastBridgeBtcTransaction", &flyover, 0),
+            ("registerFastBridgeBtcTransaction", &flyover, 1),
+        ] {
+            assert_eq!(
+                run(&high(input, word)),
+                run(&unread(input)),
+                "{name}, word {word}"
+            );
+        }
+    }
+
     /// Regression for the sync halt at mainnet #6916: the block's first tx is
     /// a registerBtcTransaction whose referenced BTC block (height 0x07ab2c)
     /// is absent from the bridge's header chain. rskj wraps the method body in

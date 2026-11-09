@@ -139,12 +139,7 @@ pub fn get_federator_public_key<CTX: crate::RskContextTr>(
     config: &BridgeConstants,
     hardfork_cfg: &crate::hardfork::RskHardforkConfig,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    if args.len() < 32 {
-        return Err(PrecompileError::other("getFederatorPublicKey: args too short"));
-    }
-    let index: usize = U256::from_be_slice(&args[..32])
-        .try_into()
-        .map_err(|_| PrecompileError::other("getFederatorPublicKey: index out of range"))?;
+    let index = index_arg(args, "getFederatorPublicKey")?;
     let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
     let fed = super::peg::active_federation(ctx, config, hardfork_cfg, block_number);
     let key = member_key_at(&fed.members, index, KeyType::Btc, "Federator")?;
@@ -257,35 +252,13 @@ pub fn is_btc_tx_hash_already_processed<CTX: crate::RskContextTr>(
     args: &[u8],
     gas_cost: u64,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    if args.len() < 64 {
-        return Err(PrecompileError::other("isBtcTxHashAlreadyProcessed: args too short"));
-    }
-    let offset = U256::from_be_slice(&args[0..32]).to::<usize>();
-    if offset + 32 > args.len() {
-        return Ok(PrecompileOutput::new(gas_cost, abi_encode_bool(false)));
-    }
-    let len = U256::from_be_slice(&args[offset..offset + 32]).to::<usize>();
-    if offset + 32 + len > args.len() {
-        return Ok(PrecompileOutput::new(gas_cost, abi_encode_bool(false)));
-    }
-    let hash_str = &args[offset + 32..offset + 32 + len];
-    let hash_hex = String::from_utf8_lossy(hash_str);
+    // rskj: `Sha256Hash.wrap((String) args[0])` inside a catch-all that throws a
+    // VMException, so a string that is not 64 lower-case hex digits reverts
+    // the call rather than answering false.
+    let hash_display = hash_arg(args, "isBtcTxHashAlreadyProcessed")?;
     // rskj goes through getHeightIfBtcTxhashIsAlreadyProcessed, which checks
     // the legacy btcTxHashesAP map first at every era (and loads it, so the
     // post-call save persists the possibly-empty map entry).
-    let mut hash_display = [0u8; 32];
-    let ok = hash_hex.len() == 64
-        && (0..32).all(|i| {
-            u8::from_str_radix(&hash_hex[2 * i..2 * i + 2], 16)
-                .map(|b| {
-                    hash_display[i] = b;
-                    true
-                })
-                .unwrap_or(false)
-        });
-    if !ok {
-        return Ok(PrecompileOutput::new(gas_cost, abi_encode_bool(false)));
-    }
     let mut hash_internal = hash_display;
     hash_internal.reverse();
     let processed = super::tx::is_btc_tx_processed(ctx, &hash_internal);
@@ -339,13 +312,11 @@ pub fn get_lock_whitelist_address<CTX: crate::RskContextTr>(
     gas_cost: u64,
     config: &BridgeConstants,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    if args.len() < 32 {
-        return Err(PrecompileError::other("getLockWhitelistAddress: args too short"));
-    }
-    let index = U256::from_be_slice(&args[..32]);
+    let index = index_arg(args, "getLockWhitelistAddress")?;
     let entries = merged_whitelist(ctx);
 
-    let address = match index.try_into().ok().and_then(|i: usize| entries.get(i)) {
+    // rskj `getLockWhitelistEntryByIndex`: a negative index is not found either.
+    let address = match usize::try_from(index).ok().and_then(|i| entries.get(i)) {
         // rskj: "Empty string is returned when address is not found".
         None => String::new(),
         Some((hash160, _)) => p2pkh_base58_address(hash160, config),
@@ -374,7 +345,7 @@ pub fn get_lock_whitelist_entry_by_address<CTX: crate::RskContextTr>(
     gas_cost: u64,
     config: &BridgeConstants,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    let Some(addr_str) = abi_decode_string(args, 0) else {
+    let Some(addr_str) = super::abi::Args::new(args).string(0) else {
         return Err(PrecompileError::other(
             "getLockWhitelistEntryByAddress: malformed string argument",
         ));
@@ -441,7 +412,10 @@ fn p2sh_version(config: &BridgeConstants) -> u8 {
 ///
 /// The version is checked but then discarded, because the whitelist's TreeMap
 /// comparator looks at the hash160 alone.
-fn parse_network_address_hash160(addr: &str, config: &BridgeConstants) -> Option<[u8; 20]> {
+pub(super) fn parse_network_address_hash160(
+    addr: &str,
+    config: &BridgeConstants,
+) -> Option<[u8; 20]> {
     let decoded = bitcoin::base58::decode_check(addr).ok()?;
     if decoded.len() != 21 {
         return None;
@@ -491,15 +465,13 @@ fn member_key(member: &super::federation::StoredMember, key_type: KeyType) -> [u
     }
 }
 
-/// The `(index, keyType)` pair the `*PublicKeyOfType` methods take.
-fn decode_index_and_key_type(args: &[u8]) -> Result<(usize, KeyType), PrecompileError> {
-    if args.len() < 64 {
-        return Err(PrecompileError::other("PublicKeyOfType: args too short"));
-    }
-    let index = U256::from_be_slice(&args[..32])
-        .try_into()
-        .map_err(|_| PrecompileError::other("PublicKeyOfType: index out of range"))?;
-    let key_type = abi_decode_string(args, 1)
+/// The `(index, keyType)` pair the `*PublicKeyOfType` methods take: the index
+/// as rskj's `intValue()`, the key type through `KeyType.byValue`, which
+/// throws for anything but "btc", "rsk" and "mst".
+fn decode_index_and_key_type(args: &[u8]) -> Result<(i32, KeyType), PrecompileError> {
+    let index = index_arg(args, "PublicKeyOfType")?;
+    let key_type = super::abi::Args::new(args)
+        .string(1)
         .as_deref()
         .and_then(parse_key_type)
         .ok_or_else(|| PrecompileError::other("PublicKeyOfType: unknown key type"))?;
@@ -507,17 +479,20 @@ fn decode_index_and_key_type(args: &[u8]) -> Result<(usize, KeyType), Precompile
 }
 
 /// rskj `FederationSupportImpl.getFederationMemberPublicKeyOfType`: an index
-/// outside the member list throws `IndexOutOfBoundsException`, which the
-/// Bridge turns into a `VMException` -- the call **reverts**, it does not
-/// return empty bytes.
+/// outside the member list, a negative one included, throws
+/// `IndexOutOfBoundsException`, which the Bridge turns into a `VMException`
+/// -- the call **reverts**, it does not return empty bytes. The index is
+/// checked only here, after the caller has found the federation: with no
+/// federation to look in, rskj answers empty whatever the index.
 fn member_key_at(
     members: &[super::federation::StoredMember],
-    index: usize,
+    index: i32,
     key_type: KeyType,
     who: &'static str,
 ) -> Result<[u8; 33], PrecompileError> {
-    members
-        .get(index)
+    usize::try_from(index)
+        .ok()
+        .and_then(|index| members.get(index))
         .map(|m| member_key(m, key_type))
         .ok_or_else(|| {
             PrecompileError::Other(
@@ -559,12 +534,7 @@ pub fn get_pending_federator_public_key<CTX: crate::RskContextTr>(
     args: &[u8],
     gas_cost: u64,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    if args.len() < 32 {
-        return Err(PrecompileError::other("getPendingFederatorPublicKey: args too short"));
-    }
-    let index: usize = U256::from_be_slice(&args[..32])
-        .try_into()
-        .map_err(|_| PrecompileError::other("getPendingFederatorPublicKey: index out of range"))?;
+    let index = index_arg(args, "getPendingFederatorPublicKey")?;
 
     if bridge_load_bytes_named(ctx, PENDING_FEDERATION_KEY).is_empty() {
         return Ok(PrecompileOutput::new(gas_cost, abi_encode_bytes(&[]).into()));
@@ -646,12 +616,7 @@ pub fn get_retiring_federator_public_key<CTX: crate::RskContextTr>(
     config: &BridgeConstants,
     hardfork_cfg: &crate::hardfork::RskHardforkConfig,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    if args.len() < 32 {
-        return Err(PrecompileError::other("getRetiringFederatorPublicKey: args too short"));
-    }
-    let index: usize = U256::from_be_slice(&args[..32])
-        .try_into()
-        .map_err(|_| PrecompileError::other("getRetiringFederatorPublicKey: index out of range"))?;
+    let index = index_arg(args, "getRetiringFederatorPublicKey")?;
     let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
     let Some(fed) = super::peg::retiring_federation(ctx, config, hardfork_cfg, block_number) else {
         return Ok(PrecompileOutput::new(gas_cost, abi_encode_bytes(&[]).into()));
@@ -763,31 +728,30 @@ pub fn get_btc_tx_hash_processed_height<CTX: crate::RskContextTr>(
     args: &[u8],
     gas_cost: u64,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    let Some(hash_hex) = abi_decode_string(args, 0) else {
-        return Err(PrecompileError::other(
-            "getBtcTxHashProcessedHeight: malformed string argument",
-        ));
-    };
-    let Some(mut hash) = parse_btc_hash_display(&hash_hex) else {
-        // rskj: `Sha256Hash.wrap` throws, the Bridge wraps it in a VMException.
-        return Err(PrecompileError::other(
-            "getBtcTxHashProcessedHeight: not a 32-byte hash",
-        ));
-    };
+    // rskj: `Sha256Hash.wrap` throws, the Bridge wraps it in a VMException.
+    let mut hash = hash_arg(args, "getBtcTxHashProcessedHeight")?;
     hash.reverse();
     let height = super::tx::get_btc_tx_processed_height(ctx, &hash).map_or(-1i64, |h| h as i64);
     Ok(PrecompileOutput::new(gas_cost, abi_encode_int(height)))
 }
 
-fn parse_btc_hash_display(hex_str: &str) -> Option<[u8; 32]> {
-    if hex_str.len() != 64 {
-        return None;
-    }
-    let mut out = [0u8; 32];
-    for (i, b) in out.iter_mut().enumerate() {
-        *b = u8::from_str_radix(hex_str.get(2 * i..2 * i + 2)?, 16).ok()?;
-    }
-    Some(out)
+/// A method's first argument as an index: `((BigInteger) args[0]).intValue()`.
+fn index_arg(args: &[u8], method: &str) -> Result<i32, PrecompileError> {
+    super::abi::Args::new(args)
+        .int(0)
+        .map(|index| index.int_value())
+        .ok_or_else(|| PrecompileError::Other(format!("{method}: no index").into()))
+}
+
+/// A method's first argument as a BTC transaction hash in display order:
+/// `Sha256Hash.wrap((String) args[0])`, whose lower-case-only hex decoding
+/// and 32-byte check both throw.
+fn hash_arg(args: &[u8], method: &str) -> Result<[u8; 32], PrecompileError> {
+    super::abi::Args::new(args)
+        .string(0)
+        .as_deref()
+        .and_then(super::abi::sha256_hash_from_hex)
+        .ok_or_else(|| PrecompileError::Other(format!("{method}: not a 32-byte hash").into()))
 }
 
 /// The federation creation time as the era reports it: milliseconds before
@@ -802,23 +766,6 @@ fn creation_time_for_era(
     } else {
         millis as i64
     }
-}
-
-/// ABI-decode the `string` at parameter slot `slot`.
-fn abi_decode_string(args: &[u8], slot: usize) -> Option<String> {
-    let head = slot * 32;
-    if args.len() < head + 32 {
-        return None;
-    }
-    let offset: usize = U256::from_be_slice(&args[head..head + 32]).try_into().ok()?;
-    if args.len() < offset + 32 {
-        return None;
-    }
-    let len: usize = U256::from_be_slice(&args[offset..offset + 32]).try_into().ok()?;
-    if args.len() < offset + 32 + len {
-        return None;
-    }
-    String::from_utf8(args[offset + 32..offset + 32 + len].to_vec()).ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -1606,5 +1553,33 @@ mod tests {
         assert_eq!(out[31], 32); // offset
         assert_eq!(out[63], 33); // length
         assert_eq!(out[64], 0xAA);
+    }
+
+    /// rskj `Sha256Hash.wrap(String)` decodes with Guava's lower-case base16
+    /// and wants 32 bytes, so an upper-case or short hash throws: it is not
+    /// read as a hash that was never processed.
+    #[test]
+    fn a_tx_hash_string_must_be_64_lower_case_hex_digits() {
+        let mut ctx = ctx_at(1);
+        let lower = "ab".repeat(32);
+        let args = |s: &str| abi_encode_bytes(s.as_bytes());
+        let out = is_btc_tx_hash_already_processed(&mut ctx, &args(&lower), 0).unwrap();
+        assert_eq!(as_int(&out), 0);
+        assert!(
+            is_btc_tx_hash_already_processed(&mut ctx, &args(&lower.to_uppercase()), 0).is_err()
+        );
+        assert!(get_btc_tx_hash_processed_height(&mut ctx, &args("ab"), 0).is_err());
+    }
+
+    /// rskj's `IntType` reads an empty payload as zero, so an index-taking
+    /// getter called with no arguments at all answers for index 0.
+    #[test]
+    fn no_arguments_is_index_zero() {
+        let mut ctx = ctx_at(1);
+        let empty = get_federator_public_key(&mut ctx, &[], 0, &mainnet(), &hardforks()).unwrap();
+        let zero =
+            get_federator_public_key(&mut ctx, &[0u8; 32], 0, &mainnet(), &hardforks()).unwrap();
+        assert_eq!(empty.bytes, zero.bytes);
+        assert_eq!(as_bytes(&empty).len(), 33);
     }
 }

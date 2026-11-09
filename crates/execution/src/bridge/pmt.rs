@@ -90,28 +90,14 @@ impl MerkleBranch {
     /// Parse from ABI-encoded arguments:
     /// `(bytes32 btcTxHash, bytes32 btcBlockHash, uint256 merkleBranchPath, bytes32[] merkleBranchHashes)`.
     /// The transaction and block hashes come back as given, in display order,
-    /// and the path as rskj's `BigInteger.intValue` reads it, its low 32 bits.
+    /// and the path as rskj's `BigInteger.intValue` reads it, its low 32 bits,
+    /// all through the decoder the Bridge's argument check uses.
     pub fn from_abi_args(args: &[u8]) -> Option<(Self, [u8; 32], [u8; 32])> {
-        if args.len() < 128 {
-            return None;
-        }
-        let tx_hash: [u8; 32] = args[0..32].try_into().ok()?;
-        let block_hash: [u8; 32] = args[32..64].try_into().ok()?;
-        let path = i32::from_be_bytes(args[92..96].try_into().ok()?);
-
-        // The array's offset and, there, its length, each in its word's low
-        // four bytes.
-        let word = |at: usize| -> Option<usize> {
-            Some(u32::from_be_bytes(args.get(at + 28..at + 32)?.try_into().ok()?) as usize)
-        };
-        let array_offset = word(96)?;
-        let count = word(array_offset)?;
-        let data_start = array_offset + 32;
-        let mut hashes = Vec::new();
-        for i in 0..count {
-            let at = data_start + i * 32;
-            hashes.push(args.get(at..at + 32)?.try_into().ok()?);
-        }
+        let args = super::abi::Args::new(args);
+        let tx_hash = args.bytes32(0)?;
+        let block_hash = args.bytes32(1)?;
+        let path = args.int(2)?.int_value();
+        let hashes = args.bytes32_array(3)?;
         Some((MerkleBranch::new(hashes, path)?, tx_hash, block_hash))
     }
 

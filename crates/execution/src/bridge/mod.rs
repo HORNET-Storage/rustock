@@ -10,6 +10,7 @@
 //! This module implements the consensus-critical subset (32 transaction-callable
 //! methods). Local-call-only getters are deferred to RPC support.
 
+pub(crate) mod abi;
 pub mod btc_block_cache;
 #[cfg(test)]
 mod btc_block_cache_readpath_tests;
@@ -67,150 +68,16 @@ pub(crate) fn compute_selector(sig: &str) -> [u8; 4] {
 // mainnet #6,223,797 tx[3] forwards `receiveHeaders(bytes[])` with a `bytes[]`
 // offset of 0xa0 into a 60-byte argument payload, so rskj's decode throws.
 //
-// `abi_args_decode_ok` mirrors the bound checks rskj's `SolidityType` decoders
-// perform (`Utils.safeCopyOfRange`/`validateArrayAllegedSize` throw when
-// `data.length < offset + size`; `IntType.decodeInt` special-cases an empty
-// payload as 0; offsets/lengths are read via `BigInteger.intValue()`).
+// The decoding is `abi::Args`, which every method handler reads its
+// arguments through as well: a payload that passes here is read by each
+// handler as rskj's `Object[] args` holds it.
 
-#[derive(Clone)]
-enum AbiArgType {
-    /// 32-byte head word read with `IntType.decodeInt` (empty payload → 0):
-    /// int/uint/address/bool.
-    Word,
-    /// 32-byte head word read with `safeCopyOfRange` (no empty special case):
-    /// bytesN.
-    FixedBytes,
-    /// Dynamic `bytes`/`string`.
-    Bytes,
-    /// Dynamic `T[]`.
-    Array(Box<AbiArgType>),
-}
-
-impl AbiArgType {
-    fn is_dynamic(&self) -> bool {
-        matches!(self, AbiArgType::Bytes | AbiArgType::Array(_))
-    }
-}
-
-/// Parse a single Solidity type name (as it appears in a bridge signature).
-fn parse_abi_type(t: &str) -> AbiArgType {
-    let t = t.trim();
-    if let Some(elem) = t.strip_suffix("[]") {
-        return AbiArgType::Array(Box::new(parse_abi_type(elem)));
-    }
-    match t {
-        "bytes" | "string" => AbiArgType::Bytes,
-        _ if t.starts_with("bytes") => AbiArgType::FixedBytes, // bytes1..bytes32
-        _ => AbiArgType::Word, // int*, uint*, address, bool
-    }
-}
-
-/// Extract the argument types from a method signature like `name(a,b,c)`.
-fn parse_signature_args(signature: &str) -> Vec<AbiArgType> {
-    let inner = signature
-        .split_once('(')
-        .and_then(|(_, rest)| rest.strip_suffix(')'))
-        .unwrap_or("");
-    if inner.is_empty() {
-        return Vec::new();
-    }
-    inner.split(',').map(parse_abi_type).collect()
-}
-
-/// rskj `IntType.decodeInt(encoded, offset).intValue()`: an empty payload
-/// decodes to 0 without bounds-checking; otherwise the 32-byte word must fit
-/// (`safeCopyOfRange`) and the result is its low-32-bit signed `intValue()`.
-fn abi_decode_int(args: &[u8], off: usize) -> Option<i64> {
-    if args.is_empty() {
-        return Some(0);
-    }
-    let end = off.checked_add(32)?;
-    if end > args.len() {
-        return None;
-    }
-    let low = u32::from_be_bytes([args[off + 28], args[off + 29], args[off + 30], args[off + 31]]);
-    Some(low as i32 as i64)
-}
-
-/// Validate that `value` (an `int`-decoded offset/length) is usable as a
-/// non-negative index. rskj throws (`Math.addExact`, array bounds) on negatives.
-fn abi_index(value: i64) -> Option<usize> {
-    if value < 0 {
-        None
-    } else {
-        Some(value as usize)
-    }
-}
-
-/// Mirror `SolidityType.decode(encoded, offset)` for one value, returning
-/// `None` exactly where rskj would throw.
-fn abi_decode_value_ok(args: &[u8], off: usize, ty: &AbiArgType) -> Option<()> {
-    match ty {
-        // IntType.decode -> decodeInt (empty payload tolerated).
-        AbiArgType::Word => abi_decode_int(args, off).map(|_| ()),
-        // Bytes32Type.decode -> safeCopyOfRange(encoded, off, 32) (strict).
-        AbiArgType::FixedBytes => {
-            let end = off.checked_add(32)?;
-            (end <= args.len()).then_some(())
-        }
-        // BytesType.decode: len = decodeInt(off); safeCopyOfRange(off+32, len).
-        AbiArgType::Bytes => {
-            let len = abi_index(abi_decode_int(args, off)?)?;
-            let data_off = off.checked_add(32)?;
-            (data_off.checked_add(len)? <= args.len()).then_some(())
-        }
-        // DynamicArrayType.decode.
-        AbiArgType::Array(elem) => {
-            if args.is_empty() {
-                return Some(()); // empty payload → empty array (no throw)
-            }
-            let len = abi_index(abi_decode_int(args, off)?)?;
-            let base = off.checked_add(32)?;
-            // validateArrayAllegedSize(encoded, base, len) — lower bound.
-            if base.checked_add(len)? > args.len() {
-                return None;
-            }
-            let mut elem_off = base;
-            for _ in 0..len {
-                if elem.is_dynamic() {
-                    let dyn_off = abi_index(abi_decode_int(args, elem_off)?)?;
-                    abi_decode_value_ok(args, base.checked_add(dyn_off)?, elem)?;
-                } else {
-                    abi_decode_value_ok(args, elem_off, elem)?;
-                }
-                elem_off = elem_off.checked_add(32)?; // every element head slot is 32 bytes
-            }
-            Some(())
-        }
-    }
-}
-
-/// rskj `CallTransaction.Function.decode(encoded, inputs)` (CallTransaction.java
-/// :409): walk the head, following each dynamic argument's offset, and confirm
-/// every value decodes without an out-of-bounds access. `args` is the calldata
-/// AFTER the 4-byte selector. Returns false where rskj's decode would throw
-/// (→ `parseData` null → flat 23_000 parse-failure cost).
+/// rskj `CallTransaction.Function.decode(encoded, inputs)`: whether every
+/// argument decodes. `args` is the calldata AFTER the 4-byte selector.
+/// Returns false where rskj's decode would throw (→ `parseData` null → flat
+/// 23_000 parse-failure cost).
 fn abi_args_decode_ok(args: &[u8], signature: &str) -> bool {
-    let types = parse_signature_args(signature);
-    let mut off = 0usize;
-    for ty in &types {
-        let ok = if ty.is_dynamic() {
-            match abi_decode_int(args, off).and_then(abi_index) {
-                Some(dyn_off) => abi_decode_value_ok(args, dyn_off, ty).is_some(),
-                None => false,
-            }
-        } else {
-            abi_decode_value_ok(args, off, ty).is_some()
-        };
-        if !ok {
-            return false;
-        }
-        match off.checked_add(32) {
-            Some(n) => off = n,
-            None => return false,
-        }
-    }
-    true
+    abi::Args::new(args).decode(signature).unwrap_or(false)
 }
 
 // ---------------------------------------------------------------------------
@@ -846,6 +713,9 @@ pub fn bridge_call_gas_cost<CTX: crate::RskContextTr>(
     let selector = [input[0], input[1], input[2], input[3]];
     let Some(method) = find_bridge_method(&selector)
         .filter(|m| m.enabled.is_enabled(hardfork_cfg, block_number))
+        // getGasForData parses the call as execute() does, so arguments that
+        // do not decode cost the flat releaseBtc amount here too.
+        .filter(|m| abi_args_decode_ok(&input[4..], m.signature))
     else {
         return Ok(23_000);
     };
@@ -871,7 +741,10 @@ fn receive_headers_cost(args: &[u8], hardfork_cfg: &RskHardforkConfig, block_num
     let base: u64 = if rskip132 { 25_000 } else { 66_000 };
     let per_additional_header: u64 = if rskip132 { 3_500 } else { 1_650 };
 
-    match abi_array_len(args, 0) {
+    match abi::Args::new(args)
+        .bytes_array(0)
+        .map(|headers| headers.len() as u64)
+    {
         Some(n) if n > 0 => base.saturating_add((n - 1).saturating_mul(per_additional_header)),
         _ => base,
     }
@@ -890,8 +763,9 @@ fn btc_tx_confirmations_cost<CTX: crate::RskContextTr>(
     const DOUBLE_HASH_COST: u64 = 144;
 
     // args: bytes32 btcTxHash, bytes32 btcBlockHash, uint256 path, bytes32[] hashes
-    let (block_hash, branch_hashes) = match (args.get(32..64), abi_array_len(args, 96)) {
-        (Some(h), Some(n)) => (alloy_primitives::B256::from_slice(h), n),
+    let args = abi::Args::new(args);
+    let (block_hash, branch_hashes) = match (args.bytes32(1), args.bytes32_array(3)) {
+        (Some(h), Some(hashes)) => (alloy_primitives::B256::from(h), hashes.len() as u64),
         _ => return BASIC_COST,
     };
 
@@ -909,14 +783,6 @@ fn btc_tx_confirmations_cost<CTX: crate::RskContextTr>(
     }
 
     BASIC_COST + depth * STEP_COST + branch_hashes * DOUBLE_HASH_COST
-}
-
-/// Length of an ABI dynamic array whose offset word sits at `slot` in `args`.
-fn abi_array_len(args: &[u8], slot: usize) -> Option<u64> {
-    let offset = U256::from_be_slice(args.get(slot..slot + 32)?).try_into().ok()?;
-    let offset: usize = offset;
-    let len = args.get(offset..offset + 32)?;
-    Some(U256::from_be_slice(len).to::<u64>())
 }
 
 /// Dispatch to individual method handlers.
@@ -967,12 +833,20 @@ fn execute_method<CTX: crate::RskContextTr>(
 
     match method_name {
         // Phase 2: BTC header chain
-        "receiveHeader" => btc_chain::receive_header(ctx, args, gas_cost, config, use_v2, hardfork_cfg),
-        "receiveHeaders" => btc_chain::receive_headers(ctx, args, gas_cost, config, use_v2, hardfork_cfg),
+        "receiveHeader" => {
+            btc_chain::receive_header(ctx, args, gas_cost, config, use_v2, hardfork_cfg)
+        }
+        "receiveHeaders" => {
+            btc_chain::receive_headers(ctx, args, gas_cost, config, use_v2, hardfork_cfg)
+        }
         "getBtcBlockchainBestChainHeight" => btc_chain::get_best_chain_height(ctx, gas_cost),
         "getBtcBlockchainBestBlockHeader" => btc_chain::get_best_block_header(ctx, gas_cost),
-        "getBtcBlockchainBlockHeaderByHash" => btc_chain::get_block_header_by_hash(ctx, args, gas_cost),
-        "getBtcBlockchainBlockHeaderByHeight" => btc_chain::get_block_header_by_height(ctx, args, gas_cost),
+        "getBtcBlockchainBlockHeaderByHash" => {
+            btc_chain::get_block_header_by_hash(ctx, args, gas_cost)
+        }
+        "getBtcBlockchainBlockHeaderByHeight" => {
+            btc_chain::get_block_header_by_height(ctx, args, gas_cost, config, hardfork_cfg)
+        }
         "getBtcBlockchainParentBlockHeaderByHash" => btc_chain::get_parent_block_header_by_hash(ctx, args, gas_cost),
 
         // RSKIP502: the union bridge, authorized against the *immediate*
@@ -1144,6 +1018,19 @@ fn unimplemented_method(method: &str) -> Result<PrecompileOutput, PrecompileErro
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The decoder reads every type the method table's signatures use, so no
+    /// method is turned away for its types alone.
+    #[test]
+    fn the_decoder_reads_every_signature_in_the_method_table() {
+        for method in BRIDGE_METHODS.iter() {
+            assert!(
+                abi::Args::new(&[]).decode(method.signature).is_some(),
+                "{}",
+                method.signature
+            );
+        }
+    }
 
     /// Every method in the table must have a dispatch arm, or be one of the
     /// four that are deliberately unimplemented.
@@ -1468,16 +1355,19 @@ mod tests {
     fn receive_headers_cost_matches_rskj() {
         let cfg = crate::hardfork::RskHardforkConfig::mainnet();
 
-        // ABI bytes[] with 3 entries: offset word + length word (entries not needed)
-        let mut args = vec![0u8; 64];
-        args[31] = 0x20; // offset 32
-        args[63] = 3;    // length 3
+        // Three headers. rskj counts the decoded array, so a count the
+        // entries do not back is not three headers but a parse failure.
+        use abi::encode::{self, Arg};
+        let header: &[u8] = &[0u8; 80];
+        let args = encode::args(&[Arg::BytesArray(&[header, header, header])]);
 
         // Pre-wasabi100: flat 22_000 regardless of header count.
         assert_eq!(receive_headers_cost(&args, &cfg, 1_590_999), 22_000);
         // Post-wasabi100 (rskip124+132 both active on mainnet): 25_000 + 2*3_500.
         assert_eq!(receive_headers_cost(&args, &cfg, 1_591_000), 32_000);
-        // Unparseable args fall back to the base cost.
+        // No headers, which is what an empty payload decodes to, is the base
+        // cost, and so is a payload that does not decode.
         assert_eq!(receive_headers_cost(&[], &cfg, 1_591_000), 25_000);
+        assert_eq!(receive_headers_cost(&args[..64], &cfg, 1_591_000), 25_000);
     }
 }

@@ -248,7 +248,7 @@ fn declared_size(pmt: &[u8]) -> Option<i32> {
 /// bitcoinj `new VarInt(buf, offset)`: the value in the Java `long` it is
 /// read into, where a nine-byte one can be negative, and how many bytes it
 /// took. `None` where it runs past the end, where bitcoinj throws.
-pub(crate) fn var_int(buf: &[u8], offset: usize) -> Option<(i64, usize)> {
+pub fn var_int(buf: &[u8], offset: usize) -> Option<(i64, usize)> {
     let first = *buf.get(offset)?;
     let rest = |n: usize| buf.get(offset + 1..offset + 1 + n);
     Some(match first {
