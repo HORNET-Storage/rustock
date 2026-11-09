@@ -49,6 +49,13 @@ const BALANCE_GAS: u64 = 400;
 /// is always active for RSK eras). Mirrors revm's TANGERINE+ static gas.
 const SUICIDE_STATIC_GAS: u64 = 5000;
 
+/// rskj `OpCodes.OP_DUPN`, `OP_SWAPN` and `OP_TXINDEX`: RSK's own opcodes,
+/// which RSKIP191 (iris300) removed. Not revm's `DUPN` and `SWAPN` (EIP-8024,
+/// 0xe6 and 0xe7), which rskj doesn't have.
+const RSK_DUPN: u8 = 0xa8;
+const RSK_SWAPN: u8 = 0xa9;
+const RSK_TXINDEX: u8 = 0xaa;
+
 thread_local! {
     /// Addresses for which EXTCODESIZE must report `2^256-1` (rskj RSKIP90:
     /// `VM.doCODESIZE` returns `DataWord.MAX_VALUE` for any active precompile).
@@ -99,12 +106,31 @@ fn assert_configured(what: &str) {
     );
 }
 
+thread_local! {
+    /// The index in its block of the transaction being executed, which
+    /// TXINDEX pushes before RSKIP191. rskj counts a block's transactions
+    /// from 0 (`BlockExecutor.executeInternal`), and a call a transaction
+    /// makes sees the transaction's index (`ProgramInvokeFactoryImpl` passes
+    /// it on). [`install`] sets it to 0, and a block sets each transaction's
+    /// with [`set_transaction_index`].
+    static TX_INDEX: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+}
+
+/// Sets the index TXINDEX pushes for the transaction about to run on this
+/// thread: its place in its block, counted from 0. See `TX_INDEX`.
+pub fn set_transaction_index(index: u64) {
+    TX_INDEX.with(|i| i.set(index));
+}
+
 /// Install the rskj-semantics CALL family into an instruction table.
 ///
 /// `extcodehash_enabled` reflects RSKIP140 (papyrus): the spec is PETERSBURG
 /// from wasabi on (for the RSKIP120 shift opcodes and RSKIP125 CREATE2), but
 /// EXTCODEHASH only activates at papyrus — so before that it must throw an
 /// invalid-opcode exception (consuming all gas), matching rskj's VM.
+///
+/// `dupn_swapn_txindex_enabled` is RSKIP191's absence: before iris300 rskj
+/// runs RSK's own DUPN, SWAPN and TXINDEX.
 pub fn install<WIRE, HOST>(
     instructions: &mut EthInstructions<WIRE, HOST>,
     extcodehash_enabled: bool,
@@ -114,6 +140,7 @@ pub fn install<WIRE, HOST>(
     staticcall_enabled: bool,
     transient_storage_enabled: bool,
     mcopy_enabled: bool,
+    dupn_swapn_txindex_enabled: bool,
     extcodesize_max_precompiles: &[Address],
     extcodehash_precompiles: &[Address],
     real_coinbase: Address,
@@ -310,6 +337,25 @@ pub fn install<WIRE, HOST>(
         Instruction::new(rsk_coinbase::<WIRE, HOST>, 2),
     );
 
+    // RSK's own opcodes, which RSKIP191 (iris300) removed. Before it rskj's VM
+    // runs DUPN (VERY_LOW, 3 gas), SWAPN (3) and TXINDEX (BASE, 2); from it
+    // rskj throws invalid-opcode, as revm does for a byte it has no opcode
+    // for. Installed either way, so that the table says which at every
+    // height. An EVM built for one call runs TXINDEX as rskj runs a call
+    // outside a block, at index 0 (`ReversibleTransactionExecutor`); a block
+    // sets each transaction's with `set_transaction_index`.
+    TX_INDEX.with(|i| i.set(0));
+    if dupn_swapn_txindex_enabled {
+        instructions.insert_instruction(RSK_DUPN, Instruction::new(rsk_dupn::<WIRE, HOST>, 3));
+        instructions.insert_instruction(RSK_SWAPN, Instruction::new(rsk_swapn::<WIRE, HOST>, 3));
+        instructions
+            .insert_instruction(RSK_TXINDEX, Instruction::new(rsk_txindex::<WIRE, HOST>, 2));
+    } else {
+        for op in [RSK_DUPN, RSK_SWAPN, RSK_TXINDEX] {
+            instructions.insert_instruction(op, Instruction::new(invalid_opcode::<WIRE, HOST>, 0));
+        }
+    }
+
     // Divergence-hunt diagnostic (env-gated, temporary): log pc/op/gas for
     // EVERY opcode. The wrapper re-dispatches to the default PETERSBURG
     // table, except for the rsk-custom opcodes which dispatch to the local
@@ -320,6 +366,7 @@ pub fn install<WIRE, HOST>(
         PUSH0_ENABLED.with(|f| f.set(push0_enabled));
         BASEFEE_ENABLED.with(|f| f.set(basefee_enabled));
         STATICCALL_ENABLED.with(|f| f.set(staticcall_enabled));
+        DUPN_SWAPN_TXINDEX_ENABLED.with(|f| f.set(dupn_swapn_txindex_enabled));
         let default_table = revm::interpreter::instructions::instruction_table_gas_changes_spec::<
             WIRE,
             HOST,
@@ -336,6 +383,8 @@ pub fn install<WIRE, HOST>(
                 opcode::SELFBALANCE if istanbul_opcodes_enabled => 5,
                 opcode::PUSH0 if push0_enabled => 2,
                 opcode::BASEFEE if basefee_enabled => 2,
+                RSK_DUPN | RSK_SWAPN if dupn_swapn_txindex_enabled => 3,
+                RSK_TXINDEX if dupn_swapn_txindex_enabled => 2,
                 _ => default_table[op as usize].static_gas(),
             };
             instructions.insert_instruction(
@@ -555,6 +604,72 @@ fn rsk_coinbase<WIRE: InterpreterTypes, H: Host + ?Sized>(
     }
 }
 
+/// DUPN (before RSKIP191), rskj `VM.doDUPN`: pops a depth `d` and pushes a
+/// copy of the item `d + 1` from the top, so DUPN of 0 is DUP1, then steps
+/// over the next byte. A depth the stack doesn't reach throws
+/// (`Program.verifyStackSize`, or `DataWord.intValueCheck` from 2^31), which
+/// spends all of the frame's gas.
+fn rsk_dupn<WIRE: InterpreterTypes, H: Host + ?Sized>(context: InstructionContext<'_, H, WIRE>) {
+    let Some([depth]) = context.interpreter.stack.popn::<1>() else {
+        context.interpreter.halt_underflow();
+        return;
+    };
+    // At least 1, which `dup` requires.
+    let item = depth.saturating_to::<usize>().checked_add(1);
+    if !item.is_some_and(|n| context.interpreter.stack.dup(n)) {
+        context.interpreter.halt_underflow();
+        return;
+    }
+    step_over_next_byte(context.interpreter);
+}
+
+/// SWAPN (before RSKIP191), rskj `VM.doSWAPN`: pops a depth `d` and swaps the
+/// top with the item `d + 2` from the top, so SWAPN of 0 is SWAP1. It fails
+/// as DUPN does, and steps over the next byte in the same way.
+fn rsk_swapn<WIRE: InterpreterTypes, H: Host + ?Sized>(context: InstructionContext<'_, H, WIRE>) {
+    let Some([depth]) = context.interpreter.stack.popn::<1>() else {
+        context.interpreter.halt_underflow();
+        return;
+    };
+    // `exchange(0, m)` swaps the top with the item `m` below it; `m` is at
+    // least 1, which it requires.
+    let below = depth.saturating_to::<usize>().checked_add(1);
+    if !below.is_some_and(|m| context.interpreter.stack.exchange(0, m)) {
+        context.interpreter.halt_underflow();
+        return;
+    }
+    step_over_next_byte(context.interpreter);
+}
+
+/// rskj's second `program.step()` in `doDUPN` and `doSWAPN`: the counter
+/// moves past the byte after the opcode, which never runs, though a jump may
+/// still land on it (`Program.computeJumpDests` skips only PUSH data, as
+/// revm's analysis does). Where that takes the counter past the code,
+/// rskj's `Program.setPC` stops the program. revm pads code with as little
+/// as one STOP and reads the next opcode unchecked, so the stop is made here
+/// rather than by stepping off the end.
+fn step_over_next_byte<WIRE: InterpreterTypes>(
+    interpreter: &mut revm::interpreter::Interpreter<WIRE>,
+) {
+    use revm::interpreter::interpreter_types::{Jumps, LegacyBytecode};
+    // revm stepped past the opcode itself before running it.
+    if interpreter.bytecode.pc() + 1 >= interpreter.bytecode.bytecode_len() {
+        interpreter.halt(InstructionResult::Stop);
+    } else {
+        interpreter.bytecode.relative_jump(1);
+    }
+}
+
+/// TXINDEX (before RSKIP191), rskj `VM.doTXINDEX`: pushes the index in its
+/// block of the transaction being executed. See `TX_INDEX`.
+fn rsk_txindex<WIRE: InterpreterTypes, H: Host + ?Sized>(context: InstructionContext<'_, H, WIRE>) {
+    assert_configured("TX_INDEX");
+    let index = TX_INDEX.with(|i| i.get());
+    if !context.interpreter.stack.push(U256::from(index)) {
+        context.interpreter.halt_overflow();
+    }
+}
+
 /// SELFBALANCE without revm's ISTANBUL spec check (RSKIP151, papyrus200).
 fn rsk_selfbalance<WIRE: InterpreterTypes, H: Host + ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
@@ -627,6 +742,8 @@ thread_local! {
     static BASEFEE_ENABLED: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
     /// RSKIP91 flag for the all-ops tracer's STATICCALL dispatch.
     static STATICCALL_ENABLED: core::cell::Cell<bool> = const { core::cell::Cell::new(true) };
+    /// RSKIP191 flag for the all-ops tracer's DUPN/SWAPN/TXINDEX dispatch.
+    static DUPN_SWAPN_TXINDEX_ENABLED: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
 }
 
 /// All-ops tracer: log pc/opcode/gas (post-static-charge), then dispatch to
@@ -697,6 +814,12 @@ fn traced_all<WIRE: InterpreterTypes, HOST: Host>(
                 invalid_opcode(context)
             }
         }
+        RSK_DUPN | RSK_SWAPN | RSK_TXINDEX if !DUPN_SWAPN_TXINDEX_ENABLED.with(|f| f.get()) => {
+            invalid_opcode(context)
+        }
+        RSK_DUPN => rsk_dupn(context),
+        RSK_SWAPN => rsk_swapn(context),
+        RSK_TXINDEX => rsk_txindex(context),
         _ => {
             let table = revm::interpreter::instructions::instruction_table_gas_changes_spec::<
                 WIRE,
@@ -1201,6 +1324,7 @@ mod thread_affinity_tests {
                 false,
                 false,
                 true,
+                false,
                 false,
                 false,
                 &[Address::new([0x01; 20])],

@@ -412,6 +412,7 @@ impl RskExecutor {
             self.hardfork_cfg.has_rskip91(header.number),
             self.hardfork_cfg.has_rskip446(header.number),
             self.hardfork_cfg.has_rskip445(header.number),
+            !self.hardfork_cfg.has_rskip191(header.number),
             &extcodesize_max_precompiles,
             &extcodehash_precompiles,
             header.beneficiary,
@@ -546,6 +547,7 @@ impl RskExecutor {
             self.hardfork_cfg.has_rskip91(header.number),
             self.hardfork_cfg.has_rskip446(header.number),
             self.hardfork_cfg.has_rskip445(header.number),
+            !self.hardfork_cfg.has_rskip191(header.number),
             &extcodesize_max_precompiles,
             &extcodehash_precompiles,
             header.beneficiary,
@@ -714,6 +716,7 @@ impl RskExecutor {
             self.hardfork_cfg.has_rskip91(header.number),
             self.hardfork_cfg.has_rskip446(header.number),
             self.hardfork_cfg.has_rskip445(header.number),
+            !self.hardfork_cfg.has_rskip191(header.number),
             &extcodesize_max_precompiles,
             &extcodehash_precompiles,
             header.beneficiary,
@@ -1366,6 +1369,7 @@ impl RskExecutor {
             self.hardfork_cfg.has_rskip91(header.number),
             self.hardfork_cfg.has_rskip446(header.number),
             self.hardfork_cfg.has_rskip445(header.number),
+            !self.hardfork_cfg.has_rskip191(header.number),
             &extcodesize_max_precompiles,
             &extcodehash_precompiles,
             header.beneficiary,
@@ -1470,6 +1474,10 @@ impl RskExecutor {
             // RSKIP-144: everything this transaction touches belongs to the
             // sublist that runs it. Inert unless the block declares edges.
             crate::collision::begin_transaction(i);
+            // TXINDEX, before RSKIP191, pushes the transaction's place in its
+            // block, counted from 0 as rskj's `BlockExecutor` counts it. A
+            // miner's candidate that is dropped keeps its place, as in rskj.
+            crate::rsk_instructions::set_transaction_index(i as u64);
 
             // rskj `TransactionExecutor.gasIsValid`: a transaction's gas
             // **limit** must fit in the container's limit minus the gas
@@ -7939,6 +7947,230 @@ mod tests {
             returned > calls / 10,
             "only {returned} of {calls} calls returned anything: {outcomes:?}"
         );
+    }
+
+    /// A call to `to` with no data and no value, with a gas limit of 1,000,000
+    /// at a gas price of 0.
+    fn bare_call(nonce: u64, to: Address) -> rustock_core::Transaction {
+        rustock_core::Transaction {
+            nonce,
+            gas_price: U256::ZERO,
+            gas_limit: U256::from(1_000_000),
+            to: Bytes::copy_from_slice(to.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::new(),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
+        }
+    }
+
+    /// Runs `code` as a contract, called by a [`bare_call`] from a funded
+    /// sender in a block at `height` on mainnet's rules.
+    fn run_contract(height: u64, code: &[u8]) -> TxExecutionResult {
+        let sender = Address::repeat_byte(0xC1);
+        let contract = Address::repeat_byte(0xC2);
+        let store = Arc::new(MemoryTrieStore::new());
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&TrieNode::empty(), store.as_ref(), &sender, 0, one_rbtc);
+        let root = put_account_with_code(&root, store.as_ref(), &contract, 1, U256::ZERO, code);
+        let dir = tempfile::tempdir().unwrap();
+        let executor = RskExecutor::new(
+            RskHardforkConfig::mainnet(),
+            Arc::new(BlockStore::open(dir.path()).unwrap()),
+        );
+        let mut block = executor
+            .execute_block(
+                &dummy_header(height),
+                &[(bare_call(0, contract), sender)],
+                &root,
+                store,
+            )
+            .unwrap();
+        block.tx_results.remove(0)
+    }
+
+    /// DUPN and SWAPN before RSKIP191 (iris300), as rskj's `VM.doDUPN` and
+    /// `doSWAPN` run them: each pops a depth `d`, and DUPN is then DUP(d + 1)
+    /// and SWAPN is SWAP(d + 1), at the same 3 gas, stepping over the byte
+    /// after it, which never runs. Checked against DUP1 to DUP16 and SWAP1 to
+    /// SWAP16, and past them against rskj's stack. A depth the stack doesn't
+    /// reach fails and spends all the gas, as rskj's `verifyStackSize` and
+    /// `intValueCheck` throw. From RSKIP191 every one of them fails, rskj
+    /// throwing invalid-opcode.
+    #[test]
+    fn dupn_and_swapn_run_as_rskj_runs_them_before_rskip191() {
+        const IRIS: u64 = 3_614_800;
+        // Seventeen distinct words, 1 to 17, then `ops`, then `left` words of
+        // the stack written out from the top, and returned.
+        let program = |ops: &[u8], left: usize| {
+            let mut code: Vec<u8> = (1..=17u8).flat_map(|word| [0x60, word]).collect();
+            code.extend_from_slice(ops);
+            for word in 0..left {
+                code.push(0x61); // PUSH2
+                code.extend(((word * 32) as u16).to_be_bytes());
+                code.push(0x52); // MSTORE
+            }
+            code.push(0x61);
+            code.extend(((left * 32) as u16).to_be_bytes());
+            code.extend([0x60, 0x00, 0xf3]); // RETURN
+            code
+        };
+        let words = |output: &[u8]| -> Vec<u64> {
+            output
+                .chunks(32)
+                .map(|word| U256::from_be_slice(word).saturating_to::<u64>())
+                .collect()
+        };
+        // rskj's stack after DUPN or SWAPN of `depth`, top first, or None
+        // where `verifyStackSize` throws.
+        let rskj = |swapn: bool, depth: usize| -> Option<Vec<u64>> {
+            let mut stack: Vec<u64> = (1..=17).collect();
+            let top = stack.len() - 1;
+            if swapn {
+                stack.swap(top, top.checked_sub(depth + 1)?);
+            } else {
+                stack.push(stack[top.checked_sub(depth)?]);
+            }
+            stack.reverse();
+            Some(stack)
+        };
+        for depth in 0..=17u8 {
+            for (swapn, name, opcode, plain, left) in [
+                (false, "DUPN", 0xa8, 0x80, 18),
+                (true, "SWAPN", 0xa9, 0x90, 17),
+            ] {
+                // INVALID after the opcode fails the call if it runs.
+                let code = program(&[0x60, depth, opcode, 0xfe], left);
+                let ran = run_contract(IRIS - 1, &code);
+                match rskj(swapn, depth.into()) {
+                    Some(stack) => {
+                        assert!(ran.success, "{name} of {depth}");
+                        assert_eq!(words(&ran.output), stack, "{name} of {depth}");
+                        if depth < 16 {
+                            let same = run_contract(IRIS - 1, &program(&[plain + depth], left));
+                            assert_eq!(ran.output, same.output, "{name} of {depth}");
+                            // The PUSH1 of the depth is the 3 more.
+                            assert_eq!(ran.gas_used, same.gas_used + 3, "{name} of {depth}");
+                        }
+                    }
+                    None => {
+                        assert!(!ran.success, "{name} of {depth} reaches below the stack");
+                        assert_eq!(ran.gas_used, 1_000_000, "{name} of {depth}");
+                    }
+                }
+                let from = run_contract(IRIS, &code);
+                assert!(!from.success, "{name} is gone from RSKIP191");
+                assert_eq!(from.gas_used, 1_000_000, "{name} from RSKIP191");
+            }
+        }
+        // A depth no Java int holds fails too.
+        for opcode in [0xa8, 0xa9] {
+            let mut ops = vec![0x7f]; // PUSH32
+            ops.extend([0xff; 32]);
+            ops.extend([opcode, 0xfe]);
+            let ran = run_contract(IRIS - 1, &program(&ops, 17));
+            assert!(!ran.success);
+            assert_eq!(ran.gas_used, 1_000_000);
+        }
+    }
+
+    /// The byte after DUPN or SWAPN never runs, rskj's `doDUPN` and `doSWAPN`
+    /// calling `program.step()` twice, though a jump may land on it: rskj's
+    /// jump analysis, like revm's, skips only PUSH data. Where the second
+    /// step leaves the code, rskj's `Program.setPC` stops the program, so
+    /// either opcode among the code's last two bytes ends the call in success,
+    /// where revm would read past its padding.
+    #[test]
+    fn dupn_and_swapn_step_over_the_next_byte_and_stop_past_the_end() {
+        const BEFORE_IRIS: u64 = 3_614_799;
+        let dupn = [0x60, 0x07, 0x60, 0x00, 0xa8]; // 7, depth 0, DUPN
+        let swapn = [0x60, 0x07, 0x60, 0x08, 0x60, 0x00, 0xa9]; // 7, 8, depth 0, SWAPN
+        for (start, gas) in [(&dupn[..], 9), (&swapn[..], 12)] {
+            for (after, succeeds) in [
+                (&[][..], true),
+                (&[0xfe][..], true),
+                (&[0xfe, 0xfe][..], false),
+            ] {
+                let code = [start, after].concat();
+                let ran = run_contract(BEFORE_IRIS, &code);
+                let hex = alloy_primitives::hex::encode(&code);
+                assert_eq!(ran.success, succeeds, "0x{hex}");
+                if succeeds {
+                    assert_eq!(ran.gas_used, 21_000 + gas, "0x{hex}");
+                }
+            }
+        }
+        // Over DUPN onto the JUMPDEST after it.
+        let ran = run_contract(BEFORE_IRIS, &[0x60, 0x04, 0x56, 0xa8, 0x5b, 0x00]);
+        assert!(ran.success);
+        assert_eq!(ran.gas_used, 21_000 + 3 + 8 + 1);
+    }
+
+    /// TXINDEX before RSKIP191, rskj `VM.doTXINDEX`: the index in its block of
+    /// the transaction being executed, counted from 0 as rskj's
+    /// `BlockExecutor` counts; the same in a call that transaction makes, as
+    /// `ProgramInvokeFactoryImpl` passes it on; and 0 in a call outside a
+    /// block, as `ReversibleTransactionExecutor` runs it. It costs 2 gas, and
+    /// from RSKIP191 it fails.
+    #[test]
+    fn txindex_pushes_the_transactions_place_in_its_block_before_rskip191() {
+        const IRIS: u64 = 3_614_800;
+        let sender = Address::repeat_byte(0xC1);
+        let reader = Address::repeat_byte(0xC2);
+        let caller = Address::repeat_byte(0xC3);
+        // TXINDEX, returned.
+        let reader_code = [0xaa, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3];
+        // Calls `reader` and returns its answer.
+        let mut caller_code = vec![
+            0x60, 0x20, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x73,
+        ];
+        caller_code.extend_from_slice(reader.as_slice());
+        caller_code.extend([0x5a, 0xf1, 0x50, 0x60, 0x20, 0x60, 0x00, 0xf3]);
+        let store = Arc::new(MemoryTrieStore::new());
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let mut root = put_account(&TrieNode::empty(), store.as_ref(), &sender, 0, one_rbtc);
+        root = put_account_with_code(&root, store.as_ref(), &reader, 1, U256::ZERO, &reader_code);
+        root = put_account_with_code(&root, store.as_ref(), &caller, 1, U256::ZERO, &caller_code);
+        let dir = tempfile::tempdir().unwrap();
+        let executor = RskExecutor::new(
+            RskHardforkConfig::mainnet(),
+            Arc::new(BlockStore::open(dir.path()).unwrap()),
+        );
+        let txs = [
+            (bare_call(0, reader), sender),
+            (bare_call(1, reader), sender),
+            (bare_call(2, caller), sender),
+            (bare_call(3, reader), sender),
+        ];
+        let index = |result: &TxExecutionResult| {
+            assert!(result.success);
+            U256::from_be_slice(&result.output).saturating_to::<u64>()
+        };
+        let block = executor
+            .execute_block(&dummy_header(IRIS - 1), &txs, &root, store.clone())
+            .unwrap();
+        assert_eq!(
+            block.tx_results.iter().map(index).collect::<Vec<_>>(),
+            [0, 1, 2, 3]
+        );
+        // TXINDEX 2, PUSH1 3, MSTORE 3 and 3 for a word of memory, two PUSH1s 6.
+        assert_eq!(block.tx_results[0].gas_used, 21_000 + 17);
+        let outside = executor
+            .execute_local_call(
+                &dummy_header(IRIS - 1),
+                &bare_call(0, reader),
+                sender,
+                &root,
+                store.clone(),
+            )
+            .unwrap();
+        assert_eq!(index(&outside), 0);
+        let from = executor
+            .execute_block(&dummy_header(IRIS), &txs[..1], &root, store)
+            .unwrap();
+        assert!(!from.tx_results[0].success, "TXINDEX is gone from RSKIP191");
     }
 
     /// BN128 refusing a point (`BN128PrecompiledContract`): before RSKIP197 it

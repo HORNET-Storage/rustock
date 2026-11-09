@@ -505,6 +505,12 @@ impl RskHardforkConfig {
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Iris300
     }
 
+    /// RSKIP191: DUPN, SWAPN and TXINDEX, RSK's own opcodes, are removed
+    /// (Iris300). Before it rskj's VM runs them (`VM.executeOpcode`).
+    pub fn has_rskip191(&self, block_number: u64) -> bool {
+        self.active_upgrade(block_number) >= RskNetworkUpgrade::Iris300
+    }
+
     /// RSKIP197: a failing precompile CALL is handled (push 0, refund the
     /// surplus, continue) instead of propagating an exception that aborts the
     /// calling frame and burns all its gas (Iris300). Post-197 a failed
