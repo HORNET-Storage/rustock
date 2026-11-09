@@ -1,6 +1,7 @@
 use alloy_rlp::{Decodable, Encodable, RlpDecodable, RlpEncodable, Header as RlpHeader};
 use alloy_primitives::{B256, Bytes, U256};
 use rustock_core::{Header, Transaction};
+use rustock_core::types::header::HeaderForm;
 use rustock_core::types::header_extension::BlockHeaderExtension;
 use rustock_core::rlp_compat::{decode_u8_lenient, decode_u64_lenient, decode_u256_lenient, decode_u32_lenient};
 use super::snap;
@@ -477,7 +478,10 @@ impl RskSubMessage {
                 let mut entries_payload = Vec::new();
                 for entry in &r.entries {
                     let mut one = Vec::new();
-                    entry.header.encode(&mut one);
+                    // A header as this node holds it, in the store's form,
+                    // which a header held compressed has too; its uncles in
+                    // full, the form its uncles hash commits to.
+                    one.extend_from_slice(&entry.header.encode_stored());
                     one.extend_from_slice(&entry.encoded_uncles());
 
                     RlpHeader { list: true, payload_length: one.len() }
@@ -495,10 +499,11 @@ impl RskSubMessage {
                 out.extend_from_slice(&params);
             }
             RskSubMessage::BlockHeadersResponse(r) => {
-                // RLP([id, RLP([RLP([headers])])])
+                // RLP([id, RLP([RLP([headers])])]), each header compressed, as
+                // rskj sends and reads them (`getEncodedCompressed`).
                 let mut headers_payload = Vec::new();
                 for h in &r.headers {
-                    h.encode(&mut headers_payload);
+                    headers_payload.extend_from_slice(&h.encode_compressed());
                 }
                 
                 let mut headers_list = Vec::new();
@@ -786,7 +791,12 @@ impl Decodable for RskMessage {
 
                 let mut headers = Vec::new();
                 while !inner_body.is_empty() {
-                    headers.push(Header::decode_with_hash(&mut inner_body)?);
+                    // rskj `decodeHeader(.., true)`: compressed.
+                    headers.push(Header::decode_with_hash_in(
+                        &mut inner_body,
+                        rustock_core::config::ActivationHeights::current(),
+                        HeaderForm::Compressed,
+                    )?);
                 }
                 RskSubMessage::BlockHeadersResponse(BlockHeadersResponse { id, headers })
             }
@@ -1020,7 +1030,11 @@ impl Decodable for RskMessage {
                     let mut entry_body = &entries_body[..entry_h.payload_length];
                     entries_body = &entries_body[entry_h.payload_length..];
 
-                    let header = Header::decode_with_hash(&mut entry_body)?;
+                    let header = Header::decode_with_hash_in(
+                        &mut entry_body,
+                        rustock_core::config::ActivationHeights::current(),
+                        HeaderForm::Stored,
+                    )?;
 
                     // Hash the uncle list exactly as it arrived. Re-encoding it
                     // and hashing that would compare our spelling of the bytes

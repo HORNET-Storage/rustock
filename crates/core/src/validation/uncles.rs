@@ -8,7 +8,7 @@
 use super::fork_detection::MainchainView;
 use super::{
     BitcoinTimestampRule, BlockNumberRule, BlockParentGasLimitRule, DifficultyRule, GasUsedRule,
-    HeaderLayoutRule, HeaderValidator, MergedMiningRule, ParentHeaderValidator,
+    HeaderValidator, MergedMiningRule, ParentHeaderValidator,
     PrevMinGasPriceRule, TimestampRule, ValidationError,
 };
 use crate::config::ChainConfig;
@@ -28,15 +28,13 @@ pub const UNCLE_GENERATION_LIMIT: u64 = 7;
 /// rule and gas used, its `BlockHeaderCompositeRule`. rskj's timestamp rule
 /// is two here: [`TimestampRule`], the clock, and [`BitcoinTimestampRule`],
 /// RSKIP179. The fourth, fork detection, reads the chain rather than the
-/// header and is [`UnclesValidationRule::fork_detection`]. Before them, the
-/// layout `BlockFactory` reads every header in, an uncle's at its own height.
+/// header and is [`UnclesValidationRule::fork_detection`].
 ///
 /// Not the trunk header rules: rskj holds no uncle to the minimum gas limit
 /// or the 32-byte extra-data cap, so an uncle may carry either and still be
 /// one.
 pub fn rsk_header_rules(config: Arc<ChainConfig>) -> Vec<Box<dyn HeaderValidator>> {
     vec![
-        Box::new(HeaderLayoutRule { config: config.clone() }),
         Box::new(MergedMiningRule { config: config.clone() }),
         Box::new(TimestampRule::new(config.max_future_block_time)),
         Box::new(BitcoinTimestampRule { config }),

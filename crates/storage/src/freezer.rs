@@ -67,7 +67,6 @@ use alloy_primitives::B256;
 use anyhow::{anyhow, bail, Context, Result};
 use rustock_core::config::ActivationHeights;
 use rustock_core::Header;
-use alloy_rlp::Encodable;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -526,16 +525,16 @@ impl Freezer {
 
     /// Stores the uncle headers `number` references.
     ///
-    /// Written as the RLP list the header's `ommers_hash` commits to, so a
-    /// reader can recompute the commitment and a peer can be served the bytes
-    /// directly. A block with no uncles stores the empty list, `0xc0`, rather
-    /// than nothing: a zero-length run would be indistinguishable from an
-    /// index entry that was never written, and "this block has no uncles" and
-    /// "this block is not frozen" must not be the same answer.
+    /// Written as an RLP list of the uncles in the store's form
+    /// ([`Header::encode_stored`]). A block with no uncles stores the empty
+    /// list, `0xc0`, rather than nothing: a zero-length run would be
+    /// indistinguishable from an index entry that was never written, and
+    /// "this block has no uncles" and "this block is not frozen" must not be
+    /// the same answer.
     pub fn put_uncles(&self, number: u64, uncles: &[Header]) -> Result<()> {
         let mut payload = Vec::new();
         for uncle in uncles {
-            uncle.encode(&mut payload);
+            payload.extend_from_slice(&uncle.encode_stored());
         }
         let mut encoded = Vec::with_capacity(payload.len() + 9);
         alloy_rlp::Header { list: true, payload_length: payload.len() }.encode(&mut encoded);
@@ -654,7 +653,11 @@ impl Freezer {
         let mut out = Vec::new();
         while !body.is_empty() {
             out.push(
-                Header::decode_with_hash_and_activations(&mut body, self.activations())
+                Header::decode_with_hash_in(
+                    &mut body,
+                    self.activations(),
+                    rustock_core::types::header::HeaderForm::Stored,
+                )
                     .map_err(|e| anyhow!("decoding frozen uncle for #{number}: {e:?}"))?,
             );
         }
@@ -874,7 +877,12 @@ fn furthest_end(index: &mut File, end_number: u64, file: u16) -> Result<u32> {
 }
 
 fn decode_header(bytes: &[u8], activations: &ActivationHeights) -> Option<Header> {
-    Header::decode_with_activations(&mut &bytes[..], activations).ok()
+    Header::decode_in(
+        &mut &bytes[..],
+        activations,
+        rustock_core::types::header::HeaderForm::Stored,
+    )
+    .ok()
 }
 
 #[cfg(test)]

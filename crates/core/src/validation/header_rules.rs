@@ -152,45 +152,6 @@ impl HeaderValidator for GasLimitRule {
     }
 }
 
-/// The fields rskj's `BlockFactory.decodeHeader` reads a header with, which
-/// depend on its height: `canBeDecoded` counts them exactly, so a header with
-/// one too many or one too few is one rskj cannot read, and so cannot take.
-/// The decoder here reads by shape rather than by height, so this holds what
-/// it read to what rskj would have.
-///
-/// - A UMM root from RSKIPUMM on, and none before it: papyrus200 on mainnet
-///   and testnet, as `reference.conf` has it, and 1 on rskj's regtest.
-/// - No RSKIP351 fields where RSKIP351 is inactive, as it is on mainnet: no
-///   version, edges or base event after the UMM root, and no commitment to
-///   an extension in the logs bloom's place. The decoder reads whatever is
-///   there as the bloom, of any length, as rskj does, so only a header built
-///   here could hold one.
-///
-/// An uncle is read the same way, at its own height.
-pub struct HeaderLayoutRule {
-    pub config: std::sync::Arc<crate::config::ChainConfig>,
-}
-
-impl HeaderValidator for HeaderLayoutRule {
-    fn validate(&self, header: &Header) -> Result<(), ValidationError> {
-        let heights = &self.config.activation_heights;
-        let umm = heights.umm_active(header.number);
-        if header.umm_root.is_some() != umm {
-            return Err(ValidationError::UmmRootMisplaced {
-                number: header.number,
-                present: header.umm_root.is_some(),
-            });
-        }
-        let rskip351 = heights.rskip351_active(header.number);
-        if !rskip351 && (header.version_fields.is_some() || header.extension_data.is_some()) {
-            return Err(ValidationError::VersionedBeforeRskip351 {
-                number: header.number,
-            });
-        }
-        Ok(())
-    }
-}
-
 /// rskj `BlockParentGasLimitRule`: a header's gas limit may move from its
 /// parent's by at most a `gas_limit_bound_divisor`th, either way.
 pub struct BlockParentGasLimitRule {

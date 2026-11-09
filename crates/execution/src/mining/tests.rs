@@ -211,7 +211,14 @@ fn fixture_on(
     flush_every: u64,
 ) -> MiningFixture {
     let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    // A store that reads headers under the chain's heights, as a node's does
+    // under the heights it installs at startup.
+    let heights = chain_config.activation_heights.clone();
+    let store = Arc::new(
+        BlockStore::open(dir.path())
+            .unwrap()
+            .with_activations(heights.clone()),
+    );
     let empty_root = TrieNode::empty().compute_hash(trie_store.as_ref());
 
     let mut parent_hash = B256::ZERO;
@@ -219,6 +226,7 @@ fn fixture_on(
     for number in 0..=height {
         let mut header = header_at(number, parent_hash, empty_root);
         header.difficulty = parent_difficulty;
+        header.umm_root = heights.umm_active(number).then(Bytes::new);
         let hash = header.hash();
         store.put_header_with_hash(hash, &header).unwrap();
         store.put_canonical_hash(number, hash).unwrap();

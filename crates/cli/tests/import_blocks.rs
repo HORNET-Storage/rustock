@@ -154,6 +154,9 @@ fn an_export_after_an_import_reproduces_rskjs_file() {
             .arg(dir.path().join("db"))
             .args(["--trie-backend", "external", "--trie-dir"])
             .arg(dir.path().join("trie"))
+            // The rule the blocks were imported under: a node reads its
+            // store, as rskj does, under its chain's heights.
+            .args(["--consensus-rule", "rskip144=-1"])
             .arg("--export-blocks")
             .arg(&file)
             .args(["--export-from", from]);

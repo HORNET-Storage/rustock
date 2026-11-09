@@ -33,7 +33,10 @@ pub(crate) fn dummy_header(number: u64, parent: B256, difficulty: U256) -> Heade
         paid_fees: U256::ZERO,
         minimum_gas_price: U256::ZERO,
         uncle_count: 0,
-        umm_root: None,
+        // A UMM root where the store's heights, this process's, read one.
+        umm_root: rustock_core::config::ActivationHeights::current()
+            .umm_active(number)
+            .then(Bytes::new),
         version_fields: None,
         bitcoin_merged_mining_header: None,
         bitcoin_merged_mining_merkle_proof: None,
@@ -7613,7 +7616,8 @@ async fn a_body_from_a_peer_that_was_not_asked_is_ignored() {
 
 /// A version-2 extension whose bloom has one bit set: bit `bit`. Its edges
 /// are empty, as rskj emits them on every versioned header while RSKIP144 is
-/// active and the block has no sublists; the store's decoder counts on it.
+/// active and the block has no sublists: a header given it has the fields
+/// rskj reads at regtest's heights.
 fn an_extension(bit: usize) -> rustock_core::types::header_extension::BlockHeaderExtension {
     let mut logs_bloom = vec![0u8; 256];
     logs_bloom[bit / 8] |= 0x80 >> (bit % 8);
@@ -7625,8 +7629,8 @@ fn an_extension(bit: usize) -> rustock_core::types::header_extension::BlockHeade
 }
 
 /// `header` as rskj sends it to its peers, holding only the commitment to
-/// `extension` in its bloom's slot, with the UMM root and merged-mining fields
-/// that every versioned header has, and that the store's decoder counts on.
+/// `extension` in its bloom's slot, with the UMM root rskj reads at
+/// regtest's heights and the merged-mining fields every versioned header has.
 fn compressed(
     header: Header,
     extension: &rustock_core::types::header_extension::BlockHeaderExtension,
@@ -7837,7 +7841,11 @@ async fn a_body_stored_without_its_header_extension_is_asked_for_again() {
     let genesis = dummy_header(0, B256::ZERO, U256::from(1));
     store.update_head(&genesis, U256::from(1)).unwrap();
     let b1 = compressed(derivable_header(1, genesis.hash()), &an_extension(5));
-    let b2 = dummy_header(2, b1.hash(), U256::from(1));
+    // A header that holds its own fields, as one does once given the
+    // extension its commitment names.
+    let b2 = compressed(dummy_header(2, b1.hash(), U256::from(1)), &an_extension(6))
+        .with_extension(&an_extension(6))
+        .unwrap();
     let hash = b1.hash();
     for (number, h) in [(1, &b1), (2, &b2)] {
         store.put_header(h).unwrap();

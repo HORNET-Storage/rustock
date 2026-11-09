@@ -91,10 +91,12 @@ pub(crate) fn mutants(seed: &[u8], count: usize, rng_seed: u64) -> Vec<Vec<u8>> 
 }
 
 /// What this crate does with a header's bytes a peer sends, done to `bytes`
-/// under each network's heights and rules: decoded both ways, hashed both
-/// ways, encoded both ways, and checked by every rule, a header's own, an
-/// uncle's and against a parent. Only that none of it panics is checked.
+/// under each network's heights and rules: decoded in each form, the hash
+/// cached or not, hashed both ways, encoded every way, and checked by every
+/// rule, a header's own, an uncle's and against a parent. Only that none of
+/// it panics is checked.
 pub(crate) fn decode_and_check_header(bytes: &[u8]) {
+    use crate::types::header::HeaderForm;
     let networks = [
         (ActivationHeights::mainnet(), ChainConfig::mainnet()),
         (ActivationHeights::testnet(), ChainConfig::testnet()),
@@ -102,17 +104,22 @@ pub(crate) fn decode_and_check_header(bytes: &[u8]) {
     ];
     for (activations, config) in networks {
         let verifier = HeaderVerifier::default_rsk(Arc::new(config));
-        let decoded = [
-            Header::decode_with_hash_and_activations(&mut &bytes[..], &activations),
-            Header::decode_with_activations(&mut &bytes[..], &activations),
-        ];
-        for header in decoded.into_iter().flatten() {
+        let decoded = [HeaderForm::Full, HeaderForm::Compressed, HeaderForm::Stored]
+            .into_iter()
+            .flat_map(|form| {
+                [
+                    Header::decode_with_hash_in(&mut &bytes[..], &activations, form),
+                    Header::decode_in(&mut &bytes[..], &activations, form),
+                ]
+            });
+        for header in decoded.flatten() {
             let _ = header.hash();
             let _ = header.hash_for_merged_mining();
             let _ = header.extension_commitment();
             let _ = header.extension();
             let _ = alloy_rlp::encode(&header);
             let _ = header.encode_compressed();
+            let _ = header.encode_stored();
             let _ = verifier.verify(&header, None);
             let _ = verifier.verify_uncle(&header);
             let _ = verifier.verify_against_parent(&header, &header);

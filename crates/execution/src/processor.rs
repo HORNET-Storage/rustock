@@ -1304,7 +1304,10 @@ mod tests {
             paid_fees: U256::ZERO,
             minimum_gas_price: U256::from(0),
             uncle_count: 0,
-            umm_root: None,
+            // A UMM root where a store's heights, this process's, read one.
+            umm_root: rustock_core::config::ActivationHeights::current()
+                .umm_active(number)
+                .then(Bytes::new),
             version_fields: None,
             bitcoin_merged_mining_header: None,
             bitcoin_merged_mining_merkle_proof: None,

@@ -6508,11 +6508,20 @@ const TESTNET_FROM_PEERS: &str = concat!(
     "352ad0c0b7e56a1ba4fcac4da0d7693e516ef40a007e0c7000000000",
 );
 
-/// A header as testnet's nodes read one.
-fn testnet_header(hex: &str) -> Header {
+/// A header as testnet's nodes read one in `form`.
+fn testnet_header_in(hex: &str, form: rustock_core::types::header::HeaderForm) -> Header {
     let bytes = hex::decode(hex).unwrap();
-    Header::decode_with_hash_and_activations(&mut bytes.as_slice(), &ActivationHeights::testnet())
-        .unwrap()
+    Header::decode_with_hash_in(&mut bytes.as_slice(), &ActivationHeights::testnet(), form).unwrap()
+}
+
+/// A header as testnet's blocks carry one: in full.
+fn testnet_header(hex: &str) -> Header {
+    testnet_header_in(hex, rustock_core::types::header::HeaderForm::Full)
+}
+
+/// A header as rskj's peers send a chain's headers: compressed.
+fn testnet_header_compressed(hex: &str) -> Header {
+    testnet_header_in(hex, rustock_core::types::header::HeaderForm::Compressed)
 }
 
 /// A header in full, as hex.
@@ -6668,7 +6677,7 @@ async fn a_testnet_block_comes_with_its_header_compressed() {
         blocks_of(raw_blocks(&state, "0x7e0c99", "0x7e0c99").await),
         vec![(TESTNET_COMPRESSED.to_string(), Vec::new())]
     );
-    follow(&state.store, &testnet_header(TESTNET_FROM_PEERS));
+    follow(&state.store, &testnet_header_compressed(TESTNET_FROM_PEERS));
     assert_eq!(
         blocks_of(raw_blocks(&state, "0x7e0c70", "0x7e0c70").await),
         vec![(TESTNET_FROM_PEERS.to_string(), Vec::new())]
@@ -6681,7 +6690,9 @@ async fn a_testnet_block_comes_with_its_header_compressed() {
 async fn raw_blocks_carry_uncles_in_full_from_the_body_or_the_freezer() {
     use rustock_execution::processor::compute_ommers_hash;
 
-    let (state, _tmp) = setup_state();
+    // A testnet node's store, which reads a testnet uncle as testnet's
+    // nodes do.
+    let (state, _tmp) = setup_testnet_state();
     let testnet = testnet_header(TESTNET_FULL);
     let other = Header {
         extra_data: Bytes::from_static(b"an uncle"),
@@ -6721,7 +6732,7 @@ async fn raw_blocks_carry_uncles_in_full_from_the_body_or_the_freezer() {
 async fn raw_blocks_stop_before_a_block_not_held_whole_or_not_following() {
     use rustock_execution::processor::compute_ommers_hash;
 
-    let compressed = testnet_header(TESTNET_FROM_PEERS);
+    let compressed = testnet_header_compressed(TESTNET_FROM_PEERS);
     let naming = |at: u64, uncles: Vec<Header>| {
         move |number: u64| Header {
             ommers_hash: if number == at {

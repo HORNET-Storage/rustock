@@ -25,7 +25,10 @@ use rustock_core::Header;
 use rustock_storage::{BlockStore, LineageBreak, Transition, Validated, verify_local_coherence};
 use tempfile::TempDir;
 
+/// A header at `number`, laid out as the store's heights, this process's,
+/// read one there: with a UMM root from RSKIPUMM on.
 fn header(number: u64, parent: B256, salt: u64) -> Header {
+    let umm = rustock_core::config::ActivationHeights::current().umm_active(number);
     Header {
         number,
         parent_hash: parent,
@@ -44,7 +47,7 @@ fn header(number: u64, parent: B256, salt: u64) -> Header {
         paid_fees: U256::ZERO,
         minimum_gas_price: U256::ZERO,
         uncle_count: 0,
-        umm_root: None,
+        umm_root: umm.then(Bytes::new),
         version_fields: None,
         bitcoin_merged_mining_header: None,
         bitcoin_merged_mining_merkle_proof: None,

@@ -195,15 +195,15 @@ impl Default for ImportTuning {
     }
 }
 
-/// RLP-encodes a header exactly as the headers column family stores it.
+/// RLP-encodes a header exactly as the headers column family stores it
+/// ([`Header::encode_stored`]).
 pub fn encode_header(header: &Header) -> Vec<u8> {
-    let mut buf = Vec::new();
-    header.encode(&mut buf);
-    buf
+    header.encode_stored()
 }
 
 /// RLP-encodes a block body exactly as the bodies column family stores it:
-/// `[[transactions], [ommers]]`.
+/// `[[transactions], [ommers]]`, each uncle in the store's form
+/// ([`Header::encode_stored`]).
 pub fn encode_body(transactions: &[Transaction], ommers: &[Header]) -> Vec<u8> {
     let mut txs_payload = Vec::new();
     for tx in transactions {
@@ -211,7 +211,7 @@ pub fn encode_body(transactions: &[Transaction], ommers: &[Header]) -> Vec<u8> {
     }
     let mut ommers_payload = Vec::new();
     for uncle in ommers {
-        uncle.encode(&mut ommers_payload);
+        ommers_payload.extend_from_slice(&uncle.encode_stored());
     }
 
     let body_len = RlpHeader { list: true, payload_length: txs_payload.len() }.length()
@@ -400,7 +400,11 @@ impl BlockStore {
 
     /// A stored header, read under this store's heights.
     fn read_header(&self, buf: &mut &[u8]) -> alloy_rlp::Result<Header> {
-        Header::decode_with_activations(buf, self.activations())
+        Header::decode_in(
+            buf,
+            self.activations(),
+            rustock_core::types::header::HeaderForm::Stored,
+        )
     }
 
     /// Scans the headers column family for the highest block number.
@@ -869,9 +873,7 @@ impl BlockStore {
         for &(header, td) in entries {
             let hash = header.hash();
 
-            let mut header_buf = Vec::new();
-            header.encode(&mut header_buf);
-            batch.put_cf(cf_headers, hash.as_slice(), &header_buf);
+            batch.put_cf(cf_headers, hash.as_slice(), encode_header(header));
 
             batch.put_cf(cf_td, hash.as_slice(), encode_td(td));
             // Fork headers arrive through here too, and they are precisely the
@@ -2113,10 +2115,10 @@ mod tests {
     }
 
     /// A store reads its headers under its chain's heights, the process's
-    /// unless set: where RSKIP-351 is active, slot 6 of a header held
-    /// compressed is the commitment to its extension, and before it the
-    /// same bytes are the logs bloom, as rskj's `BlockFactory` reads them.
-    /// The freezer reads its own alike.
+    /// unless set, as rskj's `BlockFactory` reads them, by height: a header
+    /// held compressed, as one is from RSKIP-351 on, reads back as held under
+    /// regtest's heights, and not at all under this process's, mainnet's,
+    /// which read no such header at #1. The freezer reads its own alike.
     #[test]
     fn a_store_reads_headers_under_its_chains_heights() {
         use rustock_core::config::ActivationHeights;
@@ -2124,12 +2126,13 @@ mod tests {
         commitment.extend_from_slice(&[0x55; 32]);
         let mut slot = Vec::new();
         commitment.as_slice().encode(&mut slot);
+        // rskj's regtest has RSKIPUMM and RSKIP-351 from block 1.
         let compressed = Header {
             extension_data: Some(Bytes::from(slot)),
+            umm_root: Some(Bytes::new()),
             ..dummy_header(1)
         };
         let hash = compressed.hash();
-        // rskj's regtest has RSKIP-351 from block 1.
         let regtest = ActivationHeights::regtest();
 
         let dir = tempdir().unwrap();
@@ -2144,11 +2147,9 @@ mod tests {
             assert_eq!(store.header(hash).unwrap(), Some(compressed.clone()));
             assert_eq!(store.uncles(hash).unwrap(), Some(vec![compressed.clone()]));
         }
-        // This process's heights are mainnet's, which has no RSKIP-351.
         let store = BlockStore::open(dir.path()).unwrap();
-        let read = store.header(hash).unwrap().unwrap();
-        assert_eq!(read.extension_data, None);
-        assert_eq!(read.hash(), hash, "the same bytes, the same header");
+        assert!(store.header(hash).is_err());
+        assert!(store.uncles(hash).is_err());
 
         let frozen = tempdir().unwrap();
         let freezer = crate::freezer::Freezer::open(frozen.path())
@@ -2159,19 +2160,81 @@ mod tests {
             .put_uncles(1, std::slice::from_ref(&compressed))
             .unwrap();
         freezer.sync().unwrap();
-        let read_back = |freezer: crate::freezer::Freezer| {
-            let header = freezer.header(1).unwrap().unwrap();
-            [header, freezer.uncles(1).unwrap().unwrap().remove(0)]
+        assert_eq!(freezer.header(1).unwrap(), Some(compressed.clone()));
+        let uncle = freezer.uncles(1).unwrap().unwrap().remove(0);
+        assert_eq!(uncle.extension_data, compressed.extension_data);
+        assert_eq!(uncle.hash(), hash);
+        let unread = crate::freezer::Freezer::open(frozen.path()).unwrap();
+        assert_eq!(unread.header(1).unwrap(), None);
+        assert!(unread.uncles(1).is_err());
+    }
+
+    /// Every path that writes a header writes it in the store's own form
+    /// ([`encode_header`]), so it reads back as it was held: a header at a
+    /// time, a batch, as the header sync writes one, a body's uncles, and the
+    /// freezer's headers and uncles. In rskj's full encoding, a header of
+    /// version 0 from RSKIP-351 on, which writes no version, would read back
+    /// as nothing rskj reads there.
+    #[test]
+    fn every_path_that_writes_a_header_reads_it_back_as_held() {
+        use rustock_core::config::ActivationHeights;
+        use rustock_core::types::header::HeaderVersionFields;
+        let regtest = ActivationHeights::regtest();
+        let v0 = |number| Header {
+            umm_root: Some(Bytes::new()),
+            version_fields: Some(HeaderVersionFields {
+                version: 0,
+                edges: Some(vec![1]),
+                base_event: Some(Bytes::new()),
+            }),
+            ..dummy_header(number)
         };
-        let committed = read_back(freezer);
-        let bloom = read_back(crate::freezer::Freezer::open(frozen.path()).unwrap());
-        for (header, uncle) in [(&committed[0], &committed[1]), (&bloom[0], &bloom[1])] {
-            assert_eq!(header.extension_data, uncle.extension_data);
+        let mut commitment = vec![0xe2, 0x02, 0xa0];
+        commitment.extend_from_slice(&[0x55; 32]);
+        let mut slot = Vec::new();
+        commitment.as_slice().encode(&mut slot);
+        let held = Header {
+            umm_root: Some(Bytes::new()),
+            extension_data: Some(Bytes::from(slot)),
+            ..dummy_header(6)
+        };
+        let (batched, single) = (v0(5), v0(7));
+        let uncles = vec![batched.clone(), held.clone()];
+
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path())
+            .unwrap()
+            .with_activations(regtest.clone());
+        // A total difficulty no entry passes, so the head stays where it is.
+        let entries = [(&batched, U256::from(1)), (&held, U256::from(2))];
+        store
+            .store_headers_batch(&entries, None, U256::MAX)
+            .unwrap();
+        store.put_header(&single).unwrap();
+        store.put_body(single.hash(), &[], &uncles).unwrap();
+        for header in [&batched, &held, &single] {
+            assert_eq!(store.header(header.hash()).unwrap().as_ref(), Some(header));
         }
-        assert!(committed[0].extension_data.is_some());
-        assert_eq!(bloom[0].extension_data, None);
-        for header in committed.iter().chain(&bloom) {
-            assert_eq!(header.hash(), hash);
+        assert_eq!(store.uncles(single.hash()).unwrap(), Some(uncles.clone()));
+
+        let frozen = tempdir().unwrap();
+        let freezer = crate::freezer::Freezer::open(frozen.path())
+            .unwrap()
+            .with_activations(regtest);
+        freezer.put(7, &single).unwrap();
+        freezer.put_uncles(7, &uncles).unwrap();
+        freezer.sync().unwrap();
+        assert_eq!(freezer.header(7).unwrap(), Some(single));
+        // The freezer's uncles come with the hashes its reader caches.
+        let read: Vec<_> = freezer.uncles(7).unwrap().unwrap();
+        assert_eq!(read.len(), uncles.len());
+        for (read, uncle) in read.into_iter().zip(&uncles) {
+            let uncached = Header {
+                cached_hash: None,
+                cached_hash_for_merged_mining: None,
+                ..read
+            };
+            assert_eq!(&uncached, uncle);
         }
     }
 

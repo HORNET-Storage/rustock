@@ -67,23 +67,50 @@ pub struct Header {
     pub cached_hash_for_merged_mining: Option<B256>,
 }
 
-/// What a versioned (RSKIP-351) header carries beyond a version-0 one.
+/// What a header carries after `ummRoot` from RSKIP-351 on: its version,
+/// RSKIP-144's edges and RSKIP-535's base event.
 ///
-/// rskj appends these after `ummRoot` in the uncompressed encoding only
+/// rskj writes a V1's and a V2's after `ummRoot` in the full encoding only
 /// (`BlockHeaderV1/V2.addExtraFieldsToEncodedHeader`, guarded by
-/// `!usingCompressedEncoding`). The compressed encoding -- the one that is
-/// hashed -- replaces the bloom field with a commitment to them instead.
+/// `!usingCompressedEncoding`); the compressed encoding, which is hashed,
+/// carries a commitment to them in the bloom's slot instead. A
+/// `BlockHeaderV0` writes its edges and base event in both. `None` on a
+/// header from before RSKIP-351, and on a V1 or a V2 read compressed.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HeaderVersionFields {
-    /// 1 or 2. A version-0 header has no record of a version at all, which is
-    /// why this lives behind an `Option` rather than defaulting to 0.
+    /// 1 or 2; or 0 for a header whose version is any other byte, which rskj
+    /// builds as a `BlockHeaderV0`: that holds the edges and base event it
+    /// read, writes them with no version in both encodings, and hashes them
+    /// as they are, with no extension.
     pub version: u8,
-    /// RSKIP-144 transaction execution sublist edges, when the block has any.
-    /// rskj omits the field entirely when they are absent.
+    /// RSKIP-144 transaction execution sublist edges, read where RSKIP-351
+    /// and RSKIP-144 are both active, and written only where present.
     pub edges: Option<Vec<i16>>,
-    /// RSKIP-535 base event. V2 only, and empty rather than absent when the
-    /// block carries none.
+    /// RSKIP-535 base event, read where it's enabled, and empty where the
+    /// header has no field for it. Always `None` on version 1, which ignores
+    /// one it reads.
     pub base_event: Option<Bytes>,
+}
+
+/// Which of rskj's encodings of a header is being read.
+///
+/// rskj reads a header by its height, and from RSKIP-351 on the same header
+/// has two encodings that lay its fields out differently. rskj tells what a
+/// field is by where it sits, so a reader has to be told which encoding it
+/// has.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeaderForm {
+    /// `getFullEncoded`, as blocks and their uncles carry headers
+    /// (`BlockFactory.decodeBlock`, and a body's uncles): the logs bloom in
+    /// slot 6, and the version, edges and base event after `ummRoot`.
+    Full,
+    /// `getEncodedCompressed`, as a chain's headers are sent
+    /// (`BlockHeadersResponseMessage`, read with `decodeHeader(.., true)`):
+    /// a versioned header's commitment to its extension in slot 6, and
+    /// nothing of it after `ummRoot`. A version-0 header has the one form.
+    Compressed,
+    /// This node's store: [`Header::encode_stored`].
+    Stored,
 }
 
 /// What rskj's `BlockFactory` reads from a header that [`Header`]'s typed
@@ -294,6 +321,215 @@ fn to_byte_array(value: &[u8]) -> Vec<u8> {
     bytes
 }
 
+/// rskj `BlockFactory.canBeDecoded`: whether rskj reads a header of `count`
+/// fields at `number`, in its full or its compressed encoding. It counts
+/// them exactly: the sixteen every header has; `ummRoot` from RSKIPUMM; from
+/// RSKIP-351 on and in the full encoding only, the version, the edges where
+/// RSKIP-144 is active and the base event where RSKIP-535 is; and the three
+/// merged-mining fields or none. On testnet below #7,800,000 it also reads a
+/// full header one field short, and gives it an empty base event
+/// (`isInBaseEventRecoveryWindow`).
+fn rskj_reads(
+    count: usize,
+    activations: &crate::config::ActivationHeights,
+    number: u64,
+    compressed: bool,
+) -> bool {
+    let full = !compressed && activations.rskip351_active(number);
+    let base_event = full && activations.base_event_enabled(number);
+    let fields = 16
+        + usize::from(activations.umm_active(number))
+        + usize::from(full)
+        + usize::from(full && activations.edges_active(number))
+        + usize::from(base_event);
+    let recovering = base_event
+        && activations
+            .base_event_recovery_below
+            .is_some_and(|below| number < below);
+    count == fields
+        || count == fields + 3
+        || (recovering && (count + 1 == fields || count + 1 == fields + 3))
+}
+
+/// The version of a header rskj reads compressed from RSKIP-351 on:
+/// `RLP.decodeList(extensionData).get(0).getRLPData()[0]`, the first byte of
+/// the first item of the one list in slot 6. Where there is no such byte,
+/// rskj throws and can't read the header.
+fn compressed_version(slot6: Option<&[u8]>) -> alloy_rlp::Result<u8> {
+    use crate::rskj_rlp::Element;
+    let none = || refused("a compressed header whose slot 6 names no version");
+    let elements = crate::rskj_rlp::decode2(slot6.ok_or_else(none)?).map_err(|_| none())?;
+    let [list @ Element::List { .. }] = elements.as_slice() else {
+        return Err(none());
+    };
+    let items = list.elements().map_err(|_| none())?;
+    items
+        .first()
+        .and_then(Element::data)
+        .map(|data| data[0])
+        .ok_or_else(none)
+}
+
+/// Where a version sits from RSKIP-351 on, the mark that begins this node's
+/// own layout of a header in its store ([`Header::encode_stored`]): with the
+/// version after it for a header that holds its own fields, and alone for
+/// one held compressed. rskj's full encoding has a version of one byte
+/// there, as the store wrote headers before this layout, and never this one.
+const STORED_LAYOUT: u8 = 0xff;
+
+/// The next of a header's fields.
+fn take<'h, 'a>(
+    rest: &mut &'h [crate::rskj_rlp::Element<'a>],
+) -> Option<&'h crate::rskj_rlp::Element<'a>> {
+    let (first, others) = rest.split_first()?;
+    *rest = others;
+    Some(first)
+}
+
+/// What follows a header's sixteen fields, as read at its height.
+struct Trailer<'h, 'a> {
+    umm_root: Option<Bytes>,
+    /// From RSKIP-351 on: the full encoding's own, or the one the commitment
+    /// in slot 6 names.
+    version: Option<u8>,
+    edges: Option<Vec<i16>>,
+    base_event: Option<Bytes>,
+    mining: &'h [crate::rskj_rlp::Element<'a>],
+    compressed: bool,
+}
+
+impl<'h, 'a> Trailer<'h, 'a> {
+    /// What `BlockFactory.decodeHeader` reads after the sixteen fields of a
+    /// header at `number`, in its full or its compressed encoding.
+    fn read(
+        mut rest: &'h [crate::rskj_rlp::Element<'a>],
+        slot6: Option<&[u8]>,
+        activations: &crate::config::ActivationHeights,
+        number: u64,
+        compressed: bool,
+    ) -> alloy_rlp::Result<Self> {
+        if !rskj_reads(16 + rest.len(), activations, number, compressed) {
+            return Err(refused(
+                "a header with more or fewer fields than rskj reads at its height",
+            ));
+        }
+        // `getRLPRawData`: an empty root is kept, and written back, empty.
+        let umm_root = match activations.umm_active(number) {
+            true => {
+                let root = take(&mut rest).ok_or(refused("a header without its UMM root"))?;
+                Some(Bytes::copy_from_slice(root.raw_data()))
+            }
+            false => None,
+        };
+        let version = if !activations.rskip351_active(number) {
+            None
+        } else if compressed {
+            Some(compressed_version(slot6)?)
+        } else {
+            // `getRLPData()[0]`: rskj throws on none.
+            let version = take(&mut rest)
+                .and_then(crate::rskj_rlp::Element::data)
+                .ok_or(refused("a versioned header whose version is none"))?;
+            Some(version[0])
+        };
+        // `rlpToShorts(getRLPRawData())`, where a field is left for them.
+        let edges = if !compressed && !rest.is_empty() && activations.edges_active(number) {
+            take(&mut rest).map(|edges| rlp_to_shorts(edges.raw_data()))
+        } else {
+            None
+        };
+        // Where no field is left for it, or only the three merged-mining
+        // fields are, rskj gives the header an empty base event.
+        let base_event = if !compressed && activations.base_event_enabled(number) {
+            Some(match rest.len() {
+                0 | 3 => Bytes::new(),
+                _ => Bytes::copy_from_slice(
+                    take(&mut rest).map_or(&[][..], |field| field.raw_data()),
+                ),
+            })
+        } else {
+            None
+        };
+        Ok(Self {
+            umm_root,
+            version,
+            edges,
+            base_event,
+            mining: rest,
+            compressed,
+        })
+    }
+
+    /// What follows the sixteen fields of a header in this node's store, and
+    /// in the trunk headers rustock nodes send each other: in
+    /// [`Header::encode_stored`]'s own layout, holding only the fields rskj
+    /// reads a header with at its height; or, as the store wrote headers
+    /// before that layout, in rskj's full encoding, or in the compressed one
+    /// for a header held compressed.
+    fn stored(
+        rest: &'h [crate::rskj_rlp::Element<'a>],
+        slot6: Option<&[u8]>,
+        activations: &crate::config::ActivationHeights,
+        number: u64,
+    ) -> alloy_rlp::Result<Self> {
+        use crate::rskj_rlp::Element;
+        if !activations.rskip351_active(number) {
+            return Self::read(rest, slot6, activations, number, false);
+        }
+        let umm = usize::from(activations.umm_active(number));
+        match rest.get(umm) {
+            // Held compressed: the mark alone, then the merged-mining fields.
+            Some(Element::Item([STORED_LAYOUT])) => Ok(Self {
+                mining: &rest[umm + 1..],
+                ..Self::read(&rest[..umm], slot6, activations, number, true)?
+            }),
+            Some(Element::Item([STORED_LAYOUT, version @ 0..=2])) => {
+                let unstored = || refused("a stored header in no layout this node writes");
+                let [edges, base_event, mining @ ..] = rest.get(umm + 1..).unwrap_or_default()
+                else {
+                    return Err(unstored());
+                };
+                // An empty list where a header has no such field.
+                let held = |field: &'h Element<'a>| match field {
+                    Element::List {
+                        encoding: [0xc0], ..
+                    } => None,
+                    field => Some(field),
+                };
+                let (edges, base_event) = (held(edges), held(base_event));
+                // What rskj reads at the header's height: in full, the edges
+                // where RSKIP-144 is active and a base event where RSKIP-535
+                // is, which a V1 ignores; compressed, a V0 with neither, whose
+                // slot 6 names its version.
+                let in_full = edges.is_some() == activations.edges_active(number)
+                    && base_event.is_some()
+                        == (*version != 1 && activations.base_event_enabled(number));
+                let compressed = *version == 0
+                    && edges.is_none()
+                    && base_event.is_none()
+                    && compressed_version(slot6).is_ok_and(|named| !matches!(named, 1 | 2));
+                if !in_full && !compressed {
+                    return Err(unstored());
+                }
+                Ok(Self {
+                    umm_root: rest[..umm]
+                        .first()
+                        .map(|root| Bytes::copy_from_slice(root.raw_data())),
+                    version: Some(*version),
+                    edges: edges.map(|edges| rlp_to_shorts(edges.raw_data())),
+                    base_event: base_event
+                        .map(|base_event| Bytes::copy_from_slice(base_event.raw_data())),
+                    mining,
+                    compressed: false,
+                })
+            }
+            // A version of one byte, as rskj's full encoding has it.
+            Some(Element::Item([_])) => Self::read(rest, slot6, activations, number, false),
+            _ => Self::read(rest, slot6, activations, number, true),
+        }
+    }
+}
+
 impl Header {
     /// The sixteen fields every RSK header carries, in wire order, encoded the
     /// way rskj encodes them.
@@ -463,29 +699,23 @@ impl Header {
             kept.and_then(|k| k.receipts_root.as_ref()),
             &self.receipts_root,
         );
-        // RSKIP-351: a V1/V2 header carries `RLP([version, extension_hash])`
-        // in the slot a V0 header fills with its 256-byte bloom. The bytes are
-        // already RLP, so they are appended rather than re-encoded.
-        //
-        // Encoding the bloom here regardless was invisible for as long as the
-        // decoder cached the hash from the peer's original bytes: nothing ever
-        // asked this encoder to reproduce a versioned header. Re-deriving the
-        // hash of a testnet V1 block is what surfaced it.
-        // rskj: `compressed ? getExtensionData() : getLogsBloom()`. Only the
-        // compressed form is hashed; the wire form keeps the literal bloom and
-        // carries the version, edges and base event after `ummRoot` instead.
-        match (compressed, &self.extension_data, &self.version_fields) {
-            // Already-compressed input: the literal bloom was never received,
-            // so this is all there is to emit either way.
-            (_, Some(ext), _) => list.extend_from_slice(ext),
-            (true, None, Some(_)) => match self.compressed_extension_field() {
+        // Slot 6, rskj's `compressed ? getExtensionData() : getLogsBloom()`: a
+        // versioned header's commitment to its extension in the compressed
+        // encoding and its bloom in the full one; a version-0 header's bloom
+        // in both. A header held compressed has only its commitment. The
+        // commitment is already RLP, so it is appended rather than
+        // re-encoded.
+        let versioned = self.version_fields.as_ref().is_some_and(|v| v.version != 0);
+        match &self.extension_data {
+            Some(ext) => list.extend_from_slice(ext),
+            None if compressed && versioned => match self.compressed_extension_field() {
                 Some(field) => list.extend_from_slice(&field),
                 // An extension that will not build cannot be hashed into a
                 // commitment; emitting the bloom keeps this total, and the
                 // hash it yields simply will not match, which is visible.
                 None => self.logs_bloom.encode(list),
             },
-            _ => encode_kept(
+            None => encode_kept(
                 list,
                 kept.and_then(|k| k.logs_bloom.as_ref()),
                 &self.logs_bloom,
@@ -506,38 +736,72 @@ impl Header {
         self.uncle_count.encode(list);
     }
 
-    /// rskj BlockHeader.getEncoded(true, with_merkle_proof_and_coinbase):
-    /// list payload of all header fields; the merkle proof and coinbase tx
-    /// are excluded from RSKIP92 block hashes but kept on the wire.
-    fn encode_payload(&self, with_merkle_proof_and_coinbase: bool, compressed: bool) -> Vec<u8> {
+    /// rskj `BlockHeader.getEncoded(withMergedMiningFields,
+    /// withMerkleProofAndCoinbase, compressed)`: the list payload of the
+    /// header's fields in `form`. RSKIP-92 block hashes leave out the merkle
+    /// proof and coinbase transaction, and the merged-mining hash all three
+    /// merged-mining fields.
+    fn encode_payload(
+        &self,
+        form: HeaderForm,
+        with_mining_fields: bool,
+        with_merkle_proof_and_coinbase: bool,
+    ) -> Vec<u8> {
+        let compressed = form == HeaderForm::Compressed;
         let mut list = Vec::new();
         self.encode_base_fields(&mut list, compressed);
 
         if let Some(umm) = &self.umm_root {
             umm.encode(&mut list);
         }
-        // rskj `BlockHeaderV1/V2.addExtraFieldsToEncodedHeader`: the version,
-        // the edges when the block has any, and (V2) the base event, in that
-        // order and only when not compressed.
-        if !compressed {
-            if let Some(v) = &self.version_fields {
-                list.push(v.version);
-                if let Some(edges) = &v.edges {
-                    // Already an RLP string; appending rather than encoding,
-                    // or `Vec<u8>` would go out as a list of single bytes.
-                    list.extend_from_slice(
-                        &crate::types::header_extension::shorts_to_rlp(edges),
-                    );
+        // rskj `addExtraFieldsToEncodedHeader`. The edges are already an RLP
+        // string; encoding them as a `Vec` would write a list of bytes.
+        if let Some(v) = &self.version_fields {
+            let edges = v
+                .edges
+                .as_deref()
+                .map(crate::types::header_extension::shorts_to_rlp);
+            if form == HeaderForm::Stored {
+                // This node's own layout, which reads back as this header
+                // whatever rskj would make of it: the version after a mark,
+                // then the edges and the base event, each an empty list
+                // where the header has none.
+                [STORED_LAYOUT, v.version].as_slice().encode(&mut list);
+                match &edges {
+                    Some(edges) => list.extend_from_slice(edges),
+                    None => list.push(alloy_rlp::EMPTY_LIST_CODE),
                 }
-                if let Some(be) = &v.base_event {
-                    be.encode(&mut list);
+                match &v.base_event {
+                    Some(base_event) => base_event.encode(&mut list),
+                    None => list.push(alloy_rlp::EMPTY_LIST_CODE),
+                }
+            } else if v.version == 0 || !compressed {
+                // A V1 or a V2 writes its version, then the edges where the
+                // block has them and (V2) the base event, in the full
+                // encoding only. A `BlockHeaderV0` writes its edges and base
+                // event in both, with no version.
+                if v.version != 0 {
+                    list.push(v.version);
+                }
+                if let Some(edges) = &edges {
+                    list.extend_from_slice(edges);
+                }
+                if let Some(base_event) = v.base_event.as_ref().filter(|_| v.version != 1) {
+                    base_event.encode(&mut list);
                 }
             }
+        } else if form == HeaderForm::Stored && self.extension_data.is_some() {
+            // A header held compressed, marked as one in the store.
+            [STORED_LAYOUT].as_slice().encode(&mut list);
         }
         // rskj emits the merkle proof and coinbase tx whenever the mining
         // header is present — as empty elements if need be — rather than
         // omitting them (BlockHeader.getEncoded with merged mining fields).
-        if let Some(btc) = &self.bitcoin_merged_mining_header {
+        if let Some(btc) = self
+            .bitcoin_merged_mining_header
+            .as_ref()
+            .filter(|_| with_mining_fields)
+        {
             btc.encode(&mut list);
             if with_merkle_proof_and_coinbase {
                 match &self.bitcoin_merged_mining_merkle_proof {
@@ -556,7 +820,7 @@ impl Header {
 
 impl Encodable for Header {
     fn encode(&self, out: &mut dyn alloy_rlp::BufMut) {
-        let list = self.encode_payload(true, false);
+        let list = self.encode_payload(HeaderForm::Full, true, true);
         alloy_rlp::Header { list: true, payload_length: list.len() }.encode(out);
         out.put_slice(&list);
     }
@@ -569,7 +833,8 @@ impl Encodable for Header {
 }
 
 impl alloy_rlp::Decodable for Header {
-    /// Decodes under the process-wide activation heights
+    /// Decodes rskj's full encoding, as blocks carry headers, under the
+    /// process-wide activation heights
     /// ([`ActivationHeights::current`](crate::config::ActivationHeights::current)).
     fn decode(buf: &mut &[u8]) -> alloy_rlp::Result<Self> {
         Self::decode_with_activations(buf, crate::config::ActivationHeights::current())
@@ -577,8 +842,18 @@ impl alloy_rlp::Decodable for Header {
 }
 
 impl Header {
-    /// Decode a header as rskj's `BlockFactory.decodeHeader` reads one,
-    /// under explicit activation heights.
+    /// Decode a header as rskj's `BlockFactory.decodeHeader` reads one in its
+    /// full encoding, as blocks and their uncles carry headers, under
+    /// explicit activation heights: see [`Self::decode_in`].
+    pub fn decode_with_activations(
+        buf: &mut &[u8],
+        activations: &crate::config::ActivationHeights,
+    ) -> alloy_rlp::Result<Self> {
+        Self::decode_in(buf, activations, HeaderForm::Full)
+    }
+
+    /// Decode a header as rskj's `BlockFactory.decodeHeader` reads one in
+    /// `form`, under explicit activation heights.
     ///
     /// The list and its fields are cut with rskj's own RLP
     /// ([`crate::rskj_rlp`]), which takes lengths canonical RLP refuses,
@@ -588,27 +863,30 @@ impl Header {
     /// goes in [`KeptFields`], and the header hashes as rskj writes it back
     /// from what it read, which is not always as it was sent.
     ///
-    /// Of the heights, RSKIP-144's, RSKIP-351's and orchid's (RSKIP-98) are
-    /// read here; which fields a header carries at its height is
-    /// `HeaderLayoutRule`'s to say.
-    pub fn decode_with_activations(
+    /// After the sixteen fields every header has, rskj reads by the header's
+    /// height, as the heights here say: how many fields there are, and what
+    /// each is. A header with any other count is refused.
+    pub fn decode_in(
         buf: &mut &[u8],
         activations: &crate::config::ActivationHeights,
+        form: HeaderForm,
     ) -> alloy_rlp::Result<Self> {
         let (list, next) = crate::rskj_rlp::first_element(buf)
             .map_err(|_| refused("a header rskj's RLP can't read"))?;
         let fields = list
             .elements()
             .map_err(|_| refused("a header that is not a list of fields"))?;
-        let header = Self::from_fields(&fields, activations)?;
+        let header = Self::from_fields(&fields, activations, form)?;
         *buf = &buf[next..];
         Ok(header)
     }
 
-    /// A header's fields, each read as `BlockFactory.decodeHeader` reads it.
+    /// A header's fields, each read as `BlockFactory.decodeHeader` reads it
+    /// in `form`.
     fn from_fields(
         fields: &[crate::rskj_rlp::Element<'_>],
         activations: &crate::config::ActivationHeights,
+        form: HeaderForm,
     ) -> alloy_rlp::Result<Self> {
         // rskj reads each field with `getRLPData`: none for an empty item,
         // and a list's whole encoding for a list, which it reads as bytes.
@@ -643,8 +921,8 @@ impl Header {
         let number = java_long(field(8)?)?;
 
         // Slot 6, the logs bloom or a commitment in its place, is read once
-        // the fields after it say which (below).
-        let slot6 = field(6)?.unwrap_or_default();
+        // the fields after the sixteen say which (below).
+        let slot6 = field(6)?;
 
         // `RLP.parseBlockDifficulty`: `new BigInteger(bytes)`, so a negative
         // difficulty, which `BlockDifficulty` throws on. rskj reads none as
@@ -689,99 +967,69 @@ impl Header {
         kept.minimum_gas_price = bytes;
         let uncle_count = java_int(field(15)?)?;
 
-        // What is left is told apart by count, since nothing here knows the
-        // network: none is a header without merged-mining fields, three are
-        // those fields, and four or more begin with a UMM root (RSKIPUMM,
-        // papyrus200). `HeaderLayoutRule` holds what was read to the fields
-        // rskj reads at the header's height.
-        let mut rest = &fields[16..];
-        let mut umm_root = None;
-        if rest.len() >= 4 {
-            // `getRLPRawData`: an empty root is kept, and written back, empty.
-            umm_root = Some(Bytes::copy_from_slice(rest[0].raw_data()));
-            rest = &rest[1..];
-        }
-
-        // RSKIP-351: a versioned header puts its version, its RSKIP-144 edges
-        // and (V2) its base event here, between `ummRoot` and the merged
-        // mining fields. rskj picks them out by activation height; nothing
-        // here knows the network, so the version is used as its own marker
-        // instead: a single byte, 1 or 2, a value no other field in this
-        // position can take. `ummRoot` is empty or 20 bytes, edges are an
-        // even-length string, the base event is empty or long, and a
-        // merged-mining header is 80 bytes.
-        let mut version_fields = None;
-        if let Some(&[version @ (1 | 2)]) = rest.first().map(|element| element.raw_data()) {
-            rest = &rest[1..];
-            // Whatever is left belongs to the merged mining fields, except
-            // what the version says comes first. rskj emits the edges only
-            // when the block has any, so their presence is positional: with a
-            // base event to follow (V2) there is one more item here than
-            // mining alone accounts for.
-            let mining = rest.len().min(3);
-            let extras = rest.len() - mining;
-
-            // Edges come first and are emitted whenever RSKIP144 is active --
-            // as an empty string when the block has no sublists -- so they are
-            // present on every versioned header seen here. The base event
-            // follows, and on testnet between vetiver900 and #7,800,000 it can
-            // be missing altogether: rskj accepts a header one element short
-            // there and supplies an empty base event for it
-            // (`BlockFactory.isInBaseEventRecoveryWindow`). Reading the
-            // trailing element as the base event in that case takes the edges
-            // for it and hashes the header wrong.
-            //
-            // Where RSKIP-144 is not active there are no edges, and a V2
-            // header's one trailing item is its base event (rskj's regtest
-            // once had rskip144 = -1, rskip535 = 1). rskj tells the cases apart by
-            // activation, and so does this. Both are read raw
-            // (`getRLPRawData`).
-            let mut edges = None;
-            let mut base_event = None;
-            let rskip144 = activations.rskip144.is_some_and(|height| number >= height);
-            if version >= 2 && extras == 1 && !rskip144 {
-                base_event = Some(Bytes::copy_from_slice(rest[0].raw_data()));
-                rest = &rest[1..];
-            } else {
-                if extras >= 1 {
-                    edges = Some(rlp_to_shorts(rest[0].raw_data()));
-                    rest = &rest[1..];
-                }
-                if version >= 2 && extras >= 2 {
-                    base_event = Some(Bytes::copy_from_slice(rest[0].raw_data()));
-                    rest = &rest[1..];
-                }
-            }
-            version_fields = Some(HeaderVersionFields {
-                version,
-                edges,
-                base_event,
-            });
-        }
-
-        // Slot 6 holds the logs bloom, of any length: rskj reads whatever is
-        // there as the bloom (`BlockHeaderV0.getLogsBloom`, and a versioned
-        // header's extension when it comes in full), and no rule reads an
-        // uncle's. Only where RSKIP-351 is active does a header that travels
-        // compressed hold there instead the commitment to its extension,
-        // `RLP([version, hash])`, with no version after `ummRoot`. rskj writes
-        // either back as one string (`RLP.encodeElement`), whatever form it
-        // came in.
-        let rskip351 = activations.rskip351.is_some_and(|height| number >= height);
-        let commitment = rskip351
-            && version_fields.is_none()
-            && crate::types::header_extension::ExtensionCommitment::from_extension_data(slot6)
-                .is_ok();
-        let (logs_bloom, extension_data) = if commitment {
-            let mut encoded = Vec::new();
-            slot6.encode(&mut encoded);
-            (Bloom::ZERO, Some(Bytes::from(encoded)))
-        } else if slot6.len() == 256 {
-            (Bloom::from_slice(slot6), None)
-        } else {
-            kept.logs_bloom = Some(Bytes::copy_from_slice(slot6));
-            (Bloom::ZERO, None)
+        // What follows the sixteen fields, rskj reads by the header's height.
+        let rest = &fields[16..];
+        let Trailer {
+            umm_root,
+            version,
+            edges,
+            base_event,
+            mining,
+            compressed,
+        } = match form {
+            HeaderForm::Full => Trailer::read(rest, slot6, activations, number, false)?,
+            HeaderForm::Compressed => Trailer::read(rest, slot6, activations, number, true)?,
+            HeaderForm::Stored => Trailer::stored(rest, slot6, activations, number)?,
         };
+
+        // Slot 6 holds a versioned header's commitment to its extension where
+        // it comes compressed, `RLP([version, hash])`, which rskj keeps as it
+        // came (`extensionData`) and writes, and hashes, as one string.
+        // Otherwise it holds the logs bloom, of any length: rskj reads
+        // whatever is there as the bloom, and no rule reads an uncle's.
+        let mut logs_bloom = Bloom::ZERO;
+        let mut extension_data = None;
+        let mut version_fields = None;
+        match version {
+            Some(1 | 2) if compressed => {
+                let mut encoded = Vec::new();
+                slot6.unwrap_or_default().encode(&mut encoded);
+                extension_data = Some(Bytes::from(encoded));
+            }
+            _ => {
+                // rskj's V1 and V2 hash their bloom into their extension's
+                // hash, and none is null to rskj, which throws on it.
+                if matches!(version, Some(1 | 2)) && slot6.is_none() {
+                    return Err(refused("a versioned header whose logs bloom is none"));
+                }
+                let bloom = slot6.unwrap_or_default();
+                if bloom.len() == 256 {
+                    logs_bloom = Bloom::from_slice(bloom);
+                } else {
+                    kept.logs_bloom = Some(Bytes::copy_from_slice(bloom));
+                }
+                // rskj builds a V1 or a V2 from version 1 or 2 in full, a V1
+                // ignoring the base event it read, and a `BlockHeaderV0` from
+                // any other version, in either encoding.
+                version_fields = version.map(|version| match version {
+                    1 => HeaderVersionFields {
+                        version,
+                        edges,
+                        base_event: None,
+                    },
+                    2 => HeaderVersionFields {
+                        version,
+                        edges,
+                        base_event,
+                    },
+                    _ => HeaderVersionFields {
+                        version: 0,
+                        edges,
+                        base_event,
+                    },
+                });
+            }
+        }
 
         // rskj reads the three merged-mining fields together or not at all,
         // and `canBeDecoded` counts a header's fields exactly: with one or two
@@ -791,7 +1039,7 @@ impl Header {
         // them unless the Bitcoin header is 80 bytes, none being null to it
         // (`validateBitcoinMergedMiningHeader`), as `ProofOfWorkRule` and
         // `MergedMiningRule` do again.
-        let (btc_header, merkle_proof, coinbase) = match rest {
+        let (btc_header, merkle_proof, coinbase) = match mining {
             [] => (None, None, None),
             [header, proof, coinbase] => {
                 let size = crate::validation::merged_mining::BTC_HEADER_SIZE;
@@ -986,22 +1234,21 @@ impl Header {
         if let Some(h) = self.cached_hash {
             return h;
         }
-        let payload = self.encode_payload(!self.rskip92_active(), true);
-        let mut buffer = Vec::with_capacity(payload.len() + 4);
-        alloy_rlp::Header { list: true, payload_length: payload.len() }.encode(&mut buffer);
-        buffer.extend_from_slice(&payload);
-        alloy_primitives::keccak256(&buffer)
+        alloy_primitives::keccak256(self.encoded(
+            HeaderForm::Compressed,
+            true,
+            !self.rskip92_active(),
+        ))
     }
 
-    /// The header as rskj sends a chain's headers to its peers
-    /// (`BlockHeader.getEncodedCompressed`): every field and all three
-    /// merged-mining fields, with a versioned header's commitment to its
-    /// extension in slot 6 and none of its own fields after `ummRoot`. rskj
-    /// reads a `BlockHeadersResponseMessage`'s headers so
-    /// (`decodeHeader(.., true)`), and a header taken from one is held so here.
-    /// A version-0 header has this one form.
-    pub fn encode_compressed(&self) -> Vec<u8> {
-        let payload = self.encode_payload(true, true);
+    /// [`Self::encode_payload`] as an RLP list.
+    fn encoded(
+        &self,
+        form: HeaderForm,
+        with_mining_fields: bool,
+        with_merkle_proof_and_coinbase: bool,
+    ) -> Vec<u8> {
+        let payload = self.encode_payload(form, with_mining_fields, with_merkle_proof_and_coinbase);
         let mut out = Vec::with_capacity(payload.len() + 4);
         alloy_rlp::Header {
             list: true,
@@ -1012,7 +1259,33 @@ impl Header {
         out
     }
 
-    /// Decode a header and cache both of its hashes.
+    /// The header as rskj sends a chain's headers to its peers
+    /// (`BlockHeader.getEncodedCompressed`): every field and all three
+    /// merged-mining fields, with a versioned header's commitment to its
+    /// extension in slot 6 and none of its own fields after `ummRoot`. rskj
+    /// reads a `BlockHeadersResponseMessage`'s headers so
+    /// (`decodeHeader(.., true)`), and a header taken from one is held so here.
+    /// A version-0 header has this one form.
+    pub fn encode_compressed(&self) -> Vec<u8> {
+        self.encoded(HeaderForm::Compressed, true, true)
+    }
+
+    /// The header as this node's store writes it, which [`HeaderForm::Stored`]
+    /// reads back as this header. One with RSKIP-351's fields is in a layout
+    /// of this node's own, marked where rskj's full encoding has a version:
+    /// a versioned one with its version after the mark, then its edges and
+    /// its base event, each an empty list where it has none; one held
+    /// compressed, compressed, with the mark alone. Any other is as rskj
+    /// writes it in full. rskj's full encoding of a versioned header doesn't
+    /// always read back as that header: one of version 0 writes no version,
+    /// and rskj then reads a version from its edges, and a V1 writes no base
+    /// event, so where RSKIP-535 is active rskj counts a field too few.
+    pub fn encode_stored(&self) -> Vec<u8> {
+        self.encoded(HeaderForm::Stored, true, true)
+    }
+
+    /// Decode a header in rskj's full encoding, as blocks carry headers, and
+    /// cache both of its hashes.
     ///
     /// rskj hashes a header as it writes it back from what it read
     /// (`getHash` over `getEncodedForHash`), not as it was sent: a field
@@ -1022,24 +1295,32 @@ impl Header {
     ///
     /// Nor does rskj hash the form it sends. It hashes the compressed form,
     /// which leaves out the merged-mining proof and coinbase (RSKIP-92) and,
-    /// for a versioned (RSKIP-351) header, the version, edges and base event
-    /// that follow `ummRoot` on the wire, whose commitment takes the bloom's
-    /// place in slot 6. Hashing a versioned header as sent gave every
-    /// testnet header from reed810 on a hash no other node agrees with: no
-    /// header named its parent, and the snapshot sync refused every chain it
-    /// was offered.
+    /// for a header of version 1 or 2 (RSKIP-351), the version, edges and
+    /// base event that follow `ummRoot` in its full encoding, whose
+    /// commitment takes the bloom's place in slot 6. Hashing such a header as
+    /// a block carries it gave every testnet header from reed810 on a hash
+    /// no other node agrees with: no header named its parent, and the
+    /// snapshot sync refused every chain it was offered.
     pub fn decode_with_hash(buf: &mut &[u8]) -> alloy_rlp::Result<Self> {
         Self::decode_with_hash_and_activations(buf, crate::config::ActivationHeights::current())
     }
 
-    /// [`Self::decode_with_hash`] under explicit activation heights, which
-    /// decide what a lone item after a V2 version byte is, as they do for
-    /// [`Self::decode_with_activations`].
+    /// [`Self::decode_with_hash`] under explicit activation heights.
     pub fn decode_with_hash_and_activations(
         buf: &mut &[u8],
         activations: &crate::config::ActivationHeights,
     ) -> alloy_rlp::Result<Self> {
-        let mut header = Self::decode_with_activations(buf, activations)?;
+        Self::decode_with_hash_in(buf, activations, HeaderForm::Full)
+    }
+
+    /// [`Self::decode_with_hash`] in `form`, under explicit activation
+    /// heights.
+    pub fn decode_with_hash_in(
+        buf: &mut &[u8],
+        activations: &crate::config::ActivationHeights,
+        form: HeaderForm,
+    ) -> alloy_rlp::Result<Self> {
+        let mut header = Self::decode_in(buf, activations, form)?;
         header.cached_hash = Some(header.hash());
         header.cached_hash_for_merged_mining = Some(header.hash_for_merged_mining());
         Ok(header)
@@ -1056,21 +1337,13 @@ impl Header {
 
         let is_umm_block = self.umm_root.as_ref().is_some_and(|u| !u.is_empty());
 
-        // The same encoder the block hash uses. Encoding difficulty, gas limit
+        // rskj `getBaseHashForMergedMining`: `getEncoded(false, false, true)`,
+        // the same encoder the block hash uses. Encoding difficulty, gas limit
         // and minimum gas price any other way produces a hash no other node
         // agrees with -- and since only a header this node built ever reaches
         // this path, nothing that merely replays the chain would notice.
-        let mut payload = Vec::new();
-        self.encode_base_fields(&mut payload, true);
-        if let Some(umm) = &self.umm_root {
-            umm.encode(&mut payload);
-        }
-
-        let mut out = Vec::new();
-        alloy_rlp::Header { list: true, payload_length: payload.len() }.encode(&mut out);
-        out.extend_from_slice(&payload);
-
-        let base_hash = alloy_primitives::keccak256(&out);
+        let base_hash =
+            alloy_primitives::keccak256(self.encoded(HeaderForm::Compressed, false, false));
 
         if is_umm_block {
             let umm_bytes = self.umm_root.as_ref().unwrap();
@@ -1090,7 +1363,9 @@ mod tests {
     use alloy_primitives::{Address, B256, U256, Bytes, keccak256, b256, address, hex};
     use alloy_rlp::{Decodable, Encodable};
 
-    fn standard_test_header() -> Header {
+    /// A mainnet header from below RSKIPUMM, as the heights `Header::decode`
+    /// reads under say it is: no UMM root.
+    pub(super) fn standard_test_header() -> Header {
         Header {
             parent_hash: B256::repeat_byte(0x11),
             ommers_hash: B256::repeat_byte(0x22),
@@ -1109,7 +1384,7 @@ mod tests {
             paid_fees: U256::from(100),
             minimum_gas_price: U256::from(1),
             uncle_count: 0,
-            umm_root: Some(Bytes::from("umm")),
+            umm_root: None,
             version_fields: None,
             bitcoin_merged_mining_header: Some(Bytes::from("btc_header")),
             bitcoin_merged_mining_merkle_proof: Some(Bytes::from("proof")),
@@ -1140,7 +1415,7 @@ mod tests {
     }
 
     /// The items of an RLP list, each with its own header, as written.
-    fn items_of(encoded: &[u8]) -> Vec<Vec<u8>> {
+    pub(super) fn items_of(encoded: &[u8]) -> Vec<Vec<u8>> {
         let mut buf = encoded;
         let list = alloy_rlp::Header::decode(&mut buf).unwrap();
         assert!(list.list);
@@ -1157,7 +1432,7 @@ mod tests {
     }
 
     /// An RLP list of items already written.
-    fn list_of(items: &[Vec<u8>]) -> Vec<u8> {
+    pub(super) fn list_of(items: &[Vec<u8>]) -> Vec<u8> {
         let payload = items.concat();
         let mut list = Vec::new();
         alloy_rlp::Header {
@@ -1175,12 +1450,16 @@ mod tests {
     #[test]
     fn rskj_reads_no_header_past_a_java_long_or_int() {
         let decodes = |change: &dyn Fn(&mut Header)| {
-            // From RSKIP-98 on, a Bitcoin header of 80 bytes.
+            // From RSKIP-98 on, a Bitcoin header of 80 bytes, and from
+            // RSKIPUMM a UMM root.
             let mut header = Header {
                 bitcoin_merged_mining_header: Some(Bytes::from(vec![0; 80])),
                 ..standard_test_header()
             };
             change(&mut header);
+            header.umm_root = crate::config::ActivationHeights::mainnet()
+                .umm_active(header.number)
+                .then(Bytes::new);
             let mut bytes = Vec::new();
             header.encode(&mut bytes);
             Header::decode(&mut bytes.as_slice()).is_ok()
@@ -1203,11 +1482,7 @@ mod tests {
     #[test]
     fn rskj_reads_the_merged_mining_fields_all_three_or_none() {
         let mut bytes = Vec::new();
-        Header {
-            umm_root: None,
-            ..standard_test_header()
-        }
-        .encode(&mut bytes);
+        standard_test_header().encode(&mut bytes);
         let items = items_of(&bytes);
         assert_eq!(
             items.len(),
@@ -1215,23 +1490,83 @@ mod tests {
             "sixteen fields and three for merged mining"
         );
         // The sixteen fields, then `extra` items from the three.
-        let read = |extra: usize| {
+        let fields = |extra: usize| {
             let mut fields = items[..16].to_vec();
             fields.extend(items[16..].iter().cycle().take(extra).cloned());
-            Header::decode(&mut list_of(&fields).as_slice())
+            list_of(&fields)
         };
+        let read = |extra: usize| Header::decode(&mut fields(extra).as_slice());
         assert!(read(0).is_ok(), "no merged-mining fields");
         assert!(read(1).is_err());
         assert!(read(2).is_err());
         assert!(read(3).is_ok(), "the three merged-mining fields");
-        // Four are a UMM root and the three: which a header may carry is its
-        // height's to say, in `HeaderLayoutRule`.
-        assert!(read(4).is_ok_and(|header| header.umm_root.is_some()));
+        // Four are a UMM root and the three, which rskj reads only from
+        // RSKIPUMM on.
+        assert!(read(4).is_err(), "no UMM root below RSKIPUMM");
+        let umm = crate::config::ActivationHeights {
+            rskip_umm: Some(0),
+            ..crate::config::ActivationHeights::mainnet()
+        };
+        assert!(
+            Header::decode_with_activations(&mut fields(4).as_slice(), &umm)
+                .is_ok_and(|header| header.umm_root.is_some())
+        );
         assert!(read(5).is_err(), "a field after the merged-mining fields");
     }
 
+    /// rskj reads a header's fields by its height (`BlockFactory.canBeDecoded`):
+    /// a UMM root from RSKIPUMM on and only then -- papyrus200 on mainnet and
+    /// testnet, RSKIPUMM's own height where the two part, 1 on regtest -- and
+    /// a version only from RSKIP-351 on, which is none of mainnet and
+    /// testnet's from reed810. A header with any other fields is one rskj
+    /// can't read.
+    #[test]
+    fn a_header_carries_the_fields_rskj_reads_at_its_height() {
+        use crate::config::ActivationHeights;
+        let reads = |heights: &ActivationHeights, number: u64, umm: bool, version: Option<u8>| {
+            let header = Header {
+                number,
+                umm_root: umm.then(Bytes::new),
+                version_fields: version.map(|version| HeaderVersionFields {
+                    version,
+                    edges: Some(Vec::new()),
+                    base_event: None,
+                }),
+                bitcoin_merged_mining_header: Some(Bytes::from(vec![0; 80])),
+                ..standard_test_header()
+            };
+            let mut bytes = Vec::new();
+            header.encode(&mut bytes);
+            Header::decode_with_activations(&mut bytes.as_slice(), heights).is_ok()
+        };
+        let mainnet = ActivationHeights::mainnet();
+        let papyrus = mainnet.papyrus200;
+        assert!(reads(&mainnet, papyrus - 1, false, None));
+        assert!(!reads(&mainnet, papyrus - 1, true, None));
+        assert!(reads(&mainnet, papyrus, true, None));
+        assert!(!reads(&mainnet, papyrus, false, None));
+        let apart = ActivationHeights {
+            rskip_umm: Some(papyrus + 10),
+            ..mainnet.clone()
+        };
+        assert!(reads(&apart, papyrus, false, None));
+        assert!(!reads(&apart, papyrus + 10, false, None));
+        assert!(reads(&apart, papyrus + 10, true, None));
+        let regtest = ActivationHeights::regtest();
+        assert!(reads(&regtest, 0, false, None));
+        assert!(!reads(&regtest, 0, true, None));
+        // A version where RSKIP-351 is inactive, as on all of mainnet, is a
+        // field too many.
+        assert!(!reads(&mainnet, 9_400_000, true, Some(1)));
+        let testnet = ActivationHeights::testnet();
+        let reed810 = 7_139_600;
+        assert!(!reads(&testnet, reed810 - 1, true, Some(1)));
+        assert!(reads(&testnet, reed810, true, Some(1)));
+        assert!(!reads(&testnet, reed810, true, None));
+    }
+
     /// An RLP string, as rskj's `RLP.encodeElement` writes one.
-    fn element(bytes: &[u8]) -> Vec<u8> {
+    pub(super) fn element(bytes: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
         bytes.encode(&mut out);
         out
@@ -1528,10 +1863,10 @@ mod tests {
         assert!(header.has_logs_bloom(&header.logs_bloom));
     }
 
-    /// Only where RSKIP-351 is active does slot 6 of a header without its
-    /// version, as one sent compressed, hold the commitment to its extension.
-    /// Before it, rskj reads the same bytes as the bloom. Either way they go
-    /// back as they came, and hash the same.
+    /// Only where RSKIP-351 is active does slot 6 of a header read compressed
+    /// hold the commitment to its extension. Before it, rskj reads the same
+    /// bytes as the bloom, and has one encoding. Either way they go back as
+    /// they came, and hash the same.
     #[test]
     fn a_commitment_in_the_blooms_slot_is_one_only_from_rskip351() {
         use crate::config::ActivationHeights;
@@ -1539,8 +1874,8 @@ mod tests {
         let mut items = standard_items();
         items[6] = element(&commitment);
         let bytes = list_of(&items);
-        let read = |activations: &ActivationHeights| {
-            Header::decode_with_hash_and_activations(&mut bytes.as_slice(), activations).unwrap()
+        let read = |activations: &ActivationHeights, form| {
+            Header::decode_with_hash_in(&mut bytes.as_slice(), activations, form)
         };
         // Mainnet's heights, and the same with RSKIP-351 from block 1, as
         // rskj's regtest has it. The header is #42.
@@ -1550,13 +1885,16 @@ mod tests {
             ..ActivationHeights::mainnet()
         };
 
-        let bloom = read(&before);
+        let bloom = read(&before, HeaderForm::Compressed).unwrap();
+        assert_eq!(read(&before, HeaderForm::Full).unwrap(), bloom);
         assert_eq!(bloom.extension_data, None);
         assert_eq!(
             bloom.kept().unwrap().logs_bloom,
             Some(Bytes::from(commitment.clone()))
         );
-        let committed = read(&from);
+        // In full, from RSKIP-351 on, the header lacks its version.
+        assert!(read(&from, HeaderForm::Full).is_err());
+        let committed = read(&from, HeaderForm::Compressed).unwrap();
         assert_eq!(
             committed.extension_data,
             Some(Bytes::from(element(&commitment)))
@@ -1612,15 +1950,14 @@ mod tests {
         let mut again = Vec::new();
         decoded.encode(&mut again);
         assert_eq!(again, bytes, "written back as it came");
-        // Hashed compressed: the commitment in slot 6, and no version after
-        // the UMM root.
+        // Hashed compressed: the commitment in slot 6, and no version.
         let extension = BlockHeaderExtension::V1 {
             logs_bloom: shaped,
             edges: None,
         };
         let mut hashed = items.clone();
         hashed[6] = element(&extension.create_extension_data());
-        hashed.remove(17);
+        hashed.remove(16);
         assert_eq!(decoded.hash(), keccak256(list_of(&hashed)));
     }
 
@@ -1746,7 +2083,7 @@ mod tests {
     #[test]
     fn three_empty_merged_mining_fields_are_none() {
         let mut items = standard_items();
-        items.truncate(17);
+        items.truncate(16);
         let none = list_of(&items);
         items.extend([element(&[]), element(&[]), element(&[])]);
         let decoded = Header::decode_with_hash(&mut list_of(&items).as_slice()).unwrap();
@@ -2180,7 +2517,11 @@ mod tests {
 
         // The network's decoder reaches it from the bytes as sent, edges and
         // all, and the merged-mining hash the coinbase commits to.
-        let decoded = Header::decode_with_hash(&mut raw.as_slice()).unwrap();
+        let decoded = Header::decode_with_hash_and_activations(
+            &mut raw.as_slice(),
+            &crate::config::ActivationHeights::testnet(),
+        )
+        .unwrap();
         assert_eq!(decoded.hash(), alloy_primitives::keccak256(&buf));
         let coinbase = decoded
             .bitcoin_merged_mining_coinbase_transaction
@@ -2334,13 +2675,13 @@ mod versioned_wire_header_tests {
         assert_eq!(wire(&full), hex(V2_FULL));
         // Read back as rskj's peers send it: the same hashes, and held
         // compressed, no other form.
-        let read = from_the_network(V2_COMPRESSED);
+        let read = from_peers(V2_COMPRESSED);
         assert_eq!(read.hash(), hash);
         assert_eq!(read.hash_for_merged_mining(), full.hash_for_merged_mining());
         assert_eq!(read.encode_compressed(), hex(V2_COMPRESSED));
         assert_eq!(wire(&read), hex(V2_COMPRESSED));
         // So for one that rskj's peers sent.
-        let peers = from_the_network(V2_FROM_PEERS);
+        let peers = from_peers(V2_FROM_PEERS);
         let peers_hash: B256 = "0xf343f40fdd2152318c13fda9abdc80bb5e8a57a9166e831dfbdfb448f7821bef"
             .parse()
             .unwrap();
@@ -2373,8 +2714,7 @@ mod versioned_wire_header_tests {
             let extension = full
                 .extension()
                 .expect("a versioned header's own extension");
-            let compressed =
-                from_the_network(&alloy_primitives::hex::encode(full.encode_compressed()));
+            let compressed = from_peers(&alloy_primitives::hex::encode(full.encode_compressed()));
             assert!(compressed.extension_data.is_some());
             assert_eq!(compressed.extension(), None, "only the commitment");
             let mut both = compressed.clone();
@@ -2445,7 +2785,7 @@ mod versioned_wire_header_tests {
             edges: None,
             base_event: Some(Vec::new()),
         };
-        let mut committed = from_the_network(V2_COMPRESSED);
+        let mut committed = from_peers(V2_COMPRESSED);
         let mut slot = Vec::new();
         short.create_extension_data().as_slice().encode(&mut slot);
         committed.extension_data = Some(Bytes::from(slot));
@@ -2511,14 +2851,14 @@ mod versioned_wire_header_tests {
         );
     }
 
-    /// The store re-encodes every header it writes, so anything the wire form
-    /// cannot round-trip is lost from the database rather than from a single
-    /// message. The first attempt at this encoded the edges with `Vec<u8>`,
-    /// which alloy emits as a list of single bytes, and the result would not
-    /// decode at all.
+    /// A header goes back out as rskj wrote it, and into the store in this
+    /// node's own layout, and either reads back as the same header. The first
+    /// attempt at this encoded the edges with `Vec<u8>`, which alloy emits as
+    /// a list of single bytes, and the result would not decode at all.
     #[test]
     fn a_versioned_header_survives_being_re_encoded() {
-        for wire in [V1_WIRE, V2_WIRE] {
+        let testnet = crate::config::ActivationHeights::testnet();
+        for wire in [V1_WIRE, V2_WIRE, V2_FULL] {
             let original = decode(wire);
             let mut buf = Vec::new();
             original.encode(&mut buf);
@@ -2527,17 +2867,13 @@ mod versioned_wire_header_tests {
                 wire,
                 "re-encoding must reproduce rskj's own bytes"
             );
-
-            let mut slice = buf.as_slice();
-            let mut again = Header::decode(&mut slice).unwrap();
-            again.cached_hash = None;
-            assert_eq!(again.hash(), original.hash());
-            assert_eq!(again.version_fields, original.version_fields);
-            assert_eq!(again.logs_bloom, original.logs_bloom);
-            assert_eq!(
-                again.bitcoin_merged_mining_header,
-                original.bitcoin_merged_mining_header
-            );
+            for (bytes, form) in [
+                (buf, HeaderForm::Full),
+                (original.encode_stored(), HeaderForm::Stored),
+            ] {
+                let again = Header::decode_in(&mut bytes.as_slice(), &testnet, form).unwrap();
+                assert_eq!(again, original, "{form:?}");
+            }
         }
     }
 
@@ -2627,7 +2963,11 @@ mod versioned_wire_header_tests {
         let v = h.version_fields.as_ref().unwrap();
         assert_eq!(v.version, 2);
         assert_eq!(v.edges.as_deref(), Some(&[][..]), "the edges field is present and empty");
-        assert_eq!(v.base_event, None, "no base event element on the wire");
+        assert_eq!(
+            v.base_event,
+            Some(Bytes::new()),
+            "no base event element on the wire, and rskj gives it an empty one"
+        );
         assert_eq!(
             h.hash(),
             "0x119296ea9d8d7efa82550bfb447ae9441ea75f9537f47917f1ca38e0b8982c05"
@@ -2636,46 +2976,62 @@ mod versioned_wire_header_tests {
         );
     }
 
-    /// And the short form must round-trip as the short form: re-emitting an
-    /// empty base event would add an element rskj never wrote.
+    /// rskj gives the short form an empty base event and writes that back:
+    /// the header goes out one element longer, as rskj's nodes send it, and
+    /// reads back as the same header, with the same hash.
     #[test]
-    fn the_short_v2_form_is_re_encoded_as_the_short_form() {
+    fn the_short_v2_form_goes_back_out_as_rskj_writes_it() {
+        use super::tests::{items_of, list_of};
         let original = decode(V2_SHORT_WIRE);
+        let mut items = items_of(&alloy_primitives::hex::decode(V2_SHORT_WIRE).unwrap());
+        assert_eq!(
+            (items.len(), &items[18][..]),
+            (22, &[0x80][..]),
+            "empty edges, then mining"
+        );
+        items.insert(19, vec![0x80]);
         let mut buf = Vec::new();
         original.encode(&mut buf);
-        assert_eq!(alloy_primitives::hex::encode(&buf), V2_SHORT_WIRE);
+        assert_eq!(buf, list_of(&items));
+        let testnet = crate::config::ActivationHeights::testnet();
+        let again = Header::decode_with_activations(&mut buf.as_slice(), &testnet).unwrap();
+        assert_eq!(again, original);
     }
 
-    /// The schedule perf-lab's mainnet seed runs under puts RSKIP-144 at
-    /// #9,002,504. Above it, a V2 header with one trailing item carries
-    /// edges (rskj in the base-event recovery window); under mainnet's own
-    /// schedule the same bytes carry a base event. The override reaches the
-    /// decoder through `rskip144`, the way regtest's does.
+    /// The schedule perf-lab's mainnet seed runs under puts reed810, and with
+    /// it RSKIP-144 and RSKIP-351, at #9,002,504. The override reaches the
+    /// decoder: above it a header carries its version and edges, as rskj
+    /// reads one there, and under mainnet's own heights, with neither
+    /// active, rskj reads no such header.
     #[test]
-    fn a_reed810_override_turns_a_lone_trailing_item_into_edges() {
+    fn a_reed810_override_moves_where_headers_carry_their_version() {
         let mut h = decode(V2_SHORT_WIRE);
         h.number = 9_003_580;
-        h.cached_hash = None;
-        let v = h.version_fields.as_mut().unwrap();
-        assert_eq!((v.version, v.base_event.as_ref()), (2, None));
-        v.edges = Some(vec![]);
+        // Mainnet has no RSKIP-535, so no base event.
+        h.version_fields.as_mut().unwrap().base_event = None;
         let mut buf = Vec::new();
         h.encode(&mut buf);
 
         let mut seed = crate::config::ActivationHeights::mainnet();
         seed.set_rskj_hardfork("reed810", Some(9_002_504));
-        assert_eq!(seed.rskip144, Some(9_002_504));
+        assert_eq!(
+            (seed.rskip144, seed.rskip351),
+            (Some(9_002_504), Some(9_002_504))
+        );
         let under_seed = Header::decode_with_activations(&mut buf.as_slice(), &seed).unwrap();
-        let v = under_seed.version_fields.as_ref().unwrap();
-        assert_eq!(v.edges.as_deref(), Some(&[][..]));
-        assert_eq!(v.base_event, None);
+        assert_eq!(under_seed, h);
+        assert_eq!(
+            under_seed.version_fields,
+            Some(HeaderVersionFields {
+                version: 2,
+                edges: Some(vec![]),
+                base_event: None
+            })
+        );
 
         let mainnet = crate::config::ActivationHeights::mainnet();
-        assert_eq!(mainnet.rskip144, None);
-        let under_mainnet = Header::decode_with_activations(&mut buf.as_slice(), &mainnet).unwrap();
-        let v = under_mainnet.version_fields.as_ref().unwrap();
-        assert_eq!(v.edges, None);
-        assert_eq!(v.base_event.as_ref().map(|b| b.len()), Some(0));
+        assert_eq!((mainnet.rskip144, mainnet.rskip351), (None, None));
+        assert!(Header::decode_with_activations(&mut buf.as_slice(), &mainnet).is_err());
     }
 
     /// A version-0 header must stay untouched by any of this: mainnet is
@@ -2693,15 +3049,27 @@ mod versioned_wire_header_tests {
         assert_eq!(again.version_fields, None);
     }
 
-    /// A header decoded as the network decodes one: `decode_with_hash`, over
-    /// the whole of `hex`, under testnet's heights, whose headers these are.
-    fn from_the_network(hex: &str) -> Header {
+    /// A header decoded as the network decodes one in `form`:
+    /// `decode_with_hash_in`, over the whole of `hex`, under testnet's
+    /// heights, whose headers these are.
+    fn from_the_network_in(hex: &str, form: HeaderForm) -> Header {
         let bytes = alloy_primitives::hex::decode(hex).unwrap();
         let mut rest = bytes.as_slice();
         let testnet = crate::config::ActivationHeights::testnet();
-        let h = Header::decode_with_hash_and_activations(&mut rest, &testnet).unwrap();
+        let h = Header::decode_with_hash_in(&mut rest, &testnet, form).unwrap();
         assert!(rest.is_empty(), "bytes after the header");
         h
+    }
+
+    /// A header as blocks carry one: in full.
+    fn from_the_network(hex: &str) -> Header {
+        from_the_network_in(hex, HeaderForm::Full)
+    }
+
+    /// A header as rskj's peers send a chain's headers
+    /// (`BlockHeadersResponse`): compressed.
+    fn from_peers(hex: &str) -> Header {
+        from_the_network_in(hex, HeaderForm::Compressed)
     }
 
     /// What the miner committed to in the coinbase after `RSKBLOCK:`: the
@@ -2751,13 +3119,17 @@ mod versioned_wire_header_tests {
         }
     }
 
-    /// Every layout the decoder reads, built here and read back as the
-    /// network reads it: what `decode_with_hash` caches from the items sent
-    /// is what this node derives by encoding. The captured headers above tie
-    /// both paths to rskj; this ties down where `ummRoot`, a versioned
-    /// header's own fields and the mining fields sit, across layouts no
-    /// captured header has: a UMM root, edges, a base event, no mining
-    /// fields, a header from before RSKIP-92.
+    /// Every layout the decoder reads, built here and read back under the
+    /// heights where rskj reads it, in rskj's full encoding and in the
+    /// store's own: each reads back as the header it was, so what
+    /// `decode_with_hash` caches is what this node derives by encoding. The
+    /// captured headers above tie both to rskj; this ties down where
+    /// `ummRoot`, a versioned header's own fields and the mining fields sit,
+    /// across layouts no captured header has: a UMM root or none, edges, a
+    /// base event, a version-0 header from RSKIP-351 on, no mining fields, a
+    /// header from before RSKIP-92. rskj can't read a version-0 header's
+    /// full encoding back (`a_version_0_header_from_rskip351_is_rskjs_v0`),
+    /// so that one goes through the store's form alone.
     #[test]
     fn every_layout_caches_the_hashes_it_would_encode_to() {
         let real = decode(V1_WIRE);
@@ -2769,40 +3141,37 @@ mod versioned_wire_header_tests {
                 base_event,
             })
         };
-        // RSKIP-144 decides what a lone item after a V2 version byte is: the
-        // edges where it is active, the base event where it is not. Each
-        // layout is read under heights that make it one rskj reads.
-        let with_144 = crate::config::ActivationHeights {
-            rskip144: Some(0),
-            ..crate::config::ActivationHeights::testnet()
-        };
-        let without_144 = crate::config::ActivationHeights {
-            rskip144: None,
-            ..crate::config::ActivationHeights::testnet()
-        };
+        let base_event = || Some(Bytes::from_static(b"base event"));
         let versions = [
-            (None, &with_144),
-            (fields(1, None, None), &with_144),
-            (fields(1, Some(vec![1, 3]), None), &with_144),
-            (fields(2, Some(vec![]), Some(Bytes::new())), &with_144),
-            (fields(2, Some(vec![2]), None), &with_144),
-            (fields(2, Some(vec![2]), Some(Bytes::from_static(b"base event"))), &with_144),
-            (fields(2, None, Some(Bytes::from_static(b"base event"))), &without_144),
+            None,
+            fields(0, None, None),
+            fields(0, Some(vec![1, 3]), base_event()),
+            fields(1, None, None),
+            fields(1, Some(vec![1, 3]), None),
+            fields(2, None, None),
+            fields(2, Some(vec![]), Some(Bytes::new())),
+            fields(2, Some(vec![2]), None),
+            fields(2, Some(vec![2]), base_event()),
+            fields(2, None, base_event()),
         ];
         let mut layouts = 0;
         for number in [100, real.number] {
             for umm_root in &umm {
-                for (version_fields, activations) in &versions {
+                for version_fields in &versions {
+                    let has = |field: fn(&HeaderVersionFields) -> bool| {
+                        version_fields.as_ref().is_some_and(field)
+                    };
+                    // Each field from the height its RSKIP is active.
+                    let from = |active: bool| active.then_some(0);
+                    let heights = crate::config::ActivationHeights {
+                        rskip_umm: from(umm_root.is_some()),
+                        rskip351: from(version_fields.is_some()),
+                        rskip144: from(has(|v| v.edges.is_some())),
+                        rskip535: from(has(|v| v.base_event.is_some())),
+                        base_event_recovery_below: None,
+                        ..crate::config::ActivationHeights::testnet()
+                    };
                     for mining in [true, false] {
-                        // The decoder tells `ummRoot` from the mining fields
-                        // by count, so it reads one only beside them, and
-                        // the version fields only after one.
-                        if (umm_root.is_some() || version_fields.is_some()) && !mining {
-                            continue;
-                        }
-                        if version_fields.is_some() && umm_root.is_none() {
-                            continue;
-                        }
                         let mut header = Header {
                             number,
                             umm_root: umm_root.clone(),
@@ -2814,30 +3183,36 @@ mod versioned_wire_header_tests {
                             header.bitcoin_merged_mining_merkle_proof = None;
                             header.bitcoin_merged_mining_coinbase_transaction = None;
                         }
-                        let mut wire = Vec::new();
-                        header.encode(&mut wire);
-                        assert_eq!(
-                            Header::decode_with_activations(&mut wire.as_slice(), activations).unwrap(),
-                            header,
-                            "the layout reads back"
-                        );
-                        let cached =
-                            Header::decode_with_hash_and_activations(&mut wire.as_slice(), activations)
-                                .unwrap();
-                        assert_eq!(cached.cached_hash, Some(header.hash()), "{header:?}");
-                        assert_eq!(
-                            cached.cached_hash_for_merged_mining,
-                            Some(header.hash_for_merged_mining()),
-                            "{header:?}"
-                        );
+                        let mut full = Vec::new();
+                        header.encode(&mut full);
+                        let forms = [
+                            (full, HeaderForm::Full),
+                            (header.encode_stored(), HeaderForm::Stored),
+                        ];
+                        let readable = if has(|v| v.version == 0) {
+                            &forms[1..]
+                        } else {
+                            &forms[..]
+                        };
+                        for (bytes, form) in readable {
+                            let read = Header::decode_in(&mut bytes.as_slice(), &heights, *form);
+                            assert_eq!(read.unwrap(), header, "{form:?}");
+                            let cached =
+                                Header::decode_with_hash_in(&mut bytes.as_slice(), &heights, *form)
+                                    .unwrap();
+                            assert_eq!(cached.cached_hash, Some(header.hash()), "{header:?}");
+                            assert_eq!(
+                                cached.cached_hash_for_merged_mining,
+                                Some(header.hash_for_merged_mining()),
+                                "{header:?}"
+                            );
+                        }
                         layouts += 1;
                     }
                 }
             }
         }
-        // Per height: four version-0 layouts, and six versioned ones on
-        // each of two UMM roots.
-        assert_eq!(layouts, 2 * (4 + 6 * 2));
+        assert_eq!(layouts, 2 * 3 * 10 * 2);
     }
 
     /// No variation on a versioned header's bytes, as testnet's peers send
@@ -2855,7 +3230,7 @@ mod versioned_wire_header_tests {
             V2_SHORT_WIRE,
             RSKJ_REGTEST_V2_FULL,
         ];
-        let compressed = from_the_network(V2_COMPRESSED);
+        let compressed = from_peers(V2_COMPRESSED);
         for (i, seed) in seeds.iter().enumerate() {
             let seed = alloy_primitives::hex::decode(seed).unwrap();
             crate::mutate::decode_and_check_header(&seed);
@@ -2878,5 +3253,356 @@ mod versioned_wire_header_tests {
                 }
             }
         }
+    }
+
+    /// From RSKIP-351 on, rskj reads a version other than 1 or 2 as a
+    /// `BlockHeaderV0`'s: the bloom in slot 6, and the edges and base event
+    /// read, hashed and written in either encoding with no version. Its full
+    /// encoding is then one rskj can't read back, a field short, so the store
+    /// keeps it in its own layout.
+    #[test]
+    fn a_version_0_header_from_rskip351_is_rskjs_v0() {
+        use super::tests::{items_of, list_of};
+        let testnet = crate::config::ActivationHeights::testnet();
+        let full = from_the_network(V2_FULL);
+        let v2 = full.version_fields.clone().unwrap();
+        let items = items_of(&alloy_primitives::hex::decode(V2_FULL).unwrap());
+        assert_eq!((items.len(), &items[17][..]), (23, &[0x02][..]));
+        for version in [vec![0x00], vec![0x03], vec![0x81, 0xff]] {
+            let mut sent = items.clone();
+            sent[17] = version;
+            let bytes = list_of(&sent);
+            let v0 = Header::decode_with_activations(&mut bytes.as_slice(), &testnet).unwrap();
+            assert_eq!(
+                v0.version_fields,
+                Some(HeaderVersionFields {
+                    version: 0,
+                    ..v2.clone()
+                })
+            );
+            assert_eq!(v0.logs_bloom, full.logs_bloom);
+            // Either encoding: the fields as sent, but for the version.
+            let mut written = sent;
+            written.remove(17);
+            let mut out = Vec::new();
+            v0.encode(&mut out);
+            assert_eq!(out, list_of(&written));
+            assert_eq!(v0.encode_compressed(), out);
+            // Hashed compressed, without the merged-mining proof and coinbase.
+            written.truncate(written.len() - 2);
+            assert_eq!(v0.hash(), alloy_primitives::keccak256(list_of(&written)));
+            assert!(Header::decode_with_activations(&mut out.as_slice(), &testnet).is_err());
+            let stored = v0.encode_stored();
+            let again = Header::decode_in(&mut stored.as_slice(), &testnet, HeaderForm::Stored);
+            assert_eq!(again.unwrap(), v0);
+        }
+    }
+
+    /// rskj reads a base event wherever RSKIP-535 is active, and a V1 drops
+    /// the one it read: it hashes and writes none. Its full encoding is then
+    /// a field short of what rskj reads there, so the store keeps it in its
+    /// own layout.
+    #[test]
+    fn a_v1_header_drops_the_base_event_rskj_reads() {
+        use super::tests::{element, items_of, list_of};
+        let with_535 = crate::config::ActivationHeights {
+            rskip535: Some(0),
+            base_event_recovery_below: None,
+            ..crate::config::ActivationHeights::testnet()
+        };
+        let wire = alloy_primitives::hex::decode(V1_WIRE).unwrap();
+        let mut items = items_of(&wire);
+        let mining = items.len() - 3;
+        items.insert(mining, element(b"base event"));
+        let read =
+            Header::decode_with_activations(&mut list_of(&items).as_slice(), &with_535).unwrap();
+        assert_eq!(read, decode(V1_WIRE));
+        let mut out = Vec::new();
+        read.encode(&mut out);
+        assert_eq!(out, wire);
+        assert!(Header::decode_with_activations(&mut out.as_slice(), &with_535).is_err());
+        let stored = read.encode_stored();
+        let again = Header::decode_in(&mut stored.as_slice(), &with_535, HeaderForm::Stored);
+        assert_eq!(again.unwrap(), read);
+    }
+
+    /// rskj takes the version of a header read compressed from slot 6: the
+    /// first byte of the first item of the one list there
+    /// (`RLP.decodeList(extensionData).get(0).getRLPData()[0]`). Where that
+    /// finds no byte, it can't read the header. A version other than 1 or 2
+    /// is a `BlockHeaderV0`'s, which holds slot 6 as its bloom.
+    #[test]
+    fn a_compressed_headers_version_is_the_first_byte_slot_6_names() {
+        use super::tests::{element, items_of, list_of};
+        let testnet = crate::config::ActivationHeights::testnet();
+        let items = items_of(&alloy_primitives::hex::decode(V2_COMPRESSED).unwrap());
+        let with = |slot6: &[u8]| {
+            let mut sent = items.clone();
+            sent[6] = element(slot6);
+            list_of(&sent)
+        };
+        let read = |slot6: &[u8]| {
+            Header::decode_in(
+                &mut with(slot6).as_slice(),
+                &testnet,
+                HeaderForm::Compressed,
+            )
+        };
+        for (slot6, what) in [
+            (&[][..], "none"),
+            (&[0; 256][..], "a bloom"),
+            (&[0x02][..], "no list"),
+            (&[0xc0][..], "an empty list"),
+            (&[0xc1, 0x80][..], "a list whose first item is none"),
+            (&[0xc1, 0x02, 0xc0][..], "a list, then more"),
+            (&[0xc2, 0x02][..], "a list cut short"),
+        ] {
+            assert!(read(slot6).is_err(), "{what}");
+        }
+        // Version 2, the first byte of a longer item.
+        let longer = read(&[0xc3, 0x82, 0x02, 0x99]).unwrap();
+        assert!(longer.extension_data.is_some() && longer.version_fields.is_none());
+        // Version 2, the first item's, of two.
+        let first = read(&[0xc2, 0x02, 0x03]).unwrap();
+        assert!(first.extension_data.is_some() && first.version_fields.is_none());
+        // Any other version is a V0's.
+        let v0 = read(&[0xc1, 0x03]).unwrap();
+        assert_eq!(v0.extension_data, None);
+        assert_eq!(
+            v0.version_fields,
+            Some(HeaderVersionFields {
+                version: 0,
+                edges: None,
+                base_event: None
+            })
+        );
+        assert_eq!(
+            v0.kept().unwrap().logs_bloom,
+            Some(Bytes::from_static(&[0xc1, 0x03]))
+        );
+        assert_eq!(v0.encode_compressed(), with(&[0xc1, 0x03]));
+    }
+
+    /// rskj counts a header's fields exactly at its height (`canBeDecoded`),
+    /// in either encoding. On testnet below #7,800,000 it also reads a full
+    /// header one field short, and gives it an empty base event
+    /// (`isInBaseEventRecoveryWindow`); never a compressed one.
+    #[test]
+    fn rskj_counts_a_headers_fields_at_its_height() {
+        use super::tests::{element, items_of, list_of};
+        let testnet = crate::config::ActivationHeights::testnet();
+        let read = |items: &[Vec<u8>], form| {
+            Header::decode_in(&mut list_of(items).as_slice(), &testnet, form)
+        };
+        let at = |items: &[Vec<u8>], number: u64| {
+            let mut items = items.to_vec();
+            items[8] = element(&number.to_be_bytes()[number.leading_zeros() as usize / 8..]);
+            items
+        };
+        // The short form, a field short, to the window's end.
+        let short = items_of(&alloy_primitives::hex::decode(V2_SHORT_WIRE).unwrap());
+        assert!(read(&at(&short, 7_799_999), HeaderForm::Full).is_ok());
+        assert!(read(&at(&short, 7_800_000), HeaderForm::Full).is_err());
+        let mut two_short = short.clone();
+        two_short.remove(18);
+        assert!(read(&two_short, HeaderForm::Full).is_err());
+        let mut whole = short.clone();
+        whole.insert(19, element(&[]));
+        assert!(read(&at(&whole, 7_800_000), HeaderForm::Full).is_ok());
+        whole.insert(19, element(&[]));
+        assert!(read(&whole, HeaderForm::Full).is_err(), "a field over");
+        // A compressed header is counted exactly, in the window too.
+        let compressed = items_of(&alloy_primitives::hex::decode(V2_COMPRESSED).unwrap());
+        let compressed = at(&compressed, 7_610_038);
+        assert!(read(&compressed, HeaderForm::Compressed).is_ok());
+        let mut without_umm = compressed.clone();
+        without_umm.remove(16);
+        assert!(read(&without_umm, HeaderForm::Compressed).is_err());
+    }
+
+    /// rskj hashes a V1's or a V2's bloom into its extension's hash, and
+    /// throws on none. A `BlockHeaderV0` has no extension, and takes none as
+    /// its bloom.
+    #[test]
+    fn a_versioned_header_needs_a_bloom_but_a_v0_does_not() {
+        use super::tests::{element, items_of, list_of};
+        let testnet = crate::config::ActivationHeights::testnet();
+        let read = |items: &[Vec<u8>]| {
+            Header::decode_with_activations(&mut list_of(items).as_slice(), &testnet)
+        };
+        let mut items = items_of(&alloy_primitives::hex::decode(V2_FULL).unwrap());
+        items[6] = element(&[]);
+        assert!(read(&items).is_err(), "a V2");
+        items[17] = element(&[1]);
+        assert!(read(&items).is_err(), "a V1");
+        items[17] = element(&[0]);
+        let v0 = read(&items).unwrap();
+        assert_eq!(v0.kept().unwrap().logs_bloom, Some(Bytes::new()));
+    }
+
+    /// The store's own form reads back every header as it was held. One held
+    /// compressed is marked as one, so even a Bitcoin header of one byte,
+    /// which rskj's full encoding would have as a version, reads back as the
+    /// merged-mining field it is. What the store wrote before it had this
+    /// layout reads back too: rskj's full encoding, and a header held
+    /// compressed, unmarked.
+    #[test]
+    fn the_store_reads_back_every_header_as_it_was_held() {
+        use super::tests::{element, items_of, list_of};
+        use crate::config::ActivationHeights;
+        let read = |bytes: &[u8], activations: &ActivationHeights, form| {
+            Header::decode_in(&mut &bytes[..], activations, form).unwrap()
+        };
+        let testnet = ActivationHeights::testnet();
+        for hex in [V2_COMPRESSED, V2_FROM_PEERS] {
+            let bytes = alloy_primitives::hex::decode(hex).unwrap();
+            let held = read(&bytes, &testnet, HeaderForm::Compressed);
+            assert!(held.extension_data.is_some());
+            assert_eq!(
+                read(&held.encode_stored(), &testnet, HeaderForm::Stored),
+                held
+            );
+            assert_eq!(read(&bytes, &testnet, HeaderForm::Stored), held, "unmarked");
+        }
+        for hex in [V1_WIRE, V2_WIRE, V2_FULL, V2_SHORT_WIRE] {
+            let header = decode(hex);
+            assert_eq!(
+                read(&header.encode_stored(), &testnet, HeaderForm::Stored),
+                header
+            );
+            let full = alloy_primitives::hex::decode(hex).unwrap();
+            assert_eq!(read(&full, &testnet, HeaderForm::Stored), header, "in full");
+        }
+        // Where no rule holds a Bitcoin header to 80 bytes.
+        let anywhere = ActivationHeights {
+            orchid: u64::MAX,
+            ..ActivationHeights::testnet()
+        };
+        let mut items = items_of(&alloy_primitives::hex::decode(V2_COMPRESSED).unwrap());
+        items[17] = element(&[0x07]);
+        let bytes = list_of(&items);
+        let held = read(&bytes, &anywhere, HeaderForm::Compressed);
+        assert_eq!(
+            read(&held.encode_stored(), &anywhere, HeaderForm::Stored),
+            held
+        );
+        // Unmarked, as the store wrote one before, it reads as rskj's full
+        // encoding would have it: with a version.
+        assert_ne!(read(&bytes, &anywhere, HeaderForm::Stored), held);
+        // Before RSKIP-351 a header is as rskj writes it in full, even one
+        // whose Bitcoin header is the mark.
+        let early = Header {
+            bitcoin_merged_mining_header: Some(Bytes::from(vec![STORED_LAYOUT])),
+            ..super::tests::standard_test_header()
+        };
+        let mainnet = ActivationHeights {
+            orchid: u64::MAX,
+            ..ActivationHeights::mainnet()
+        };
+        assert_eq!(
+            read(&early.encode_stored(), &mainnet, HeaderForm::Stored),
+            early
+        );
+    }
+
+    /// Rustock nodes send each other trunk headers in the store's layout, so
+    /// it reads only what rskj reads a header with at its height: in full,
+    /// the edges where RSKIP-144 is active and a base event where RSKIP-535
+    /// is, which a V1 ignores; compressed, a V0 with neither, whose slot 6
+    /// names its version. A header with other fields is one rskj can't read,
+    /// and so can't take.
+    #[test]
+    fn the_stored_layout_holds_only_what_rskj_reads_at_a_height() {
+        use super::tests::{element, items_of, list_of};
+        use crate::config::ActivationHeights;
+        let testnet = ActivationHeights::testnet();
+        let stored = |header: &Header, heights: &ActivationHeights| {
+            let bytes = header.encode_stored();
+            Header::decode_in(&mut bytes.as_slice(), heights, HeaderForm::Stored)
+        };
+        // Testnet's #8,260,761, with RSKIP-144's edges and RSKIP-535's base
+        // event.
+        let v2 = decode(V2_FULL);
+        let fields = v2.version_fields.clone().unwrap();
+        let (edges, base_event) = (fields.edges, fields.base_event);
+        assert!(edges.is_some() && base_event.is_some());
+        let with = |version: u8, edges: &Option<Vec<i16>>, base_event: &Option<Bytes>| Header {
+            version_fields: Some(HeaderVersionFields {
+                version,
+                edges: edges.clone(),
+                base_event: base_event.clone(),
+            }),
+            ..v2.clone()
+        };
+        for version in [0, 2] {
+            let header = with(version, &edges, &base_event);
+            assert_eq!(stored(&header, &testnet).unwrap(), header);
+            assert!(
+                stored(&with(version, &None, &base_event), &testnet).is_err(),
+                "no edges"
+            );
+            assert!(
+                stored(&with(version, &edges, &None), &testnet).is_err(),
+                "no base event"
+            );
+            // Before RSKIP-535, a base event is a field too many.
+            let before = ActivationHeights {
+                rskip535: None,
+                ..testnet.clone()
+            };
+            assert!(stored(&header, &before).is_err());
+            assert!(stored(&with(version, &edges, &None), &before).is_ok());
+        }
+        assert!(stored(&with(1, &edges, &None), &testnet).is_ok());
+        assert!(
+            stored(&with(1, &edges, &base_event), &testnet).is_err(),
+            "a V1's base event"
+        );
+        assert!(
+            stored(&with(1, &None, &None), &testnet).is_err(),
+            "no edges"
+        );
+        // A V0 with neither field reads only as rskj reads one compressed:
+        // where slot 6 names its version, which a bloom of 256 bytes doesn't.
+        assert!(stored(&with(0, &None, &None), &testnet).is_err());
+        let mut items = items_of(&alloy_primitives::hex::decode(V2_COMPRESSED).unwrap());
+        items[6] = element(&[0xc1, 0x03]);
+        let compressed = Header::decode_in(
+            &mut list_of(&items).as_slice(),
+            &testnet,
+            HeaderForm::Compressed,
+        )
+        .unwrap();
+        assert_eq!(
+            compressed.version_fields,
+            Some(HeaderVersionFields {
+                version: 0,
+                edges: None,
+                base_event: None
+            })
+        );
+        assert_eq!(stored(&compressed, &testnet).unwrap(), compressed);
+        // But not one whose slot 6 names version 1 or 2, which rskj reads
+        // as held compressed, nor a V1 or a V2 with neither field.
+        let mut named = compressed.clone();
+        named.kept.as_mut().unwrap().logs_bloom = Some(Bytes::from_static(&[0xc1, 0x02]));
+        assert!(stored(&named, &testnet).is_err());
+        for version in [1, 2] {
+            let neither = Header {
+                version_fields: Some(HeaderVersionFields {
+                    version,
+                    edges: None,
+                    base_event: None,
+                }),
+                ..compressed.clone()
+            };
+            assert!(stored(&neither, &testnet).is_err());
+        }
+        // No version after the mark but those this node writes.
+        let mut items = items_of(&v2.encode_stored());
+        assert_eq!(&items[17][..], &[0x82, 0xff, 0x02][..]);
+        items[17] = element(&[0xff, 0x03]);
+        let bytes = list_of(&items);
+        assert!(Header::decode_in(&mut bytes.as_slice(), &testnet, HeaderForm::Stored).is_err());
     }
 }
