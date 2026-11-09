@@ -13,7 +13,11 @@
 //! - per precompile call: `commit_call` on method success, `discard_call` on
 //!   failure (rskj commits the call's child track only on success);
 //! - per transaction: `begin_tx` / `discard_tx` (a failed tx reverts all of
-//!   its calls' committed writes).
+//!   its calls' committed writes);
+//! - but a kept write (`put_kept`) stays through both: what rskj writes
+//!   straight into the repository a transaction's own call to a precompile
+//!   was given, which `TransactionExecutor.go` commits however the call
+//!   ended, even after a throw or running out of gas.
 //!
 //! Known limitation (consciously accepted): if a contract internally calls a
 //! state-writing bridge method, the bridge call succeeds, and the CALLER
@@ -55,6 +59,11 @@ pub struct RawStorage {
     pending: Vec<RawWrite>,
     /// `committed` length when the current transaction started.
     tx_start: usize,
+    /// The current transaction's kept writes ([`RawStorage::put_kept`]), in
+    /// write order.
+    kept: Vec<RawWrite>,
+    /// How many of `kept` are in `committed` already.
+    kept_committed: usize,
     /// Read-through to the parent block's state.
     reader: Option<(Arc<dyn TrieStore>, TrieNode)>,
 }
@@ -106,26 +115,46 @@ impl RawStorage {
         self.pending.push((addr, key, value));
     }
 
+    /// [`RawStorage::put`] a write that stays however the in-flight call and
+    /// its transaction end: neither [`RawStorage::discard_call`] nor
+    /// [`RawStorage::discard_tx`] drops it. The call reads it in order with
+    /// its other writes.
+    pub fn put_kept(&mut self, addr: Address, key: U256, value: Option<Vec<u8>>) {
+        let write = (addr, key, value.filter(|v| !v.is_empty()));
+        self.pending.push(write.clone());
+        self.kept.push(write);
+    }
+
     /// Promote the in-flight call's writes (precompile method succeeded).
     pub fn commit_call(&mut self) {
         self.committed.append(&mut self.pending);
+        self.kept_committed = self.kept.len();
     }
 
-    /// Drop the in-flight call's writes (precompile method failed).
+    /// Drop the in-flight call's writes (precompile method failed), but its
+    /// kept ones.
     pub fn discard_call(&mut self) {
         self.pending.clear();
+        self.committed
+            .extend_from_slice(&self.kept[self.kept_committed..]);
+        self.kept_committed = self.kept.len();
     }
 
     /// Mark the start of a transaction.
     pub fn begin_tx(&mut self) {
         debug_assert!(self.pending.is_empty());
         self.tx_start = self.committed.len();
+        self.kept.clear();
+        self.kept_committed = 0;
     }
 
-    /// Revert every write of the current transaction (tx failed).
+    /// Revert every write of the current transaction (tx failed), but its
+    /// kept ones.
     pub fn discard_tx(&mut self) {
         self.committed.truncate(self.tx_start);
         self.pending.clear();
+        self.committed.extend_from_slice(&self.kept);
+        self.kept_committed = self.kept.len();
     }
 
     /// The writes the current transaction has committed so far.
@@ -134,7 +163,8 @@ impl RawStorage {
     /// where RSKIP-144 collision tracking reads it: these are unitrie cells
     /// like any other, and two parallel sublists that both drive the Bridge
     /// into writing one have collided. Already net of
-    /// [`RawStorage::discard_tx`], so a failed transaction reports nothing.
+    /// [`RawStorage::discard_tx`], so a failed transaction reports only its
+    /// kept writes, which are made all the same.
     pub fn tx_writes(&self) -> &[RawWrite] {
         &self.committed[self.tx_start..]
     }
@@ -143,6 +173,8 @@ impl RawStorage {
     pub fn drain(&mut self) -> Vec<RawWrite> {
         self.pending.clear();
         self.tx_start = 0;
+        self.kept.clear();
+        self.kept_committed = 0;
         std::mem::take(&mut self.committed)
     }
 }
@@ -218,5 +250,55 @@ mod tests {
         // An overlay delete shadows the trie value.
         raw.put(ADDR, key(7), None);
         assert_eq!(raw.get(ADDR, key(7)), None);
+    }
+
+    /// A kept write reads in order with its call's other writes, and stays
+    /// when the call and then its transaction are discarded, where an
+    /// ordinary write goes.
+    #[test]
+    fn a_kept_write_stays_however_its_call_and_transaction_end() {
+        let mut raw = RawStorage::default();
+        raw.begin_tx();
+        raw.put_kept(ADDR, key(1), Some(vec![1]));
+        raw.put(ADDR, key(1), Some(vec![2]));
+        raw.put(ADDR, key(2), Some(vec![3]));
+        assert_eq!(raw.get(ADDR, key(1)), Some(vec![2]), "the later write wins");
+        raw.discard_call();
+        assert_eq!(raw.get(ADDR, key(1)), Some(vec![1]));
+        assert_eq!(raw.get(ADDR, key(2)), None);
+
+        // Once committed, a kept write is like any other: a later write
+        // wins, and a later call's failure doesn't bring it back.
+        raw.put_kept(ADDR, key(2), Some(vec![4]));
+        raw.commit_call();
+        raw.put(ADDR, key(2), Some(vec![5]));
+        raw.commit_call();
+        raw.put(ADDR, key(3), Some(vec![6]));
+        raw.discard_call();
+        assert_eq!(raw.get(ADDR, key(2)), Some(vec![5]));
+
+        raw.discard_tx();
+        let kept = [(ADDR, key(1), Some(vec![1])), (ADDR, key(2), Some(vec![4]))];
+        assert_eq!(raw.tx_writes(), kept);
+
+        // The next transaction keeps its own and nothing of this one's: what
+        // a discarded call kept, and what its unfinished call kept, once.
+        raw.begin_tx();
+        raw.put_kept(ADDR, key(3), Some(vec![7]));
+        raw.discard_call();
+        raw.put_kept(ADDR, key(4), Some(vec![8]));
+        raw.put(ADDR, key(1), Some(vec![9]));
+        raw.discard_tx();
+        raw.discard_call();
+        let mut all = kept.to_vec();
+        all.extend([(ADDR, key(3), Some(vec![7])), (ADDR, key(4), Some(vec![8]))]);
+        assert_eq!(raw.drain(), all);
+
+        // A drained overlay starts afresh, and keeps a write once however
+        // often its call is discarded.
+        raw.put_kept(ADDR, key(5), Some(vec![10]));
+        raw.discard_call();
+        raw.discard_call();
+        assert_eq!(raw.drain(), [(ADDR, key(5), Some(vec![10]))]);
     }
 }

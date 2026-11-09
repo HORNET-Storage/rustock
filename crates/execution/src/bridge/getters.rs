@@ -892,8 +892,12 @@ pub fn get_state_for_svp_client<CTX: crate::RskContextTr>(
 pub fn get_state_for_debugging<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     gas_cost: u64,
+    config: &BridgeConstants,
     hardfork_cfg: &crate::hardfork::RskHardforkConfig,
 ) -> Result<PrecompileOutput, PrecompileError> {
+    // rskj builds the state from `getBtcBlockchainBestChainHeight()`, which
+    // seeds a store nothing has seeded yet (`ensureBtcBlockStore`).
+    super::btc_chain::ensure_btc_block_store(ctx, config, hardfork_cfg);
     let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
     // rskj `BridgeState.shouldUsePapyrusEncoding` == RSKIP146.
     let papyrus = hardfork_cfg.has_rskip146(block_number);
@@ -1528,16 +1532,24 @@ mod tests {
     fn state_for_debugging_has_six_fields_with_the_height_as_an_integer() {
         let mut ctx = ctx_at(6_500_000);
         let forks = hardforks();
-        let out = get_state_for_debugging(&mut ctx, 0, &forks).unwrap();
+        let config = mainnet();
+        let out = get_state_for_debugging(&mut ctx, 0, &config, &forks).unwrap();
         let rlp = as_bytes(&out);
 
         let fields = crate::bridge::serialization::rlp_decode_list(&rlp)
             .expect("BridgeState is an RLP list");
         assert_eq!(fields.len(), 6, "btcHeight, utxos, waitingFS, queue, pegouts, nextHeight");
 
-        // An empty store gives height 0, which `encodeBigInteger` renders as
-        // the empty byte string rather than a zero byte.
-        assert!(fields[0].is_empty() || fields[0] == vec![0u8], "height as an integer");
+        // The height comes from `getBtcBlockchainBestChainHeight()`, which
+        // seeds an empty store, so it's the checkpoint's: a minimal-length
+        // integer, as `encodeBigInteger` writes it.
+        let checkpoint = config.btc_checkpoint.unwrap().1;
+        let minimal: Vec<u8> = checkpoint
+            .to_be_bytes()
+            .into_iter()
+            .skip_while(|b| *b == 0)
+            .collect();
+        assert_eq!(fields[0], minimal, "height as an integer");
         // The middle four are byte strings holding their own RLP lists.
         for (i, field) in fields.iter().enumerate().take(5).skip(1) {
             assert!(

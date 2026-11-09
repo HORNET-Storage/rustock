@@ -1909,6 +1909,11 @@ impl RskExecutor {
                         }
                     }
                 } else {
+                    // Out of gas before `execute`. rskj's `go()` commits the
+                    // repository all the same, with what `getGasForData` wrote
+                    // straight into it (a BTC store its cost seeded): the
+                    // writes this keeps of the cost's.
+                    evm.ctx.chain_mut().raw_storage.discard_call();
                     (false, Vec::new(), Vec::new())
                 };
 
@@ -8274,6 +8279,161 @@ mod tests {
         );
         assert!(result.tx_results[0].success);
         assert_eq!(result.tx_results[0].gas_used, enough);
+    }
+
+    /// rskj's BTC block store writes straight into the repository a
+    /// transaction's own call to the Bridge is given, which
+    /// `TransactionExecutor.go` commits however the call ends. So such a call
+    /// that seeds a store nothing has seeded yet keeps the genesis block and
+    /// the head though it then throws (an invisible exception) or runs out of
+    /// gas, and only the height index, which the Bridge's storage provider
+    /// writes when a method returns, is left out. A call that returns writes
+    /// all three, each in its block's layout.
+    #[test]
+    fn a_transactions_own_bridge_call_keeps_the_btc_store_it_seeded_however_it_ends() {
+        use crate::abi::encode::{self, Arg};
+        use crate::bridge::btc_store::{btc_hash_to_storage_key, compute_work, StoredBlock};
+        use crate::bridge::storage::{bridge_storage_key, compound_key, BTC_BLOCK_HEIGHT_KEY};
+        let bridge = crate::precompiles::BRIDGE_ADDR;
+        let genesis = bitcoin::constants::genesis_block(bitcoin::Network::Regtest).header;
+        let cells = [
+            btc_hash_to_storage_key(&genesis.block_hash()),
+            bridge_storage_key("blockStoreChainHead"),
+            compound_key(BTC_BLOCK_HEIGHT_KEY, "-", "0"),
+        ];
+        // What the block last wrote to the genesis block's cell, the head's
+        // and the index entry's, after its one transaction to the Bridge.
+        let written = |input: &[u8], gas_limit: u64| {
+            let result = execute_alone(
+                RskHardforkConfig::all_active(33),
+                8_000_000,
+                bridge,
+                U256::ZERO,
+                gas_limit,
+                input,
+                &[],
+            );
+            let last = |cell: &U256| {
+                let raw = &result.markers.raw_storage;
+                let write = raw
+                    .iter()
+                    .rev()
+                    .find(|(address, key, _)| *address == bridge && key == cell);
+                write.and_then(|(_, _, value)| value.clone())
+            };
+            (
+                result.tx_results[0].success,
+                cells.iter().map(last).collect::<Vec<_>>(),
+            )
+        };
+        // The genesis block in RSKIP454's layout, which its cell and the head
+        // both hold, and its hash as the index holds it.
+        let stored =
+            StoredBlock::new(genesis, 0, compute_work(genesis.bits)).serialize_compact_v2();
+        let hash = crate::bridge::btc_chain::bitcoin_hash_to_b256(&genesis.block_hash());
+        let indexed = crate::bridge::serialization::rlp_encode_element(hash.as_slice());
+        let seeded = vec![Some(stored.clone()), Some(stored.clone()), None];
+
+        // Seeded first, then refused for a tree of the wrong size.
+        let mut input = crate::abi::selector(
+            "registerBtcCoinbaseTransaction(bytes,bytes32,bytes,bytes32,bytes32)",
+        )
+        .to_vec();
+        input.extend(encode::args(&[
+            Arg::Bytes(&[]),
+            Arg::Word([0x11; 32]),
+            Arg::Bytes(&[]),
+            Arg::Word([0; 32]),
+            Arg::Word([0; 32]),
+        ]));
+        assert_eq!(written(&input, 1_000_000), (true, seeded.clone()));
+
+        // Seeded by its cost, then out of gas: the cost is 27,000 at least.
+        let mut input = crate::abi::selector(
+            "getBtcTransactionConfirmations(bytes32,bytes32,uint256,bytes32[])",
+        )
+        .to_vec();
+        input.extend(encode::args(&[
+            Arg::Word([0x11; 32]),
+            Arg::Word([0x22; 32]),
+            Arg::Word(encode::int(0)),
+            Arg::Words(&[]),
+        ]));
+        let short = intrinsic_gas(&input, 68) + 1_000;
+        assert_eq!(written(&input, short), (false, seeded));
+
+        let input = crate::abi::selector("getBtcBlockchainBestChainHeight()").to_vec();
+        let all = vec![Some(stored.clone()), Some(stored), Some(indexed)];
+        assert_eq!(written(&input, 1_000_000), (true, all));
+    }
+
+    /// A transaction's own call to the Bridge that can't pay what its
+    /// `getGasForData` works out keeps what working that out wrote straight
+    /// into the repository, since `go()` commits it all the same: here the
+    /// store `getBtcTransactionConfirmations`' cost seeds with mainnet's
+    /// checkpoint, in the block's layout, and none of the height index. On
+    /// both of rskj's paths: from RSKIP136, and before it, where the limit
+    /// is held to the cost alone. No chain has the method before RSKIP136
+    /// (mainnet's bahamas is #3,397, its wasabi100 #1,591,000), so the second
+    /// runs every upgrade but RSKIP136, at mainnet's #1,000.
+    #[test]
+    fn a_bridge_call_short_of_its_cost_keeps_the_store_the_cost_seeded() {
+        use crate::abi::encode::{self, Arg};
+        use crate::bridge::btc_store::{btc_hash_to_storage_key, StoredBlock};
+        use crate::bridge::storage::{bridge_storage_key, compound_key, BTC_BLOCK_HEIGHT_KEY};
+        let bridge = crate::precompiles::BRIDGE_ADDR;
+        let config = crate::bridge::constants::BridgeConstants::mainnet();
+        let (header_hex, height, work_hex) = config.btc_checkpoint.unwrap();
+        let checkpoint: bitcoin::block::Header =
+            bitcoin::consensus::deserialize(&alloy_primitives::hex::decode(header_hex).unwrap())
+                .unwrap();
+        let work = U256::from_be_slice(&alloy_primitives::hex::decode(work_hex).unwrap());
+        let stored = StoredBlock::new(checkpoint, height, work);
+        let genesis = bitcoin::constants::genesis_block(bitcoin::Network::Bitcoin).header;
+        let mut input = crate::abi::selector(
+            "getBtcTransactionConfirmations(bytes32,bytes32,uint256,bytes32[])",
+        )
+        .to_vec();
+        input.extend(encode::args(&[
+            Arg::Word([0x11; 32]),
+            Arg::Word([0x22; 32]),
+            Arg::Word(encode::int(0)),
+            Arg::Words(&[]),
+        ]));
+        // Enough for the transaction, short of the cost: 27,000 and the data's.
+        let limit = intrinsic_gas(&input, 68);
+        assert!(limit < 27_000 + 2 * input.len() as u64);
+
+        // What the block wrote to the head, once it's checked the rest.
+        let head = |cfg: RskHardforkConfig, number: u64| {
+            let result = execute_alone(cfg, number, bridge, U256::ZERO, limit, &input, &[]);
+            assert!(!result.tx_results[0].success);
+            assert_eq!(result.tx_results[0].gas_used, limit);
+            let last = |cell: U256| {
+                let raw = &result.markers.raw_storage;
+                let write = raw
+                    .iter()
+                    .rev()
+                    .find(|(address, key, _)| *address == bridge && *key == cell);
+                write.and_then(|(_, _, value)| value.clone())
+            };
+            assert!(last(btc_hash_to_storage_key(&genesis.block_hash())).is_some());
+            assert!(last(btc_hash_to_storage_key(&checkpoint.block_hash())).is_some());
+            for indexed in [0, height] {
+                let cell = compound_key(BTC_BLOCK_HEIGHT_KEY, "-", &indexed.to_string());
+                assert_eq!(last(cell), None);
+            }
+            last(bridge_storage_key("blockStoreChainHead"))
+        };
+        let after = RskHardforkConfig::mainnet();
+        assert!(after.has_rskip136(2_000_000));
+        assert_eq!(
+            head(after, 2_000_000),
+            Some(stored.serialize_compact_legacy())
+        );
+        let before = RskHardforkConfig::all_active(crate::hardfork::RSK_MAINNET_CHAIN_ID);
+        assert!(!before.has_rskip136(1_000));
+        assert_eq!(head(before, 1_000), Some(stored.serialize_compact_v2()));
     }
 
     /// **No call to a precompile panics the node.**

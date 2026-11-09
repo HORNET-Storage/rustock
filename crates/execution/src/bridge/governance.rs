@@ -1174,15 +1174,12 @@ pub fn set_lock_whitelist_disable_block_delay<CTX: crate::RskContextTr>(
     gas_cost: u64,
     config: &super::constants::BridgeConstants,
     hardfork_cfg: &crate::hardfork::RskHardforkConfig,
-    use_v2: bool,
     tx_ctx: &crate::precompiles::BridgeTxContext,
 ) -> Result<PrecompileOutput, PrecompileError> {
     // rskj `BridgeSupport.setLockWhitelistDisableBlockDelay` reads the BTC
     // chain's height before anything asks who is calling, and seeds the chain
     // where nothing has yet (`ensureBtcBlockStore`), whoever calls.
-    let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
-    let rskip199 = hardfork_cfg.has_rskip199(block_number);
-    super::btc_chain::ensure_btc_chain_seeded(ctx, config, use_v2, rskip199);
+    super::btc_chain::ensure_btc_block_store(ctx, config, hardfork_cfg);
     let best_height = super::btc_store::load_chain_head(ctx)
         .map(|h| h.height as i32)
         .unwrap_or(0);
@@ -1193,6 +1190,7 @@ pub fn set_lock_whitelist_disable_block_delay<CTX: crate::RskContextTr>(
 
     // rskj reads the whitelist from here on, so it writes it back however the
     // call ends but a throw.
+    let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
     let mut whitelist = LockWhitelist::load(ctx, hardfork_cfg.has_rskip87(block_number));
     let code = if whitelist.disable_height < i32::MAX {
         -1 // delay already set
@@ -1653,7 +1651,7 @@ mod tests {
 
         let set = |ctx, args: Vec<u8>, tx: &BridgeTxContext, hardforks| {
             run(ctx, |ctx| {
-                set_lock_whitelist_disable_block_delay(ctx, &args, 0, &config, hardforks, true, tx)
+                set_lock_whitelist_disable_block_delay(ctx, &args, 0, &config, hardforks, tx)
             })
         };
         assert_eq!(set(fresh(), delay(100), &stranger, &all), unread(-10));
@@ -1679,7 +1677,6 @@ mod tests {
             0,
             &config,
             &all,
-            true,
             &authorized
         )
         .is_err());
@@ -1711,10 +1708,8 @@ mod tests {
 
         let mut ctx = fresh();
         let stranger = crate::precompiles::BridgeTxContext::default();
-        set_lock_whitelist_disable_block_delay(
-            &mut ctx, &args, 0, &config, &hardforks, true, &stranger,
-        )
-        .unwrap();
+        set_lock_whitelist_disable_block_delay(&mut ctx, &args, 0, &config, &hardforks, &stranger)
+            .unwrap();
         assert_eq!(
             super::super::btc_store::load_chain_head(&mut ctx).map(|head| head.height as i32),
             Some(checkpoint),
@@ -1728,7 +1723,6 @@ mod tests {
             0,
             &config,
             &hardforks,
-            true,
             &authorized,
         )
         .unwrap();

@@ -173,6 +173,8 @@ pub fn register_btc_coinbase_transaction<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     args: &[u8],
     gas_cost: u64,
+    config: &super::constants::BridgeConstants,
+    hardfork_cfg: &crate::hardfork::RskHardforkConfig,
 ) -> Result<PrecompileOutput, PrecompileError> {
     // The five arguments, as rskj's decoder reads them: the transaction, the
     // block hash, the partial merkle tree, the witness merkle root and the
@@ -197,6 +199,10 @@ pub fn register_btc_coinbase_transaction<CTX: crate::RskContextTr>(
         ));
     };
     let (btc_tx_data, pmt_data) = (btc_tx_data.to_vec(), pmt_data.to_vec());
+
+    // rskj `ensureBtcBlockStore` comes first, so a store nothing has seeded
+    // yet is seeded even where the call then returns without registering.
+    super::btc_chain::ensure_btc_block_store(ctx, config, hardfork_cfg);
 
     // Compute BTC tx hash (double-SHA256)
     let btc_tx_hash = calculate_btc_tx_hash(&btc_tx_data);
@@ -679,6 +685,39 @@ mod tests {
         let calculated = *sha256d::Hash::hash(&commitment_data).as_byte_array();
 
         assert_ne!(calculated, expected, "mismatching commitment must be rejected");
+    }
+
+    /// rskj's `registerBtcCoinbaseTransaction` seeds the BTC store before
+    /// anything else (`ensureBtcBlockStore`), so a store nothing has seeded
+    /// yet is seeded even by a call that then registers nothing, as one whose
+    /// transaction isn't in its tree.
+    #[test]
+    fn a_coinbase_registration_seeds_an_empty_store_first() {
+        use crate::abi::encode::{self, Arg};
+        use revm::MainContext;
+        let config = super::super::constants::BridgeConstants::mainnet();
+        let cfg = crate::hardfork::RskHardforkConfig::mainnet();
+        let mut ctx =
+            revm::Context::mainnet().with_chain(crate::raw_storage::RskChainExt::default());
+        // A tree of one transaction, not the one sent.
+        let mut pmt = 1u32.to_le_bytes().to_vec();
+        pmt.push(1);
+        pmt.extend_from_slice(&[0xaa; 32]);
+        pmt.extend_from_slice(&[1, 0x01]);
+        let args = encode::args(&[
+            Arg::Bytes(&[]),
+            Arg::Word([0x11; 32]),
+            Arg::Bytes(&pmt),
+            Arg::Word([0; 32]),
+            Arg::Word([0; 32]),
+        ]);
+
+        let out = register_btc_coinbase_transaction(&mut ctx, &args, 0, &config, &cfg).unwrap();
+        assert!(out.bytes.is_empty(), "registered nothing");
+        assert_eq!(
+            load_chain_head(&mut ctx).map(|head| head.height),
+            Some(config.btc_checkpoint.unwrap().1)
+        );
     }
 
     /// `find_witness_commitment` must take the LAST matching output (BIP141 / rskj

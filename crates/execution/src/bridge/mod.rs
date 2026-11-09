@@ -738,7 +738,7 @@ pub fn bridge_call_gas_cost<CTX: crate::RskContextTr>(
     let function_cost = match method.gas_cost {
         BridgeGasCost::Fixed(c) => c,
         BridgeGasCost::InputDependent => receive_headers_cost(args, hardfork_cfg, block_number),
-        BridgeGasCost::Dynamic => btc_tx_confirmations_cost(ctx, args, config),
+        BridgeGasCost::Dynamic => btc_tx_confirmations_cost(ctx, args, config, hardfork_cfg),
     };
     // rskj Bridge.getGasForData: totalCost = functionCost + data.length * 2
     Ok(function_cost.saturating_add(2 * input.len() as u64))
@@ -770,6 +770,7 @@ fn btc_tx_confirmations_cost<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     args: &[u8],
     config: &BridgeConstants,
+    hardfork_cfg: &RskHardforkConfig,
 ) -> u64 {
     const BASIC_COST: u64 = 27_000;
     const STEP_COST: u64 = 315;
@@ -782,6 +783,13 @@ fn btc_tx_confirmations_cost<CTX: crate::RskContextTr>(
         _ => return BASIC_COST,
     };
 
+    // rskj seeds a store nothing has seeded yet before it looks the block up
+    // (`ensureBtcBlockStore`), so on an empty store the genesis block and
+    // the checkpoint are found. A transaction's own call keeps the seeding
+    // though it then runs out of gas, since rskj's `TransactionExecutor.go`
+    // commits what the store wrote (`btc_store::store_raw_bytes`); a
+    // contract's call that runs out of gas drops it.
+    crate::bridge::btc_chain::ensure_btc_block_store(ctx, config, hardfork_cfg);
     let block_hash = crate::bridge::btc_chain::b256_to_bitcoin_hash(&block_hash);
     let Some(block) = crate::bridge::btc_store::get_stored_block(ctx, &block_hash) else {
         return BASIC_COST;
@@ -852,15 +860,21 @@ fn execute_method<CTX: crate::RskContextTr>(
         "receiveHeaders" => {
             btc_chain::receive_headers(ctx, args, gas_cost, config, use_v2, hardfork_cfg)
         }
-        "getBtcBlockchainBestChainHeight" => btc_chain::get_best_chain_height(ctx, gas_cost),
-        "getBtcBlockchainBestBlockHeader" => btc_chain::get_best_block_header(ctx, gas_cost),
+        "getBtcBlockchainBestChainHeight" => {
+            btc_chain::get_best_chain_height(ctx, gas_cost, config, hardfork_cfg)
+        }
+        "getBtcBlockchainBestBlockHeader" => {
+            btc_chain::get_best_block_header(ctx, gas_cost, config, hardfork_cfg)
+        }
         "getBtcBlockchainBlockHeaderByHash" => {
-            btc_chain::get_block_header_by_hash(ctx, args, gas_cost)
+            btc_chain::get_block_header_by_hash(ctx, args, gas_cost, config, hardfork_cfg)
         }
         "getBtcBlockchainBlockHeaderByHeight" => {
             btc_chain::get_block_header_by_height(ctx, args, gas_cost, config, hardfork_cfg)
         }
-        "getBtcBlockchainParentBlockHeaderByHash" => btc_chain::get_parent_block_header_by_hash(ctx, args, gas_cost),
+        "getBtcBlockchainParentBlockHeaderByHash" => {
+            btc_chain::get_parent_block_header_by_hash(ctx, args, gas_cost, config, hardfork_cfg)
+        }
 
         // RSKIP502: the union bridge, authorized against the *immediate*
         // caller.
@@ -918,7 +932,9 @@ fn execute_method<CTX: crate::RskContextTr>(
         }
 
         // Phase 3: BTC transaction verification
-        "registerBtcCoinbaseTransaction" => tx::register_btc_coinbase_transaction(ctx, args, gas_cost),
+        "registerBtcCoinbaseTransaction" => {
+            tx::register_btc_coinbase_transaction(ctx, args, gas_cost, config, hardfork_cfg)
+        }
         "hasBtcBlockCoinbaseTransactionInformation" => tx::has_btc_block_coinbase_info(ctx, args, gas_cost),
         "getBtcTransactionConfirmations" => {
             tx::get_btc_transaction_confirmations(ctx, args, gas_cost, config, use_v2, hardfork_cfg)
@@ -946,7 +962,7 @@ fn execute_method<CTX: crate::RskContextTr>(
         "addUnlimitedLockWhitelistAddress" => governance::add_unlimited_lock_whitelist_address(ctx, args, gas_cost, config, hardfork_cfg, tx_ctx),
         "removeLockWhitelistAddress" => governance::remove_lock_whitelist_address(ctx, args, gas_cost, config, hardfork_cfg, tx_ctx),
         "setLockWhitelistDisableBlockDelay" => {
-            governance::set_lock_whitelist_disable_block_delay(ctx, args, gas_cost, config, hardfork_cfg, use_v2, tx_ctx)
+            governance::set_lock_whitelist_disable_block_delay(ctx, args, gas_cost, config, hardfork_cfg, tx_ctx)
         }
 
         // Transaction-callable read-only
@@ -999,7 +1015,7 @@ fn execute_method<CTX: crate::RskContextTr>(
         "getBtcBlockchainBlockLocator" => btc_chain::get_block_locator(ctx, gas_cost, config, hardfork_cfg),
         "getStateForBtcReleaseClient" => getters::get_state_for_btc_release_client(ctx, gas_cost),
         "getStateForSvpClient" => getters::get_state_for_svp_client(ctx, gas_cost),
-        "getStateForDebugging" => getters::get_state_for_debugging(ctx, gas_cost, hardfork_cfg),
+        "getStateForDebugging" => getters::get_state_for_debugging(ctx, gas_cost, config, hardfork_cfg),
 
         // Every method in `bridge_method_table` must appear above. A name that
         // reaches here is a table entry with no implementation, which is a bug
@@ -1388,5 +1404,30 @@ mod tests {
         // cost, and so is a payload that does not decode.
         assert_eq!(receive_headers_cost(&[], &cfg, 1_591_000), 25_000);
         assert_eq!(receive_headers_cost(&args[..64], &cfg, 1_591_000), 25_000);
+    }
+
+    /// rskj's `getBtcTransactionConfirmationsGetCost` seeds the BTC store
+    /// before it looks the block up (`ensureBtcBlockStore`), so on an empty
+    /// regtest store the genesis block is found at depth 0, and the branch is
+    /// charged for. Unseeded, it wasn't found: the base cost alone.
+    #[test]
+    fn the_confirmations_cost_seeds_an_empty_store_first() {
+        use crate::abi::encode::{self, Arg};
+        use revm::MainContext;
+        let (config, cfg) = (BridgeConstants::regtest(), RskHardforkConfig::regtest());
+        let genesis = bitcoin::constants::genesis_block(bitcoin::Network::Regtest).header;
+        let block_hash = btc_chain::bitcoin_hash_to_b256(&genesis.block_hash());
+        let args = encode::args(&[
+            Arg::Word([0x11; 32]),
+            Arg::Word(block_hash.0),
+            Arg::Word(encode::int(0)),
+            Arg::Words(&[[0x22; 32], [0x33; 32]]),
+        ]);
+        let mut ctx =
+            revm::Context::mainnet().with_chain(crate::raw_storage::RskChainExt::default());
+        assert_eq!(
+            btc_tx_confirmations_cost(&mut ctx, &args, &config, &cfg),
+            27_000 + 2 * 144
+        );
     }
 }

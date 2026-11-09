@@ -258,10 +258,27 @@ pub fn get_stored_block<CTX: crate::RskContextTr>(ctx: &mut CTX, hash: &BlockHas
 // (rskj Repository.addStorageBytes / getStorageBytes).
 // ---------------------------------------------------------------------------
 
+/// Write a cell of the BTC block store. rskj's store
+/// (`RepositoryBtcBlockStoreWithCache.put`, `setChainHead`) writes straight
+/// into the repository the Bridge was given, not through the Bridge's storage
+/// provider, which writes only when a method returns (and which the height
+/// index, `setMainChainBlock`, goes through). A transaction's own call to the
+/// Bridge is given the transaction's repository, which
+/// `TransactionExecutor.go` commits however the call ended, so these writes
+/// stay though the method then throws or the call runs out of gas. A
+/// contract's call is given a repository of its own, which a failed call
+/// rolls back (`Program.callToPrecompiledAddress`).
 fn store_raw_bytes<CTX: crate::RskContextTr>(ctx: &mut CTX, base_key: U256, data: &[u8]) {
-    ctx.chain_mut()
-        .raw_storage
-        .put(BRIDGE_ADDR, base_key, Some(data.to_vec()));
+    use revm::context_interface::JournalTr;
+    // A transaction's own call runs in the first frame. Before RSKIP136 its
+    // cost is worked out before that frame opens, at depth 0.
+    let transactions_own_call = ctx.journal().depth() <= 1;
+    let raw = &mut ctx.chain_mut().raw_storage;
+    if transactions_own_call {
+        raw.put_kept(BRIDGE_ADDR, base_key, Some(data.to_vec()));
+    } else {
+        raw.put(BRIDGE_ADDR, base_key, Some(data.to_vec()));
+    }
 }
 
 fn load_raw_bytes<CTX: crate::RskContextTr>(ctx: &mut CTX, base_key: U256) -> Vec<u8> {
