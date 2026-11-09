@@ -44,7 +44,7 @@ use super::storage::*;
 /// content. A payload that reaches a method has already decoded, so this
 /// only fails for a caller that skipped the Bridge's argument check.
 fn abi_decode_string_arg(args: &[u8], slot: usize) -> Result<String, PrecompileError> {
-    super::abi::Args::new(args)
+    crate::abi::Args::new(args)
         .string(slot)
         .ok_or_else(|| PrecompileError::other("governance: malformed string argument"))
 }
@@ -67,7 +67,7 @@ fn btc_address_to_hash160(
 /// with `RLP.encodeBigInteger`, whose `asUnsignedByteArray` writes a negative
 /// number's shortest two's-complement bytes. What the entry reads back as,
 /// in rskj and here, is those bytes taken unsigned: -5 becomes 251.
-fn one_off_max_transfer_value(max: &super::abi::Int) -> Option<u64> {
+fn one_off_max_transfer_value(max: &crate::abi::Int) -> Option<u64> {
     let value = max.long_value_exact()?;
     if value >= 0 {
         return Some(value as u64);
@@ -784,7 +784,7 @@ pub fn vote_fee_per_kb_change<CTX: crate::RskContextTr>(
     // rskj `Bridge.voteFeePerKbChange` takes `Coin.valueOf(longValueExact())`
     // before anything else, and a value no long holds is GENERIC_ERROR: -10,
     // the same code an unauthorized caller gets.
-    let Some(fee) = super::abi::Args::new(args)
+    let Some(fee) = crate::abi::Args::new(args)
         .int(0)
         .and_then(|fee| fee.long_value_exact())
     else {
@@ -953,7 +953,7 @@ pub fn increase_locking_cap<CTX: crate::RskContextTr>(
     // int256 satoshis; rskj getCoinFromBigInteger (longValueExact) and the
     // <= 0 check both end in BridgeIllegalArgumentException, before the
     // authorizer is looked at.
-    let new_cap = super::abi::Args::new(args)
+    let new_cap = crate::abi::Args::new(args)
         .int(0)
         .and_then(|cap| cap.long_value_exact())
         .and_then(|cap| u64::try_from(cap).ok())
@@ -1051,7 +1051,7 @@ pub fn add_one_off_lock_whitelist_address<CTX: crate::RskContextTr>(
         Err(_) => return Ok(encode_int_result(gas_cost, -2)),
     };
 
-    let max_val = super::abi::Args::new(args)
+    let max_val = crate::abi::Args::new(args)
         .int(1)
         .as_ref()
         .and_then(one_off_max_transfer_value)
@@ -1198,7 +1198,7 @@ pub fn set_lock_whitelist_disable_block_delay<CTX: crate::RskContextTr>(
     // rskj `disableBlockDelayBI.intValueExact()`: a delay no int holds
     // throws. The sum is Java int arithmetic, so one that wraps is not above
     // the height either.
-    let delay = super::abi::Args::new(args)
+    let delay = crate::abi::Args::new(args)
         .int(0)
         .and_then(|delay| delay.int_value_exact())
         .ok_or_else(|| {
@@ -1321,7 +1321,7 @@ fn decode_bytes_arg(args: &[u8]) -> Result<Vec<u8>, PrecompileError> {
 
 /// Decode the `index`-th `bytes` ABI argument, as rskj's decoder does.
 fn decode_bytes_arg_at(args: &[u8], index: usize) -> Result<Vec<u8>, PrecompileError> {
-    super::abi::Args::new(args)
+    crate::abi::Args::new(args)
         .bytes(index)
         .map(<[u8]>::to_vec)
         .ok_or_else(|| PrecompileError::other("bytes arg: malformed"))
@@ -1489,7 +1489,7 @@ mod tests {
     /// throws for one beyond a Java long -- all before the sender is checked.
     #[test]
     fn a_one_off_value_beyond_a_long_throws_before_the_sender_check() {
-        use crate::bridge::abi::encode::{self, Arg};
+        use crate::abi::encode::{self, Arg};
         use revm::MainContext;
         let config = super::super::constants::BridgeConstants::mainnet();
         let tx_ctx = crate::precompiles::BridgeTxContext::default();

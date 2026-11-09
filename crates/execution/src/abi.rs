@@ -1,11 +1,12 @@
-//! A Bridge call's arguments, read as rskj reads them.
+//! A call's arguments, read as rskj reads them for its own contracts.
 //!
-//! rskj decodes a call's arguments once, in `Bridge.parseData`, through
-//! `CallTransaction.Function.decode` and the decoders of
-//! `org.ethereum.solidity.SolidityType`; a payload they cannot decode is a
-//! parse failure. Each method then converts the `BigInteger`s it gets as Java
-//! does. Those rules are not the ABI's, and a transaction can reach every
-//! place they differ:
+//! rskj decodes the arguments of a call to the Bridge or to a native contract
+//! (HDWalletUtils, BlockHeader, Environment) once, in `Bridge.parseData` or
+//! `NativeContract.parseData`, through `CallTransaction.Function.decode` and
+//! the decoders of `org.ethereum.solidity.SolidityType`; a payload they cannot
+//! decode is a parse failure. Each method then converts the `BigInteger`s it
+//! gets as Java does. Those rules are not the ABI's, and a transaction can
+//! reach every place they differ:
 //!
 //! - an offset or a length is a word's `intValue()`: its low 32 bits as a
 //!   signed int, whatever the other 28 bytes hold;
@@ -54,6 +55,12 @@ impl Int {
     /// `BigInteger.longValueExact()`: the number, if a long holds it.
     pub(crate) fn long_value_exact(&self) -> Option<i64> {
         self.fits(8).then(|| self.long_value())
+    }
+
+    /// `BigInteger.shortValueExact()`: the number, if a short holds it.
+    pub(crate) fn short_value_exact(&self) -> Option<i16> {
+        self.fits(2)
+            .then(|| i16::from_be_bytes([self.0[30], self.0[31]]))
     }
 
     /// The number itself.
@@ -133,8 +140,8 @@ impl<'a> Args<'a> {
     }
 
     /// Whether every parameter of `signature` decodes: `Function.decode`
-    /// returning rather than throwing. `None` for a parameter type the
-    /// Bridge does not use.
+    /// returning rather than throwing. `None` for a parameter type none of
+    /// rskj's contracts use.
     pub(crate) fn decode(&self, signature: &str) -> Option<bool> {
         let mut decodes = true;
         for (i, param) in params(signature).enumerate() {
@@ -239,28 +246,32 @@ fn data_word(value: &Int) -> [u8; 32] {
     padded
 }
 
-/// `Sha256Hash.wrap(String)`: bitcoinj's `Utils.HEX`, Guava's lower-case
-/// base16, decodes the string, and the hash must be 32 bytes. Upper-case
-/// digits are refused.
-pub(crate) fn sha256_hash_from_hex(hex: &str) -> Option<[u8; 32]> {
-    let digit = |c: u8| match c {
-        b'0'..=b'9' => Some(c - b'0'),
-        b'a'..=b'f' => Some(c - b'a' + 10),
-        _ => None,
-    };
-    let digits = hex.as_bytes();
-    if digits.len() != 64 {
-        return None;
-    }
-    let mut hash = [0u8; 32];
-    for (byte, pair) in hash.iter_mut().zip(digits.chunks_exact(2)) {
-        *byte = (digit(pair[0])? << 4) | digit(pair[1])?;
-    }
-    Some(hash)
+/// `Function.encodeSignature()`: the first four bytes of the signature's
+/// Keccak-256, as a call's payload starts.
+pub(crate) fn selector(signature: &str) -> [u8; 4] {
+    use sha3::{Digest, Keccak256};
+    let hash = Keccak256::digest(signature.as_bytes());
+    [hash[0], hash[1], hash[2], hash[3]]
 }
 
-/// Arguments encoded as rskj's `CallTransaction` encodes them, for the
-/// Bridge's tests.
+/// `Function.encodeOutputs` of a single `bytes` or `string` result: the
+/// offset of its data, its length, then the data padded to whole words.
+///
+/// `BytesType.encode` pads to `((len - 1) / 32 + 1) * 32` bytes, and Java's
+/// `-1 / 32 == 0` gives an empty value a zero word of its own: 96 bytes, not
+/// the ABI's 64. The word is consensus, since a caller's `RETURNDATACOPY`
+/// pays for it (mainnet #1,669,062).
+pub(crate) fn encode_bytes(data: &[u8]) -> Vec<u8> {
+    let padded = data.len().div_ceil(32).max(1) * 32;
+    let mut out = Vec::with_capacity(64 + padded);
+    out.extend_from_slice(&U256::from(32u8).to_be_bytes::<32>());
+    out.extend_from_slice(&U256::from(data.len()).to_be_bytes::<32>());
+    out.extend_from_slice(data);
+    out.resize(64 + padded, 0);
+    out
+}
+
+/// Arguments encoded as rskj's `CallTransaction` encodes them, for tests.
 #[cfg(test)]
 pub(crate) mod encode {
     use alloy_primitives::{I256, U256};
@@ -464,15 +475,11 @@ mod tests {
         assert_eq!(Int(word(1 << 31)).int_value(), i32::MIN);
         assert_eq!(Int(word((1 << 31) - 1)).int_value_exact(), Some(i32::MAX));
         assert_eq!(Int(word(1 << 63)).long_value_exact(), None);
-    }
-
-    #[test]
-    fn a_hash_string_is_64_lower_case_hex_digits() {
-        let lower = "00".repeat(31) + "ab";
-        assert_eq!(sha256_hash_from_hex(&lower).map(|h| h[31]), Some(0xAB));
-        assert_eq!(sha256_hash_from_hex(&lower.to_uppercase()), None);
-        assert_eq!(sha256_hash_from_hex(&lower[2..]), None);
-        assert_eq!(sha256_hash_from_hex(&("0".repeat(61) + "\u{FFFD}")), None);
+        assert_eq!(Int(word(32_767)).short_value_exact(), Some(i16::MAX));
+        assert_eq!(Int(word(32_768)).short_value_exact(), None);
+        assert_eq!(Int(negative(-32_768)).short_value_exact(), Some(i16::MIN));
+        assert_eq!(Int(negative(-32_769)).short_value_exact(), None);
+        assert_eq!(minus_one.short_value_exact(), Some(-1));
     }
 
     #[test]
@@ -488,5 +495,28 @@ mod tests {
         assert_eq!(Args::new(&[]).decode("f(int256,bool,address)"), Some(true));
         assert_eq!(Args::new(&[]).decode("f(bytes32)"), Some(false));
         assert_eq!(Args::new(&[]).decode("f(int256[])"), None);
+    }
+
+    /// Both selectors as solc compiled them into rskj's own test contracts
+    /// (`dsl/nested_environment_calls.txt`).
+    #[test]
+    fn a_selector_is_keccak_of_the_signature() {
+        assert_eq!(selector("getCallStackDepth()"), [0xe8, 0xce, 0x22, 0x74]);
+        assert_eq!(
+            selector("callGetCallStackDepth()"),
+            [0x6e, 0xad, 0x0b, 0x33]
+        );
+    }
+
+    #[test]
+    fn an_empty_bytes_result_takes_a_zero_word_of_its_own() {
+        let empty = encode_bytes(&[]);
+        assert_eq!(empty, payload(&[word(32), word(0), word(0)], &[]));
+        let mut one = payload(&[word(32), word(1)], &[0xAB]);
+        one.resize(96, 0);
+        assert_eq!(encode_bytes(&[0xAB]), one);
+        assert_eq!(encode_bytes(&[1; 32]).len(), 96);
+        assert_eq!(encode_bytes(&[1; 33]).len(), 128);
+        assert_eq!(&encode_bytes(&[1; 33])[32..64], &word(33));
     }
 }

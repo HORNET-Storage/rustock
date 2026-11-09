@@ -247,7 +247,7 @@ pub fn set_contract_address_for_testnet<CTX: crate::RskContextTr>(
     }
     // rskj `new RskAddress((DataWord) args[0])`: the address as its decoder
     // reads it, an empty argument list being the zero address.
-    let Some(new_address) = super::abi::Args::new(args).address(0) else {
+    let Some(new_address) = crate::abi::Args::new(args).address(0) else {
         return int_result(gas_cost, UnionResponse::GenericError.code());
     };
     store_long(ctx, UNION_CONTRACT_ADDRESS_KEY, &rlp_encode_bytes(new_address.as_slice()));
@@ -291,7 +291,7 @@ pub fn increase_locking_cap<CTX: crate::RskContextTr>(
     if sender != constants.change_locking_cap_authorizer {
         return int_result(gas_cost, UnionResponse::UnauthorizedCaller.code());
     }
-    let Some(new_cap) = super::abi::Args::new(args).int(0) else {
+    let Some(new_cap) = crate::abi::Args::new(args).int(0) else {
         return int_result(gas_cost, UnionResponse::GenericError.code());
     };
     let current = locking_cap(ctx, hardfork_cfg);
@@ -327,7 +327,7 @@ pub fn request_rbtc<CTX: crate::RskContextTr>(
     if !request_enabled(ctx) {
         return int_result(gas_cost, UnionResponse::TransferDisabled.code());
     }
-    let Some(amount) = super::abi::Args::new(args).int(0) else {
+    let Some(amount) = crate::abi::Args::new(args).int(0) else {
         return int_result(gas_cost, UnionResponse::GenericError.code());
     };
     // rskj `isAmountRequestedValid` refuses an amount that is not positive,
@@ -422,7 +422,7 @@ pub fn set_transfer_permissions<CTX: crate::RskContextTr>(
     }
     // rskj's `BoolType` looks at its word's low 32 bits only, and an empty
     // argument list reads as two falses.
-    let args = super::abi::Args::new(args);
+    let args = crate::abi::Args::new(args);
     let (Some(request), Some(release)) = (args.bool(0), args.bool(1)) else {
         return int_result(gas_cost, UnionResponse::GenericError.code());
     };
@@ -469,7 +469,7 @@ pub fn set_event<CTX: crate::RskContextTr>(
     hardfork_cfg: &RskHardforkConfig,
     sender: Address,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    let event = super::abi::Args::new(args)
+    let event = crate::abi::Args::new(args)
         .bytes(0)
         .map(<[u8]>::to_vec)
         .ok_or_else(|| {
@@ -521,7 +521,7 @@ fn require_union_bridge_caller<CTX: crate::RskContextTr>(
 
 /// rskj `new co.rsk.core.Coin((BigInteger) arg)`: the word as a signed
 /// number, `None` where it is negative.
-fn coin(value: &super::abi::Int) -> Option<U256> {
+fn coin(value: &crate::abi::Int) -> Option<U256> {
     let value = value.signed();
     (!value.is_negative()).then(|| value.into_raw())
 }

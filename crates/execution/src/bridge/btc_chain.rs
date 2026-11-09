@@ -75,7 +75,7 @@ pub fn receive_header<CTX: crate::RskContextTr>(
     let rskip199 = hardfork_cfg.has_rskip199(block_number);
     ensure_btc_chain_seeded(ctx, config, use_v2, rskip199);
 
-    let header_bytes = super::abi::Args::new(args)
+    let header_bytes = crate::abi::Args::new(args)
         .bytes(0)
         .ok_or_else(|| PrecompileError::other("receiveHeader: invalid ABI encoding"))?;
 
@@ -465,7 +465,7 @@ pub fn receive_headers<CTX: crate::RskContextTr>(
     use_v2: bool,
     hardfork_cfg: &RskHardforkConfig,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    let headers = super::abi::Args::new(args)
+    let headers = crate::abi::Args::new(args)
         .bytes_array(0)
         .ok_or_else(|| PrecompileError::other("receiveHeaders: invalid ABI encoding"))?;
 
@@ -668,7 +668,7 @@ pub fn get_block_hash_at_depth<CTX: crate::RskContextTr>(
     // 32 bits, so 2^32 + 5 is depth 5, and a negative int fails the bound
     // check below.
     let depth = i64::from(
-        super::abi::Args::new(args)
+        crate::abi::Args::new(args)
             .int(0)
             .ok_or_else(|| PrecompileError::other("getBtcBlockchainBlockHashAtDepth: no depth"))?
             .int_value(),
@@ -740,7 +740,7 @@ pub fn get_block_header_by_hash<CTX: crate::RskContextTr>(
     args: &[u8],
     gas_cost: u64,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    let hash = super::abi::Args::new(args)
+    let hash = crate::abi::Args::new(args)
         .bytes32(0)
         .ok_or_else(|| PrecompileError::other("getBlockHeaderByHash: no hash"))?;
     let hash = b256_to_bitcoin_hash(&alloy_primitives::B256::from(hash));
@@ -773,7 +773,7 @@ pub fn get_block_header_by_height<CTX: crate::RskContextTr>(
     config: &BridgeConstants,
     hardfork_cfg: &RskHardforkConfig,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    let height = super::abi::Args::new(args)
+    let height = crate::abi::Args::new(args)
         .int(0)
         .ok_or_else(|| PrecompileError::other("getBlockHeaderByHeight: no height"))?
         .int_value();
@@ -802,7 +802,7 @@ pub fn get_parent_block_header_by_hash<CTX: crate::RskContextTr>(
     args: &[u8],
     gas_cost: u64,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    let hash = super::abi::Args::new(args)
+    let hash = crate::abi::Args::new(args)
         .bytes32(0)
         .ok_or_else(|| PrecompileError::other("getParentBlockHeaderByHash: no hash"))?;
     let hash = b256_to_bitcoin_hash(&alloy_primitives::B256::from(hash));
@@ -818,7 +818,7 @@ pub fn get_parent_block_header_by_hash<CTX: crate::RskContextTr>(
 }
 
 // ---------------------------------------------------------------------------
-// ABI encoding helpers (arguments are read through `super::abi`)
+// ABI encoding helpers (arguments are read through `crate::abi`)
 // ---------------------------------------------------------------------------
 
 /// ABI-encode a `bytes` return value.
@@ -1035,7 +1035,7 @@ mod tests {
     fn abi_bytes_roundtrip() {
         let original = vec![1u8, 2, 3, 4, 5];
         let encoded = encode_abi_bytes(&original);
-        let decoded = crate::bridge::abi::Args::new(&encoded).bytes(0).unwrap();
+        let decoded = crate::abi::Args::new(&encoded).bytes(0).unwrap();
         assert_eq!(decoded, original);
     }
 
@@ -1043,7 +1043,7 @@ mod tests {
     fn abi_bytes_80_byte_header() {
         let data = vec![0xABu8; 80];
         let encoded = encode_abi_bytes(&data);
-        let decoded = crate::bridge::abi::Args::new(&encoded).bytes(0).unwrap();
+        let decoded = crate::abi::Args::new(&encoded).bytes(0).unwrap();
         assert_eq!(decoded, data);
         // 80 bytes → offset + length + ceil(80/32)*32 = 32 + 32 + 96 = 160.
         assert_eq!(encoded.len(), 160);
@@ -1064,10 +1064,7 @@ mod tests {
         // offset 0x20, length 0, one zero word.
         assert_eq!(encoded[31], 0x20);
         assert!(encoded[32..].iter().all(|&b| b == 0));
-        assert_eq!(
-            crate::bridge::abi::Args::new(&encoded).bytes(0),
-            Some(&[][..])
-        );
+        assert_eq!(crate::abi::Args::new(&encoded).bytes(0), Some(&[][..]));
     }
 
     #[test]
@@ -1134,7 +1131,7 @@ mod tests {
     /// and refuses the whole call for one of the wrong size.
     #[test]
     fn receive_headers_refuses_them_all_for_one_of_the_wrong_size() {
-        use crate::bridge::abi::encode::{self, Arg};
+        use crate::abi::encode::{self, Arg};
         let args = encode::args(&[Arg::BytesArray(&[&[0u8; 80], &[0u8; 79]])]);
         let (config, cfg) = (BridgeConstants::mainnet(), RskHardforkConfig::mainnet());
         assert!(receive_headers(&mut empty_ctx(), &args, 0, &config, false, &cfg).is_err());

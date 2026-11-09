@@ -93,7 +93,7 @@ impl MerkleBranch {
     /// and the path as rskj's `BigInteger.intValue` reads it, its low 32 bits,
     /// all through the decoder the Bridge's argument check uses.
     pub fn from_abi_args(args: &[u8]) -> Option<(Self, [u8; 32], [u8; 32])> {
-        let args = super::abi::Args::new(args);
+        let args = crate::abi::Args::new(args);
         let tx_hash = args.bytes32(0)?;
         let block_hash = args.bytes32(1)?;
         let path = args.int(2)?.int_value();

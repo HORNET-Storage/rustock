@@ -240,7 +240,7 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
 ) -> Result<PrecompileOutput, PrecompileError> {
     // rskj `Bridge.registerBtcTransaction`: the transaction, the height as
     // `intValue()`, the partial merkle tree, all as its decoder reads them.
-    let decoded = super::abi::Args::new(args);
+    let decoded = crate::abi::Args::new(args);
     let (Some(btc_tx_data), Some(height), Some(pmt_data)) =
         (decoded.bytes(0), decoded.int(1), decoded.bytes(2))
     else {
@@ -1645,7 +1645,7 @@ pub fn register_fast_bridge_btc_transaction<CTX: crate::RskContextTr>(
         bool,
     );
     let parse = (|| -> Option<Parsed> {
-        let args = super::abi::Args::new(args);
+        let args = crate::abi::Args::new(args);
         Some((
             args.bytes(0)?.to_vec(),
             args.int(1)?.int_value(),
@@ -4369,7 +4369,7 @@ pub fn add_signature<CTX: crate::RskContextTr>(
             Ok(PrecompileOutput::new(gas_cost, Bytes::new()))
         }
     };
-    let decoded = super::abi::Args::new(args);
+    let decoded = crate::abi::Args::new(args);
     let (Some(fed_key), Some(sigs), Some(rsk_tx_hash)) =
         (decoded.bytes(0), decoded.bytes_array(1), decoded.bytes(2))
     else {
@@ -5691,7 +5691,7 @@ pub fn get_estimated_fees_for_pegout_amount<CTX: crate::RskContextTr>(
     // rskj `new co.rsk.core.Coin((BigInteger) args[0]).toBitcoin()`: the wei
     // as a signed number, divided by 10^10 toward zero, then `longValue()`,
     // its low 64 bits. A negative amount is below the minimum like any other.
-    let wei = super::abi::Args::new(args)
+    let wei = crate::abi::Args::new(args)
         .int(0)
         .ok_or_else(|| PrecompileError::other("getEstimatedFeesForPegOutAmount: no amount"))?;
     let negative = wei.0[0] & 0x80 != 0;
@@ -7827,7 +7827,7 @@ mod tests {
         );
     }
 
-    use crate::bridge::abi::encode::{self, Arg};
+    use crate::abi::encode::{self, Arg};
 
     /// A tree of one transaction, the one given, matched. Its root is the
     /// transaction's hash, so it proves any bytes at all.

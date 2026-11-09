@@ -372,6 +372,7 @@ impl RskExecutor {
             rsk_precompiles(&self.hardfork_cfg, header.number),
             &self.hardfork_cfg,
             Some(self.block_store.clone()),
+            header.parent_hash,
             self.remasc_config.clone(),
         )
         .with_bridge_config(self.bridge_constants.clone());
@@ -503,6 +504,7 @@ impl RskExecutor {
             rsk_precompiles(&self.hardfork_cfg, header.number),
             &self.hardfork_cfg,
             Some(self.block_store.clone()),
+            header.parent_hash,
             self.remasc_config.clone(),
         )
         .with_bridge_config(self.bridge_constants.clone());
@@ -670,6 +672,7 @@ impl RskExecutor {
             rsk_precompiles(&self.hardfork_cfg, header.number),
             &self.hardfork_cfg,
             Some(self.block_store.clone()),
+            header.parent_hash,
             self.remasc_config.clone(),
         )
         .with_bridge_config(self.bridge_constants.clone());
@@ -1323,6 +1326,7 @@ impl RskExecutor {
             rsk_precompiles(&self.hardfork_cfg, header.number),
             &self.hardfork_cfg,
             Some(self.block_store.clone()),
+            header.parent_hash,
             self.remasc_config.clone(),
         )
         .with_bridge_config(self.bridge_constants.clone());
@@ -7218,7 +7222,11 @@ mod tests {
         assert_eq!(result.gas_used, 21_064, "Environment costs 0 gas, total = intrinsic only");
     }
 
-    /// Environment precompile with unknown selector should fail.
+    /// Environment with a selector that names no method: rskj's
+    /// `NativeContract.execute` throws, which in a transaction's own call is
+    /// the invisible exception, a success with no output that used the
+    /// intrinsic gas and nothing more (`getGasForData` is 0 for a payload that
+    /// does not parse).
     #[test]
     fn test_environment_precompile_unknown_selector() {
         let store = Arc::new(MemoryTrieStore::new());
@@ -7259,11 +7267,16 @@ mod tests {
             .execute_tx(&header, &tx, sender, &root, store)
             .unwrap();
 
-        assert!(!result.success, "unknown selector should fail");
+        assert!(result.success, "an invisible exception records success");
+        assert!(result.output.is_empty());
+        assert_eq!(
+            result.gas_used, 21_064,
+            "21,000 and four nonzero bytes at 16"
+        );
     }
 
-    /// Environment precompile called via contract STATICCALL should return
-    /// depth > 1 (one extra level for the contract frame).
+    /// Environment called by the contract a transaction calls: rskj counts
+    /// that contract at depth 0, so the answer is 1 (`EnvironmentTest`).
     #[test]
     fn test_environment_precompile_via_contract() {
         let store = Arc::new(MemoryTrieStore::new());
@@ -7403,10 +7416,360 @@ mod tests {
             call_result.output[31],
         ]);
 
+        assert_eq!(
+            depth, 1,
+            "the contract the transaction calls is rskj's depth 0"
+        );
+    }
+
+    /// rskj's `nested_environment_calls.txt`: the contract a transaction calls
+    /// is at depth 0 and hears 1 from Environment; two calls further down, 3.
+    #[test]
+    fn environment_counts_the_depth_of_the_contract_that_asks() {
+        // STATICCALL Environment with getCallStackDepth(), return its answer.
+        let leaf_code = [
+            0x63, 0xe8, 0xce, 0x22, 0x74, 0x60, 0x00, 0x52, // mem[28..32] = selector
+            0x60, 0x20, 0x60, 0x00, 0x60, 0x04, 0x60, 0x1c, // ret 0..32, args 28..32
+            0x63, 0x01, 0x00, 0x00, 0x11, 0x5a, 0xfa, 0x50, // Environment, GAS, STATICCALL
+            0x60, 0x20, 0x60, 0x00, 0xf3, // RETURN mem[0..32]
+        ];
+        // CALL the address in calldata's first word with the rest of the
+        // calldata, and return the callee's answer.
+        let relay_code = [
+            0x60, 0x20, 0x36, 0x03, 0x80, // n = CALLDATASIZE - 32
+            0x60, 0x20, 0x60, 0x00, 0x37, // mem[0..n] = calldata[32..]
+            0x60, 0x20, 0x60, 0x00, 0x82, 0x60, 0x00, 0x60,
+            0x00, // ret 0..32, args 0..n, no value
+            0x60, 0x00, 0x35, 0x5a, 0xf1, 0x50, 0x50, // CALL calldata[0..32]
+            0x60, 0x20, 0x60, 0x00, 0xf3, // RETURN mem[0..32]
+        ];
+        let leaf = Address::repeat_byte(0xC0);
+        let relay = Address::repeat_byte(0xB0);
+        let word = |address: Address| {
+            let mut word = vec![0u8; 12];
+            word.extend_from_slice(address.as_slice());
+            word
+        };
+        let depth = |to: Address, calldata: Vec<u8>| {
+            let store = Arc::new(MemoryTrieStore::new());
+            let sender = Address::repeat_byte(0xAA);
+            let one_rbtc = U256::from(10u64).pow(U256::from(18));
+            let root = put_account(&TrieNode::empty(), store.as_ref(), &sender, 0, one_rbtc);
+            let root =
+                put_account_with_code(&root, store.as_ref(), &leaf, 1, U256::ZERO, &leaf_code);
+            let root =
+                put_account_with_code(&root, store.as_ref(), &relay, 1, U256::ZERO, &relay_code);
+            let tx = rustock_core::Transaction {
+                nonce: 0,
+                gas_price: U256::ZERO,
+                gas_limit: U256::from(1_000_000),
+                to: Bytes::copy_from_slice(to.as_slice()),
+                value: U256::ZERO,
+                input: Bytes::from(calldata),
+                v: 0,
+                r: U256::ZERO,
+                s: U256::ZERO,
+                cached_rlp: None,
+            };
+            let block_store =
+                Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+            let executor = RskExecutor::new(RskHardforkConfig::all_active(33), block_store);
+            let result = executor
+                .execute_tx(&dummy_header(8_000_000), &tx, sender, &root, store)
+                .unwrap();
+            assert!(result.success);
+            U256::from_be_slice(&result.output)
+        };
+        assert_eq!(depth(leaf, Vec::new()), U256::from(1));
+        // The transaction calls the relay, which calls itself, which calls the leaf.
+        let mut path = word(relay);
+        path.extend(word(leaf));
+        assert_eq!(depth(relay, path), U256::from(3));
+    }
+
+    /// The intrinsic gas of a transaction carrying `data`, at `nonzero` a
+    /// nonzero byte: 68, or 16 from RSKIP400.
+    fn intrinsic_gas(data: &[u8], nonzero: u64) -> u64 {
+        21_000
+            + data
+                .iter()
+                .map(|byte| if *byte == 0 { 4 } else { nonzero })
+                .sum::<u64>()
+    }
+
+    /// The extended key of rskj's `ExtractPublicKeyFromExtendedPublicKeyTest`.
+    const XPUB: &str = "xpub661MyMwAqRbcFMGNG2YcHvj3x63bAZN9U5cKikaiQ4zu2D1cvpnZYyXNR9nH62sGp4RR39Ui7SVQSq1PY4JbPuEuu5prVJJC3d5Pogft712";
+
+    /// HDWalletUtils' `extractPublicKeyFromExtendedPublicKey(xpub)`, which
+    /// costs 11,300 and throws for a string that is no extended key.
+    fn extract_public_key_call(xpub: &[u8]) -> Vec<u8> {
+        use crate::abi::encode::{self, Arg};
+        let mut input =
+            crate::abi::selector("extractPublicKeyFromExtendedPublicKey(string)").to_vec();
+        input.extend(encode::args(&[Arg::Bytes(xpub)]));
+        input
+    }
+
+    /// One transaction from a funded sender at 60,000,000 wei a gas, in a
+    /// block of its own.
+    fn execute_alone(
+        cfg: RskHardforkConfig,
+        height: u64,
+        to: Address,
+        value: U256,
+        gas_limit: u64,
+        input: &[u8],
+        contracts: &[(Address, &[u8])],
+    ) -> BlockExecutionResult {
+        let store = Arc::new(MemoryTrieStore::new());
+        let sender = Address::repeat_byte(0xAA);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let mut root = put_account(&TrieNode::empty(), store.as_ref(), &sender, 0, one_rbtc);
+        for (address, code) in contracts {
+            root = put_account_with_code(&root, store.as_ref(), address, 1, U256::ZERO, code);
+        }
+        let tx = rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::from(60_000_000u64),
+            gas_limit: U256::from(gas_limit),
+            to: Bytes::copy_from_slice(to.as_slice()),
+            value,
+            input: Bytes::copy_from_slice(input),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
+        };
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        RskExecutor::new(cfg, block_store)
+            .execute_block(&dummy_header(height), &[(tx, sender)], &root, store)
+            .expect("block executes")
+    }
+
+    fn fee(gas: u64) -> U256 {
+        U256::from(gas) * U256::from(60_000_000u64)
+    }
+
+    /// rskj's invisible exception (`TransactionExecutor.call`) for a native
+    /// contract: a transaction whose own call to HDWalletUtils throws succeeds
+    /// with no output, having used its intrinsic gas and the method's 11,300.
+    /// Its sender pays for the whole limit, which REMASC receives, and keeps
+    /// the value, and the precompile's account is left as it was. The same
+    /// call with a key it can read is a plain success.
+    #[test]
+    fn a_native_contract_that_throws_in_a_transactions_own_call_is_an_invisible_exception() {
+        let hd_wallet = crate::precompiles::HD_WALLET_UTILS_ADDR;
+        let sender = Address::repeat_byte(0xAA);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let value = U256::from(7);
+
+        let input = extract_public_key_call(b"this-is-not-an-xpub");
+        let result = execute_alone(
+            RskHardforkConfig::all_active(33),
+            8_000_000,
+            hd_wallet,
+            value,
+            1_000_000,
+            &input,
+            &[],
+        );
+        let receipt = &result.tx_results[0];
+        assert!(receipt.success, "the receipt records success");
+        assert!(receipt.output.is_empty());
+        assert_eq!(receipt.gas_used, intrinsic_gas(&input, 16) + 11_300);
+        assert_eq!(
+            result.state_changes.get(&sender).unwrap().info.balance,
+            one_rbtc - fee(1_000_000),
+            "the sender pays for the whole limit and keeps the value"
+        );
+        assert_eq!(
+            result
+                .state_changes
+                .get(&crate::precompiles::REMASC_ADDR)
+                .unwrap()
+                .info
+                .balance,
+            fee(1_000_000)
+        );
+        assert_eq!(result.paid_fees, fee(1_000_000));
         assert!(
-            depth >= 2,
-            "depth via contract call should be >= 2 (tx frame + contract frame), got {}",
-            depth
+            result
+                .state_changes
+                .get(&hd_wallet)
+                .is_none_or(|account| !account.is_touched()),
+            "the precompile's account is left as it was"
+        );
+        assert!(
+            !result.markers.precompiles.contains(&hd_wallet),
+            "no setupContract"
+        );
+
+        let input = extract_public_key_call(XPUB.as_bytes());
+        let result = execute_alone(
+            RskHardforkConfig::all_active(33),
+            8_000_000,
+            hd_wallet,
+            value,
+            1_000_000,
+            &input,
+            &[],
+        );
+        let receipt = &result.tx_results[0];
+        assert!(receipt.success);
+        let used = intrinsic_gas(&input, 16) + 11_300;
+        assert_eq!(receipt.gas_used, used);
+        assert_eq!(
+            result.paid_fees,
+            fee(used),
+            "a success pays for the gas it used"
+        );
+        assert_eq!(
+            result.state_changes.get(&hd_wallet).unwrap().info.balance,
+            value
+        );
+        assert!(result.markers.precompiles.contains(&hd_wallet));
+    }
+
+    /// A transaction's own call that cannot pay what a native contract asks
+    /// for fails, using all its gas (`TransactionExecutor.call`'s execError).
+    #[test]
+    fn a_direct_call_short_of_a_native_contracts_gas_fails_with_all_of_it() {
+        let hd_wallet = crate::precompiles::HD_WALLET_UTILS_ADDR;
+        let input = extract_public_key_call(XPUB.as_bytes());
+        let enough = intrinsic_gas(&input, 16) + 11_300;
+        let result = execute_alone(
+            RskHardforkConfig::all_active(33),
+            8_000_000,
+            hd_wallet,
+            U256::ZERO,
+            enough - 1,
+            &input,
+            &[],
+        );
+        assert!(!result.tx_results[0].success);
+        assert_eq!(result.tx_results[0].gas_used, enough - 1);
+        assert_eq!(result.paid_fees, fee(enough - 1));
+        let result = execute_alone(
+            RskHardforkConfig::all_active(33),
+            8_000_000,
+            hd_wallet,
+            U256::ZERO,
+            enough,
+            &input,
+            &[],
+        );
+        assert!(result.tx_results[0].success);
+        assert_eq!(result.tx_results[0].gas_used, enough);
+    }
+
+    /// BN128 refusing a point (`BN128PrecompiledContract`): before RSKIP197 it
+    /// answers with no bytes, a plain success; from RSKIP197 it throws, which
+    /// in a transaction's own call is the invisible exception.
+    #[test]
+    fn bn128_refusing_a_point_answers_empty_before_rskip197_and_throws_from_it() {
+        let bn128_add = Address::with_last_byte(6);
+        // (1, 1) is not on the curve.
+        let mut off_curve = vec![0u8; 128];
+        off_curve[31] = 1;
+        off_curve[63] = 1;
+        let used = intrinsic_gas(&off_curve, 68) + 150;
+
+        let before = execute_alone(
+            RskHardforkConfig::mainnet(),
+            3_000_000,
+            bn128_add,
+            U256::ZERO,
+            1_000_000,
+            &off_curve,
+            &[],
+        );
+        assert!(before.tx_results[0].success);
+        assert_eq!(before.tx_results[0].gas_used, used);
+        assert_eq!(
+            before.paid_fees,
+            fee(used),
+            "a success pays for the gas it used"
+        );
+
+        let from = execute_alone(
+            RskHardforkConfig::mainnet(),
+            3_614_801,
+            bn128_add,
+            U256::ZERO,
+            1_000_000,
+            &off_curve,
+            &[],
+        );
+        assert!(from.tx_results[0].success);
+        assert_eq!(from.tx_results[0].gas_used, used);
+        assert_eq!(
+            from.paid_fees,
+            fee(1_000_000),
+            "an invisible exception pays for the whole limit"
+        );
+    }
+
+    /// A contract's call to HDWalletUtils that throws
+    /// (`Program.callToPrecompiledAddress`): from RSKIP197 the call fails and
+    /// costs what the method asked for, and the contract goes on; before it the
+    /// throw takes all the gas the call was given (#295).
+    #[test]
+    fn a_native_contract_that_throws_inside_a_call_fails_the_call() {
+        let hd_wallet = crate::precompiles::HD_WALLET_UTILS_ADDR;
+        let caller = Address::repeat_byte(0xBB);
+        // CALL HDWalletUtils with this transaction's calldata and all the gas,
+        // and return what the CALL pushed.
+        let mut code: Vec<u8> = vec![
+            0x36, 0x60, 0x00, 0x60, 0x00, 0x37, // mem[0..n] = calldata
+            0x60, 0x00, 0x60, 0x00, 0x36, 0x60, 0x00, 0x60,
+            0x00, // no return, args 0..n, no value
+            0x73, // PUSH20
+        ];
+        code.extend_from_slice(hd_wallet.as_slice());
+        code.extend_from_slice(&[
+            0x5a, 0xf1, // GAS, CALL
+            0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3, // RETURN the pushed word
+        ]);
+        let contracts: &[(Address, &[u8])] = &[(caller, &code)];
+        let call = |height: u64, input: &[u8]| {
+            let result = execute_alone(
+                RskHardforkConfig::mainnet(),
+                height,
+                caller,
+                U256::ZERO,
+                1_000_000,
+                input,
+                contracts,
+            );
+            result.tx_results.into_iter().next().unwrap()
+        };
+        let bad = extract_public_key_call(b"this-is-not-an-xpub");
+
+        let from = call(3_614_801, &bad);
+        assert!(from.success, "the contract goes on");
+        assert_eq!(
+            U256::from_be_slice(&from.output),
+            U256::ZERO,
+            "the CALL pushes 0"
+        );
+        assert!(
+            from.gas_used < 100_000,
+            "from RSKIP197 the call costs 11,300 and its overhead, not the limit (got {})",
+            from.gas_used
+        );
+
+        let fine = call(3_614_801, &extract_public_key_call(XPUB.as_bytes()));
+        assert_eq!(
+            U256::from_be_slice(&fine.output),
+            U256::from(1),
+            "the CALL pushes 1"
+        );
+
+        let before = call(2_000_000, &bad);
+        assert!(
+            before.gas_used > 900_000,
+            "before RSKIP197 the throw takes the gas it was given (got {})",
+            before.gas_used
         );
     }
 
@@ -7528,6 +7891,7 @@ mod tests {
         let parent_number = current_number - 1;
         let mut parent_header = dummy_header(parent_number);
         parent_header.difficulty = U256::from(1);
+        parent_header.uncle_count = 2;
         let parent_hash = parent_header.hash();
         block_store.put_header(&parent_header).unwrap();
         block_store.put_canonical_hash(parent_number, parent_hash).unwrap();
@@ -7585,12 +7949,20 @@ mod tests {
     }
 
     /// Ported from rskj BlockHeaderContractTest.*_whenMethodDisabled_shouldThrowVME:
-    /// both methods fail before RSKIP536 activates (mainnet vetiver900).
+    /// before RSKIP536 (mainnet vetiver900) neither method parses, so the
+    /// contract throws, at no cost. In a transaction's own call that is rskj's
+    /// invisible exception: a success with no output and only the intrinsic gas.
     #[test]
     fn test_rskip536_methods_disabled_before_activation() {
         for sig in ["getDifficultyWithUncles(int256)", "getCumulativeWork(int256)"] {
             let result = rskip536_call(sig, RskHardforkConfig::mainnet(), 8_804_199);
-            assert!(!result.success, "{sig} must fail before vetiver900");
+            assert!(result.success, "{sig}: the throw is invisible");
+            assert!(result.output.is_empty(), "{sig}");
+            assert_eq!(
+                result.gas_used,
+                intrinsic_gas(&bh_input(sig, 0), 16),
+                "{sig}"
+            );
         }
     }
 
@@ -7905,7 +8277,7 @@ mod tests {
     /// worked out, or its arguments read, before anything checks the sender.
     #[test]
     fn bridge_offsets_are_read_from_their_low_32_bits() {
-        use crate::bridge::abi::encode::{self, Arg};
+        use crate::abi::encode::{self, Arg};
         let run = |input: &[u8]| {
             let store = Arc::new(MemoryTrieStore::new());
             let sender = Address::repeat_byte(0xAA);
@@ -8415,9 +8787,11 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
         assert!(decoded.is_empty(), "should return empty bytes for depth >= 4000");
     }
 
-    /// Negative depth should fail (rskj throws VMException).
+    /// A negative depth throws (rskj `BlockAccessor.getBlock`) after the method
+    /// is charged 4,000 and two a byte; in a transaction's own call that is
+    /// the invisible exception.
     #[test]
-    fn test_block_header_negative_depth_fails() {
+    fn test_block_header_negative_depth_throws() {
         let store = Arc::new(MemoryTrieStore::new());
         let root = TrieNode::empty();
 
@@ -8438,17 +8812,21 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
             gas_limit: U256::from(100_000),
             to: Bytes::copy_from_slice(crate::precompiles::BLOCK_HEADER_ADDR.as_slice()),
             value: U256::ZERO,
-            input: Bytes::from(input),
-            v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
+            input: Bytes::from(input.clone()),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
         };
 
-        let executor = RskExecutor::new(
-            RskHardforkConfig::all_active(33),
-            block_store,
-        );
+        let executor = RskExecutor::new(RskHardforkConfig::all_active(33), block_store);
 
-        let result = executor.execute_tx(&header, &tx, sender, &root, store).unwrap();
-        assert!(!result.success, "negative depth should fail");
+        let result = executor
+            .execute_tx(&header, &tx, sender, &root, store)
+            .unwrap();
+        assert!(result.success, "an invisible exception records success");
+        assert!(result.output.is_empty());
+        assert_eq!(result.gas_used, intrinsic_gas(&input, 16) + 4_000 + 2 * 36);
     }
 
     /// Block not found at depth returns empty bytes.
@@ -8705,7 +9083,8 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
         let mut uncle1 = dummy_header(98);
         uncle1.beneficiary = uncle1_coinbase;
 
-        let parent = dummy_header(99);
+        let mut parent = dummy_header(99);
+        parent.uncle_count = 2;
         let parent_hash = parent.hash();
         block_store.put_header(&parent).unwrap();
         block_store.put_canonical_hash(99, parent_hash).unwrap();
@@ -8780,7 +9159,8 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
     }
 
     /// Ported from rskj BlockHeaderContractTest.negativeUncleIndex:
-    ///   Negative uncle index should fail.
+    ///   a negative uncle index throws, which in a transaction's own call is
+    ///   the invisible exception.
     #[test]
     fn test_rskj_block_header_negative_uncle_index() {
         let store = Arc::new(MemoryTrieStore::new());
@@ -8815,22 +9195,27 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
             gas_limit: U256::from(100_000),
             to: Bytes::copy_from_slice(crate::precompiles::BLOCK_HEADER_ADDR.as_slice()),
             value: U256::ZERO,
-            input: Bytes::from(input),
-            v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
+            input: Bytes::from(input.clone()),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
         };
 
-        let executor = RskExecutor::new(
-            RskHardforkConfig::all_active(33),
-            block_store,
-        );
+        let executor = RskExecutor::new(RskHardforkConfig::all_active(33), block_store);
 
-        let result = executor.execute_tx(&header, &tx, sender, &root, store).unwrap();
-        assert!(!result.success, "negative uncle index should fail");
+        let result = executor
+            .execute_tx(&header, &tx, sender, &root, store)
+            .unwrap();
+        assert!(result.success, "an invisible exception records success");
+        assert!(result.output.is_empty());
+        assert_eq!(result.gas_used, intrinsic_gas(&input, 16) + 4_000 + 2 * 68);
     }
 
     /// Ported from rskj BlockHeaderContractTest.getEmptyMergedMiningTags:
-    ///   When parent has no bitcoin_merged_mining_coinbase_transaction,
-    ///   getMergedMiningTags returns empty bytes.
+    ///   when the parent's merged-mining coinbase has no RSK tag,
+    ///   getMergedMiningTags returns empty bytes. (A block with no coinbase
+    ///   at all throws, as rskj's does.)
     #[test]
     fn test_rskj_block_header_empty_merged_mining_tags() {
         let store = Arc::new(MemoryTrieStore::new());
@@ -8844,9 +9229,12 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
             BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap(),
         );
 
-        // Parent with no merged mining data at all
-        let parent = dummy_header(99);
-        assert!(parent.bitcoin_merged_mining_coinbase_transaction.is_none());
+        // Merged-mining fields whose coinbase has no RSKBLOCK: tag, as rskj's
+        // test chain has. A header holds the three together or none of them.
+        let mut parent = dummy_header(99);
+        parent.bitcoin_merged_mining_header = Some(Bytes::from(vec![0; 80]));
+        parent.bitcoin_merged_mining_merkle_proof = Some(Bytes::from(vec![0; 32]));
+        parent.bitcoin_merged_mining_coinbase_transaction = Some(Bytes::from(vec![0xAB; 64]));
         let parent_hash = parent.hash();
         block_store.put_header(&parent).unwrap();
         block_store.put_canonical_hash(99, parent_hash).unwrap();
@@ -8874,7 +9262,8 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
         assert!(result.success, "empty merged mining should succeed");
 
         let decoded = decode_abi_bytes(&result.output);
-        assert!(decoded.is_empty(), "no coinbase tx → empty merged mining tags");
+        assert_eq!(result.output.len(), 96, "empty bytes, encoded");
+        assert!(decoded.is_empty(), "no RSK tag → empty merged mining tags");
     }
 
     /// Ported from rskj BlockHeaderContractTest.invalidBlockDepth:

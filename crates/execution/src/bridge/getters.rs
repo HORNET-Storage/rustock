@@ -345,7 +345,7 @@ pub fn get_lock_whitelist_entry_by_address<CTX: crate::RskContextTr>(
     gas_cost: u64,
     config: &BridgeConstants,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    let Some(addr_str) = super::abi::Args::new(args).string(0) else {
+    let Some(addr_str) = crate::abi::Args::new(args).string(0) else {
         return Err(PrecompileError::other(
             "getLockWhitelistEntryByAddress: malformed string argument",
         ));
@@ -470,7 +470,7 @@ fn member_key(member: &super::federation::StoredMember, key_type: KeyType) -> [u
 /// throws for anything but "btc", "rsk" and "mst".
 fn decode_index_and_key_type(args: &[u8]) -> Result<(i32, KeyType), PrecompileError> {
     let index = index_arg(args, "PublicKeyOfType")?;
-    let key_type = super::abi::Args::new(args)
+    let key_type = crate::abi::Args::new(args)
         .string(1)
         .as_deref()
         .and_then(parse_key_type)
@@ -737,7 +737,7 @@ pub fn get_btc_tx_hash_processed_height<CTX: crate::RskContextTr>(
 
 /// A method's first argument as an index: `((BigInteger) args[0]).intValue()`.
 fn index_arg(args: &[u8], method: &str) -> Result<i32, PrecompileError> {
-    super::abi::Args::new(args)
+    crate::abi::Args::new(args)
         .int(0)
         .map(|index| index.int_value())
         .ok_or_else(|| PrecompileError::Other(format!("{method}: no index").into()))
@@ -747,11 +747,31 @@ fn index_arg(args: &[u8], method: &str) -> Result<i32, PrecompileError> {
 /// `Sha256Hash.wrap((String) args[0])`, whose lower-case-only hex decoding
 /// and 32-byte check both throw.
 fn hash_arg(args: &[u8], method: &str) -> Result<[u8; 32], PrecompileError> {
-    super::abi::Args::new(args)
+    crate::abi::Args::new(args)
         .string(0)
         .as_deref()
-        .and_then(super::abi::sha256_hash_from_hex)
+        .and_then(sha256_hash_from_hex)
         .ok_or_else(|| PrecompileError::Other(format!("{method}: not a 32-byte hash").into()))
+}
+
+/// `Sha256Hash.wrap(String)`: bitcoinj's `Utils.HEX`, Guava's lower-case
+/// base16, decodes the string, and the hash must be 32 bytes. Upper-case
+/// digits are refused.
+fn sha256_hash_from_hex(hex: &str) -> Option<[u8; 32]> {
+    let digit = |c: u8| match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        _ => None,
+    };
+    let digits = hex.as_bytes();
+    if digits.len() != 64 {
+        return None;
+    }
+    let mut hash = [0u8; 32];
+    for (byte, pair) in hash.iter_mut().zip(digits.chunks_exact(2)) {
+        *byte = (digit(pair[0])? << 4) | digit(pair[1])?;
+    }
+    Some(hash)
 }
 
 /// The federation creation time as the era reports it: milliseconds before
@@ -1581,5 +1601,14 @@ mod tests {
             get_federator_public_key(&mut ctx, &[0u8; 32], 0, &mainnet(), &hardforks()).unwrap();
         assert_eq!(empty.bytes, zero.bytes);
         assert_eq!(as_bytes(&empty).len(), 33);
+    }
+
+    #[test]
+    fn a_hash_string_is_64_lower_case_hex_digits() {
+        let lower = "00".repeat(31) + "ab";
+        assert_eq!(sha256_hash_from_hex(&lower).map(|h| h[31]), Some(0xAB));
+        assert_eq!(sha256_hash_from_hex(&lower.to_uppercase()), None);
+        assert_eq!(sha256_hash_from_hex(&lower[2..]), None);
+        assert_eq!(sha256_hash_from_hex(&("0".repeat(61) + "\u{FFFD}")), None);
     }
 }

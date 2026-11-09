@@ -177,7 +177,7 @@ pub fn register_btc_coinbase_transaction<CTX: crate::RskContextTr>(
     // The five arguments, as rskj's decoder reads them: the transaction, the
     // block hash, the partial merkle tree, the witness merkle root and the
     // witness reserved value.
-    let decoded = super::abi::Args::new(args);
+    let decoded = crate::abi::Args::new(args);
     let (
         Some(btc_tx_data),
         Some(block_hash),
@@ -293,7 +293,7 @@ pub fn has_btc_block_coinbase_info<CTX: crate::RskContextTr>(
     args: &[u8],
     gas_cost: u64,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    let block_hash = super::abi::Args::new(args).bytes32(0).ok_or_else(|| {
+    let block_hash = crate::abi::Args::new(args).bytes32(0).ok_or_else(|| {
         PrecompileError::other("hasBtcBlockCoinbaseTransactionInformation: no block hash")
     })?;
     let has_info = has_coinbase_information(ctx, &block_hash);

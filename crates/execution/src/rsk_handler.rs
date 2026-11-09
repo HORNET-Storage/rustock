@@ -41,7 +41,7 @@ use revm::handler::{
 };
 use revm::interpreter::interpreter::EthInterpreter;
 use revm::interpreter::interpreter_action::FrameInit;
-use revm::interpreter::{CallOutcome, CreateOutcome, InstructionResult, InterpreterAction};
+use revm::interpreter::{CallOutcome, CreateOutcome, Gas, InstructionResult, InterpreterAction};
 use revm::primitives::hardfork::SpecId;
 use revm::primitives::{Address, Bytes, U256};
 use revm::inspector::JournalExt;
@@ -282,6 +282,37 @@ where
     ) {
         exec_result.gas_mut().record_refund(eip7702_refund);
         exec_result.gas_mut().set_final_refund(false);
+    }
+
+    /// The mainnet settlement of the transaction's gas, after one change for
+    /// rskj's invisible exception (`TransactionExecutor.call`). When a
+    /// precompile throws in the transaction's own call, its frame reverts, so
+    /// revm hands the value back and forgets the touch. Here the transaction
+    /// becomes a success that used its intrinsic gas and what the precompile
+    /// asked for. `reimburse_caller` and `reward_beneficiary` charge the
+    /// whole gas limit.
+    fn last_frame_result(
+        &mut self,
+        evm: &mut Self::Evm,
+        frame_result: &mut FrameResult,
+    ) -> Result<(), Self::Error> {
+        use revm::context_interface::Transaction;
+        if self.invisible_exception.load(Ordering::Relaxed) {
+            frame_result.interpreter_result_mut().result = InstructionResult::Return;
+        }
+        let instruction_result = frame_result.interpreter_result().result;
+        let gas = frame_result.gas_mut();
+        let remaining = gas.remaining();
+        let refunded = gas.refunded();
+        // Spend the gas limit; what the transaction left comes back below.
+        *gas = Gas::new_spent(evm.ctx().tx().gas_limit());
+        if instruction_result.is_ok_or_revert() {
+            gas.erase_cost(remaining);
+        }
+        if instruction_result.is_ok() {
+            gas.record_refund(refunded);
+        }
+        Ok(())
     }
 
     /// The mainnet exec loop with two additions:

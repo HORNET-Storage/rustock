@@ -10,7 +10,6 @@
 //! This module implements the consensus-critical subset (32 transaction-callable
 //! methods). Local-call-only getters are deferred to RPC support.
 
-pub(crate) mod abi;
 pub mod btc_block_cache;
 #[cfg(test)]
 mod btc_block_cache_readpath_tests;
@@ -68,7 +67,7 @@ pub(crate) fn compute_selector(sig: &str) -> [u8; 4] {
 // mainnet #6,223,797 tx[3] forwards `receiveHeaders(bytes[])` with a `bytes[]`
 // offset of 0xa0 into a 60-byte argument payload, so rskj's decode throws.
 //
-// The decoding is `abi::Args`, which every method handler reads its
+// The decoding is `crate::abi::Args`, which every method handler reads its
 // arguments through as well: a payload that passes here is read by each
 // handler as rskj's `Object[] args` holds it.
 
@@ -77,7 +76,9 @@ pub(crate) fn compute_selector(sig: &str) -> [u8; 4] {
 /// Returns false where rskj's decode would throw (→ `parseData` null → flat
 /// 23_000 parse-failure cost).
 fn abi_args_decode_ok(args: &[u8], signature: &str) -> bool {
-    abi::Args::new(args).decode(signature).unwrap_or(false)
+    crate::abi::Args::new(args)
+        .decode(signature)
+        .unwrap_or(false)
 }
 
 // ---------------------------------------------------------------------------
@@ -741,7 +742,7 @@ fn receive_headers_cost(args: &[u8], hardfork_cfg: &RskHardforkConfig, block_num
     let base: u64 = if rskip132 { 25_000 } else { 66_000 };
     let per_additional_header: u64 = if rskip132 { 3_500 } else { 1_650 };
 
-    match abi::Args::new(args)
+    match crate::abi::Args::new(args)
         .bytes_array(0)
         .map(|headers| headers.len() as u64)
     {
@@ -763,7 +764,7 @@ fn btc_tx_confirmations_cost<CTX: crate::RskContextTr>(
     const DOUBLE_HASH_COST: u64 = 144;
 
     // args: bytes32 btcTxHash, bytes32 btcBlockHash, uint256 path, bytes32[] hashes
-    let args = abi::Args::new(args);
+    let args = crate::abi::Args::new(args);
     let (block_hash, branch_hashes) = match (args.bytes32(1), args.bytes32_array(3)) {
         (Some(h), Some(hashes)) => (alloy_primitives::B256::from(h), hashes.len() as u64),
         _ => return BASIC_COST,
@@ -1025,7 +1026,9 @@ mod tests {
     fn the_decoder_reads_every_signature_in_the_method_table() {
         for method in BRIDGE_METHODS.iter() {
             assert!(
-                abi::Args::new(&[]).decode(method.signature).is_some(),
+                crate::abi::Args::new(&[])
+                    .decode(method.signature)
+                    .is_some(),
                 "{}",
                 method.signature
             );
@@ -1357,7 +1360,7 @@ mod tests {
 
         // Three headers. rskj counts the decoded array, so a count the
         // entries do not back is not three headers but a parse failure.
-        use abi::encode::{self, Arg};
+        use crate::abi::encode::{self, Arg};
         let header: &[u8] = &[0u8; 80];
         let args = encode::args(&[Arg::BytesArray(&[header, header, header])]);
 
