@@ -87,6 +87,34 @@ fn a_minimum_gas_price_past_256_bits_prints_whole() {
     assert_eq!(notified["minimumGasPrice"], json!(whole));
 }
 
+/// rskj prints the null address, which an empty coinbase reads as, from
+/// its no bytes: `0x` in a block (`toUnformattedJsonHex`) and `0x00` in a
+/// `newHeads` notification (`toJsonHex`). The zero address is 20 bytes.
+#[test]
+fn the_null_address_prints_as_no_bytes() {
+    let null = Header {
+        beneficiary: Address::ZERO,
+        kept: Some(Box::new(rustock_core::types::header::KeptFields {
+            null_coinbase: true,
+            ..Default::default()
+        })),
+        ..test_header(1)
+    };
+    let block = crate::helpers::BlockResultDto::from_header(&null, B256::ZERO, U256::ZERO);
+    assert_eq!(block.miner, "0x");
+    let notified = crate::subscribe::header_dto(&null, B256::ZERO);
+    assert_eq!(notified["miner"], json!("0x00"));
+    let zero = Header {
+        beneficiary: Address::ZERO,
+        ..test_header(1)
+    };
+    let twenty = format!("0x{}", "0".repeat(40));
+    let block = crate::helpers::BlockResultDto::from_header(&zero, B256::ZERO, U256::ZERO);
+    assert_eq!(block.miner, twenty);
+    let notified = crate::subscribe::header_dto(&zero, B256::ZERO);
+    assert_eq!(notified["miner"], json!(twenty));
+}
+
 fn setup_state() -> (RpcState, tempfile::TempDir) {
     setup_state_with(|store| store)
 }
@@ -5084,6 +5112,57 @@ async fn hashrate_is_zero_without_a_miner_and_counts_only_our_blocks_with_one() 
     // A coinbase that mined nothing in the window earns nothing.
     let none = crate::eth::eth_hashrate_for(json!(1), &state.store, Some(Address::repeat_byte(0xCC)));
     assert_eq!(none.result.unwrap(), json!("0x0"));
+}
+
+/// rskj's ownership test is `RskAddress.equals`: a block whose coinbase is
+/// empty was mined by the null address, which is no miner's, not even that of
+/// a node whose coinbase is the zero address.
+#[tokio::test]
+async fn hashrate_counts_no_block_with_an_empty_coinbase_as_ours() {
+    use alloy_primitives::Address;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(tmp.path()).unwrap());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    // Two blocks in the window, both of the zero address as the typed field
+    // reads it: the first's coinbase is empty, the second's twenty zeros.
+    let mut parent = B256::ZERO;
+    for number in 0u64..2 {
+        let header = Header {
+            parent_hash: parent,
+            timestamp: now - 60 + number,
+            difficulty: U256::from(3_600_000u64),
+            beneficiary: Address::ZERO,
+            kept: (number == 0).then(|| {
+                Box::new(rustock_core::types::header::KeptFields {
+                    null_coinbase: true,
+                    ..Default::default()
+                })
+            }),
+            ..test_header(number)
+        };
+        store.put_header(&header).unwrap();
+        store.put_canonical_hash(number, header.hash()).unwrap();
+        store
+            .put_total_difficulty(header.hash(), U256::from(1u64))
+            .unwrap();
+        store.put_body(header.hash(), &[], &[]).unwrap();
+        store.set_head(header.hash()).unwrap();
+        parent = header.hash();
+    }
+
+    // The network figure counts both; the zero address mined only the second.
+    let net = crate::eth::eth_net_hashrate(json!(1), &store);
+    assert_eq!(net.result.unwrap().as_u64().unwrap(), 7_200_000 / 3600);
+    let mine = crate::eth::eth_hashrate_for(json!(1), &store, Some(Address::ZERO));
+    assert_eq!(
+        mine.result.unwrap(),
+        json!(format!("0x{:x}", 3_600_000u64 / 3600))
+    );
 }
 
 /// Administrative methods are reported as unknown rather than forbidden, so a

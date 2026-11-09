@@ -210,7 +210,7 @@ impl BlockHeader<'_> {
     /// `null`.
     fn read(&self, call: &Call, hash: B256, header: &Header) -> Result<Option<Vec<u8>>, Failure> {
         let value = match call.method {
-            Method::CoinbaseAddress => header.beneficiary.to_vec(),
+            Method::CoinbaseAddress => coinbase_bytes(header),
             Method::BlockHash => hash.to_vec(),
             Method::MergedMiningTags => merged_mining_tags(header)?,
             // `Coin.getBytes()`, of any size.
@@ -234,7 +234,7 @@ impl BlockHeader<'_> {
                     .map_err(|_| Failure::threw("an uncle index cannot be negative"))?;
                 self.uncles(hash, header)?
                     .get(index)
-                    .map(|uncle| uncle.beneficiary.to_vec())
+                    .map(coinbase_bytes)
                     .unwrap_or_default()
             }
             // `Block.getCumulativeDifficulty`.
@@ -296,6 +296,14 @@ fn non_empty(field: &Option<Bytes>) -> Option<&[u8]> {
         .as_ref()
         .map(|bytes| &bytes[..])
         .filter(|bytes| !bytes.is_empty())
+}
+
+/// `getCoinbase().getBytes()`: none for rskj's null address, which an
+/// empty coinbase reads as.
+fn coinbase_bytes(header: &Header) -> Vec<u8> {
+    header
+        .coinbase()
+        .map_or_else(Vec::new, |coinbase| coinbase.to_vec())
 }
 
 /// `BigInteger.toByteArray()` of a non-negative number: its shortest
@@ -502,6 +510,44 @@ mod tests {
             call(&contract, &get, 4_072),
             Outcome::Returned { gas: 4_072, .. }
         ));
+    }
+
+    /// rskj's null address, which an empty coinbase reads as, has no bytes,
+    /// for a block's coinbase and an uncle's alike. The zero address has 20.
+    #[test]
+    fn the_null_address_is_no_bytes() {
+        let null = || {
+            Some(Box::new(rustock_core::types::header::KeptFields {
+                null_coinbase: true,
+                ..Default::default()
+            }))
+        };
+        let (_dir, blocks, hashes) = chain_with(10, |block| {
+            if block.number == 10 {
+                block.beneficiary = Address::ZERO;
+                block.kept = null();
+                block.uncle_count = 1;
+            }
+        });
+        let mut uncle = header(9, hashes[8]);
+        uncle.beneficiary = Address::ZERO;
+        uncle.kept = null();
+        blocks.put_body(hashes[10], &[], &[uncle]).unwrap();
+        let contract = at(&blocks, &hashes, 11);
+        let returned = |gas, value: &[u8]| Outcome::Returned {
+            gas,
+            output: encode_bytes(value).into(),
+        };
+        let get = input("getCoinbaseAddress(int256)", &[int(0)]);
+        assert_eq!(call(&contract, &get, 1_000_000), returned(4_072, &[]));
+        let get = input("getUncleCoinbaseAddress(int256,int256)", &[int(0), int(0)]);
+        assert_eq!(call(&contract, &get, 1_000_000), returned(4_136, &[]));
+        // Block 0's coinbase is the zero address, which is 20 bytes.
+        let genesis = input("getCoinbaseAddress(int256)", &[int(0)]);
+        assert_eq!(
+            call(&at(&blocks, &hashes, 1), &genesis, 1_000_000),
+            returned(4_072, &[0; 20])
+        );
     }
 
     #[test]

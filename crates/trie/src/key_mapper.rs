@@ -98,7 +98,9 @@ pub fn storage_key_from_bytes(addr_bytes: &[u8], slot_bytes: &[u8]) -> Vec<u8> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrieKeyKind {
     /// `0x00 || keccak(addr)[0:10] || addr`. The address is raw bytes because
-    /// RSK has short addresses: REMASC's sender is the single byte `0x00`.
+    /// RSK has short addresses: REMASC's sender is the single byte `0x00`,
+    /// and the null address, which REMASC pays where a block's coinbase is
+    /// empty, has none.
     Account { address: Vec<u8> },
     /// `account_key || 0x80`.
     Code { address: Vec<u8> },
@@ -123,13 +125,17 @@ const MAX_ADDR_LEN: usize = 20;
 /// 13 bytes, which no length rule distinguishes from some other key's prefix.
 /// Verifying the digest makes the decode exact.
 fn recover_address(key: &[u8]) -> Option<&[u8]> {
-    if key.first() != Some(&DOMAIN_PREFIX) || key.len() < 1 + SECURE_KEY_SIZE + 1 {
+    if key.first() != Some(&DOMAIN_PREFIX) || key.len() < 1 + SECURE_KEY_SIZE {
         return None;
     }
     let body = &key[1 + SECURE_KEY_SIZE..];
     let claimed = &key[1..1 + SECURE_KEY_SIZE];
     let max = MAX_ADDR_LEN.min(body.len());
-    (1..=max).rev().find(|&len| secure_prefix(&body[..len]) == claimed).map(|len| &body[..len])
+    // Down to no bytes, the null address's.
+    (0..=max)
+        .rev()
+        .find(|&len| secure_prefix(&body[..len]) == claimed)
+        .map(|len| &body[..len])
 }
 
 /// Recovers the full 32-byte slot from the stripped tail. Storage slots are
@@ -329,6 +335,23 @@ mod classify_tests {
             }
             other => panic!("expected storage, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn the_null_addresss_account_key_names_no_address_bytes() {
+        // rskj's null address, which REMASC pays where a block's coinbase is
+        // empty, has no bytes: its account key is the domain byte and the
+        // secure prefix of nothing.
+        let account = account_key_from_bytes(&[]);
+        assert_eq!(account.len(), 11);
+        assert_eq!(
+            classify_key(&account),
+            TrieKeyKind::Account { address: vec![] }
+        );
+        // The prefix is checked, as for any address.
+        let mut forged = account.clone();
+        forged[1] ^= 0xff;
+        assert_eq!(classify_key(&forged), TrieKeyKind::Unknown);
     }
 
     #[test]

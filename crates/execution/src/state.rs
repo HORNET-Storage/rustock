@@ -34,6 +34,12 @@ pub struct ContractMarkers {
     /// value per unitrie storage key, bypassing revm's U256-valued slots.
     /// `None` deletes the entry.
     pub raw_storage: Vec<crate::raw_storage::RawWrite>,
+    /// What REMASC paid rskj's null address, if it paid it: the account of
+    /// a coinbase that is empty (`RskAddress.nullAddress()`), whose address
+    /// has no bytes, at the trie key of none. revm can't hold it, so it is
+    /// credited here, as `bump_remasc_sender` is, and created if it is new,
+    /// even for nothing, as rskj's `addBalance` creates it.
+    pub null_account: Option<U256>,
 }
 
 /// Apply all state changes from EVM execution to the trie, returning the new root.
@@ -150,6 +156,16 @@ pub fn apply_state_changes(
             .unwrap_or_default();
         acct.nonce += U256::from(1);
         new_root = new_root.put(&key, &acct.encode(), store);
+    }
+
+    if let Some(paid) = markers.null_account {
+        let key = TrieKeySlice::from_key(&rustock_trie::account_key_from_bytes(&[]));
+        let mut account = new_root
+            .get(&key, store)
+            .and_then(|data| AccountState::decode(&data).ok())
+            .unwrap_or_default();
+        account.balance += paid;
+        new_root = new_root.put(&key, &account.encode(), store);
     }
 
     new_root
@@ -475,6 +491,35 @@ mod tests {
 
         let marker_key = TrieKeySlice::from_key(&storage_prefix_key(&ecrecover));
         assert_eq!(new_root.get(&marker_key, &store), Some(vec![1]));
+    }
+
+    /// What REMASC paid rskj's null address lands at the account key of no
+    /// address bytes: on top of what it held, and created, even for nothing,
+    /// where it held nothing. The zero address is another account.
+    #[test]
+    fn the_null_account_is_credited_at_its_own_key() {
+        let (store, root) = empty_trie();
+        let null_key = rustock_trie::account_key_from_bytes(&[]);
+        let null = |root: &TrieNode| {
+            root.get(&TrieKeySlice::from_key(&null_key), &store)
+                .and_then(|data| AccountState::decode(&data).ok())
+        };
+        let paid = |amount: u64| ContractMarkers {
+            null_account: Some(U256::from(amount)),
+            ..Default::default()
+        };
+        let none = EvmState::default();
+        let created = apply_state_changes(&root, &store, &none, &paid(0));
+        assert_eq!(null(&created), Some(AccountState::default()));
+        let credited = apply_state_changes(&created, &store, &none, &paid(3_327));
+        let again = apply_state_changes(&credited, &store, &none, &paid(1_000));
+        assert_eq!(
+            null(&again).map(|account| account.balance),
+            Some(U256::from(4_327))
+        );
+        assert!(read_account(&again, &store, &Address::ZERO).is_none());
+        let unpaid = apply_state_changes(&root, &store, &none, &ContractMarkers::default());
+        assert_eq!(null(&unpaid), None);
     }
 
     #[test]

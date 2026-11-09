@@ -488,6 +488,7 @@ impl BlockProcessor {
                 trie_store.as_ref(),
                 &exec_result.state_changes,
             )
+            .with_null_account(exec_result.markers.null_account)
         } else {
             crate::supply::SupplyReport::default()
         };
@@ -1647,6 +1648,65 @@ mod tests {
             processor(moved).validate_block_body_rules(&block(Some(vec![1])), None),
             Ok(())
         );
+    }
+
+    /// What REMASC pays the null address reaches its account after the
+    /// transactions, outside their state changes, and the block's supply check
+    /// counts it there: the payment moves value and burns none.
+    #[test]
+    fn paying_the_null_address_burns_nothing() {
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let mut parent_hash = B256::ZERO;
+        for number in 0..15 {
+            let mut header = dummy_header(number);
+            header.parent_hash = parent_hash;
+            if number == 5 {
+                // An empty coinbase: rskj's null address.
+                header.beneficiary = Address::ZERO;
+                header.paid_fees = U256::from(21_000);
+                header.kept = Some(Box::new(rustock_core::types::header::KeptFields {
+                    null_coinbase: true,
+                    ..Default::default()
+                }));
+            }
+            let hash = header.hash();
+            block_store.put_header_with_hash(hash, &header).unwrap();
+            block_store.put_canonical_hash(number, hash).unwrap();
+            parent_hash = hash;
+        }
+        let store: Arc<dyn TrieStore> = Arc::new(MemoryTrieStore::new());
+        let remasc = crate::precompiles::REMASC_ADDR;
+        let root = put_account(
+            &TrieNode::empty(),
+            store.as_ref(),
+            &remasc,
+            0,
+            U256::from(21_000),
+        );
+        let mut header = dummy_header(15);
+        header.parent_hash = parent_hash;
+        let block = Block {
+            header,
+            transactions: vec![Transaction::remasc(15)],
+            ommers: vec![],
+        };
+
+        let processor = BlockProcessor::new(test_hardfork_cfg(), block_store);
+        let (processed, imbalances) = crate::supply::imbalances_while(|| {
+            processor.execute_block(&block, &root, store.clone())
+        });
+        // `remasc_basic_distribution_no_siblings`: the coinbase is paid 3,327.
+        let null = rustock_trie::account_key_from_bytes(&[]);
+        let account = processed
+            .unwrap()
+            .new_state_root
+            .get(&TrieKeySlice::from_key(&null), store.as_ref())
+            .and_then(|data| AccountState::decode(&data).ok());
+        assert_eq!(
+            account.map(|account| account.balance),
+            Some(U256::from(3_327))
+        );
+        assert_eq!(imbalances, Vec::<String>::new());
     }
 
     /// The chain configuration's sequential minimum reaches the executor. On

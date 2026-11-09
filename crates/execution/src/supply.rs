@@ -118,6 +118,16 @@ impl SupplyReport {
         self
     }
 
+    /// Account for what REMASC paid rskj's null address, the account of an
+    /// empty coinbase. revm can't hold it, so REMASC's side is in the state
+    /// and the null account's isn't: the trie credits it at the block's end
+    /// (`ContractMarkers::null_account`). The value moves, and counts as
+    /// though it had been credited.
+    pub fn with_null_account(mut self, paid: Option<U256>) -> Self {
+        self.inflow = self.inflow.saturating_add(paid.unwrap_or_default());
+        self
+    }
+
     /// BTC was destroyed. Worth recording, not fatal.
     pub fn destroyed_supply(&self) -> bool {
         self.outflow > self.inflow
@@ -393,6 +403,45 @@ pub fn report_transaction(block: u64, index: usize, report: &SupplyReport) {
     }
 }
 
+/// What `f` logs as a supply imbalance on this thread, a line per event. An
+/// imbalance that burns value is only logged, so this is how a test sees that
+/// the checks balanced; `report_transaction`'s lines name a `tx`.
+#[cfg(test)]
+pub(crate) fn imbalances_while<R>(f: impl FnOnce() -> R) -> (R, Vec<String>) {
+    use std::fmt::Write as _;
+    use std::sync::{Arc, Mutex};
+
+    struct Line(String);
+    impl tracing::field::Visit for Line {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            let _ = write!(self.0, " {}={value:?}", field.name());
+        }
+    }
+    struct Recorder(Arc<Mutex<Vec<String>>>);
+    impl tracing::Subscriber for Recorder {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            metadata.target() == "rustock::supply"
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut line = Line(event.metadata().level().to_string());
+            event.record(&mut line);
+            self.0.lock().unwrap().push(line.0);
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    let lines = Arc::new(Mutex::new(Vec::new()));
+    let out = tracing::subscriber::with_default(Recorder(lines.clone()), f);
+    let lines = std::mem::take(&mut *lines.lock().unwrap());
+    (out, lines)
+}
+
 #[cfg(test)]
 mod movement_tests {
     use super::*;
@@ -615,5 +664,36 @@ mod tests {
 
         let r = account_supply_change(&root, &store, &state);
         assert!(r.is_balanced(), "a peg-in must not change the total: {r:?}");
+    }
+
+    /// REMASC paying rskj's null address, whose account revm doesn't hold:
+    /// it is a payment, in the block and in the transaction.
+    #[test]
+    fn a_payment_to_the_null_address_moves_value() {
+        let remasc = crate::precompiles::REMASC_ADDR;
+        let (store, root) = store_with(&[(remasc, 10_000)]);
+        let before = AccountInfo {
+            balance: U256::from(10_000),
+            ..Default::default()
+        };
+        let mut paid = Account::from(before.clone());
+        paid.original_info = Box::new(before);
+        paid.info.balance = U256::from(6_673);
+        paid.transaction_id = 1;
+        paid.mark_touch();
+        let mut state = EvmState::default();
+        state.insert(remasc, paid);
+
+        let block = account_supply_change(&root, &store, &state);
+        assert_eq!(block.net(), (false, U256::from(3_327)), "{block:?}");
+        let block = block.with_null_account(Some(U256::from(3_327)));
+        assert!(block.is_balanced(), "{block:?}");
+        let transaction = transaction_supply_change(&state, 1);
+        assert!(transaction.destroyed_supply(), "{transaction:?}");
+        let transaction = transaction.with_null_account(Some(U256::from(3_327)));
+        assert!(transaction.is_balanced(), "{transaction:?}");
+        assert!(SupplyReport::default()
+            .with_null_account(None)
+            .is_balanced());
     }
 }

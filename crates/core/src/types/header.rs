@@ -104,7 +104,8 @@ pub struct KeptFields {
     pub gas_limit: Option<Bytes>,
     /// An empty coinbase, which rskj reads as its null address, an
     /// `RskAddress` of no bytes, and writes back empty. `beneficiary`
-    /// holds zero, which is what COINBASE reads for it.
+    /// holds zero, which is what COINBASE reads for it; where rskj reads
+    /// the address itself, see [`Header::coinbase`].
     pub null_coinbase: bool,
     /// An uncles hash that isn't 32 bytes. No rule reads an uncle's, and a
     /// block's must be the hash of its uncles. `ommers_hash` holds zero.
@@ -857,6 +858,15 @@ impl Header {
         self.kept.as_deref()
     }
 
+    /// The coinbase as rskj holds it: `None` for its null address, which an
+    /// empty coinbase reads as (`RskAddress.nullAddress()`), an address of
+    /// no bytes. Its `getBytes()` is empty, and REMASC pays its account at
+    /// a trie key of its own.
+    pub fn coinbase(&self) -> Option<Address> {
+        let null = self.kept().is_some_and(|kept| kept.null_coinbase);
+        (!null).then_some(self.beneficiary)
+    }
+
     /// The gas limit's bytes, as rskj holds them (`getGasLimit`): as they
     /// came, or as its miner writes the value. Its readers read them
     /// differently: the BlockHeader contract returns them, `GasCost.toGas`
@@ -1442,11 +1452,13 @@ mod tests {
         let decoded = decoded.unwrap();
         assert!(decoded.kept().unwrap().null_coinbase);
         assert_eq!(decoded.beneficiary, Address::ZERO);
+        assert_eq!(decoded.coinbase(), None);
         writes_back_as(&decoded, &items);
         let zero = Header {
             beneficiary: Address::ZERO,
             ..standard_test_header()
         };
+        assert_eq!(zero.coinbase(), Some(Address::ZERO));
         assert_ne!(
             decoded.hash(),
             zero.hash(),

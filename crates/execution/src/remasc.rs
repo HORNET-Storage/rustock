@@ -253,10 +253,11 @@ pub fn remasc_transfer<CTX: crate::RskContextTr>(ctx: &mut CTX, recipient: Addre
 #[derive(Debug, Clone)]
 pub struct Sibling {
     pub hash: B256,
-    pub coinbase: Address,
+    /// The uncle's coinbase: `None` for rskj's null address ([`Header::coinbase`]).
+    pub coinbase: Option<Address>,
     pub paid_fees: U256,
-    /// Coinbase of the block that included this uncle.
-    pub included_block_coinbase: Address,
+    /// Coinbase of the block that included this uncle, likewise.
+    pub included_block_coinbase: Option<Address>,
     /// Height of the block that included this uncle.
     pub included_height: u64,
     pub uncle_count: u64,
@@ -300,9 +301,9 @@ fn collect_siblings(
             if ommer.number == candidate_number {
                 siblings.push(Sibling {
                     hash: ommer.hash(),
-                    coinbase: ommer.beneficiary,
+                    coinbase: ommer.coinbase(),
                     paid_fees: ommer.paid_fees,
-                    included_block_coinbase: including_header.beneficiary,
+                    included_block_coinbase: including_header.coinbase(),
                     included_height: height,
                     uncle_count: ommer.uncle_count,
                 });
@@ -404,20 +405,26 @@ impl SiblingPayment {
 
 /// rskj `RemascFeesPayer.payMiningFees`: transfer plus a `mining_fee_topic`
 /// log (topics: [topic, payee-as-word], data: RLP([processingBlockHash, value])).
-/// Format groundtruthed by the mainnet #4010 REMASC receipt.
+/// Format groundtruthed by the mainnet #4010 REMASC receipt. `to` is `None`
+/// for rskj's null address, whose word is zero (`DataWord.valueOf` of no
+/// bytes).
 fn pay_mining_fees<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     processing_block_hash: alloy_primitives::B256,
-    to: Address,
+    to: Option<Address>,
     value: U256,
 ) {
     use alloy_rlp::Encodable;
     use revm::context_interface::JournalTr;
 
-    remasc_transfer(ctx, to, value);
-
     let mut topic_payee = [0u8; 32];
-    topic_payee[12..].copy_from_slice(to.as_slice());
+    match to {
+        Some(to) => {
+            remasc_transfer(ctx, to, value);
+            topic_payee[12..].copy_from_slice(to.as_slice());
+        }
+        None => pay_null_address(ctx, value),
+    }
 
     let mut inner = Vec::with_capacity(40);
     processing_block_hash.as_slice().encode(&mut inner);
@@ -434,6 +441,26 @@ fn pay_mining_fees<CTX: crate::RskContextTr>(
         ],
         alloy_primitives::Bytes::from(data),
     ));
+}
+
+/// rskj's `addBalance(nullAddress, value)`, after REMASC's own. The null
+/// address has no bytes for revm to hold, so REMASC's balance goes down
+/// here and the null account's goes up in the trie at the block's end
+/// (`RskChainExt::null_account`), which creates it if it is new, even for
+/// nothing, as `addBalance` does.
+fn pay_null_address<CTX: crate::RskContextTr>(ctx: &mut CTX, value: U256) {
+    use revm::context_interface::journaled_state::account::JournaledAccountTr;
+    if !value.is_zero() {
+        // As `remasc_transfer`: a payment REMASC can't cover isn't made.
+        let paid = ctx
+            .journal_mut()
+            .load_account_mut(REMASC_ADDR)
+            .is_ok_and(|mut remasc| remasc.decr_balance(value));
+        if !paid {
+            return;
+        }
+    }
+    *ctx.chain_mut().null_account.get_or_insert(U256::ZERO) += value;
 }
 
 /// Active federation members as RSK addresses: the Bridge-stored federation,
@@ -526,7 +553,7 @@ fn pay_to_federation<CTX: crate::RskContextTr>(
     let last = federators.len() - 1;
     for (k, federator) in federators.iter().enumerate() {
         let amount = if k == last { per_federator + remainder } else { per_federator };
-        pay_mining_fees(ctx, processing_block_hash, *federator, amount);
+        pay_mining_fees(ctx, processing_block_hash, Some(*federator), amount);
     }
     federation_reward
 }
@@ -631,7 +658,7 @@ pub fn process_miners_fees<CTX: crate::RskContextTr>(
     // Pay RSK Labs (use RSKIP218 address if active)
     let rsk_labs_pay = synthetic_reward / U256::from(config.rsk_labs_divisor);
     let labs_addr = config.labs_address_at(current_number);
-    pay_mining_fees(ctx, processing_hash, labs_addr, rsk_labs_pay);
+    pay_mining_fees(ctx, processing_hash, Some(labs_addr), rsk_labs_pay);
     let mut remaining = synthetic_reward - rsk_labs_pay;
 
     // Pay the federation its cut (rskj Remasc.payToFederation)
@@ -657,7 +684,12 @@ pub fn process_miners_fees<CTX: crate::RskContextTr>(
             remaining -= punishment;
             add_to_burned(ctx, punishment);
         }
-        pay_mining_fees(ctx, processing_hash, processing_header.beneficiary, remaining);
+        pay_mining_fees(
+            ctx,
+            processing_hash,
+            processing_header.coinbase(),
+            remaining,
+        );
     }
 
     Ok(())
@@ -706,7 +738,12 @@ fn pay_with_siblings<CTX: crate::RskContextTr>(
     }
 
     // Pay main chain miner
-    pay_mining_fees(ctx, processing_hash, processing_header.beneficiary, calc.individual_miner_reward);
+    pay_mining_fees(
+        ctx,
+        processing_hash,
+        processing_header.coinbase(),
+        calc.individual_miner_reward,
+    );
 }
 
 /// Add amount to burnedBalance storage.
@@ -913,9 +950,9 @@ mod tests {
         hash.0[0] = hash_byte;
         Sibling {
             hash,
-            coinbase: Address::repeat_byte(0x22),
+            coinbase: Some(Address::repeat_byte(0x22)),
             paid_fees: U256::from(paid_fees),
-            included_block_coinbase: Address::repeat_byte(0x33),
+            included_block_coinbase: Some(Address::repeat_byte(0x33)),
             included_height: 6,
             uncle_count,
         }

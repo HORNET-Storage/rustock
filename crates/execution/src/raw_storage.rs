@@ -39,6 +39,11 @@ pub struct RskChainExt {
     /// from outside to survive; `None` disables caching entirely, which is
     /// what tests and one-shot tools use.
     pub btc_block_cache: Option<Arc<crate::bridge::btc_block_cache::BtcBlockCache>>,
+    /// What REMASC paid rskj's null address in this block, if it paid it:
+    /// the account of a header whose coinbase is empty. The null address
+    /// has no bytes, so revm can't hold its account, and the trie is
+    /// credited at the block's end instead (`ContractMarkers::null_account`).
+    pub null_account: Option<U256>,
 }
 
 /// Raw-bytes storage overlay for the block being executed.

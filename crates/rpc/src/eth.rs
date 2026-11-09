@@ -789,7 +789,9 @@ fn hashrate_over_window(
         // which are counted. An uncle is credited to the block that included
         // it, as rskj does -- `getCumulativeDifficulty` sums them into the
         // including block and the ownership test is applied to that block.
-        let counts = coinbase.is_none_or(|want| block.header.beneficiary == want);
+        // That test is `RskAddress.equals`: an empty coinbase is the null
+        // address, which is no miner's, not even the zero address's.
+        let counts = coinbase.is_none_or(|want| block.header.coinbase() == Some(want));
         if counts {
             total = total.saturating_add(block.header.difficulty);
             for uncle in &block.ommers {

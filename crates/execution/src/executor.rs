@@ -149,6 +149,10 @@ fn merge_markers(into: &mut crate::state::ContractMarkers, from: crate::state::C
     }
     into.bump_remasc_sender |= from.bump_remasc_sender;
     into.raw_storage.extend(from.raw_storage);
+    into.null_account = match (into.null_account, from.null_account) {
+        (Some(paid), Some(more)) => Some(paid + more),
+        (paid, more) => paid.or(more),
+    };
 }
 
 /// Fold one sublist's state into the block's reported state.
@@ -810,6 +814,8 @@ impl RskExecutor {
     /// Runs on the journal as it stands immediately after the transaction, so
     /// the balances are the ones that transaction produced. No database reads:
     /// the baseline comes from revm's per-transaction `original_info`.
+    /// `null_account` is what REMASC paid rskj's null address, which revm
+    /// doesn't hold (`ContractMarkers::null_account`).
     fn check_tx_supply(
         state: &revm::state::EvmState,
         transaction_id: usize,
@@ -817,9 +823,11 @@ impl RskExecutor {
         index: usize,
         fees_withheld: U256,
         fees_settled: U256,
+        null_account: Option<U256>,
     ) -> Result<(), ExecutionError> {
         let report = crate::supply::transaction_supply_change(state, transaction_id)
-            .with_fees_in_transit(fees_withheld, fees_settled);
+            .with_fees_in_transit(fees_withheld, fees_settled)
+            .with_null_account(null_account);
         if report.is_balanced() {
             return Ok(());
         }
@@ -1683,6 +1691,8 @@ impl RskExecutor {
                         .raw_storage
                         .put(REMASC_ADDR, siblings_slot, Some(vec![0xc0]));
                     evm.ctx.chain_mut().raw_storage.commit_call();
+                    // What REMASC paid rskj's null address, for the trie.
+                    markers.null_account = evm.ctx.chain_mut().null_account.take();
                 }
 
                 // Drain the mining_fee_topic logs into the receipt.
@@ -1714,7 +1724,15 @@ impl RskExecutor {
                 if crate::supply::per_transaction_enabled() {
                     use revm::context_interface::ContextTr;
                     let st = &evm.ctx.journal_mut().inner.state;
-                    Self::check_tx_supply(st, supply_tid, header.number, i, U256::ZERO, settled_now)?;
+                    Self::check_tx_supply(
+                        st,
+                        supply_tid,
+                        header.number,
+                        i,
+                        U256::ZERO,
+                        settled_now,
+                        markers.null_account,
+                    )?;
                 }
                 // RSKIP-144: what this transaction read and wrote, attributed
                 // to its sublist. Inert unless the block declares sublist
@@ -1928,7 +1946,15 @@ impl RskExecutor {
                 if crate::supply::per_transaction_enabled() {
                     use revm::context_interface::ContextTr;
                     let st = &evm.ctx.journal_mut().inner.state;
-                    Self::check_tx_supply(st, supply_tid, header.number, i, withheld_now, U256::ZERO)?;
+                    Self::check_tx_supply(
+                        st,
+                        supply_tid,
+                        header.number,
+                        i,
+                        withheld_now,
+                        U256::ZERO,
+                        None,
+                    )?;
                 }
                 // RSKIP-144: what this transaction read and wrote, attributed to
                 // its sublist. Inert unless the block declares sublist edges.
@@ -2135,7 +2161,15 @@ impl RskExecutor {
             if crate::supply::per_transaction_enabled() {
                 use revm::context_interface::ContextTr;
                 let st = &evm.ctx.journal_mut().inner.state;
-                Self::check_tx_supply(st, supply_tid, header.number, i, withheld_now, U256::ZERO)?;
+                Self::check_tx_supply(
+                    st,
+                    supply_tid,
+                    header.number,
+                    i,
+                    withheld_now,
+                    U256::ZERO,
+                    None,
+                )?;
             }
             // RSKIP-144: what this transaction read and wrote, attributed to
             // its sublist. Inert unless the block declares sublist edges.
@@ -11432,6 +11466,230 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
         let acct = state.get(&miner).expect("zero-paid miner account must exist");
         assert!(acct.is_touched(), "recipient must be touched");
         assert!(acct.is_created(), "frontier materialises the empty account");
+    }
+
+    /// A header whose coinbase is empty: rskj's null address.
+    fn with_null_coinbase(mut header: Header) -> Header {
+        header.beneficiary = Address::ZERO;
+        header.kept = Some(Box::new(rustock_core::types::header::KeptFields {
+            null_coinbase: true,
+            ..Default::default()
+        }));
+        header
+    }
+
+    /// REMASC at the height after `chain`, each block with its uncles, from a
+    /// state where it holds `balance`: what it did, and the state after it.
+    fn remasc_after(
+        chain: &[(Header, Vec<Header>)],
+        config: crate::remasc::RemascConfig,
+        balance: U256,
+    ) -> (BlockExecutionResult, TrieNode, Arc<MemoryTrieStore>) {
+        let blocks = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let mut parent_hash = B256::ZERO;
+        for (number, (block, uncles)) in chain.iter().enumerate() {
+            let mut block = block.clone();
+            block.parent_hash = parent_hash;
+            let hash = block.hash();
+            blocks.put_header_with_hash(hash, &block).unwrap();
+            blocks.put_canonical_hash(number as u64, hash).unwrap();
+            if !uncles.is_empty() {
+                blocks.put_body(hash, &[], uncles).unwrap();
+            }
+            parent_hash = hash;
+        }
+        let store = Arc::new(MemoryTrieStore::new());
+        let sender = Address::repeat_byte(0xAA);
+        let ether = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&TrieNode::empty(), store.as_ref(), &sender, 0, ether);
+        let root = put_account(&root, store.as_ref(), &REMASC_ADDR, 0, balance);
+        let header = dummy_header(chain.len() as u64);
+        let remasc = rustock_core::Transaction::remasc(header.number);
+        let result = RskExecutor::new(RskHardforkConfig::all_active(33), blocks)
+            .with_remasc_config(config)
+            .with_bridge_constants(crate::bridge::constants::BridgeConstants::mainnet())
+            .execute_block(&header, &[(remasc, sender)], &root, store.clone())
+            .unwrap();
+        let after = crate::state::apply_state_changes(
+            &root,
+            store.as_ref(),
+            &result.state_changes,
+            &result.markers,
+        );
+        (result, after, store)
+    }
+
+    /// The null account in `state`, if it is there.
+    fn null_account_in(state: &TrieNode, store: &MemoryTrieStore) -> Option<AccountState> {
+        let key = rustock_trie::account_key_from_bytes(&[]);
+        state
+            .get(&TrieKeySlice::from_key(&key), store)
+            .and_then(|data| AccountState::decode(&data).ok())
+    }
+
+    /// rskj pays an empty coinbase at its null address, an account of no
+    /// address bytes, what it would pay any coinbase: the same sums, the same
+    /// log but for a payee word of zero, and an account at its own trie key.
+    /// The zero address is another account, and gets nothing.
+    #[test]
+    fn remasc_pays_an_empty_coinbase_at_the_null_address() {
+        let miner = Address::repeat_byte(0x11);
+        let fees = U256::from(21_000);
+        let chain = |coinbase: fn(Header) -> Header| -> Vec<(Header, Vec<Header>)> {
+            (0..15)
+                .map(|number| {
+                    let mut block = dummy_header(number);
+                    if number == 5 {
+                        block.beneficiary = miner;
+                        block.paid_fees = fees;
+                        block = coinbase(block);
+                    }
+                    (block, vec![])
+                })
+                .collect()
+        };
+        let config = crate::remasc::RemascConfig::regtest;
+        let (paid, _, _) = remasc_after(&chain(|block| block), config(), fees);
+        let ((null, state, store), imbalances) = crate::supply::imbalances_while(|| {
+            remasc_after(&chain(with_null_coinbase), config(), fees)
+        });
+
+        // `remasc_basic_distribution_no_siblings`: the coinbase is paid 3,327.
+        assert_eq!(paid.state_changes[&miner].info.balance, U256::from(3_327));
+        assert_eq!(paid.markers.null_account, None);
+        assert_eq!(null.markers.null_account, Some(U256::from(3_327)));
+        // It leaves the journal for the null account's own key, and the
+        // transaction's supply check counts it there: moved, not burnt.
+        assert_eq!(imbalances, Vec::<String>::new());
+        assert!(!null.state_changes.contains_key(&miner));
+        assert!(!null.state_changes.contains_key(&Address::ZERO));
+        assert_eq!(
+            null.state_changes[&REMASC_ADDR].info.balance,
+            paid.state_changes[&REMASC_ADDR].info.balance
+        );
+        let (paid_logs, null_logs) = (&paid.tx_results[0].logs, &null.tx_results[0].logs);
+        assert_eq!(null_logs.len(), paid_logs.len());
+        let (paid_log, null_log) = (paid_logs.last().unwrap(), null_logs.last().unwrap());
+        assert_eq!(
+            paid_log.topics()[1],
+            B256::left_padding_from(miner.as_slice())
+        );
+        assert_eq!(null_log.topics()[1], B256::ZERO);
+        // RLP([the processing block's hash, 3,327]), each block's hash its own.
+        assert_eq!(null_log.data.data[34..], [0x82, 0x0c, 0xff]);
+        assert_eq!(paid_log.data.data[34..], [0x82, 0x0c, 0xff]);
+
+        let account = null_account_in(&state, &store);
+        assert_eq!(
+            account.map(|account| account.balance),
+            Some(U256::from(3_327))
+        );
+        let zero = account_key(&Address::ZERO);
+        assert_eq!(
+            state.get(&TrieKeySlice::from_key(&zero), store.as_ref()),
+            None
+        );
+    }
+
+    /// So are a sibling's empty coinbase and that of the block that included
+    /// it, the publisher's share and the sibling miner's, and the processing
+    /// block's own where it has siblings.
+    #[test]
+    fn remasc_pays_empty_sibling_coinbases_at_the_null_address() {
+        let miner = Address::repeat_byte(0x11);
+        let fees = U256::from(21_000);
+        let chain = |processing: fn(Header) -> Header| -> Vec<(Header, Vec<Header>)> {
+            (0..15)
+                .map(|number| {
+                    let mut block = dummy_header(number);
+                    match number {
+                        5 => {
+                            block.beneficiary = miner;
+                            block.paid_fees = fees;
+                            (processing(block), vec![])
+                        }
+                        6 => {
+                            let uncle = make_uncle(5, Address::ZERO, U256::from(31_500), 0);
+                            (with_null_coinbase(block), vec![with_null_coinbase(uncle)])
+                        }
+                        _ => (block, vec![]),
+                    }
+                })
+                .collect()
+        };
+        let config = crate::remasc::RemascConfig::regtest;
+
+        // `remasc_with_one_sibling`: the publisher 332, each miner 1,497.
+        let (result, state, store) = remasc_after(&chain(|block| block), config(), fees);
+        assert_eq!(result.markers.null_account, Some(U256::from(332 + 1_497)));
+        assert_eq!(result.state_changes[&miner].info.balance, U256::from(1_497));
+        assert!(!result.state_changes.contains_key(&Address::ZERO));
+        let account = null_account_in(&state, &store);
+        assert_eq!(
+            account.map(|account| account.balance),
+            Some(U256::from(1_829))
+        );
+
+        let (result, _, _) = remasc_after(&chain(with_null_coinbase), config(), fees);
+        assert_eq!(
+            result.markers.null_account,
+            Some(U256::from(332 + 1_497 + 1_497))
+        );
+        assert!(!result.state_changes.contains_key(&miner));
+        assert!(!result.state_changes.contains_key(&Address::ZERO));
+    }
+
+    /// What REMASC paid the null address is summed across sublists, as their
+    /// state is, though the one REMASC transaction pays it all.
+    #[test]
+    fn merging_markers_sums_what_remasc_paid_the_null_address() {
+        let paid = |amount: Option<u64>| crate::state::ContractMarkers {
+            null_account: amount.map(U256::from),
+            ..Default::default()
+        };
+        for (into, from, merged) in [
+            (None, None, None),
+            (None, Some(5), Some(5)),
+            (Some(3), None, Some(3)),
+            (Some(3), Some(5), Some(8)),
+        ] {
+            let mut markers = paid(into);
+            merge_markers(&mut markers, paid(from));
+            assert_eq!(
+                markers.null_account,
+                merged.map(U256::from),
+                "{into:?} {from:?}"
+            );
+        }
+    }
+
+    /// rskj's `addBalance` creates the account it pays, even for nothing
+    /// (`remasc_zero_payment_creates_recipient_account`), the null address's
+    /// too.
+    #[test]
+    fn remasc_creates_the_null_account_even_for_nothing() {
+        let mut config = crate::remasc::RemascConfig::regtest();
+        // Before RSKIP85, nothing is not too little to pay.
+        config.rskip85_activation_height = u64::MAX;
+        let chain: Vec<(Header, Vec<Header>)> = (0..15)
+            .map(|number| {
+                let block = dummy_header(number);
+                (
+                    if number == 5 {
+                        with_null_coinbase(block)
+                    } else {
+                        block
+                    },
+                    vec![],
+                )
+            })
+            .collect();
+        let (result, state, store) = remasc_after(&chain, config, U256::ZERO);
+        assert_eq!(result.markers.null_account, Some(U256::ZERO));
+        assert_eq!(
+            null_account_in(&state, &store),
+            Some(AccountState::default())
+        );
     }
 
     /// Port of rskj `BridgeSupportIT.callUpdateCollectionsChangeGetsOutOfDust`

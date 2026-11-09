@@ -207,7 +207,11 @@ impl BlockResultDto {
             hash: to_hex_b256(&hash),
             parent_hash: to_hex_b256(&header.parent_hash),
             sha3_uncles: to_hex_b256(&header.ommers_hash),
-            miner: format!("{:#x}", header.beneficiary),
+            // `toUnformattedJsonHex(getCoinbase().getBytes())`: `0x` for the
+            // null address an empty coinbase reads as.
+            miner: header
+                .coinbase()
+                .map_or_else(|| "0x".to_owned(), |coinbase| format!("{coinbase:#x}")),
             state_root: to_hex_b256(&header.state_root),
             transactions_root: to_hex_b256(&header.transactions_root),
             receipts_root: to_hex_b256(&header.receipts_root),
