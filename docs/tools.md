@@ -33,6 +33,8 @@ usage.
 | [`pegin_refunds`](../crates/cli/examples/pegin_refunds.rs) | Did the Bridge's peg-in refund path ever execute on mainnet? |
 | [`scan_pegin_calls`](../crates/cli/examples/scan_pegin_calls.rs) | Find `registerBtcTransaction` calls by reading blocks, without executing them. |
 | [`scan_silent`](../crates/cli/examples/scan_silent.rs) | Read the silent-decision store: what the Bridge decided without logging it. |
+| [`flyover_registry`](../crates/cli/examples/flyover_registry.rs) | Did the Bridge register this flyover address, and under which derivation? One trie read per address, no replay — and it separates "never registered" from "this store is pruned and cannot say". |
+| [`legacy_events`](../crates/cli/examples/legacy_events.rs) | Query the peg events reconstructed for the era the Bridge logged nothing, and merge them with the node's real event index into one history. |
 | [`check_supply`](../crates/cli/examples/check_supply.rs) | Replay canonical blocks and report any that do not conserve the native supply, changing nothing on disk. |
 | [`bridge_btc_holdings`](../crates/cli/examples/bridge_btc_holdings.rs) | How much bitcoin the peg holds and where it sits, listed outpoint by outpoint — the federation's own script and every Flyover-derived address, read from the unitrie without executing anything. |
 
@@ -59,6 +61,7 @@ usage.
 | [`diff_roots`](../crates/cli/examples/diff_roots.rs) | Diff two unitrie roots that live in two different stores. |
 | [`diff_self`](../crates/cli/examples/diff_self.rs) | Diagnostic: show the unitrie leaf delta produced by executing a single block. Replays from the executed head to <number>-1 (the base), then executes <number> and hash-prune-diffs the two rustock-computed tries. Prints only the leaves that changed — the exact state delta of <number>. No rskj DB needed (both sides are rustock-computed); use when rskj isn't synced past the target. |
 | [`rbtc_supply`](../crates/cli/examples/rbtc_supply.rs) | Sum every rBTC balance in the unitrie at one block: a parallel whole-trie walk split by the committed `children_size`, reporting the account census, the conservation check against the premine, and the Bridge and REMASC balances. |
+| [`trie_probe`](../crates/cli/examples/trie_probe.rs) | Is this node hash in this rustock-format trie store? Opens the `trie_nodes` column family, which `rskj_root_probe` does not — probing one of our stores with that tool reports ABSENT for everything. |
 | [`trie_footprint`](../crates/cli/examples/trie_footprint.rs) | Measure the trie working set of a range of blocks. |
 | [`trie_window`](../crates/cli/examples/trie_window.rs) | Measure the miss rate of a sliding-window trie cache against window length. |
 | [`lsm_stats`](../crates/cli/examples/lsm_stats.rs) | LSM shape and table properties of a trie store: level layout, and whether the SSTs carry bloom filters at all. |
@@ -122,6 +125,28 @@ usage.
 | tool | what it answers |
 |---|---|
 | [`check_alerts_config`](../crates/cli/examples/check_alerts_config.rs) | Validate a peg-out alert configuration without starting a node or sending mail: parse it, resolve `${NAME}` references against the env file, and report what would happen. Secrets are never printed — only whether they resolved and how long they are. |
+
+## Flyover peg-ins leave no event
+
+`registerFlyoverBtcTransaction` calls no `eventLogger`, in rskj or in our
+port, so from iris300 (#3,614,800) every successful Flyover peg-in is missing
+from `bridge_events` — there is nothing to index. The Bridge's *state* knows,
+though, and `flyover_registry` reads it.
+[`flyover-peg-ins.md`](flyover-peg-ins.md) has the evidence on both sides, the
+contract-only caller rule, three flyover-shaped addresses that were never
+registered and had to be recovered by hand, and the three tooling traps that
+each produced a wrong answer along the way.
+
+## Auditing the peg, in more detail
+
+`rbtc_supply` and `bridge_btc_holdings` answer one question between them —
+how much rBTC is outstanding, and how much bitcoin backs it — but their two
+figures cannot simply be subtracted. Locked REMASC fees, bitcoin the Bridge
+has not yet registered, and peg-out fees paid from peg funds all sit between
+them, and the terms are large enough to flip the sign of the result.
+[`peg-accounting.md`](peg-accounting.md) gives the method, how to read each
+tool's output, and a worked example where the naive subtraction gets it
+backwards.
 
 ## The PowPeg signature audit, in more detail
 
