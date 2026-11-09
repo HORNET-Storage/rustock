@@ -586,6 +586,27 @@ impl RskPrecompileProvider {
             _ => None,
         }
     }
+
+    /// Whether this is a transaction's own call to BLAKE2F with no data before
+    /// RSKIP552 (vetiver900), whose block rskj can't process. rskj reads empty
+    /// data as null (`RLPItem.getRLPData`), and BLAKE2F's `getGasForData`
+    /// reads its length: a NullPointerException, which
+    /// `TransactionExecutor.call` doesn't catch. RSKIP552 prices null data at
+    /// 0 and refuses it as any other wrong length. Every other precompile's
+    /// `getGasForData` takes null, and a contract's call never passes null
+    /// (`Program.callToPrecompiledAddress`).
+    fn blake2f_reads_null<CTX: crate::RskContextTr>(
+        &self,
+        context: &CTX,
+        addr: &Address,
+        input: &[u8],
+    ) -> bool {
+        let block = context.block().number().to::<u64>();
+        *addr == BLAKE2F_ADDR
+            && input.is_empty()
+            && context.journal().depth() == 1
+            && !self.hardfork_cfg.has_rskip552(block)
+    }
 }
 
 /// REMASC and the Bridge, which run with the whole context: they read and
@@ -1057,7 +1078,9 @@ impl<CTX: crate::RskContextTr> PrecompileProvider<CTX> for RskPrecompileProvider
                 CallInput::Bytes(bytes) => bytes.as_ref(),
             };
             let input = max_input.map_or(input, |max| &input[..input.len().min(max)]);
-            if NATIVE_CONTRACTS.contains(&addr) {
+            if self.blake2f_reads_null(context, &addr, input) {
+                Outcome::Fatal("BLAKE2F's getGasForData throws on null data".into())
+            } else if NATIVE_CONTRACTS.contains(&addr) {
                 self.run_native(context, addr, input, inputs.gas_limit)
             } else {
                 run_precompile(precompile, &addr, input, inputs.gas_limit, rskip197)

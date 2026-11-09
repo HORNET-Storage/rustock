@@ -7527,6 +7527,20 @@ mod tests {
         input: &[u8],
         contracts: &[(Address, &[u8])],
     ) -> BlockExecutionResult {
+        try_execute_alone(cfg, height, to, value, gas_limit, input, contracts)
+            .expect("block executes")
+    }
+
+    /// [`execute_alone`], or what fails the block.
+    fn try_execute_alone(
+        cfg: RskHardforkConfig,
+        height: u64,
+        to: Address,
+        value: U256,
+        gas_limit: u64,
+        input: &[u8],
+        contracts: &[(Address, &[u8])],
+    ) -> Result<BlockExecutionResult, ExecutionError> {
         let store = Arc::new(MemoryTrieStore::new());
         let sender = Address::repeat_byte(0xAA);
         let one_rbtc = U256::from(10u64).pow(U256::from(18));
@@ -7547,9 +7561,8 @@ mod tests {
             cached_rlp: None,
         };
         let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
-        RskExecutor::new(cfg, block_store)
-            .execute_block(&dummy_header(height), &[(tx, sender)], &root, store)
-            .expect("block executes")
+        let executor = RskExecutor::new(cfg, block_store);
+        executor.execute_block(&dummy_header(height), &[(tx, sender)], &root, store)
     }
 
     fn fee(gas: u64) -> U256 {
@@ -8499,6 +8512,35 @@ mod tests {
         assert_eq!(run_alone(8_052_200, blake2f, &exact, &[]).output, hash);
         let direct = run_alone(8_052_200, blake2f, &long, &[]);
         assert!(direct.output.is_empty(), "a transaction's input is whole");
+    }
+
+    /// Before RSKIP552 (vetiver900) rskj can't process a block holding a
+    /// transaction that calls BLAKE2F with no data: it reads the data as null,
+    /// and BLAKE2F's `getGasForData` throws a NullPointerException that
+    /// `TransactionExecutor.call` doesn't catch. From RSKIP552 the call costs
+    /// 0 and is refused as any other wrong length, an invisible exception. A
+    /// contract's call with no data was always refused that way.
+    #[test]
+    fn a_transactions_empty_call_to_blake2f_fails_its_block_before_rskip552() {
+        let blake2f = Address::with_last_byte(9);
+        let alone = |height: u64, to: Address, contracts: &[(Address, &[u8])]| {
+            let cfg = RskHardforkConfig::mainnet();
+            try_execute_alone(cfg, height, to, U256::ZERO, 1_000_000, &[], contracts)
+        };
+        let error = alone(8_804_199, blake2f, &[]).unwrap_err().to_string();
+        assert!(error.contains("BLAKE2F"), "{error}");
+
+        let from = alone(8_804_200, blake2f, &[]).unwrap();
+        let direct = &from.tx_results[0];
+        assert!(direct.success && direct.output.is_empty());
+        assert_eq!(direct.gas_used, 21_000, "BLAKE2F asks for nothing");
+
+        let caller = Address::repeat_byte(0xB6);
+        let code = call_and_return_pushed(blake2f, 100_000);
+        let contracts: &[(Address, &[u8])] = &[(caller, &code)];
+        let via = alone(8_804_199, caller, contracts).unwrap();
+        let pushed = U256::from_be_slice(&via.tx_results[0].output);
+        assert_eq!(pushed, U256::ZERO, "a contract's call fails");
     }
 
     fn hex_to_bytes(hex: &str) -> Vec<u8> {

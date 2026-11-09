@@ -37,7 +37,8 @@ pub(crate) enum Outcome {
     /// `execute` threw, and the call cost `gas`: its `getGasForData`, which is
     /// 0 when no method was called.
     Threw { gas: u64, reason: String },
-    /// The node could not read what the call needs, so it has no answer.
+    /// The call has no answer, and its block fails: the node could not read
+    /// what the call needs, or rskj can't process the block.
     Fatal(String),
 }
 
