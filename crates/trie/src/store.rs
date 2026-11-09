@@ -188,6 +188,24 @@ impl OverlayTrieStore {
         }
     }
 
+    /// Drops the in-memory writes, keeping the base.
+    ///
+    /// For a replay that resolves each block's parent from the base rather
+    /// than carrying it forward: nothing a block wrote is needed once the
+    /// block is done, so holding it is a leak that grows without bound over
+    /// millions of blocks. Clearing between blocks makes such a replay
+    /// constant-memory and, because nothing is spilled, **purely reads** on
+    /// the disk — no scratch database, no compaction competing with the
+    /// reads.
+    ///
+    /// Wrong for a sequential replay, where the next block's parent state is
+    /// exactly what the last one wrote. A no-op when writes go to a spill.
+    pub fn clear_overlay(&self) {
+        if self.spill.is_none() {
+            self.overlay.lock().unwrap().clear();
+        }
+    }
+
     /// Number of nodes written since the overlay was created.
     pub fn written(&self) -> usize {
         match self.spill {
@@ -373,5 +391,42 @@ mod overlay_spill_tests {
         }
         assert!(overlay.overlay.lock().unwrap().is_empty(), "nothing held in memory");
         assert_eq!(overlay.written(), 1000);
+    }
+}
+
+#[cfg(test)]
+mod overlay_clear_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn clearing_drops_writes_but_keeps_the_base() {
+        let base = Arc::new(MemoryTrieStore::new());
+        base.put(b"frombase", b"B");
+        let o = OverlayTrieStore::new(base);
+
+        o.put(b"written", b"W");
+        assert_eq!(o.get(b"written").as_deref(), Some(&b"W"[..]));
+
+        o.clear_overlay();
+        assert_eq!(o.get(b"written"), None, "the write is gone");
+        assert_eq!(o.get(b"frombase").as_deref(), Some(&b"B"[..]), "the base is not");
+    }
+
+    /// A spilled overlay is a sequential replay's carried state. Clearing it
+    /// would silently discard the next block's parent.
+    #[test]
+    fn clearing_is_a_no_op_when_writes_go_to_a_spill() {
+        let base = Arc::new(MemoryTrieStore::new());
+        let spill = Arc::new(MemoryTrieStore::new());
+        let o = OverlayTrieStore::with_spill(base, spill);
+
+        o.put(b"carried", b"C");
+        o.clear_overlay();
+        assert_eq!(
+            o.get(b"carried").as_deref(),
+            Some(&b"C"[..]),
+            "a spilled write must survive clear_overlay"
+        );
     }
 }

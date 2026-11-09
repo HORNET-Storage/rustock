@@ -1020,6 +1020,38 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
     Ok(PrecompileOutput::new(gas_cost, Bytes::new()))
 }
 
+/// Emits `release_requested`, or records it when the Bridge of the day did
+/// not.
+///
+/// The event arrives with RSKIP146 (papyrus200). Before it the peg-out was
+/// queued exactly the same way and nothing was written to the receipts, which
+/// is why a receipts-derived index has no peg-outs for that era. Recording
+/// the same three fields here is what lets the legacy-event store rebuild the
+/// event rather than approximate it.
+///
+/// A no-op on the recording side unless a replay tool turned recording on, so
+/// production pays one thread-local read per peg-out.
+fn release_requested_or_record<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    logged: bool,
+    rsk_tx_hash: &[u8; 32],
+    btc_tx_hash: &[u8; 32],
+    amount_satoshis: u64,
+) {
+    if logged {
+        super::events::log_release_requested(ctx, rsk_tx_hash, btc_tx_hash, amount_satoshis);
+        return;
+    }
+    crate::silent::record_here(
+        SilentKind::PegoutRequested,
+        vec![
+            ("rskTxHash", FieldValue::Bytes(rsk_tx_hash.to_vec())),
+            ("btcTxHash", FieldValue::Bytes(btc_tx_hash.to_vec())),
+            ("amountSat", FieldValue::U64(amount_satoshis)),
+        ],
+    );
+}
+
 /// Describes a peg-in decision for the silent-decision store.
 ///
 /// A no-op unless a replay tool turned recording on, so the cost on an
@@ -1206,14 +1238,13 @@ fn emit_pegin_rejection_release<CTX: crate::RskContextTr>(
             rsk_block_height: rsk_height,
             rsk_tx_hash: use_tx_hash.then_some(tx_ctx.rsk_tx_hash),
         });
-        if use_tx_hash {
-            super::events::log_release_requested(
-                ctx,
-                &tx_ctx.rsk_tx_hash,
-                &btc_txid_event_bytes(&built.tx),
-                total_value,
-            );
-        }
+        release_requested_or_record(
+            ctx,
+            use_tx_hash,
+            &tx_ctx.rsk_tx_hash,
+            &btc_txid_event_bytes(&built.tx),
+            total_value,
+        );
         store_pegout_confirmation_set(ctx, &waiting, use_tx_hash);
     } else {
         // The refund was due and could not be built -- in practice the inputs
@@ -2246,14 +2277,13 @@ fn emit_flyover_rejection_release<CTX: crate::RskContextTr>(
             rsk_block_height: rsk_height,
             rsk_tx_hash: use_tx_hash.then_some(tx_ctx.rsk_tx_hash),
         });
-        if use_tx_hash {
-            super::events::log_release_requested(
-                ctx,
-                &tx_ctx.rsk_tx_hash,
-                &btc_txid_event_bytes(&built.tx),
-                total_satoshis,
-            );
-        }
+        release_requested_or_record(
+            ctx,
+            use_tx_hash,
+            &tx_ctx.rsk_tx_hash,
+            &btc_txid_event_bytes(&built.tx),
+            total_satoshis,
+        );
         store_pegout_confirmation_set(ctx, &waiting, use_tx_hash);
     }
 }
@@ -2732,15 +2762,14 @@ pub fn update_collections<CTX: crate::RskContextTr>(
                         rsk_block_height: block_number,
                         rsk_tx_hash: if use_tx_hash { rsk_tx_hash } else { None },
                     });
-                    if use_tx_hash {
-                        if let Some(hash) = rsk_tx_hash {
-                            super::events::log_release_requested(
-                                ctx,
-                                &hash,
-                                &btc_txid_event_bytes(&built.tx),
-                                amount,
-                            );
-                        }
+                    if let Some(hash) = rsk_tx_hash {
+                        release_requested_or_record(
+                            ctx,
+                            use_tx_hash,
+                            &hash,
+                            &btc_txid_event_bytes(&built.tx),
+                            amount,
+                        );
                     }
                     // RSKIP428 (lovell700): processReleaseTransactionInfo emits
                     // pegout_transaction_created right after release_requested,
@@ -3833,11 +3862,12 @@ fn process_funds_migration<CTX: crate::RskContextTr>(
                 rsk_block_height: block_number,
                 rsk_tx_hash: use_tx_hash.then_some(tx_ctx.rsk_tx_hash),
             });
-            if use_tx_hash {
+            {
                 let amount_migrated: u64 =
                     built.used_utxos.iter().map(|u| u.value_satoshis).sum();
-                super::events::log_release_requested(
+                release_requested_or_record(
                     ctx,
+                    use_tx_hash,
                     &tx_ctx.rsk_tx_hash,
                     &btc_txid_event_bytes(&built.tx),
                     amount_migrated,
