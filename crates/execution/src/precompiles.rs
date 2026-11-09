@@ -566,6 +566,26 @@ impl RskPrecompileProvider {
         self.hardfork_cfg
             .has_rskip197(context.block().number().to::<u64>())
     }
+
+    /// RSKIP516 (reed800): how much of a contract's input the precompile at
+    /// `addr` takes, its `getMaxInput` (`Program.getInputLength`), or `None`
+    /// for all of it. A transaction's own data reaches a precompile whole
+    /// (`TransactionExecutor.call`), and so does a contract's before reed800
+    /// or to any other precompile. Only BLAKE2F answers differently for it:
+    /// the others never read past their limit, while BLAKE2F refuses an input
+    /// that isn't 213 bytes, at no cost.
+    fn max_input<CTX: crate::RskContextTr>(&self, context: &CTX, addr: &Address) -> Option<usize> {
+        let block = context.block().number().to::<u64>();
+        if context.journal().depth() == 1 || !self.hardfork_cfg.has_rskip516(block) {
+            return None;
+        }
+        match *addr {
+            ECRECOVER_ADDR | BN128_ADD_ADDR | SECP256K1_ADD_ADDR => Some(128),
+            BN128_MUL_ADDR | SECP256K1_MUL_ADDR => Some(96),
+            BLAKE2F_ADDR => Some(213),
+            _ => None,
+        }
+    }
 }
 
 /// REMASC and the Bridge, which run with the whole context: they read and
@@ -1021,6 +1041,7 @@ impl<CTX: crate::RskContextTr> PrecompileProvider<CTX> for RskPrecompileProvider
         }
 
         let rskip197 = self.rskip197_active(context);
+        let max_input = self.max_input(context, &addr);
         let outcome = {
             let shared;
             let input = match &inputs.input {
@@ -1035,6 +1056,7 @@ impl<CTX: crate::RskContextTr> PrecompileProvider<CTX> for RskPrecompileProvider
                 }
                 CallInput::Bytes(bytes) => bytes.as_ref(),
             };
+            let input = max_input.map_or(input, |max| &input[..input.len().min(max)]);
             if NATIVE_CONTRACTS.contains(&addr) {
                 self.run_native(context, addr, input, inputs.gas_limit)
             } else {

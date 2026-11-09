@@ -8442,6 +8442,65 @@ mod tests {
         assert_eq!(via.output, expected);
     }
 
+    /// Code that hands its own input to `to`, giving it 100,000 gas, and
+    /// returns the word the CALL pushed and the 64 bytes `to` answered into.
+    /// For an input shorter than 512 bytes.
+    fn pass_input_to(to: Address) -> Vec<u8> {
+        let mut code = vec![
+            0x36, 0x60, 0x00, 0x60, 0x00, 0x37, // CALLDATACOPY all of it to 0
+            0x60, 0x40, 0x61, 0x02, 0x20, // a return area of 64 bytes at 544
+            0x36, 0x60, 0x00, 0x60, 0x00, 0x73, // all of it as arguments, no value
+        ];
+        code.extend_from_slice(to.as_slice());
+        code.extend_from_slice(&[
+            0x62, 0x01, 0x86, 0xa0, 0xf1, // PUSH3 100,000, CALL
+            0x61, 0x02, 0x00, 0x52, // MSTORE the pushed word at 512
+            0x60, 0x60, 0x61, 0x02, 0x00, 0xf3, // RETURN the word and the area
+        ]);
+        code
+    }
+
+    /// RSKIP516 (reed800): a contract's input to BLAKE2F is cut to the 213
+    /// bytes BLAKE2F reads (`Program.getInputLength`). Before it BLAKE2F
+    /// refuses a longer input, for its price on the wrong length, 0; from it
+    /// BLAKE2F takes the first 213 bytes and charges their rounds, and a byte
+    /// past them costs only as the transaction's data. A transaction's own
+    /// input is never cut (`TransactionExecutor.call`).
+    #[test]
+    fn a_contracts_input_to_blake2f_is_cut_to_213_bytes_from_reed800() {
+        let blake2f = Address::with_last_byte(9);
+        let caller = Address::repeat_byte(0xB5);
+        let code = pass_input_to(blake2f);
+        let contracts: &[(Address, &[u8])] = &[(caller, &code)];
+        let answer = |result: &TxExecutionResult| {
+            assert!(result.success);
+            let pushed = U256::from_be_slice(&result.output[..32]);
+            (pushed, result.output[32..].to_vec())
+        };
+        // Twelve rounds of the final block.
+        let mut exact = vec![0_u8; 213];
+        exact[3] = 12;
+        exact[212] = 1;
+        let mut long = exact.clone();
+        long.push(0xff);
+
+        let whole = run_alone(8_052_200, caller, &exact, contracts);
+        let (pushed, hash) = answer(&whole);
+        assert_eq!(pushed, U256::from(1));
+        let cut = run_alone(8_052_200, caller, &long, contracts);
+        assert_eq!(answer(&cut), (pushed, hash.clone()), "the first 213 bytes");
+        // RSKIP400's price for a byte of data that isn't zero.
+        assert_eq!(cut.gas_used - whole.gas_used, 16, "the byte past them");
+
+        let before = run_alone(8_052_199, caller, &long, contracts);
+        assert_eq!(answer(&before).0, U256::ZERO, "BLAKE2F refuses it");
+        assert_eq!(cut.gas_used - before.gas_used, 12, "for 0, not 12 rounds");
+
+        assert_eq!(run_alone(8_052_200, blake2f, &exact, &[]).output, hash);
+        let direct = run_alone(8_052_200, blake2f, &long, &[]);
+        assert!(direct.output.is_empty(), "a transaction's input is whole");
+    }
+
     fn hex_to_bytes(hex: &str) -> Vec<u8> {
         (0..hex.len())
             .step_by(2)

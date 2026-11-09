@@ -612,6 +612,13 @@ impl RskHardforkConfig {
         block_number >= height
     }
 
+    /// RSKIP516 (Reed800): the secp256k1 addition and multiplication
+    /// contracts, and a contract's input to a precompile cut to what the
+    /// precompile reads (`Program.getInputLength`).
+    pub fn has_rskip516(&self, block_number: u64) -> bool {
+        self.active_upgrade(block_number) >= RskNetworkUpgrade::Reed800
+    }
+
     /// RSKIP375: pegouts-waiting-for-signatures keyed by the pegout creation
     /// RSK tx hash again (Fingerroot500).
     pub fn has_rskip375(&self, block_number: u64) -> bool {
