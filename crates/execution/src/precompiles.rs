@@ -428,6 +428,12 @@ pub struct RskPrecompileProvider {
     /// finalization: no leftover refund, REMASC gets gasLimit * gasPrice.
     /// Cleared by `RskHandler::load_accounts` before each transaction.
     invisible_exception: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Set when a precompile that a contract called throws before RSKIP197.
+    /// rskj's `Program.executePrecompiled` has no error handling: the throw
+    /// leaves the VM as a `RuntimeException`, and `VM.steps` fails the
+    /// contract that made the call, spending all its gas. `RskHandler`
+    /// halts that contract as it takes the call's result.
+    aborts_caller: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Precompiles successfully called during the current transaction. rskj
     /// writes the contract storage-prefix marker (`setupContract`) on every
     /// successful precompile call; the executor drains this after each tx and
@@ -462,6 +468,11 @@ impl RskPrecompileProvider {
     /// Returns the shared invisible-exception flag for `RskHandler`.
     pub fn invisible_exception_flag(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
         std::sync::Arc::clone(&self.invisible_exception)
+    }
+
+    /// Returns the shared caller-abort flag for `RskHandler` (see the field).
+    pub fn aborts_caller_flag(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        std::sync::Arc::clone(&self.aborts_caller)
     }
 
     /// Returns the shared list of successfully-called precompiles.
@@ -539,6 +550,7 @@ impl RskPrecompileProvider {
             bridge_config: BridgeConstants::mainnet(),
             bridge_tx_context: std::sync::Arc::new(std::sync::Mutex::new(BridgeTxContext::default())),
             invisible_exception: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            aborts_caller: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             called_precompiles: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             reached_sequential_only: std::sync::Arc::new(
                 std::sync::atomic::AtomicBool::new(false),
@@ -643,30 +655,21 @@ impl RskPrecompileProvider {
                 assert!(underflow, "gas pre-checked against the cost");
                 return Ok(Some(result));
             }
-            // Internal (depth>1) Bridge method throw: rskj
+            // Internal (depth>1) throw, by a Bridge method or by REMASC: rskj
             // `Program.executePrecompiledAndHandleError` consumes only
             // `requiredGas` and the CALL fails (pushes zero). Record that cost
             // and revert so the caller refunds the forwarded leftover.
             if let Some(spent) = crate::bridge::internal_throw_gas(e) {
                 if !self.rskip197_active(context) {
-                    // Before RSKIP197 (iris300) there is no error handling at
-                    // all. `Program.executePrecompiled` wraps the method's
-                    // `VMException` in a `RuntimeException`, which escapes the
-                    // VM: no `stackPushZero`, no rollback-and-continue. The
-                    // transaction dies and is charged its whole gas limit.
-                    //
-                    // Modelled as a non-revert precompile error, which spends
-                    // the entire forwarded gas. A caller that forwarded
-                    // everything -- what a bare Solidity `.call()` does -- is
-                    // then left with the 63/64 remainder and runs out, so the
-                    // transaction ends where rskj ends it, with the same gas.
-                    // A caller holding back enough to continue would carry on
-                    // here and not there; that case is #295.
-                    //
-                    // Testnet #808,484 is the live instance: a constructor
-                    // calls the Bridge with a selector that is not a Bridge
-                    // method, which post-RSKIP88 throws.
-                    let _ = spent;
+                    // Before RSKIP197 (iris300) `Program.executePrecompiled`
+                    // has no error handling: the throw leaves the VM and fails
+                    // the contract that made the call, with all its gas, which
+                    // `RskHandler` does on the flag. Testnet #808,484 is the
+                    // live instance: a constructor calls the Bridge with a
+                    // selector that is not a Bridge method, which post-RSKIP88
+                    // throws, and the transaction is charged its whole limit.
+                    self.aborts_caller
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
                     let underflow = result.gas.record_cost(inputs.gas_limit);
                     assert!(underflow, "spending exactly the forwarded gas");
                     result.result = InstructionResult::PrecompileError;
@@ -774,29 +777,32 @@ impl RskPrecompileProvider {
     /// which the executor dispatches directly — every invocation arriving
     /// here is a user tx or an internal CALL. rskj (Remasc.processMinersFees)
     /// throws RemascInvalidInvocationException for those, EXCEPT
-    /// getStateForDebugging() which has no caller guard and succeeds
-    /// (no state changes, so only its return data is modelled loosely).
+    /// getStateForDebugging(), which has no caller guard and answers with the
+    /// contract's state. (Its `save()` also writes the `siblings` cell, which
+    /// every block's REMASC transaction has written since block 1.)
     fn run_remasc<CTX: crate::RskContextTr>(
         &self,
         context: &mut CTX,
         input: &[u8],
         _gas_limit: u64,
     ) -> Result<PrecompileOutput, PrecompileError> {
-        const GET_STATE_FOR_DEBUGGING: [u8; 4] = [0x0d, 0x0c, 0xee, 0x93];
-        if input.len() == 4 && input[..4] == GET_STATE_FOR_DEBUGGING {
-            return Ok(PrecompileOutput::new(0, Bytes::new()));
+        // `RemascContract.getFunction` takes a selector of exactly four bytes.
+        if input == crate::remasc::GET_STATE_FOR_DEBUGGING {
+            let state = crate::remasc::state_for_debugging(context);
+            return Ok(PrecompileOutput::new(0, state.into()));
         }
         // Everything else throws in rskj: invisible for a direct tx
-        // (receipt SUCCESS, intrinsic gas, sender charged the full limit),
-        // a plain CALL failure for internal calls.
+        // (receipt SUCCESS, intrinsic gas, sender charged the full limit).
+        // For a contract's call it is the Bridge's internal throw, costing
+        // REMASC's getGasForData: from RSKIP197 a failed CALL that gives all
+        // the forwarded gas back, and before it the end of the contract that
+        // made the call.
         use revm::context_interface::JournalTr;
         if context.journal().depth() == 1 {
             // REMASC getGasForData is 0; the invisible path forces 0 anyway.
             return Err(crate::bridge::invisible_exception_marker_with_gas(0));
         }
-        Err(PrecompileError::other(
-            "Remasc: invoked outside the block's REMASC system tx",
-        ))
+        Err(crate::bridge::internal_throw_marker_with_gas(0))
     }
 
     /// One of rskj's native contracts, on the block executing.
@@ -850,8 +856,9 @@ impl RskPrecompileProvider {
     /// `RskHandler` turns the transaction's result back into a success.
     ///
     /// In a contract's call, from RSKIP197 a throw costs what the precompile
-    /// asked for and the call fails. Before it the throw escapes the VM, which
-    /// spending the call's gas approximates (#295).
+    /// asked for and the call fails. Before it the throw escapes the VM and
+    /// fails the contract that made the call, with all its gas: the call fails
+    /// here, and `RskHandler` halts that contract on the flag set here.
     fn finish<CTX: crate::RskContextTr>(
         &self,
         context: &CTX,
@@ -889,6 +896,8 @@ impl RskPrecompileProvider {
                 } else if self.rskip197_active(context) {
                     InstructionResult::Revert
                 } else {
+                    self.aborts_caller
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
                     InstructionResult::PrecompileError
                 };
             }
@@ -910,6 +919,7 @@ impl Clone for RskPrecompileProvider {
             bridge_config: self.bridge_config.clone(),
             bridge_tx_context: std::sync::Arc::clone(&self.bridge_tx_context),
             invisible_exception: std::sync::Arc::clone(&self.invisible_exception),
+            aborts_caller: std::sync::Arc::clone(&self.aborts_caller),
             called_precompiles: std::sync::Arc::clone(&self.called_precompiles),
             reached_sequential_only: std::sync::Arc::clone(&self.reached_sequential_only),
         }

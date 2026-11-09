@@ -184,6 +184,42 @@ pub fn remasc_load_bool<CTX: crate::RskContextTr>(ctx: &mut CTX, key: U256) -> b
     remasc_sload(ctx, key) != U256::ZERO
 }
 
+/// `getStateForDebugging()`'s selector. It is the one REMASC method that
+/// answers any caller, a contract's call or any transaction.
+pub const GET_STATE_FOR_DEBUGGING: [u8; 4] = [0x0d, 0x0c, 0xee, 0x93];
+
+/// rskj `RemascContract.getStateForDebugging`: the contract's state as
+/// `RemascState.getEncoded` writes it, ABI-encoded as the method's one
+/// `bytes` output (`Function.encodeOutputs`).
+pub fn state_for_debugging<CTX: crate::RskContextTr>(ctx: &mut CTX) -> Vec<u8> {
+    let reward = remasc_sload(ctx, remasc_storage_key(REWARD_BALANCE_KEY));
+    let burned = remasc_sload(ctx, remasc_storage_key(BURNED_BALANCE_KEY));
+    let broken = remasc_load_bool(ctx, remasc_storage_key(BROKEN_SELECTION_RULE_KEY));
+    crate::abi::encode_bytes(&encode_state(reward, burned, broken))
+}
+
+/// `RemascState.getEncoded`: an RLP list of the reward balance and the burned
+/// balance (`RLP.encodeCoin`, which alloy's encoding of a `U256` matches:
+/// `0x80` for zero, else the value's bytes as a string), an empty list where
+/// the siblings once were, and the broken-selection-rule flag as a bare byte,
+/// 0 or 1, which goes into the list without being encoded.
+fn encode_state(reward: U256, burned: U256, broken: bool) -> Vec<u8> {
+    use alloy_rlp::Encodable;
+    let mut items = Vec::new();
+    reward.encode(&mut items);
+    burned.encode(&mut items);
+    items.push(alloy_rlp::EMPTY_LIST_CODE);
+    items.push(u8::from(broken));
+    let mut state = Vec::with_capacity(items.len() + 2);
+    alloy_rlp::Header {
+        list: true,
+        payload_length: items.len(),
+    }
+    .encode(&mut state);
+    state.extend_from_slice(&items);
+    state
+}
+
 // ---------------------------------------------------------------------------
 // Balance transfer helper
 // ---------------------------------------------------------------------------
@@ -801,6 +837,41 @@ mod tests {
             let expected_clean = expected.replace(' ', "");
             assert_eq!(actual, expected_clean, "key mismatch for {name}");
         }
+    }
+
+    /// `getStateForDebugging()` as `Function.encodeSignature` hashes it.
+    #[test]
+    fn get_state_for_debugging_selector() {
+        assert_eq!(
+            GET_STATE_FOR_DEBUGGING,
+            crate::abi::selector("getStateForDebugging()")
+        );
+    }
+
+    /// `RemascState.getEncoded`, worked by hand from rskj's `RLP`: a zero coin
+    /// is `0x80`, a coin below `0x80` is its own byte and one from `0x80` a
+    /// string, the flag goes in bare, and a payload of 56 bytes or more takes
+    /// the long list header.
+    #[test]
+    fn remasc_state_encodes_as_rskj_encodes_it() {
+        assert_eq!(
+            encode_state(U256::ZERO, U256::ZERO, false),
+            [0xc4, 0x80, 0x80, 0xc0, 0x00]
+        );
+        assert_eq!(
+            encode_state(U256::from(0x1234), U256::from(0x7f), true),
+            [0xc6, 0x82, 0x12, 0x34, 0x7f, 0xc0, 0x01]
+        );
+        assert_eq!(
+            encode_state(U256::from(0x80), U256::ZERO, false),
+            [0xc5, 0x81, 0x80, 0x80, 0xc0, 0x00]
+        );
+        let mut largest = vec![0xf8, 68, 0xa0];
+        largest.extend([0xff; 32]);
+        largest.push(0xa0);
+        largest.extend([0xff; 32]);
+        largest.extend([0xc0, 0x01]);
+        assert_eq!(encode_state(U256::MAX, U256::MAX, true), largest);
     }
 
     // -----------------------------------------------------------------------

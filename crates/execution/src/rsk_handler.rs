@@ -68,6 +68,13 @@ pub struct RskHandler<CTX, ERROR, FRAME> {
     /// receipt stays SUCCESS with only the spent gas (mainnet #764,123:
     /// receipt 47,408 gas, fee charged for the full 1,000,000 limit).
 invisible_exception: Arc<AtomicBool>,
+    /// Shared with `RskPrecompileProvider`: set when a precompile that a
+    /// contract called throws before RSKIP197. rskj's
+    /// `Program.executePrecompiled` lets the throw leave the VM, and
+    /// `VM.steps` fails the contract that made the call, spending all its gas
+    /// (testnet #808,484). The exec loop halts that contract as soon as the
+    /// call's result reaches it.
+    aborts_caller: Arc<AtomicBool>,
     /// Accumulate the fee instead of crediting it to the beneficiary.
     ///
     /// rskj builds every sublist executor with `postponeFeePayment = true`
@@ -121,6 +128,7 @@ impl<CTX, ERROR, FRAME> RskHandler<CTX, ERROR, FRAME> {
             empty_create_on_unpayable_deposit,
             false,
             invisible_exception,
+            Arc::default(),
             None,
             Vec::new(),
             false,
@@ -139,6 +147,7 @@ impl<CTX, ERROR, FRAME> RskHandler<CTX, ERROR, FRAME> {
         empty_create_on_unpayable_deposit: bool,
         rskip125_active: bool,
         invisible_exception: Arc<AtomicBool>,
+        aborts_caller: Arc<AtomicBool>,
         pre_rskip150_precompiles: Option<Vec<Address>>,
         active_precompiles: Vec<Address>,
         rskip171_active: bool,
@@ -147,6 +156,7 @@ impl<CTX, ERROR, FRAME> RskHandler<CTX, ERROR, FRAME> {
             empty_create_on_unpayable_deposit,
             rskip125_active,
             invisible_exception,
+            aborts_caller,
             pre_rskip150_precompiles,
             active_precompiles,
             rskip171_active,
@@ -185,8 +195,9 @@ where
     type HaltReason = HaltReason;
 
     fn load_accounts(&self, evm: &mut Self::Evm) -> Result<(), Self::Error> {
-        // Clear any stale invisible-exception flag from a previous tx.
+        // Clear any stale flag a previous tx left set.
         self.invisible_exception.store(false, Ordering::Relaxed);
+        self.aborts_caller.store(false, Ordering::Relaxed);
         revm::handler::pre_execution::load_accounts::<EVM, ERROR>(evm)?;
         // The default sets the journal spec from CfgEnv; pin it back to
         // rskj's eternal frontier account semantics.
@@ -315,13 +326,15 @@ where
         Ok(())
     }
 
-    /// The mainnet exec loop with two additions:
+    /// The mainnet exec loop with rskj's rules added, among them:
     /// - immediately after a CREATE frame is initialized, reset the created
     ///   account's nonce to 0 (rskj has no EIP-161; revm seeds it to 1 from
     ///   the per-era CfgEnv spec). Must happen before the constructor runs —
     ///   addresses the new contract derives via CREATE depend on its nonce.
     /// - frames run through `rsk_frame_run`, which applies the pre-RSKIP453
     ///   empty-deploy quirk to internal creates.
+    /// - before RSKIP197, a contract whose call to a precompile threw is
+    ///   halted as it takes the call's result (see `aborts_caller`).
     fn run_exec_loop(
         &mut self,
         evm: &mut Self::Evm,
@@ -502,6 +515,15 @@ where
                 use revm::interpreter::interpreter_types::ReturnData;
                 // Undo revm's insert_call_outcome buffer clear (EIP-211).
                 evm.frame_stack().get().interpreter.return_data.set_buffer(buffer);
+            }
+            // The precompile this contract just called threw before RSKIP197:
+            // the contract stops here, its gas spent and its changes undone,
+            // as rskj's `VM.steps` stops it.
+            if self.aborts_caller.swap(false, Ordering::Relaxed) {
+                evm.frame_stack()
+                    .get()
+                    .interpreter
+                    .halt(InstructionResult::PrecompileError);
             }
         }
     }

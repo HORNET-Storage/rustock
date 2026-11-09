@@ -502,6 +502,12 @@ pub fn internal_throw_gas(e: &PrecompileError) -> Option<u64> {
     marker_gas(e, INTERNAL_BRIDGE_THROW_MARKER)
 }
 
+/// Build the internal (depth>1) throw error carrying its `requiredGas`.
+/// REMASC throws through it too, with its `getGasForData` of 0.
+pub fn internal_throw_marker_with_gas(gas: u64) -> PrecompileError {
+    marker_with_gas(INTERNAL_BRIDGE_THROW_MARKER, gas)
+}
+
 /// Marker prefix for the rskj `Program.callToPrecompiledAddress` insufficient-
 /// gas branch: when `requiredGas > msg.getGas()` for an INTERNAL (depth>1)
 /// call, rskj does `refundGas(0); stackPushZero(); track.rollback()` — the

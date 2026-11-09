@@ -384,6 +384,7 @@ impl RskExecutor {
             }
         }
         let invisible_flag = precompile_provider.invisible_exception_flag();
+        let aborts_caller = precompile_provider.aborts_caller_flag();
         let reached_sequential_only = precompile_provider.reached_sequential_only_slot();
         let active_precompiles: Vec<Address> =
             rsk_precompiles(&self.hardfork_cfg, header.number).addresses().copied().collect();
@@ -426,6 +427,7 @@ impl RskExecutor {
                 !self.hardfork_cfg.has_rskip453(header.number),
                 self.hardfork_cfg.has_rskip125(header.number),
                 invisible_flag,
+                aborts_caller,
                 pre_rskip150_precompiles,
                 active_precompiles,
                 self.hardfork_cfg.has_rskip171(header.number),
@@ -517,6 +519,7 @@ impl RskExecutor {
             }
         }
         let invisible_flag = precompile_provider.invisible_exception_flag();
+        let aborts_caller = precompile_provider.aborts_caller_flag();
         let reached_sequential_only = precompile_provider.reached_sequential_only_slot();
         let active_precompiles: Vec<Address> =
             rsk_precompiles(&self.hardfork_cfg, header.number).addresses().copied().collect();
@@ -560,6 +563,7 @@ impl RskExecutor {
                 !self.hardfork_cfg.has_rskip453(header.number),
                 self.hardfork_cfg.has_rskip125(header.number),
                 invisible_flag,
+                aborts_caller,
                 pre_rskip150_precompiles,
                 active_precompiles,
                 self.hardfork_cfg.has_rskip171(header.number),
@@ -686,6 +690,7 @@ impl RskExecutor {
             }
         }
         let invisible_flag = precompile_provider.invisible_exception_flag();
+        let aborts_caller = precompile_provider.aborts_caller_flag();
         let reached_sequential_only = precompile_provider.reached_sequential_only_slot();
         let active_precompiles: Vec<Address> =
             rsk_precompiles(&self.hardfork_cfg, header.number).addresses().copied().collect();
@@ -729,6 +734,7 @@ impl RskExecutor {
                 !self.hardfork_cfg.has_rskip453(header.number),
                 self.hardfork_cfg.has_rskip125(header.number),
                 invisible_flag,
+                aborts_caller,
                 pre_rskip150_precompiles,
                 active_precompiles,
                 self.hardfork_cfg.has_rskip171(header.number),
@@ -1338,6 +1344,7 @@ impl RskExecutor {
         // it between transactions.
         let bridge_ctx_slot = precompile_provider.bridge_tx_context_slot();
         let invisible_flag = precompile_provider.invisible_exception_flag();
+        let aborts_caller = precompile_provider.aborts_caller_flag();
         let called_precompiles = precompile_provider.called_precompiles_slot();
         let reached_sequential_only = precompile_provider.reached_sequential_only_slot();
         let active_precompiles: Vec<Address> =
@@ -1909,6 +1916,7 @@ impl RskExecutor {
                 !self.hardfork_cfg.has_rskip453(header.number),
                 self.hardfork_cfg.has_rskip125(header.number),
                 invisible_flag.clone(),
+                aborts_caller.clone(),
                 pre_rskip150_precompiles.clone(),
                 active_precompiles.clone(),
                 self.hardfork_cfg.has_rskip171(header.number),
@@ -2443,25 +2451,15 @@ mod tests {
         );
     }
 
-    /// KNOWN DIVERGENCE (#295): a caller that caps the gas it forwards
-    /// survives here, where rskj kills the transaction.
-    ///
-    /// rskj's escaping `RuntimeException` ends the transaction regardless of
-    /// how much gas the caller still held. Modelling the throw as a
-    /// spent-everything precompile error reproduces that only when the caller
-    /// forwarded everything, because then the caller runs out too. A caller
-    /// using `call{gas: n}` keeps the rest and carries on.
-    ///
-    /// Pinned rather than left unsaid, so the gap is visible and so that
-    /// closing it fails this test instead of passing silently.
+    /// Before RSKIP197 a throw fails the contract that made the call however
+    /// much gas it held back (#295): rskj's `RuntimeException` leaves the VM,
+    /// and `VM.steps` spends all the contract's gas. Here the contract is the
+    /// transaction's own call, so the transaction is charged its whole limit,
+    /// though it forwarded only 50,000.
     #[test]
-    fn a_capped_forward_still_survives_the_pre_rskip197_throw() {
+    fn a_pre_rskip197_throw_fails_the_caller_however_much_gas_it_held_back() {
         let used = bridge_throw_gas_with_capped_forward(2_060_499);
-        assert_eq!(
-            used, 96_733,
-            "only the forwarded 50,000 is burned; rskj would charge the whole \
-             1,000,000 limit -- see #295"
-        );
+        assert_eq!(used, 1_000_000, "the caller fails with all its gas");
 
         // From iris300 both agree: the caller continues on what it kept.
         let after = bridge_throw_gas_with_capped_forward(2_060_500);
@@ -2489,7 +2487,7 @@ mod tests {
                 0x60, 0x00, // retSize
                 0x60, 0x00, // retOffset
                 0x60, 0x04, // argsSize
-                0x60, 0x00, // argsOffset (selector is the word's high bytes)
+                0x60, 0x1c, // argsOffset: the selector is the word's last four bytes
                 0x60, 0x00, // value
                 0x73, // PUSH20
             ];
@@ -2549,7 +2547,7 @@ mod tests {
             0x60, 0x00, // retSize
             0x60, 0x00, // retOffset
             0x60, 0x04, // argsSize
-            0x60, 0x00, // argsOffset
+            0x60, 0x1c, // argsOffset
             0x60, 0x00, // value
             0x73, // PUSH20
         ];
@@ -8223,13 +8221,15 @@ mod tests {
     /// A contract's call to HDWalletUtils that throws
     /// (`Program.callToPrecompiledAddress`): from RSKIP197 the call fails and
     /// costs what the method asked for, and the contract goes on; before it the
-    /// throw takes all the gas the call was given (#295).
+    /// throw fails the contract too, with all its gas (#295).
     #[test]
     fn a_native_contract_that_throws_inside_a_call_fails_the_call() {
         let hd_wallet = crate::precompiles::HD_WALLET_UTILS_ADDR;
         let caller = Address::repeat_byte(0xBB);
-        // CALL HDWalletUtils with this transaction's calldata and all the gas,
-        // and return what the CALL pushed.
+        // CALL HDWalletUtils with this transaction's calldata and 500,000 gas,
+        // and return what the CALL pushed. The contract keeps the rest of its
+        // gas: RSK has no 63/64 rule, so with GAS it would keep none and run
+        // out after any throw, which would hide what the throw itself does.
         let mut code: Vec<u8> = vec![
             0x36, 0x60, 0x00, 0x60, 0x00, 0x37, // mem[0..n] = calldata
             0x60, 0x00, 0x60, 0x00, 0x36, 0x60, 0x00, 0x60,
@@ -8238,7 +8238,7 @@ mod tests {
         ];
         code.extend_from_slice(hd_wallet.as_slice());
         code.extend_from_slice(&[
-            0x5a, 0xf1, // GAS, CALL
+            0x62, 0x07, 0xa1, 0x20, 0xf1, // PUSH3 500,000, CALL
             0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3, // RETURN the pushed word
         ]);
         let contracts: &[(Address, &[u8])] = &[(caller, &code)];
@@ -8277,11 +8277,169 @@ mod tests {
         );
 
         let before = call(2_000_000, &bad);
-        assert!(
-            before.gas_used > 900_000,
-            "before RSKIP197 the throw takes the gas it was given (got {})",
-            before.gas_used
+        assert!(!before.success, "before RSKIP197 the contract fails");
+        assert_eq!(before.gas_used, 1_000_000, "with all its gas");
+    }
+
+    /// The one transaction's result of [`execute_alone`], on mainnet's rules,
+    /// with no value and a gas limit of 1,000,000.
+    fn run_alone(
+        height: u64,
+        to: Address,
+        input: &[u8],
+        contracts: &[(Address, &[u8])],
+    ) -> TxExecutionResult {
+        let block = execute_alone(
+            RskHardforkConfig::mainnet(),
+            height,
+            to,
+            U256::ZERO,
+            1_000_000,
+            input,
+            contracts,
         );
+        block.tx_results.into_iter().next().unwrap()
+    }
+
+    /// Code that CALLs `to` with no data and no value, giving it `gas`, and
+    /// returns the word the CALL pushed.
+    fn call_and_return_pushed(to: Address, gas: u32) -> Vec<u8> {
+        // No return area, no arguments, no value.
+        let mut code = vec![
+            0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x73,
+        ];
+        code.extend_from_slice(to.as_slice());
+        code.push(0x63); // PUSH4 the gas
+        code.extend_from_slice(&gas.to_be_bytes());
+        code.extend_from_slice(&[
+            0xf1, // CALL
+            0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3, // RETURN the pushed word
+        ]);
+        code
+    }
+
+    /// Before RSKIP197 a precompile's throw fails the contract that made the
+    /// call and no more: the contract above it gets 0 from its CALL and goes
+    /// on, having lost all the gas it gave. From RSKIP197 the contract that
+    /// made the call goes on itself.
+    ///
+    /// The outer contract gives the inner one `given` gas. The inner one calls
+    /// HDWalletUtils with no payload, which names no method and throws, and
+    /// then stops.
+    #[test]
+    fn a_pre_rskip197_throw_fails_only_the_contract_that_made_the_call() {
+        let outer = Address::repeat_byte(0xB1);
+        let inner = Address::repeat_byte(0xB2);
+        let mut inner_code = vec![
+            0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x73,
+        ];
+        inner_code.extend_from_slice(crate::precompiles::HD_WALLET_UTILS_ADDR.as_slice());
+        inner_code.extend_from_slice(&[0x5a, 0xf1, 0x00]); // GAS, CALL, STOP
+        let run = |height: u64, given: u32| {
+            let outer_code = call_and_return_pushed(inner, given);
+            let contracts: &[(Address, &[u8])] = &[(outer, &outer_code), (inner, &inner_code)];
+            run_alone(height, outer, &[], contracts)
+        };
+
+        let (less, more) = (run(2_000_000, 200_000), run(2_000_000, 300_000));
+        for before in [&less, &more] {
+            assert!(before.success, "the outer contract goes on");
+            assert_eq!(
+                U256::from_be_slice(&before.output),
+                U256::ZERO,
+                "its CALL pushes 0"
+            );
+        }
+        assert_eq!(
+            more.gas_used - less.gas_used,
+            100_000,
+            "all the gas given is spent"
+        );
+
+        let (less, more) = (run(3_614_801, 200_000), run(3_614_801, 300_000));
+        for from in [&less, &more] {
+            assert!(from.success);
+            assert_eq!(
+                U256::from_be_slice(&from.output),
+                U256::from(1),
+                "its CALL pushes 1"
+            );
+        }
+        assert_eq!(
+            more.gas_used, less.gas_used,
+            "what the inner one left comes back"
+        );
+    }
+
+    /// A contract's call to REMASC, which refuses anything but
+    /// `getStateForDebugging()` from any transaction but the block's REMASC
+    /// one (`Remasc.processMinersFees`). From RSKIP197 the call fails and costs
+    /// REMASC's `getGasForData`, 0, so all the gas given comes back. Before it
+    /// the contract that made the call fails.
+    #[test]
+    fn a_contract_calling_remasc_is_refused_as_rskj_refuses_it() {
+        let caller = Address::repeat_byte(0xB3);
+        let run = |height: u64, given: u32| {
+            let code = call_and_return_pushed(crate::precompiles::REMASC_ADDR, given);
+            let contracts: &[(Address, &[u8])] = &[(caller, &code)];
+            run_alone(height, caller, &[], contracts)
+        };
+
+        let (less, more) = (run(3_614_801, 200_000), run(3_614_801, 300_000));
+        for from in [&less, &more] {
+            assert!(from.success, "the contract goes on");
+            assert_eq!(
+                U256::from_be_slice(&from.output),
+                U256::ZERO,
+                "its CALL pushes 0"
+            );
+        }
+        assert_eq!(more.gas_used, less.gas_used, "all the gas given comes back");
+
+        let before = run(2_000_000, 200_000);
+        assert!(!before.success, "before RSKIP197 the contract fails");
+        assert_eq!(before.gas_used, 1_000_000, "with all its gas");
+    }
+
+    /// `getStateForDebugging()`, the REMASC method with no caller guard,
+    /// answers a transaction and a contract alike with REMASC's state:
+    /// `RemascState.getEncoded`, ABI-encoded. With nothing stored that is two
+    /// zero coins, the empty siblings list and a false flag.
+    #[test]
+    fn remasc_answers_get_state_for_debugging_to_any_caller() {
+        let remasc = crate::precompiles::REMASC_ADDR;
+        let selector = crate::remasc::GET_STATE_FOR_DEBUGGING;
+        let expected = crate::abi::encode_bytes(&[0xc4, 0x80, 0x80, 0xc0, 0x00]);
+
+        let direct = run_alone(3_614_801, remasc, &selector, &[]);
+        assert!(direct.success);
+        assert_eq!(direct.output, expected);
+        assert_eq!(
+            direct.gas_used,
+            intrinsic_gas(&selector, 68),
+            "REMASC asks for no gas"
+        );
+
+        // A contract that makes the same call and returns what it got back.
+        let caller = Address::repeat_byte(0xB4);
+        let mut code = vec![0x63]; // PUSH4 the selector
+        code.extend_from_slice(&selector);
+        code.extend_from_slice(&[
+            0x60, 0x00, 0x52, // MSTORE: the selector is the word's last four bytes
+            0x60, 0x00, 0x60, 0x00, // no return area
+            0x60, 0x04, 0x60, 0x1c, 0x60, 0x00, // arguments 0x1c..0x20, no value
+            0x73, // PUSH20
+        ]);
+        code.extend_from_slice(remasc.as_slice());
+        code.extend_from_slice(&[
+            0x5a, 0xf1, 0x50, // GAS, CALL, POP
+            0x3d, 0x60, 0x00, 0x60, 0x00, 0x3e, // RETURNDATACOPY all of it to 0
+            0x3d, 0x60, 0x00, 0xf3, // RETURN it
+        ]);
+        let contracts: &[(Address, &[u8])] = &[(caller, &code)];
+        let via = run_alone(3_614_801, caller, &[], contracts);
+        assert!(via.success);
+        assert_eq!(via.output, expected);
     }
 
     fn hex_to_bytes(hex: &str) -> Vec<u8> {
