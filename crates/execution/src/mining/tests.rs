@@ -24,7 +24,7 @@ use crate::processor::BlockProcessor;
 // ── fixtures ──────────────────────────────────────────────────────────
 
 /// Activation heights with merged mining live from block 0 and UMM never, so
-/// tests can work at low block numbers. `papyrus200` is raised out of reach
+/// tests can work at low block numbers. RSKIPUMM is left out of reach
 /// deliberately: a separate test covers the `ummRoot` a real chain carries.
 fn test_chain_config() -> Arc<ChainConfig> {
     Arc::new(ChainConfig {
@@ -46,15 +46,20 @@ fn test_chain_config() -> Arc<ChainConfig> {
             iris300: 0,
             fingerroot500: 0,
             hop400: 0,
+            reed810: u64::MAX,
             // Active from genesis: this fixture mines blocks back to back,
             // so the ten-minute drop would only add noise.
             rskip97: Some(0),
+            // Neither, as `all_active`, the ladder `fixture_on` runs; the
+            // fixtures that run the sublists take theirs from their ladder
+            // (`with_heights_of`).
             rskip144: None,
-            // From genesis too: a partitioned template carries the version
-            // fields RSKIP351 brings.
-            rskip351: Some(0),
+            rskip351: None,
             // Testnet's floor alone, and this chain is not testnet.
             rskip290: None,
+            rskip_umm: None,
+            rskip535: None,
+            base_event_recovery_below: None,
         },
         genesis_spec: None,
         skip_pow_validation: false,
@@ -130,9 +135,9 @@ fn fixture(height: u64) -> MiningFixture {
     fixture_with(height, test_chain_config(), U256::from(2))
 }
 
-fn fixture_with_papyrus_at(papyrus200: u64, height: u64) -> MiningFixture {
+fn fixture_with_umm_at(rskip_umm: u64, height: u64) -> MiningFixture {
     let mut config = (*test_chain_config()).clone();
-    config.activation_heights.papyrus200 = papyrus200;
+    config.activation_heights.rskip_umm = Some(rskip_umm);
     fixture_with(height, Arc::new(config), U256::from(2))
 }
 
@@ -619,16 +624,26 @@ fn filling_the_mining_fields_does_not_move_the_merged_mining_hash() {
     assert_eq!(before, header.hash_for_merged_mining());
 }
 
-/// From papyrus200 rskj puts an empty `ummRoot` in every header it builds.
-/// Its presence changes both hashes, so a miner that decided by activation
-/// height differently from its peers produces blocks nobody accepts.
+/// From RSKIPUMM rskj puts an empty `ummRoot` in every header it builds
+/// (`BlockHeaderBuilder`). Its presence changes both hashes, so a miner that
+/// decided by activation height differently from its peers produces blocks
+/// nobody accepts. RSKIPUMM is papyrus200 on mainnet and testnet, and 1 on
+/// rskj's regtest, so papyrus200 alone does not say.
 #[test]
-fn umm_root_appears_once_papyrus_is_active() {
+fn umm_root_appears_once_rskip_umm_is_active() {
     let fx = fixture(20);
     assert!(fx.build().unwrap().block.header.umm_root.is_none());
 
-    let fx = fixture_with_papyrus_at(0, 20);
+    // The template is #21: a height above it is not reached yet.
+    let fx = fixture_with_umm_at(22, 20);
+    assert!(fx.build().unwrap().block.header.umm_root.is_none());
+    let fx = fixture_with_umm_at(21, 20);
     assert_eq!(fx.build().unwrap().block.header.umm_root, Some(Bytes::new()));
+
+    let mut papyrus = (*test_chain_config()).clone();
+    papyrus.activation_heights.papyrus200 = 0;
+    let fx = fixture_with(20, Arc::new(papyrus), U256::from(2));
+    assert!(fx.build().unwrap().block.header.umm_root.is_none());
 }
 
 /// Inheriting the parent's gas limit and minimum gas price is always valid --
@@ -1410,12 +1425,12 @@ fn a_solution_is_imported_on_a_chain_deep_enough_for_remasc_to_pay() {
 }
 
 /// And the round trip with `ummRoot` present, which is what mainnet actually
-/// carries. Elsewhere these tests keep papyrus200 out of reach so they can
+/// carries. Elsewhere these tests keep RSKIPUMM out of reach so they can
 /// work at low block numbers, which means the field every real header has is
 /// absent from the block they mine.
 #[test]
 fn a_solution_is_imported_with_umm_root_present() {
-    let fx = fixture_with_papyrus_at(0, 20);
+    let fx = fixture_with_umm_at(0, 20);
     let work = fx.server.get_work().unwrap();
 
     let raw = bitcoin::consensus::serialize(&solve(&work));
@@ -1833,6 +1848,40 @@ mod partitioned_templates {
         senders: u8,
         hardfork_cfg: RskHardforkConfig,
         minimum_gas_price: u64,
+    ) -> (
+        BlockTemplateBuilder,
+        Header,
+        Vec<SigningKey>,
+        Arc<dyn TrieStore>,
+        Arc<BlockStore>,
+    ) {
+        fixture_with_state(senders, hardfork_cfg, minimum_gas_price, |root, _| root)
+    }
+
+    /// The test chain with the header heights `ladder` runs: RSKIP144,
+    /// RSKIP351 and RSKIP535 from the first block that has them, as a node
+    /// moves them with its ladder (`--consensus-rule`). These ladders
+    /// schedule each at 0 or 1, if at all.
+    fn with_heights_of(ladder: &RskHardforkConfig) -> Arc<ChainConfig> {
+        let first = |active: fn(&RskHardforkConfig, u64) -> bool| {
+            (0..=1).find(|&number| active(ladder, number))
+        };
+        let mut config = (*test_chain_config()).clone();
+        let heights = &mut config.activation_heights;
+        heights.rskip144 = first(RskHardforkConfig::has_rskip144);
+        heights.rskip351 = first(RskHardforkConfig::has_rskip351);
+        heights.rskip535 = first(RskHardforkConfig::has_rskip535);
+        Arc::new(config)
+    }
+
+    /// `fixture_with_forks_priced` on a state that `seed` adds to once the
+    /// senders are funded.
+    #[allow(clippy::type_complexity)]
+    fn fixture_with_state(
+        senders: u8,
+        hardfork_cfg: RskHardforkConfig,
+        minimum_gas_price: u64,
+        seed: impl FnOnce(TrieNode, &dyn TrieStore) -> TrieNode,
     ) -> (BlockTemplateBuilder, Header, Vec<SigningKey>, Arc<dyn TrieStore>, Arc<BlockStore>) {
         let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
         let store = Arc::new(BlockStore::open(dir.path()).unwrap());
@@ -1849,6 +1898,7 @@ mod partitioned_templates {
             let k = rustock_trie::TrieKeySlice::from_key(&rustock_trie::account_key(&addr));
             root = root.put(&k, &acct.encode(), trie_store.as_ref());
         }
+        let mut root = seed(root, trie_store.as_ref());
         let state_root = root.compute_hash(trie_store.as_ref());
         root.save(trie_store.as_ref(), true);
         // The seeding is the fixture's whole premise; a silent failure here
@@ -1880,7 +1930,7 @@ mod partitioned_templates {
         let builder = BlockTemplateBuilder::new(
             Arc::new(BlockProcessor::new(hardfork_cfg.clone(), store.clone())),
             trie_store.clone(),
-            test_chain_config(),
+            with_heights_of(&hardfork_cfg),
             hardfork_cfg,
             MiningConfig {
                 coinbase_address: address!("00000000000000000000000000000000c0117b45"),
@@ -2032,6 +2082,165 @@ mod partitioned_templates {
         processor
             .process_block(&template.block, &parent_state, trie_store)
             .expect("the block validates");
+    }
+
+    /// rskj `BlockHeaderBuilder`, `ActivationConfig.getHeaderVersion` and
+    /// `BlockExecutor.fill`: the fields a template carries by its height,
+    /// partitioned or not. RSKIP351 makes it version 1 and RSKIP535 version
+    /// 2, whose base event is empty while the Union Bridge holds none; with
+    /// RSKIP144 and RSKIP351 a block that runs as one list has an empty list
+    /// of edges, not none.
+    #[test]
+    fn a_template_carries_the_fields_its_height_brings() {
+        use crate::hardfork::ConsensusRule;
+        use rustock_core::types::header::HeaderVersionFields;
+        let fields = |version, edges: Option<Vec<i16>>, base_event: Option<Bytes>| {
+            Some(HeaderVersionFields {
+                version,
+                edges,
+                base_event,
+            })
+        };
+        let parallel = RskHardforkConfig::all_active_parallel(33);
+        let parallel_without_535 = parallel
+            .clone()
+            .with_consensus_rule(ConsensusRule::Rskip535, None);
+        let only_351 = RskHardforkConfig::all_active(33)
+            .with_consensus_rule(ConsensusRule::Rskip351, Some(0))
+            .with_consensus_rule(ConsensusRule::Rskip535, None);
+        for (ladder, expected) in [
+            (RskHardforkConfig::all_active(33), None),
+            (only_351, fields(1, None, None)),
+            (parallel_without_535, fields(1, Some(vec![]), None)),
+            (parallel, fields(2, Some(vec![]), Some(Bytes::new()))),
+        ] {
+            let (builder, parent, _, trie_store, store) = fixture_with_forks(1, ladder.clone());
+            let template = builder
+                .build(std::slice::from_ref(&parent), Vec::new(), &Pool(Vec::new()))
+                .expect("the template builds");
+            assert_eq!(template.block.header.version_fields, expected, "{ladder:?}");
+
+            let processor = BlockProcessor::new(ladder, store);
+            let parent_state = builder.load_state_root(parent.state_root).unwrap();
+            processor
+                .process_block(&template.block, &parent_state, trie_store)
+                .expect("the block validates");
+        }
+    }
+
+    /// A call from `from` to `to` carrying `input` and no value, signed.
+    fn call(
+        from: &SigningKey,
+        to: Address,
+        nonce: u64,
+        chain_id: u64,
+        input: Vec<u8>,
+    ) -> PendingTransaction {
+        let mut tx = Transaction {
+            nonce,
+            gas_price: U256::from(1),
+            gas_limit: U256::from(100_000),
+            to: Bytes::copy_from_slice(to.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::from(input),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
+        };
+        sign(&mut tx, from, chain_id);
+        let hash = B256::from_slice(&sha3::Keccak256::digest(tx.rlp_for_trie()));
+        PendingTransaction {
+            tx,
+            sender: address_of(from),
+            hash,
+        }
+    }
+
+    /// `setBaseEvent(bytes)`'s call data: the selector, then rskj's
+    /// `BytesType`, an offset, the length and the bytes padded to a word.
+    fn set_base_event(event: &[u8]) -> Vec<u8> {
+        let mut input = sha3::Keccak256::digest(b"setBaseEvent(bytes)")[..4].to_vec();
+        input.extend_from_slice(&U256::from(32u64).to_be_bytes::<32>());
+        input.extend_from_slice(&U256::from(event.len()).to_be_bytes::<32>());
+        input.extend_from_slice(event);
+        input.resize(4 + 64 + event.len().div_ceil(32) * 32, 0);
+        input
+    }
+
+    /// rskj `BlockExecutor.fill`: a version-2 header carries the base event
+    /// the Union Bridge holds once its block has run -- here the one the
+    /// block's own transaction sets, which its parent's state does not hold.
+    #[test]
+    fn a_version_2_template_carries_the_base_event_its_block_sets() {
+        use crate::bridge::union::{union_key, BASE_EVENT_KEY, UNION_CONTRACT_ADDRESS_KEY};
+        use crate::precompiles::BRIDGE_ADDR;
+        use rustock_trie::{
+            account_key, storage_key, storage_prefix_key, AccountState, TrieKeySlice,
+        };
+        let ladder = RskHardforkConfig::all_active_parallel(33);
+        let union_bridge = address_of(&signing_key(1));
+        let (builder, parent, keys, trie_store, store) =
+            fixture_with_state(1, ladder.clone(), 0, |root, trie_store| {
+                // The Bridge, and the cell naming the union bridge contract as
+                // rskj's `serializeRskAddress` writes it: RLP of the twenty
+                // bytes.
+                let at = |key: &[u8]| TrieKeySlice::from_key(key);
+                let account = AccountState::new(U256::ZERO, U256::ZERO).encode();
+                let root = root.put(&at(&account_key(&BRIDGE_ADDR)), &account, trie_store);
+                let root = root.put(&at(&storage_prefix_key(&BRIDGE_ADDR)), &[1], trie_store);
+                let slot = B256::from(union_key(UNION_CONTRACT_ADDRESS_KEY));
+                let named = [&[0x94][..], union_bridge.as_slice()].concat();
+                root.put(&at(&storage_key(&BRIDGE_ADDR, &slot)), &named, trie_store)
+            });
+        let base_event = |state: B256| {
+            let root = builder.load_state_root(state).unwrap();
+            let slot = B256::from(union_key(BASE_EVENT_KEY));
+            root.get(
+                &TrieKeySlice::from_key(&storage_key(&BRIDGE_ADDR, &slot)),
+                trie_store.as_ref(),
+            )
+        };
+        assert_eq!(base_event(parent.state_root), None, "the parent holds none");
+
+        let event = b"a base event".to_vec();
+        let pool = Pool(vec![call(
+            &keys[0],
+            BRIDGE_ADDR,
+            0,
+            33,
+            set_base_event(&event),
+        )]);
+        let template = builder
+            .build(std::slice::from_ref(&parent), Vec::new(), &pool)
+            .expect("the template builds");
+        assert_eq!(
+            but_remasc(&template.block.transactions).len(),
+            1,
+            "the call is in"
+        );
+        assert_eq!(
+            base_event(template.block.header.state_root),
+            Some(event.clone())
+        );
+        let fields = template
+            .block
+            .header
+            .version_fields
+            .clone()
+            .expect("versioned");
+        assert_eq!(fields.version, 2);
+        assert_eq!(
+            fields.base_event,
+            Some(Bytes::from(event)),
+            "read after the block"
+        );
+
+        let processor = BlockProcessor::new(ladder, store);
+        let parent_state = builder.load_state_root(parent.state_root).unwrap();
+        processor
+            .process_block(&template.block, &parent_state, trie_store)
+            .expect("a block this miner built must be one this node would accept");
     }
 
     // ── packing by gas used, and the RSKIP252 cap ─────────────────────

@@ -158,11 +158,8 @@ impl HeaderValidator for GasLimitRule {
 /// The decoder here reads by shape rather than by height, so this holds what
 /// it read to what rskj would have.
 ///
-/// - A UMM root from RSKIPUMM on, and none before it. rskj's `reference.conf`
-///   puts RSKIPUMM at papyrus200, which mainnet and testnet keep. A chain
-///   with no papyrus200, rustock's regtest, is not held to either: rskj's
-///   regtest has `rskipUMM = 1`, and both regtests are read here, rustock's
-///   own and one imported from rskj.
+/// - A UMM root from RSKIPUMM on, and none before it: papyrus200 on mainnet
+///   and testnet, as `reference.conf` has it, and 1 on rskj's regtest.
 /// - No RSKIP351 fields where RSKIP351 is inactive, as it is on mainnet: no
 ///   version, edges or base event after the UMM root, and no commitment to
 ///   an extension in the logs bloom's place. The decoder reads whatever is
@@ -177,16 +174,14 @@ pub struct HeaderLayoutRule {
 impl HeaderValidator for HeaderLayoutRule {
     fn validate(&self, header: &Header) -> Result<(), ValidationError> {
         let heights = &self.config.activation_heights;
-        let umm = header.number >= heights.papyrus200;
-        if heights.papyrus200 != u64::MAX && header.umm_root.is_some() != umm {
+        let umm = heights.umm_active(header.number);
+        if header.umm_root.is_some() != umm {
             return Err(ValidationError::UmmRootMisplaced {
                 number: header.number,
                 present: header.umm_root.is_some(),
             });
         }
-        let rskip351 = heights
-            .rskip351
-            .is_some_and(|height| header.number >= height);
+        let rskip351 = heights.rskip351_active(header.number);
         if !rskip351 && (header.version_fields.is_some() || header.extension_data.is_some()) {
             return Err(ValidationError::VersionedBeforeRskip351 {
                 number: header.number,

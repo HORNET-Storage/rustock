@@ -86,6 +86,7 @@ pub const TESTNET_ACTIVATIONS: &[(u64, RskNetworkUpgrade)] = &[
 /// by name are here; every other rule follows its upgrade.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConsensusRule {
+    Rskip144,
     Rskip351,
     Rskip535,
     Rskip536,
@@ -95,6 +96,7 @@ impl ConsensusRule {
     /// The rule rskj calls `name` in `consensusRules`.
     pub fn from_rskj_name(name: &str) -> Option<Self> {
         Some(match name {
+            "rskip144" => Self::Rskip144,
             "rskip351" => Self::Rskip351,
             "rskip535" => Self::Rskip535,
             "rskip536" => Self::Rskip536,
@@ -294,10 +296,10 @@ impl RskHardforkConfig {
     /// - `orchid060` and `tbd1000`: nothing here reads them. `tbd1000` only
     ///   turns on RSKIP-559 (deterministic pegout sorting in the Bridge),
     ///   which this node does not implement. Accepted and reported as such.
-    /// - `rskip351`, `rskip535`, `rskip536`: scheduled apart from their
-    ///   upgrade.
-    /// - `rskipUMM`: follows papyrus200 here, so it is accepted at that height
-    ///   and refused at any other.
+    /// - `rskip144`, `rskip351`, `rskip535`, `rskip536`: scheduled apart from
+    ///   their upgrade.
+    /// - `rskipUMM`: accepted at any height. Only a header's layout reads it,
+    ///   from the chain's activation heights, which the caller moves.
     ///
     /// Returns the names that were accepted without effect, for the log.
     pub fn with_rskj_overrides(
@@ -326,17 +328,11 @@ impl RskHardforkConfig {
             if let Some(rule) = ConsensusRule::from_rskj_name(name) {
                 self = self.with_consensus_rule(rule, *height);
             } else if name == "rskipUMM" {
-                let papyrus200 = self.activation_height(RskNetworkUpgrade::Papyrus200);
-                if *height != papyrus200 {
-                    return Err(format!(
-                        "consensus rule rskipUMM: this node reads it at papyrus200 \
-                         ({papyrus200:?}) and cannot move it"
-                    ));
-                }
+                // Nothing on the ladder reads it.
             } else {
                 return Err(format!(
                     "consensus rule {name}: not one this node schedules on its own \
-                     (rskip351, rskip535, rskip536, rskipUMM)"
+                     (rskip144, rskip351, rskip535, rskip536, rskipUMM)"
                 ));
             }
         }
@@ -823,7 +819,13 @@ impl RskHardforkConfig {
     /// inert only because nothing read this predicate yet and mainnet headers
     /// carry no sublist edges. The first thing to depend on it would have
     /// forked the node.
+    ///
+    /// A `consensusRules` entry moves it off reed810, as rskj's
+    /// `regtest.conf` does (`rskip144 = 1`).
     pub fn has_rskip144(&self, block_number: u64) -> bool {
+        if let Some(height) = self.rule_override(ConsensusRule::Rskip144) {
+            return height.is_some_and(|h| block_number >= h);
+        }
         self.activation_height(RskNetworkUpgrade::Reed810)
             .is_some_and(|h| block_number >= h)
     }
@@ -1408,9 +1410,13 @@ mod override_tests {
         let moved = RskHardforkConfig::mainnet()
             .with_rskj_overrides(&[h("hop401", 5_000_000)], &[]);
         assert!(moved.is_err());
-        let umm = RskHardforkConfig::mainnet()
-            .with_rskj_overrides(&[], &[h("rskipUMM", 1)]);
-        assert!(umm.is_err());
+        // Only a header's layout reads RSKIPUMM, from the chain's heights:
+        // the ladder takes it at any height and changes nothing.
+        let (umm, unmodelled) = RskHardforkConfig::mainnet()
+            .with_rskj_overrides(&[], &[h("rskipUMM", 1)])
+            .unwrap();
+        assert_eq!(umm.activations, RskHardforkConfig::mainnet().activations);
+        assert_eq!((umm.rule_overrides, unmodelled), (Vec::new(), Vec::<String>::new()));
         let unknown = RskHardforkConfig::mainnet()
             .with_rskj_overrides(&[h("quartz", 1)], &[]);
         assert!(unknown.is_err());
@@ -1443,6 +1449,17 @@ mod override_tests {
             .unwrap();
         assert!(moved.has_rskip144(8_000_000));
         assert!(!moved.runs_sublists(8_000_000));
+        // rskip144 moves apart from reed810 too, as rskj's regtest has it.
+        let (moved, _) = RskHardforkConfig::testnet()
+            .with_rskj_overrides(&[], &[h("rskip144", 7_500_000)])
+            .unwrap();
+        assert!(moved.has_rskip351(7_139_600) && !moved.has_rskip144(7_499_999));
+        assert!(!moved.runs_sublists(7_499_999));
+        assert!(moved.runs_sublists(7_500_000));
+        let (off, _) = RskHardforkConfig::testnet()
+            .with_rskj_overrides(&[], &[h("rskip144", -1)])
+            .unwrap();
+        assert!(!off.has_rskip144(8_000_000) && !off.runs_sublists(8_000_000));
     }
 }
 

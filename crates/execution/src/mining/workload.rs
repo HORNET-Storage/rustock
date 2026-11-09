@@ -578,6 +578,13 @@ impl Workload {
         let mut chain_config = rustock_core::config::ChainConfig::testnet();
         chain_config.chain_id = self.chain_id as u8;
         chain_config.min_difficulty = U256::from(1);
+        // The header's layout on the ladder's schedule, which runs blocks as
+        // their sublists from genesis: RSKIP144 and RSKIP351 there, and
+        // RSKIP535 where the ladder has it by the first block.
+        let heights = &mut chain_config.activation_heights;
+        heights.rskip144 = Some(0);
+        heights.rskip351 = Some(0);
+        heights.rskip535 = hardfork_cfg.has_rskip535(1).then_some(1);
         // The miner and the validator on the same constants: the sequential
         // sublist's minimum sets every sublist's gas limit, which the
         // validator holds the miner's partition to.

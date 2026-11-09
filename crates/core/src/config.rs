@@ -38,6 +38,11 @@ pub struct ActivationHeights {
     /// Bitcoin-to-RSK timestamp window on testnet (5 minutes to 2 hours).
     /// Read only on testnet; mainnet keeps 5 minutes at every height.
     pub hop400: u64,
+    /// Reed810 hardfork, where `reference.conf` puts RSKIP144 and RSKIP351.
+    /// Read here only so that moving it moves them where the chain keeps
+    /// them there ([`Self::set_rskj_hardfork`]); the execution ladder
+    /// schedules the upgrade itself.
+    pub reed810: u64,
     /// Height at which RSKIP97 -- "no 10-minute difficulty drop" -- activates,
     /// or `None` where it never does.
     ///
@@ -54,11 +59,9 @@ pub struct ActivationHeights {
     /// Height at which RSKIP-144 (parallel transaction sublists) activates,
     /// or `None` where it never does. rskj gates it on `reed810`.
     ///
-    /// The header decoder needs it: after an RSKIP-351 version byte, one
-    /// trailing item is the sublist edges where RSKIP-144 is active and the
-    /// V2 base event where it is not (rskj `BlockFactory` decides by the same
-    /// activation). rskj's own regtest is the second case: `rskip144 = -1`
-    /// with `rskip535 = 1`.
+    /// The header's layout needs it: from here on, where RSKIP-351 is active
+    /// too, a header carries the sublist edges, empty for a block that runs
+    /// as one list (rskj `BlockFactory` and `BlockHeaderBuilder`).
     pub rskip144: Option<u64>,
     /// Height at which RSKIP351 -- versioned headers, the version and its
     /// extension where a header had only a logs bloom -- activates, or
@@ -72,6 +75,23 @@ pub struct ActivationHeights {
     /// alone (`Constants.getMinimumDifficulty`), so on the other chains it
     /// is recorded but changes nothing: see [`ChainConfig::min_difficulty_at`].
     pub rskip290: Option<u64>,
+    /// Height at which RSKIPUMM -- a UMM root after the uncle count --
+    /// activates, or `None` where it never does. `reference.conf` sets it at
+    /// papyrus200, which mainnet and testnet keep, and rskj's regtest at
+    /// block 1. rskj's `BlockFactory` reads the field by this height, and its
+    /// miner writes it, empty, from here on (`BlockHeaderBuilder`).
+    pub rskip_umm: Option<u64>,
+    /// Height at which RSKIP535 -- a versioned header's base event --
+    /// activates, or `None` where it never does. `reference.conf` leaves it
+    /// at -1, which mainnet keeps; testnet sets it at vetiver900 (#7,604,200)
+    /// and regtest at 1. With RSKIP351 it makes a header version 2
+    /// (`ActivationConfig.getHeaderVersion`).
+    pub rskip535: Option<u64>,
+    /// Below this height rskj takes a full header one field short of its
+    /// layout where the base event is enabled, and gives it an empty base
+    /// event (`BlockFactory.isInBaseEventRecoveryWindow`): on testnet alone,
+    /// below `BASE_EVENT_RECOVERY_UPPER_BOUND`, #7,800,000. `None` elsewhere.
+    pub base_event_recovery_below: Option<u64>,
 }
 
 /// Process-wide activation heights, consulted by block-hash computation
@@ -93,19 +113,77 @@ impl ActivationHeights {
 
     /// Set the height this struct carries for an rskj upgrade name, for the
     /// names it carries: `orchid`, `wasabi100`, `papyrus200`, `iris300`,
-    /// `fingerroot500`, and `reed810`, which is RSKIP-144's height. `None`
-    /// is rskj's `-1`. Any other name is the execution ladder's to judge and
-    /// is left alone here.
+    /// `fingerroot500` and `reed810`. `None` is rskj's `-1`. Any other name is
+    /// the execution ladder's to judge and is left alone here.
+    ///
+    /// The rules `reference.conf` puts at an upgrade move with it where the
+    /// chain keeps them there: RSKIPUMM with papyrus200, RSKIP144 and
+    /// RSKIP351 with reed810. A chain that sets its own, as rskj's regtest
+    /// does, keeps them.
     pub fn set_rskj_hardfork(&mut self, name: &str, height: Option<u64>) {
         let never = u64::MAX;
+        let at = |upgrade: u64| (upgrade != never).then_some(upgrade);
         match name {
             "orchid" => self.orchid = height.unwrap_or(never),
             "wasabi100" => self.wasabi100 = height.unwrap_or(never),
-            "papyrus200" => self.papyrus200 = height.unwrap_or(never),
+            "papyrus200" => {
+                if self.rskip_umm == at(self.papyrus200) {
+                    self.rskip_umm = height;
+                }
+                self.papyrus200 = height.unwrap_or(never);
+            }
             "iris300" => self.iris300 = height.unwrap_or(never),
             "fingerroot500" => self.fingerroot500 = height.unwrap_or(never),
-            "reed810" => self.rskip144 = height,
+            "reed810" => {
+                let followed = at(self.reed810);
+                for rule in [&mut self.rskip144, &mut self.rskip351] {
+                    if *rule == followed {
+                        *rule = height;
+                    }
+                }
+                self.reed810 = height.unwrap_or(never);
+            }
             _ => {}
+        }
+    }
+
+    /// Whether `number` is at or past `height`, rskj's `isActive`.
+    fn reached(height: Option<u64>, number: u64) -> bool {
+        height.is_some_and(|height| number >= height)
+    }
+
+    /// Whether a header at `number` carries a UMM root (RSKIPUMM).
+    pub fn umm_active(&self, number: u64) -> bool {
+        Self::reached(self.rskip_umm, number)
+    }
+
+    /// Whether RSKIP-144's sublist edges are a header field at `number`:
+    /// rskj reads and writes them where RSKIP351 and RSKIP144 are both
+    /// active.
+    pub fn edges_active(&self, number: u64) -> bool {
+        Self::reached(self.rskip351, number) && Self::reached(self.rskip144, number)
+    }
+
+    /// Whether a header at `number` is versioned (RSKIP351).
+    pub fn rskip351_active(&self, number: u64) -> bool {
+        Self::reached(self.rskip351, number)
+    }
+
+    /// rskj `BlockFactory.isBaseEventEnabled`: RSKIP535 and RSKIP351 both.
+    pub fn base_event_enabled(&self, number: u64) -> bool {
+        Self::reached(self.rskip535, number) && Self::reached(self.rskip351, number)
+    }
+
+    /// rskj `ActivationConfig.getHeaderVersion`: 2 with RSKIP535, 1 without
+    /// it, and 0 before RSKIP351.
+    pub fn header_version(&self, number: u64) -> u8 {
+        match (
+            self.rskip351_active(number),
+            Self::reached(self.rskip535, number),
+        ) {
+            (false, _) => 0,
+            (true, false) => 1,
+            (true, true) => 2,
         }
     }
 
@@ -117,14 +195,20 @@ impl ActivationHeights {
             iris300: 3_614_800,
             fingerroot500: 5_468_000,
             hop400: 4_598_500,
+            // main.conf: `reed810 = -1`.
+            reed810: u64::MAX,
             // reference.conf: `rskip97 = orchid`, not overridden by main.conf.
             rskip97: Some(729_000),
-            // main.conf: reed810 = -1.
+            // reference.conf: `rskip144 = reed810` and `rskip351 = reed810`.
             rskip144: None,
-            // main.conf: `reed810 = -1`.
             rskip351: None,
             // reference.conf: `rskip290 = hop400`. Mainnet's floor stays 7e15.
             rskip290: Some(4_598_500),
+            // reference.conf: `rskipUMM = papyrus200`.
+            rskip_umm: Some(2_392_700),
+            // reference.conf: `rskip535 = -1`, which main.conf keeps.
+            rskip535: None,
+            base_event_recovery_below: None,
         }
     }
 
@@ -138,15 +222,21 @@ impl ActivationHeights {
             iris300: 2_060_500,
             fingerroot500: 4_015_800,
             hop400: 3_103_000,
+            // testnet.conf: `reed810 = 7139600`.
+            reed810: 7_139_600,
             // testnet.conf: `rskip97 = -1  # disable orchid difficulty drop`.
             rskip97: None,
-
-            // testnet.conf: reed810.
+            // reference.conf: `rskip144 = reed810` and `rskip351 = reed810`.
             rskip144: Some(7_139_600),
-            // testnet.conf: `reed810 = 7139600`.
             rskip351: Some(7_139_600),
             // testnet.conf: `rskip290 = 2581800`, not hop400.
             rskip290: Some(2_581_800),
+            // reference.conf: `rskipUMM = papyrus200`.
+            rskip_umm: Some(863_000),
+            // testnet.conf: `rskip535 = 7604200`, vetiver900's height.
+            rskip535: Some(7_604_200),
+            // BlockFactory.BASE_EVENT_RECOVERY_UPPER_BOUND, testnet's alone.
+            base_event_recovery_below: Some(7_800_000),
         }
     }
 
@@ -154,19 +244,33 @@ impl ActivationHeights {
         Self {
             orchid: 0,
             wasabi100: 0,
+            // regtest.conf puts papyrus200 at 0, but nothing read here from it
+            // applies on regtest: RSKIP156's divisor skips it
+            // (`Constants.getDifficultyBoundDivisor`), and its UMM root has
+            // its own height below.
             papyrus200: u64::MAX,
             iris300: 0,
             fingerroot500: 0,
             hop400: 0,
+            // regtest.conf: `reed810 = 0`, though rustock's regtest ladder
+            // does not schedule it yet; RSKIP144 and RSKIP351 have their
+            // own heights below, so they do not move with it.
+            reed810: 0,
             // regtest.conf: `rskip97 = -1`, same as testnet.
             rskip97: None,
-            // regtest.conf: `rskip144 = -1`; rustock's regtest ladder does
-            // not schedule reed810 either.
-            rskip144: None,
+            // regtest.conf: `rskip144 = 1`. rustock's regtest ladder does not
+            // run blocks as their sublists yet, so its blocks run as one
+            // list and carry empty edges.
+            rskip144: Some(1),
             // regtest.conf: `rskip351 = 1`.
             rskip351: Some(1),
             // reference.conf's hop400, which regtest.conf puts at genesis.
             rskip290: Some(0),
+            // regtest.conf: `rskipUMM = 1`, not papyrus200.
+            rskip_umm: Some(1),
+            // regtest.conf: `rskip535 = 1`.
+            rskip535: Some(1),
+            base_event_recovery_below: None,
         }
     }
 }
@@ -666,6 +770,111 @@ mod tests {
         assert_eq!(heights.orchid, 0);
         assert_eq!(heights.wasabi100, 0);
         assert_eq!(heights.papyrus200, u64::MAX);
+    }
+
+    /// The heights a header's layout is read by, as rskj's `reference.conf`,
+    /// `testnet.conf` and `regtest.conf` set them, and `BlockFactory`'s
+    /// testnet recovery bound.
+    #[test]
+    fn header_layout_heights_are_rskjs() {
+        let layout = |h: ActivationHeights| {
+            (
+                h.rskip_umm,
+                h.rskip144,
+                h.rskip351,
+                h.rskip535,
+                h.base_event_recovery_below,
+            )
+        };
+        assert_eq!(
+            layout(ActivationHeights::mainnet()),
+            (Some(2_392_700), None, None, None, None)
+        );
+        assert_eq!(
+            layout(ActivationHeights::testnet()),
+            (
+                Some(863_000),
+                Some(7_139_600),
+                Some(7_139_600),
+                Some(7_604_200),
+                Some(7_800_000)
+            )
+        );
+        assert_eq!(
+            layout(ActivationHeights::regtest()),
+            (Some(1), Some(1), Some(1), Some(1), None)
+        );
+    }
+
+    /// rskj `ActivationConfig.getHeaderVersion` and the fields `BlockFactory`
+    /// reads by height, on testnet's heights: the UMM root from papyrus200,
+    /// version 1 with edges from reed810, version 2 with a base event from
+    /// RSKIP535.
+    #[test]
+    fn a_header_is_laid_out_by_its_height() {
+        let t = ActivationHeights::testnet();
+        assert!(!t.umm_active(862_999));
+        assert!(t.umm_active(863_000));
+        for (number, version, edges, base_event) in [
+            (7_139_599, 0, false, false),
+            (7_139_600, 1, true, false),
+            (7_604_199, 1, true, false),
+            (7_604_200, 2, true, true),
+        ] {
+            assert_eq!(t.header_version(number), version, "#{number}");
+            assert_eq!(t.rskip351_active(number), version > 0, "#{number}");
+            assert_eq!(t.edges_active(number), edges, "#{number}");
+            assert_eq!(t.base_event_enabled(number), base_event, "#{number}");
+        }
+        // RSKIP535 without RSKIP351 is no version and no base event; RSKIP351
+        // without RSKIP144, no edges.
+        let alone = ActivationHeights {
+            rskip351: None,
+            ..ActivationHeights::regtest()
+        };
+        assert_eq!(alone.header_version(5), 0);
+        assert!(!alone.base_event_enabled(5));
+        let no_144 = ActivationHeights {
+            rskip144: None,
+            ..ActivationHeights::regtest()
+        };
+        assert_eq!(no_144.header_version(5), 2);
+        assert!(!no_144.edges_active(5));
+    }
+
+    /// `reference.conf` has `rskipUMM = papyrus200`, and `rskip144` and
+    /// `rskip351` at reed810: moving the upgrade moves them where the chain
+    /// keeps them there, and not on regtest, which sets its own.
+    #[test]
+    fn rules_follow_their_upgrade_where_the_chain_has_them_follow() {
+        let mut mainnet = ActivationHeights::mainnet();
+        mainnet.set_rskj_hardfork("papyrus200", Some(100));
+        assert_eq!((mainnet.papyrus200, mainnet.rskip_umm), (100, Some(100)));
+        mainnet.set_rskj_hardfork("papyrus200", None);
+        assert_eq!((mainnet.papyrus200, mainnet.rskip_umm), (u64::MAX, None));
+        mainnet.set_rskj_hardfork("papyrus200", Some(7));
+        assert_eq!(mainnet.rskip_umm, Some(7));
+
+        mainnet.set_rskj_hardfork("reed810", Some(9_002_504));
+        let reed = |h: &ActivationHeights| (h.reed810, h.rskip144, h.rskip351);
+        assert_eq!(
+            reed(&mainnet),
+            (9_002_504, Some(9_002_504), Some(9_002_504))
+        );
+        mainnet.set_rskj_hardfork("reed810", None);
+        assert_eq!(reed(&mainnet), (u64::MAX, None, None));
+        let mut testnet = ActivationHeights::testnet();
+        testnet.set_rskj_hardfork("reed810", Some(8_000_000));
+        assert_eq!(
+            reed(&testnet),
+            (8_000_000, Some(8_000_000), Some(8_000_000))
+        );
+
+        let mut regtest = ActivationHeights::regtest();
+        regtest.set_rskj_hardfork("papyrus200", Some(0));
+        assert_eq!((regtest.papyrus200, regtest.rskip_umm), (0, Some(1)));
+        regtest.set_rskj_hardfork("reed810", Some(5));
+        assert_eq!(reed(&regtest), (5, Some(1), Some(1)));
     }
 
     #[test]

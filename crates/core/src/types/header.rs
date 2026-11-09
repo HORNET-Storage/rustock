@@ -732,8 +732,8 @@ impl Header {
             // for it and hashes the header wrong.
             //
             // Where RSKIP-144 is not active there are no edges, and a V2
-            // header's one trailing item is its base event (rskj's regtest:
-            // rskip144 = -1, rskip535 = 1). rskj tells the cases apart by
+            // header's one trailing item is its base event (rskj's regtest
+            // once had rskip144 = -1, rskip535 = 1). rskj tells the cases apart by
             // activation, and so does this. Both are read raw
             // (`getRLPRawData`).
             let mut edges = None;
@@ -2576,10 +2576,11 @@ mod versioned_wire_header_tests {
         "d50308ca8a1200741eb600000000",
     );
 
-    /// Block 1 of a chain rskj's regtest mined (regtest.conf: rskip144 = -1,
-    /// rskip351 = 1, rskip535 = 1), in rskj's full encoding as `ExportBlocks`
-    /// writes it. Its one trailing item after the version byte is an empty
-    /// base event, not edges: there are no edges without RSKIP-144.
+    /// Block 1 of a chain rskj's regtest mined while its `regtest.conf` had
+    /// `rskip144 = -1` (with rskip351 = 1 and rskip535 = 1; it has rskip144 = 1
+    /// now), in rskj's full encoding as `ExportBlocks` writes it. Its one
+    /// trailing item after the version byte is an empty base event, not
+    /// edges: there are no edges without RSKIP-144.
     const RSKJ_REGTEST_V2_FULL: &str = concat!(
         "f902b1a0227d8e8d835f5e7290e333f4177e551ef1222dde4704f677ba4a120051c31cc2a01dcc4de8dec75d7aab85b5",
         "67b6ccd41ad312451b948a7413f0a142fd40d4934794916d3652976d82540412b561bf674f72cf5174f7a095f20004ac",
@@ -2601,7 +2602,10 @@ mod versioned_wire_header_tests {
     #[test]
     fn a_v2_header_without_rskip144_carries_a_base_event_not_edges() {
         let bytes = alloy_primitives::hex::decode(RSKJ_REGTEST_V2_FULL).unwrap();
-        let regtest = crate::config::ActivationHeights::regtest();
+        let regtest = crate::config::ActivationHeights {
+            rskip144: None,
+            ..crate::config::ActivationHeights::regtest()
+        };
         let h = Header::decode_with_activations(&mut bytes.as_slice(), &regtest).unwrap();
         let v = h.version_fields.as_ref().unwrap();
         assert_eq!(v.version, 2);

@@ -3078,10 +3078,12 @@ mod tests {
     }
 
     /// Regtest's constants with rskj's timestamp rule on, so every rule an
-    /// uncle faces runs.
+    /// uncle faces runs, and without RSKIPUMM, so these headers need no UMM
+    /// root.
     fn uncle_config() -> Arc<rustock_core::config::ChainConfig> {
         let mut config = rustock_core::config::ChainConfig::regtest();
         config.max_future_block_time = 60;
+        config.activation_heights.rskip_umm = None;
         Arc::new(config)
     }
 

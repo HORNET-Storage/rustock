@@ -5,6 +5,11 @@
 //! `ExportBlocks` writes them: version-2 headers, twenty contract calls a
 //! block, a flush at block 10 and REMASC's first payout at block 15, which
 //! pays rskj's regtest federation.
+//!
+//! That regtest ran RSKIP-144 at -1, as rskj's `regtest.conf` then had it:
+//! its headers carry a base event and no edges. rskj's `regtest.conf` now
+//! has `rskip144 = 1`, so the import names the rule the blocks were mined
+//! under, as an rskj node replaying them would have to.
 
 use std::path::Path;
 use std::process::Command;
@@ -27,6 +32,7 @@ fn import_command(blocks: &Path, dir: &Path) -> Command {
         .arg("--genesis")
         .arg(Path::new(DATA).join("rskj-regtest-genesis.json"))
         .args(["--skip-pow-validation", "--consensus-rule", "rskip97=0"])
+        .args(["--consensus-rule", "rskip144=-1"])
         .args(["--min-gas-limit", "3000000"])
         .arg("--import-blocks")
         .arg(blocks);

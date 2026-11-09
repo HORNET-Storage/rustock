@@ -1601,10 +1601,13 @@ impl uncles::AncestorSource for Ancestry {
 }
 
 /// Regtest's constants with rskj's timestamp rule switched on, so that every
-/// rule an uncle faces runs.
+/// rule an uncle faces runs, and without RSKIPUMM, so these headers need no
+/// UMM root: `a_header_carries_the_fields_rskj_reads_at_its_height` holds
+/// regtest's to it.
 fn uncle_config() -> Arc<crate::config::ChainConfig> {
     let mut config = crate::config::ChainConfig::regtest();
     config.max_future_block_time = 60;
+    config.activation_heights.rskip_umm = None;
     Arc::new(config)
 }
 
@@ -1809,7 +1812,8 @@ fn default_rsk_holds_uncles_to_rskjs_uncle_rules() {
 }
 
 /// rskj reads a header's fields by its height (`BlockFactory.canBeDecoded`):
-/// a UMM root from RSKIPUMM, papyrus200, on and only then, and no RSKIP351
+/// a UMM root from RSKIPUMM on and only then -- papyrus200 on mainnet and
+/// testnet, 1 on regtest -- and no RSKIP351
 /// fields where RSKIP351 is inactive, which is all of mainnet. The decoder
 /// reads by shape, so the verifier holds what it read to that, for a block
 /// and for an uncle alike, before anything else.
@@ -1832,6 +1836,29 @@ fn a_header_carries_the_fields_rskj_reads_at_its_height() {
     assert_eq!(rule.validate(&at(papyrus - 1, true)), misplaced(papyrus - 1, true));
     assert_eq!(rule.validate(&at(papyrus, true)), Ok(()));
     assert_eq!(rule.validate(&at(papyrus, false)), misplaced(papyrus, false));
+    // RSKIPUMM's own height, not papyrus200's, where the two part.
+    let apart = HeaderLayoutRule {
+        config: Arc::new(ChainConfig {
+            activation_heights: crate::config::ActivationHeights {
+                rskip_umm: Some(papyrus + 10),
+                ..mainnet.activation_heights.clone()
+            },
+            ..(*mainnet).clone()
+        }),
+    };
+    assert_eq!(apart.validate(&at(papyrus, false)), Ok(()));
+    assert_eq!(
+        apart.validate(&at(papyrus + 10, false)),
+        misplaced(papyrus + 10, false)
+    );
+    // rskj's regtest: from block 1, as `regtest.conf` has it.
+    let regtest = HeaderLayoutRule {
+        config: Arc::new(ChainConfig::regtest()),
+    };
+    assert_eq!(regtest.validate(&at(0, false)), Ok(()));
+    assert_eq!(regtest.validate(&at(0, true)), misplaced(0, true));
+    assert_eq!(regtest.validate(&at(1, true)), Ok(()));
+    assert_eq!(regtest.validate(&at(1, false)), misplaced(1, false));
 
     let versioned = |mut header: Header| {
         header.version_fields =

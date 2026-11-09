@@ -3897,12 +3897,20 @@ fn apply_chain_options(mut config: ChainConfig, args: &Args) -> Result<ChainConf
         let (name, height) = parse_rskj_height("--consensus-rule", rule)?;
         match name.as_str() {
             "rskip97" => config.activation_heights.rskip97 = height,
-            // The ladder reads it from the overrides, and the header layout
-            // rule from the activation heights: both must move.
-            "rskip351" => {
-                config.activation_heights.rskip351 = height;
+            // The ladder reads these from the overrides, and the header's
+            // layout from the activation heights: both must move.
+            "rskip144" | "rskip351" | "rskip535" => {
+                let heights = &mut config.activation_heights;
+                let field = match name.as_str() {
+                    "rskip144" => &mut heights.rskip144,
+                    "rskip351" => &mut heights.rskip351,
+                    _ => &mut heights.rskip535,
+                };
+                *field = height;
                 config.consensus_rule_overrides.push((name, height));
             }
+            // The header's layout alone reads it.
+            "rskipUMM" => config.activation_heights.rskip_umm = height,
             _ => config.consensus_rule_overrides.push((name, height)),
         }
     }
@@ -5354,7 +5362,35 @@ mod genesis_tests {
         let config = apply_chain_options(ChainConfig::regtest(), &disabled).unwrap();
         assert_eq!(config.activation_heights.rskip97, None);
 
-        let unknown = regtest_args(&["--consensus-rule", "rskip144=0"]);
+        // RSKIP-144 moves apart from reed810, for the header's layout and
+        // the ladder both, as an rskj node replaying older regtest blocks
+        // would set it.
+        let moved = regtest_args(&["--consensus-rule", "rskip144=-1"]);
+        let config = apply_chain_options(ChainConfig::regtest(), &moved).unwrap();
+        assert_eq!(config.activation_heights.rskip144, None);
+        let (ladder, _) = hardfork_config(&config).unwrap();
+        assert!(!ladder.has_rskip144(1));
+        let moved = regtest_args(&["--consensus-rule", "rskip144=5"]);
+        let config = apply_chain_options(ChainConfig::regtest(), &moved).unwrap();
+        assert_eq!(config.activation_heights.rskip144, Some(5));
+        let (ladder, _) = hardfork_config(&config).unwrap();
+        assert!(!ladder.has_rskip144(4) && ladder.has_rskip144(5));
+        // Only the header's layout reads RSKIPUMM.
+        let umm = regtest_args(&["--consensus-rule", "rskipUMM=5"]);
+        let config = apply_chain_options(ChainConfig::regtest(), &umm).unwrap();
+        assert_eq!(config.activation_heights.rskip_umm, Some(5));
+
+        // Moving reed810 on a copy of mainnet moves RSKIP144 and RSKIP351
+        // with it, in the header's heights as on the ladder.
+        let reed810 = mainnet_args(&["--allow-chain-overrides", "--hardfork", "reed810=100"]);
+        let config = apply_chain_options(ChainConfig::mainnet(), &reed810).unwrap();
+        let heights = &config.activation_heights;
+        assert_eq!((heights.rskip144, heights.rskip351), (Some(100), Some(100)));
+        let (ladder, _) = hardfork_config(&config).unwrap();
+        assert!(ladder.runs_sublists(100) && !ladder.runs_sublists(99));
+
+        // A rule this node does not schedule on its own is refused.
+        let unknown = regtest_args(&["--consensus-rule", "rskip126=0"]);
         assert!(apply_chain_options(ChainConfig::regtest(), &unknown).is_err());
 
         let mainnet = Args::parse_from(["rustock-cli", "--skip-pow-validation"]);
@@ -5421,8 +5457,11 @@ mod genesis_tests {
         let config = apply_chain_options(ChainConfig::mainnet(), &mainnet_args(SEED_FLAGS)).unwrap();
         assert_eq!(config.chain_id, 30);
         assert_eq!(config.activation_heights.rskip144, Some(9_002_504));
-        // The header layout rule reads RSKIP351 here, the ladder below.
+        // The header's layout reads RSKIP351 and RSKIP535 here, the ladder
+        // below; RSKIPUMM only here.
         assert_eq!(config.activation_heights.rskip351, Some(9_002_504));
+        assert_eq!(config.activation_heights.rskip535, Some(9_002_504));
+        assert_eq!(config.activation_heights.rskip_umm, Some(2_392_700));
         assert_eq!(config.activation_heights.orchid, 729_000);
         assert_eq!(config.activation_heights.rskip97, Some(729_000));
         assert_eq!(config.activation_heights.papyrus200, 2_392_700);

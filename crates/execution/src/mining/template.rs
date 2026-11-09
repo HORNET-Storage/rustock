@@ -247,15 +247,13 @@ impl BlockTemplateBuilder {
         transactions.push(remasc_transaction(number));
 
         let rskip126 = self.hardfork_cfg.has_unitrie_state_root(number);
-        // rskj sets ummRoot to the empty byte array from papyrus200 on (the
-        // UMM contracts were never deployed, so it is never non-empty). Its
-        // mere presence changes both the block hash and the merged-mining
-        // hash, so a header built without it is rejected by every peer.
-        let umm_root = if number >= self.chain_config.activation_heights.papyrus200 {
-            Some(Bytes::new())
-        } else {
-            None
-        };
+        // rskj `BlockHeaderBuilder` sets ummRoot to the empty byte array from
+        // RSKIPUMM on (the UMM contracts were never deployed, so it is never
+        // non-empty). Its mere presence changes both the block hash and the
+        // merged-mining hash, so a header built without it is rejected by
+        // every peer.
+        let heights = &self.chain_config.activation_heights;
+        let umm_root = heights.umm_active(number).then(Bytes::new);
 
         #[allow(unused_mut)]
         let mut header = Header {
@@ -339,14 +337,24 @@ impl BlockTemplateBuilder {
         } else {
             None
         };
-        if let Some(partitioned) = partitioned {
-            transactions = partitioned.transactions;
-            header.transactions_root = ordered_tx_trie_root(&transactions, rskip126);
+        let edges = match partitioned {
+            Some(partitioned) => {
+                transactions = partitioned.transactions;
+                header.transactions_root = ordered_tx_trie_root(&transactions, rskip126);
+                Some(partitioned.edges)
+            }
+            // rskj `BlockHeaderBuilder`: an empty field where RSKIP351 and
+            // RSKIP144 make the edges one, for a block that runs as one list.
+            None => heights.edges_active(number).then(Vec::new),
+        };
+        // rskj `ActivationConfig.getHeaderVersion`: 2 with RSKIP535, 1 with
+        // RSKIP351 alone, and none before RSKIP351, where no block runs as its
+        // sublists either.
+        let version = heights.header_version(number);
+        if version > 0 {
             header.version_fields = Some(rustock_core::types::header::HeaderVersionFields {
-                // RSKIP-351 travels with RSKIP-144; the extension is what
-                // carries the edges.
-                version: 1,
-                edges: Some(partitioned.edges),
+                version,
+                edges,
                 base_event: None,
             });
         }
@@ -360,6 +368,20 @@ impl BlockTemplateBuilder {
         header.logs_bloom = executed.logs_bloom;
         header.gas_used = executed.gas_used;
         header.paid_fees = executed.paid_fees;
+        // rskj `BlockExecutor.fill`: a version-2 header carries the base event
+        // the Union Bridge holds once the block has run, which a transaction
+        // in this very block may have set, and an empty one while it holds
+        // none.
+        if let Some(fields) = header
+            .version_fields
+            .as_mut()
+            .filter(|fields| fields.version >= 2)
+        {
+            fields.base_event = Some(stored_base_event(
+                &executed.new_state_root,
+                self.trie_store.as_ref(),
+            ));
+        }
 
         let hash_for_merged_mining =
             fork_detection::apply_to_hash(header.hash_for_merged_mining(), &fork_data);
@@ -700,6 +722,19 @@ fn account_nonce(state_root: &TrieNode, store: &dyn TrieStore, addr: &Address) -
         Some(data) => AccountState::decode(&data).map(|a| a.nonce.to::<u64>()).unwrap_or(0),
         None => 0,
     }
+}
+
+/// The base event the Union Bridge holds in `state` (RSKIP529), empty while
+/// it holds none: rskj `UnionBridgeStorageProviderImpl.getBaseEvent`, which
+/// takes the cell's bytes as they are.
+fn stored_base_event(state: &TrieNode, store: &dyn TrieStore) -> Bytes {
+    use crate::bridge::union::{union_key, BASE_EVENT_KEY};
+    let slot = B256::from(union_key(BASE_EVENT_KEY));
+    let key = rustock_trie::storage_key(&crate::precompiles::BRIDGE_ADDR, &slot);
+    state
+        .get(&TrieKeySlice::from_key(&key), store)
+        .map(Bytes::from)
+        .unwrap_or_default()
 }
 
 /// The REMASC transaction for a block, byte-for-byte as rskj encodes it.
