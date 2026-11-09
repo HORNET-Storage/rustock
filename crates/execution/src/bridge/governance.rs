@@ -1003,9 +1003,10 @@ pub fn add_lock_whitelist_address<CTX: crate::RskContextTr>(
     args: &[u8],
     gas_cost: u64,
     config: &super::constants::BridgeConstants,
+    hardfork_cfg: &crate::hardfork::RskHardforkConfig,
     tx_ctx: &crate::precompiles::BridgeTxContext,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    add_one_off_lock_whitelist_address(ctx, args, gas_cost, config, tx_ctx)
+    add_one_off_lock_whitelist_address(ctx, args, gas_cost, config, hardfork_cfg, tx_ctx)
 }
 
 /// rskj AddressBasedAuthorizer (minimum ONE): the tx sender must be the RSK
@@ -1036,6 +1037,7 @@ pub fn add_one_off_lock_whitelist_address<CTX: crate::RskContextTr>(
     args: &[u8],
     gas_cost: u64,
     config: &super::constants::BridgeConstants,
+    hardfork_cfg: &crate::hardfork::RskHardforkConfig,
     tx_ctx: &crate::precompiles::BridgeTxContext,
 ) -> Result<PrecompileOutput, PrecompileError> {
     let addr_str = match abi_decode_string_arg(args, 0) {
@@ -1063,19 +1065,18 @@ pub fn add_one_off_lock_whitelist_address<CTX: crate::RskContextTr>(
         return Ok(encode_int_result(gas_cost, -10));
     }
 
-    let (mut entries, disable_h) = load_one_off_whitelist(ctx);
-
-    // Duplicates across BOTH whitelists (rskj LockWhitelist.isWhitelisted)
-    if entries.iter().any(|(h, _)| h == &hash160)
-        || load_unlimited_whitelist(ctx).contains(&hash160)
-    {
-        return Ok(encode_int_result(gas_cost, -1));
-    }
-
-    entries.push((hash160, max_val));
-    store_one_off_whitelist(ctx, &entries, disable_h);
-
-    Ok(encode_int_result(gas_cost, 1))
+    // rskj reads the whitelist from here on, so it writes it back however the
+    // call ends.
+    let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
+    let mut whitelist = LockWhitelist::load(ctx, hardfork_cfg.has_rskip87(block_number));
+    let code = if whitelist.contains(&hash160) {
+        -1
+    } else {
+        whitelist.one_off.push((hash160, max_val));
+        1
+    };
+    whitelist.save(ctx);
+    Ok(encode_int_result(gas_cost, code))
 }
 
 /// `addUnlimitedLockWhitelistAddress(string address)` → int256
@@ -1092,6 +1093,7 @@ pub fn add_unlimited_lock_whitelist_address<CTX: crate::RskContextTr>(
     args: &[u8],
     gas_cost: u64,
     config: &super::constants::BridgeConstants,
+    hardfork_cfg: &crate::hardfork::RskHardforkConfig,
     tx_ctx: &crate::precompiles::BridgeTxContext,
 ) -> Result<PrecompileOutput, PrecompileError> {
     let addr_str = match abi_decode_string_arg(args, 0) {
@@ -1108,19 +1110,18 @@ pub fn add_unlimited_lock_whitelist_address<CTX: crate::RskContextTr>(
         return Ok(encode_int_result(gas_cost, -10));
     }
 
-    let mut entries = load_unlimited_whitelist(ctx);
-
-    // Duplicates across BOTH whitelists (rskj LockWhitelist.isWhitelisted)
-    if entries.iter().any(|h| h == &hash160)
-        || load_one_off_whitelist(ctx).0.iter().any(|(h, _)| h == &hash160)
-    {
-        return Ok(encode_int_result(gas_cost, -1));
-    }
-
-    entries.push(hash160);
-    store_unlimited_whitelist(ctx, &entries);
-
-    Ok(encode_int_result(gas_cost, 1))
+    // rskj reads the whitelist from here on, so it writes it back however the
+    // call ends.
+    let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
+    let mut whitelist = LockWhitelist::load(ctx, hardfork_cfg.has_rskip87(block_number));
+    let code = if whitelist.contains(&hash160) {
+        -1
+    } else {
+        whitelist.unlimited.push(hash160);
+        1
+    };
+    whitelist.save(ctx);
+    Ok(encode_int_result(gas_cost, code))
 }
 
 /// `removeLockWhitelistAddress(string address)` → int256
@@ -1136,6 +1137,7 @@ pub fn remove_lock_whitelist_address<CTX: crate::RskContextTr>(
     args: &[u8],
     gas_cost: u64,
     config: &super::constants::BridgeConstants,
+    hardfork_cfg: &crate::hardfork::RskHardforkConfig,
     tx_ctx: &crate::precompiles::BridgeTxContext,
 ) -> Result<PrecompileOutput, PrecompileError> {
     if !is_whitelist_change_authorized(config, tx_ctx.rsk_sender) {
@@ -1147,30 +1149,17 @@ pub fn remove_lock_whitelist_address<CTX: crate::RskContextTr>(
         Err(_) => return Ok(encode_int_result(gas_cost, -2)),
     };
 
-    let hash160 = match btc_address_to_hash160(&addr_str, config) {
-        Ok(h) => h,
-        Err(_) => return Ok(encode_int_result(gas_cost, -2)),
+    // rskj reads the whitelist before it parses the address, so it writes it
+    // back however the call ends, for an address that doesn't parse too.
+    let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
+    let mut whitelist = LockWhitelist::load(ctx, hardfork_cfg.has_rskip87(block_number));
+    let code = match btc_address_to_hash160(&addr_str, config) {
+        Err(_) => -2,
+        Ok(hash160) if whitelist.remove(&hash160) => 1,
+        Ok(_) => -1,
     };
-
-    // Try to remove from one-off whitelist first
-    let (mut one_off, disable_h) = load_one_off_whitelist(ctx);
-    let before_len = one_off.len();
-    one_off.retain(|(h, _)| h != &hash160);
-    if one_off.len() < before_len {
-        store_one_off_whitelist(ctx, &one_off, disable_h);
-        return Ok(encode_int_result(gas_cost, 1));
-    }
-
-    // Try unlimited whitelist
-    let mut unlimited = load_unlimited_whitelist(ctx);
-    let before_len = unlimited.len();
-    unlimited.retain(|h| h != &hash160);
-    if unlimited.len() < before_len {
-        store_unlimited_whitelist(ctx, &unlimited);
-        return Ok(encode_int_result(gas_cost, 1));
-    }
-
-    Ok(encode_int_result(gas_cost, -1))
+    whitelist.save(ctx);
+    Ok(encode_int_result(gas_cost, code))
 }
 
 /// `setLockWhitelistDisableBlockDelay(int256 delay)` → int256
@@ -1184,36 +1173,48 @@ pub fn set_lock_whitelist_disable_block_delay<CTX: crate::RskContextTr>(
     args: &[u8],
     gas_cost: u64,
     config: &super::constants::BridgeConstants,
+    hardfork_cfg: &crate::hardfork::RskHardforkConfig,
+    use_v2: bool,
     tx_ctx: &crate::precompiles::BridgeTxContext,
 ) -> Result<PrecompileOutput, PrecompileError> {
+    // rskj `BridgeSupport.setLockWhitelistDisableBlockDelay` reads the BTC
+    // chain's height before anything asks who is calling, and seeds the chain
+    // where nothing has yet (`ensureBtcBlockStore`), whoever calls.
+    let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
+    let rskip199 = hardfork_cfg.has_rskip199(block_number);
+    super::btc_chain::ensure_btc_chain_seeded(ctx, config, use_v2, rskip199);
+    let best_height = super::btc_store::load_chain_head(ctx)
+        .map(|h| h.height as i32)
+        .unwrap_or(0);
+
     if !is_whitelist_change_authorized(config, tx_ctx.rsk_sender) {
         return Ok(encode_int_result(gas_cost, -10));
     }
 
-    let (entries, disable_h) = load_one_off_whitelist(ctx);
-    if disable_h < i32::MAX {
-        return Ok(encode_int_result(gas_cost, -1)); // delay already set
-    }
-
-    // rskj `disableBlockDelayBI.intValueExact()`: a delay no int holds
-    // throws. The sum is Java int arithmetic, so one that wraps is not above
-    // the height either.
-    let delay = crate::abi::Args::new(args)
-        .int(0)
-        .and_then(|delay| delay.int_value_exact())
-        .ok_or_else(|| {
-            PrecompileError::other("setLockWhitelistDisableBlockDelay: the delay is not an int")
-        })?;
-    let best_height = super::btc_store::load_chain_head(ctx)
-        .map(|h| h.height as i32)
-        .unwrap_or(0);
-    if delay.wrapping_add(best_height) <= best_height {
-        return Ok(encode_int_result(gas_cost, -2)); // invalid delay
-    }
-
-    store_one_off_whitelist(ctx, &entries, best_height.wrapping_add(delay));
-
-    Ok(encode_int_result(gas_cost, 1))
+    // rskj reads the whitelist from here on, so it writes it back however the
+    // call ends but a throw.
+    let mut whitelist = LockWhitelist::load(ctx, hardfork_cfg.has_rskip87(block_number));
+    let code = if whitelist.disable_height < i32::MAX {
+        -1 // delay already set
+    } else {
+        // rskj `disableBlockDelayBI.intValueExact()`: a delay no int holds
+        // throws. The sum is Java int arithmetic, so one that wraps is not
+        // above the height either.
+        let delay = crate::abi::Args::new(args)
+            .int(0)
+            .and_then(|delay| delay.int_value_exact())
+            .ok_or_else(|| {
+                PrecompileError::other("setLockWhitelistDisableBlockDelay: the delay is not an int")
+            })?;
+        if delay.wrapping_add(best_height) <= best_height {
+            -2 // invalid delay
+        } else {
+            whitelist.disable_height = best_height.wrapping_add(delay);
+            1
+        }
+    };
+    whitelist.save(ctx);
+    Ok(encode_int_result(gas_cost, code))
 }
 
 // ---------------------------------------------------------------------------
@@ -1492,12 +1493,13 @@ mod tests {
         use crate::abi::encode::{self, Arg};
         use revm::MainContext;
         let config = super::super::constants::BridgeConstants::mainnet();
+        let hardforks = crate::hardfork::RskHardforkConfig::mainnet();
         let tx_ctx = crate::precompiles::BridgeTxContext::default();
         let mut ctx =
             revm::Context::mainnet().with_chain(crate::raw_storage::RskChainExt::default());
         let mut call = |address: &str, value: [u8; 32]| {
             let args = encode::args(&[Arg::Bytes(address.as_bytes()), Arg::Word(value)]);
-            add_one_off_lock_whitelist_address(&mut ctx, &args, 0, &config, &tx_ctx)
+            add_one_off_lock_whitelist_address(&mut ctx, &args, 0, &config, &hardforks, &tx_ctx)
                 .map(|out| i64::from_be_bytes(out.bytes[24..32].try_into().unwrap()))
         };
         let address = "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2";
@@ -1509,6 +1511,230 @@ mod tests {
             call(address, encode::int(1_000)).unwrap(),
             -10,
             "then the sender"
+        );
+    }
+
+    /// A Bridge call that reads the whitelist writes it back as the call
+    /// returns, whatever it answers (upstream #291): `save()` writes whatever
+    /// the call loaded. The changes read it after the sender check, the adds
+    /// only once the address parses, and a removal before it parses. On a store
+    /// that never held the whitelist, the cells show which answers read it.
+    #[test]
+    fn a_whitelist_change_writes_the_whitelist_back_once_it_has_read_it() {
+        use crate::abi::encode::{self, Arg};
+        use crate::precompiles::BridgeTxContext;
+        use revm::MainContext;
+
+        /// The call's answer, then the one-off and unlimited cells after it.
+        fn run<CTX: crate::RskContextTr>(
+            mut ctx: CTX,
+            call: impl FnOnce(&mut CTX) -> Result<PrecompileOutput, PrecompileError>,
+        ) -> (i64, String, String) {
+            let out = call(&mut ctx).unwrap();
+            let code = i64::from_be_bytes(out.bytes[24..32].try_into().unwrap());
+            let mut cell =
+                |key: &str| alloy_primitives::hex::encode(bridge_load_bytes_named(&mut ctx, key));
+            (
+                code,
+                cell(LOCK_WHITELIST_KEY),
+                cell(UNLIMITED_LOCK_WHITELIST_KEY),
+            )
+        }
+        let fresh =
+            || revm::Context::mainnet().with_chain(crate::raw_storage::RskChainExt::default());
+        let config = super::super::constants::BridgeConstants::mainnet();
+        // Block 0, where regtest has RSKIP87 and mainnet doesn't.
+        let (all, mainnet) = (
+            crate::hardfork::RskHardforkConfig::regtest(),
+            crate::hardfork::RskHardforkConfig::mainnet(),
+        );
+        let authorizer =
+            alloy_primitives::hex::decode(config.whitelist_authorizer_keys[0]).unwrap();
+        let authorized = BridgeTxContext {
+            rsk_sender: super::super::federation::rsk_address_from_public_key(&authorizer).unwrap(),
+            ..BridgeTxContext::default()
+        };
+        let stranger = BridgeTxContext::default();
+        let address = "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2";
+        let hash160 = btc_address_to_hash160(address, &config).unwrap();
+        let string = |s: &str| encode::args(&[Arg::Bytes(s.as_bytes())]);
+        let one_off =
+            |s: &str| encode::args(&[Arg::Bytes(s.as_bytes()), Arg::Word(encode::int(1_000))]);
+        let delay = |n: i64| encode::args(&[Arg::Word(encode::int(n))]);
+        let read = |code: i64| (code, "c5847fffffff".to_string(), "c0".to_string());
+        let unread = |code: i64| (code, String::new(), String::new());
+        // The address on the one-off list, in a store with no unlimited cell.
+        let listed = || {
+            let mut ctx = fresh();
+            store_one_off_whitelist(&mut ctx, &[(hash160, 1_000)], i32::MAX);
+            ctx
+        };
+        let listed_cell = alloy_primitives::hex::encode(serialize_one_off_whitelist(
+            &[(hash160, 1_000)],
+            i32::MAX,
+        ));
+
+        // The address on the unlimited list.
+        let unlimited_listed = || {
+            let mut ctx = fresh();
+            store_one_off_whitelist(&mut ctx, &[], i32::MAX);
+            store_unlimited_whitelist(&mut ctx, &[hash160]);
+            ctx
+        };
+        let unlimited_cell =
+            alloy_primitives::hex::encode(serialize_unlimited_whitelist(&[hash160]));
+
+        let add = |ctx, args: Vec<u8>, tx: &BridgeTxContext, hardforks| {
+            run(ctx, |ctx| {
+                add_one_off_lock_whitelist_address(ctx, &args, 0, &config, hardforks, tx)
+            })
+        };
+        assert_eq!(add(fresh(), one_off(address), &stranger, &all), unread(-10));
+        assert_eq!(
+            add(fresh(), one_off("not an address"), &authorized, &all),
+            unread(-2)
+        );
+        assert_eq!(
+            add(listed(), one_off(address), &authorized, &all),
+            (-1, listed_cell.clone(), "c0".to_string()),
+            "already listed, and written back"
+        );
+        assert_eq!(
+            add(listed(), one_off(address), &authorized, &mainnet),
+            (-1, listed_cell.clone(), String::new())
+        );
+        assert_eq!(
+            add(unlimited_listed(), one_off(address), &authorized, &all),
+            (-1, "c5847fffffff".to_string(), unlimited_cell.clone()),
+            "listed as unlimited"
+        );
+        let unlimited = |ctx, args: Vec<u8>| {
+            run(ctx, |ctx| {
+                add_unlimited_lock_whitelist_address(ctx, &args, 0, &config, &all, &authorized)
+            })
+        };
+        assert_eq!(unlimited(fresh(), string("not an address")), unread(-2));
+        assert_eq!(
+            unlimited(listed(), string(address)),
+            (-1, listed_cell, "c0".to_string())
+        );
+        assert_eq!(
+            unlimited(unlimited_listed(), string(address)),
+            (-1, "c5847fffffff".to_string(), unlimited_cell)
+        );
+
+        let remove = |ctx, args: Vec<u8>, tx: &BridgeTxContext, hardforks| {
+            run(ctx, |ctx| {
+                remove_lock_whitelist_address(ctx, &args, 0, &config, hardforks, tx)
+            })
+        };
+        assert_eq!(
+            remove(fresh(), string(address), &stranger, &all),
+            unread(-10)
+        );
+        assert_eq!(
+            remove(fresh(), string("not an address"), &authorized, &all),
+            read(-2),
+            "read before the address is parsed"
+        );
+        assert_eq!(
+            remove(fresh(), string(address), &authorized, &all),
+            read(-1)
+        );
+        assert_eq!(
+            remove(fresh(), string(address), &authorized, &mainnet),
+            (-1, "c5847fffffff".to_string(), String::new()),
+            "the unlimited cell is written from RSKIP87 on"
+        );
+        assert_eq!(
+            remove(unlimited_listed(), string(address), &authorized, &all),
+            read(1)
+        );
+
+        let set = |ctx, args: Vec<u8>, tx: &BridgeTxContext, hardforks| {
+            run(ctx, |ctx| {
+                set_lock_whitelist_disable_block_delay(ctx, &args, 0, &config, hardforks, true, tx)
+            })
+        };
+        assert_eq!(set(fresh(), delay(100), &stranger, &all), unread(-10));
+        assert_eq!(set(fresh(), delay(0), &authorized, &all), read(-2));
+        assert_eq!(
+            set(fresh(), delay(0), &authorized, &mainnet),
+            (-2, "c5847fffffff".to_string(), String::new())
+        );
+        let disabled = || {
+            let mut ctx = fresh();
+            store_one_off_whitelist(&mut ctx, &[], 50);
+            ctx
+        };
+        assert_eq!(
+            set(disabled(), delay(100), &authorized, &all),
+            (-1, "c132".to_string(), "c0".to_string())
+        );
+        let mut ctx = fresh();
+        let beyond_an_int = encode::args(&[Arg::Word(encode::int(1 << 31))]);
+        assert!(set_lock_whitelist_disable_block_delay(
+            &mut ctx,
+            &beyond_an_int,
+            0,
+            &config,
+            &all,
+            true,
+            &authorized
+        )
+        .is_err());
+        assert!(
+            bridge_load_bytes_named(&mut ctx, LOCK_WHITELIST_KEY).is_empty(),
+            "a throw ends the call before it saves"
+        );
+    }
+
+    /// rskj `setLockWhitelistDisableBlockDelay` reads the BTC chain's height
+    /// first, which seeds a chain nothing has seeded yet, whoever calls; the
+    /// disable height is then counted from the checkpoint.
+    #[test]
+    fn the_disable_delay_counts_from_the_seeded_btc_chain() {
+        use crate::abi::encode::{self, Arg};
+        use revm::MainContext;
+        let config = super::super::constants::BridgeConstants::mainnet();
+        let hardforks = crate::hardfork::RskHardforkConfig::regtest();
+        let checkpoint = config.btc_checkpoint.unwrap().1 as i32;
+        let authorizer =
+            alloy_primitives::hex::decode(config.whitelist_authorizer_keys[0]).unwrap();
+        let authorized = crate::precompiles::BridgeTxContext {
+            rsk_sender: super::super::federation::rsk_address_from_public_key(&authorizer).unwrap(),
+            ..crate::precompiles::BridgeTxContext::default()
+        };
+        let args = encode::args(&[Arg::Word(encode::int(100))]);
+        let fresh =
+            || revm::Context::mainnet().with_chain(crate::raw_storage::RskChainExt::default());
+
+        let mut ctx = fresh();
+        let stranger = crate::precompiles::BridgeTxContext::default();
+        set_lock_whitelist_disable_block_delay(
+            &mut ctx, &args, 0, &config, &hardforks, true, &stranger,
+        )
+        .unwrap();
+        assert_eq!(
+            super::super::btc_store::load_chain_head(&mut ctx).map(|head| head.height as i32),
+            Some(checkpoint),
+            "seeded before the sender check"
+        );
+
+        let mut ctx = fresh();
+        set_lock_whitelist_disable_block_delay(
+            &mut ctx,
+            &args,
+            0,
+            &config,
+            &hardforks,
+            true,
+            &authorized,
+        )
+        .unwrap();
+        assert_eq!(
+            LockWhitelist::load(&mut ctx, true).disable_height,
+            checkpoint + 100
         );
     }
 }

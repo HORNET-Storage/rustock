@@ -291,11 +291,17 @@ pub fn is_btc_tx_hash_already_processed<CTX: crate::RskContextTr>(
 // was found from the *serialized* whitelist cells at mainnet #1,590,999.)
 
 /// `getLockWhitelistSize()` → int256, one-off plus unlimited entries.
+///
+/// Every lock-whitelist getter that reads the whitelist writes it back as the
+/// call returns, as rskj's `save()` does for whatever the call loaded (see
+/// `save_lock_whitelist`). Only a getter run in a transaction keeps that
+/// write, so only one reached before RSKIP88 made them local calls.
 pub fn get_lock_whitelist_size<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     gas_cost: u64,
+    hardfork_cfg: &crate::hardfork::RskHardforkConfig,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    let entries = merged_whitelist(ctx);
+    let entries = merged_whitelist(&loaded_and_saved_whitelist(ctx, hardfork_cfg));
     Ok(PrecompileOutput::new(gas_cost, abi_encode_int(entries.len() as i64)))
 }
 
@@ -311,9 +317,10 @@ pub fn get_lock_whitelist_address<CTX: crate::RskContextTr>(
     args: &[u8],
     gas_cost: u64,
     config: &BridgeConstants,
+    hardfork_cfg: &crate::hardfork::RskHardforkConfig,
 ) -> Result<PrecompileOutput, PrecompileError> {
     let index = index_arg(args, "getLockWhitelistAddress")?;
-    let entries = merged_whitelist(ctx);
+    let entries = merged_whitelist(&loaded_and_saved_whitelist(ctx, hardfork_cfg));
 
     // rskj `getLockWhitelistEntryByIndex`: a negative index is not found either.
     let address = match usize::try_from(index).ok().and_then(|i| entries.get(i)) {
@@ -344,6 +351,7 @@ pub fn get_lock_whitelist_entry_by_address<CTX: crate::RskContextTr>(
     args: &[u8],
     gas_cost: u64,
     config: &BridgeConstants,
+    hardfork_cfg: &crate::hardfork::RskHardforkConfig,
 ) -> Result<PrecompileOutput, PrecompileError> {
     let Some(addr_str) = crate::abi::Args::new(args).string(0) else {
         return Err(PrecompileError::other(
@@ -351,11 +359,13 @@ pub fn get_lock_whitelist_entry_by_address<CTX: crate::RskContextTr>(
         ));
     };
 
+    // rskj parses the address before it reads the whitelist, so one that
+    // doesn't parse leaves the whitelist unread and unwritten.
     let Some(hash160) = parse_network_address_hash160(&addr_str, config) else {
         return Ok(PrecompileOutput::new(gas_cost, abi_encode_int(ADDRESS_NOT_EXIST)));
     };
 
-    let value = merged_whitelist(ctx)
+    let value = merged_whitelist(&loaded_and_saved_whitelist(ctx, hardfork_cfg))
         .into_iter()
         .find(|(h, _)| *h == hash160)
         .map_or(ADDRESS_NOT_EXIST, |(_, cap)| match cap {
@@ -367,16 +377,28 @@ pub fn get_lock_whitelist_entry_by_address<CTX: crate::RskContextTr>(
     Ok(PrecompileOutput::new(gas_cost, abi_encode_int(value)))
 }
 
+/// rskj `getLockWhitelist` for the block being run, written back as the call
+/// returns.
+fn loaded_and_saved_whitelist<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    hardfork_cfg: &crate::hardfork::RskHardforkConfig,
+) -> LockWhitelist {
+    let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
+    let whitelist = LockWhitelist::load(ctx, hardfork_cfg.has_rskip87(block_number));
+    whitelist.save(ctx);
+    whitelist
+}
+
 /// The whitelist as rskj's `LockWhitelist` holds it: one-off and unlimited
 /// entries in one map, ordered by hash160 ascending. `None` marks an unlimited
 /// entry, `Some(cap)` a one-off entry's `maxTransferValue`.
-fn merged_whitelist<CTX: crate::RskContextTr>(ctx: &mut CTX) -> Vec<([u8; 20], Option<u64>)> {
-    let mut entries: Vec<([u8; 20], Option<u64>)> = load_one_off_whitelist(ctx)
-        .0
-        .into_iter()
-        .map(|(hash160, cap)| (hash160, Some(cap)))
+fn merged_whitelist(whitelist: &LockWhitelist) -> Vec<([u8; 20], Option<u64>)> {
+    let mut entries: Vec<([u8; 20], Option<u64>)> = whitelist
+        .one_off
+        .iter()
+        .map(|&(hash160, cap)| (hash160, Some(cap)))
         .collect();
-    entries.extend(load_unlimited_whitelist(ctx).into_iter().map(|h| (h, None)));
+    entries.extend(whitelist.unlimited.iter().map(|&h| (h, None)));
     // `UnsignedBytes.lexicographicalComparator()` over the 20-byte hash160.
     entries.sort_by(|a, b| a.0.cmp(&b.0));
     entries
@@ -1076,7 +1098,7 @@ mod tests {
         store_one_off_whitelist(&mut ctx, &[([0x11; 20], 500), ([0x22; 20], 600)], 1_000);
         store_unlimited_whitelist(&mut ctx, &[[0x33; 20]]);
 
-        let out = get_lock_whitelist_size(&mut ctx, 0).unwrap();
+        let out = get_lock_whitelist_size(&mut ctx, 0, &hardforks()).unwrap();
         assert_eq!(as_int(&out), 3);
     }
 
@@ -1138,7 +1160,53 @@ mod tests {
         address: &str,
         config: &BridgeConstants,
     ) -> PrecompileOutput {
-        get_lock_whitelist_entry_by_address(ctx, &abi_string_arg(address), 0, config).unwrap()
+        get_lock_whitelist_entry_by_address(ctx, &abi_string_arg(address), 0, config, &hardforks())
+            .unwrap()
+    }
+
+    /// A getter that reads the whitelist writes it back as the call returns,
+    /// as rskj's `save()` does for whatever the call loaded (upstream #291),
+    /// so on a store that never held it the cells appear: the unlimited one
+    /// from RSKIP87 on. The by-address getter parses the address first, and
+    /// one that doesn't parse leaves the whitelist unread.
+    #[test]
+    fn the_whitelist_getters_write_the_whitelist_back() {
+        fn cells<CTX: crate::RskContextTr>(ctx: &mut CTX) -> (String, String) {
+            let mut cell =
+                |key: &str| alloy_primitives::hex::encode(bridge_load_bytes_named(ctx, key));
+            (cell(LOCK_WHITELIST_KEY), cell(UNLIMITED_LOCK_WHITELIST_KEY))
+        }
+        let read = ("c5847fffffff".to_string(), "c0".to_string());
+        let config = mainnet();
+
+        let mut ctx = ctx_at(1_000_000);
+        assert_eq!(
+            as_int(&get_lock_whitelist_size(&mut ctx, 0, &hardforks()).unwrap()),
+            0
+        );
+        assert_eq!(cells(&mut ctx), read);
+
+        let mut ctx = ctx_at(728_999);
+        get_lock_whitelist_size(&mut ctx, 0, &hardforks()).unwrap();
+        assert_eq!(
+            cells(&mut ctx),
+            ("c5847fffffff".to_string(), String::new()),
+            "before RSKIP87, the one-off cell alone"
+        );
+
+        let mut ctx = ctx_at(1_000_000);
+        get_lock_whitelist_address(&mut ctx, &[0u8; 32], 0, &config, &hardforks()).unwrap();
+        assert_eq!(cells(&mut ctx), read);
+
+        let mut ctx = ctx_at(1_000_000);
+        assert_eq!(
+            as_int(&query_whitelist(&mut ctx, "not an address", &config)),
+            -1
+        );
+        assert_eq!(cells(&mut ctx), (String::new(), String::new()), "unread");
+        let stranger = p2pkh_base58_address(&[0x99; 20], &config);
+        assert_eq!(as_int(&query_whitelist(&mut ctx, &stranger, &config)), -1);
+        assert_eq!(cells(&mut ctx), read);
     }
 
     /// ABI head+tail for a single `string` argument.
@@ -1180,7 +1248,7 @@ mod tests {
         let at = |ctx: &mut _, i: u64| {
             let mut arg = [0u8; 32];
             arg[24..32].copy_from_slice(&i.to_be_bytes());
-            as_string(&get_lock_whitelist_address(ctx, &arg, 0, &config).unwrap())
+            as_string(&get_lock_whitelist_address(ctx, &arg, 0, &config, &hardforks()).unwrap())
         };
         assert_eq!(
             at(&mut ctx, 0),
@@ -1197,7 +1265,7 @@ mod tests {
     fn lock_whitelist_order_is_unsigned() {
         let mut ctx = ctx_at(1_000_000);
         store_one_off_whitelist(&mut ctx, &[([0xff; 20], 1), ([0x01; 20], 2)], 1_000);
-        let merged = merged_whitelist(&mut ctx);
+        let merged = merged_whitelist(&LockWhitelist::load(&mut ctx, true));
         assert_eq!(
             merged.iter().map(|(h, _)| h[0]).collect::<Vec<_>>(),
             vec![0x01, 0xff]

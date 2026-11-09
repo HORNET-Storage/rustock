@@ -404,6 +404,75 @@ pub fn save_lock_whitelist<CTX: crate::RskContextTr>(
     }
 }
 
+/// rskj's `LockWhitelist` as a Bridge call holds it once it has read it
+/// (`WhitelistStorageProviderImpl.getLockWhitelist`): the one-off entries with
+/// the disable height, and the unlimited entries. rskj writes it back when the
+/// call returns, whatever the call answers and whether or not it changed it
+/// ([`save_lock_whitelist`]), so every path that reads it saves it.
+pub struct LockWhitelist {
+    pub one_off: Vec<([u8; 20], u64)>,
+    pub disable_height: i32,
+    pub unlimited: Vec<[u8; 20]>,
+    /// The activation it was read under, which `save` writes under too.
+    rskip87: bool,
+}
+
+impl LockWhitelist {
+    /// rskj `initializeLockWhitelist`. With no one-off cell the whitelist is
+    /// empty and the unlimited cell is never read; with one, the unlimited
+    /// cell is read from RSKIP87 on.
+    pub fn load<CTX: crate::RskContextTr>(ctx: &mut CTX, rskip87: bool) -> Self {
+        let data = bridge_load_bytes_named(ctx, LOCK_WHITELIST_KEY);
+        if data.is_empty() {
+            return Self {
+                one_off: Vec::new(),
+                disable_height: i32::MAX,
+                unlimited: Vec::new(),
+                rskip87,
+            };
+        }
+        let (one_off, disable_height) =
+            deserialize_one_off_whitelist(&data).unwrap_or((Vec::new(), i32::MAX));
+        let unlimited = if rskip87 {
+            load_unlimited_whitelist(ctx)
+        } else {
+            Vec::new()
+        };
+        Self {
+            one_off,
+            disable_height,
+            unlimited,
+            rskip87,
+        }
+    }
+
+    /// rskj `LockWhitelist.isWhitelisted`: in either list.
+    pub fn contains(&self, hash160: &[u8; 20]) -> bool {
+        self.one_off.iter().any(|(h, _)| h == hash160) || self.unlimited.contains(hash160)
+    }
+
+    /// rskj `LockWhitelist.remove`: out of whichever list holds it, and
+    /// whether one did.
+    pub fn remove(&mut self, hash160: &[u8; 20]) -> bool {
+        let held = self.one_off.len() + self.unlimited.len();
+        self.one_off.retain(|(h, _)| h != hash160);
+        self.unlimited.retain(|h| h != hash160);
+        self.one_off.len() + self.unlimited.len() < held
+    }
+
+    /// rskj `WhitelistStorageProviderImpl.save`, as the call returns: both
+    /// cells, the unlimited one from RSKIP87 on.
+    pub fn save<CTX: crate::RskContextTr>(&self, ctx: &mut CTX) {
+        save_lock_whitelist(
+            ctx,
+            &self.one_off,
+            self.disable_height,
+            &self.unlimited,
+            self.rskip87,
+        );
+    }
+}
+
 /// Load the unlimited lock whitelist from Bridge storage.
 pub fn load_unlimited_whitelist<CTX: crate::RskContextTr>(ctx: &mut CTX) -> Vec<[u8; 20]> {
     let data = bridge_load_bytes_named(ctx, UNLIMITED_LOCK_WHITELIST_KEY);

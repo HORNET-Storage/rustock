@@ -941,11 +941,13 @@ fn execute_method<CTX: crate::RskContextTr>(
         "addFederatorPublicKeyMultikey" => governance::add_federator_public_key_multikey(ctx, args, gas_cost, config, hardfork_cfg, tx_ctx),
         "voteFeePerKbChange" => governance::vote_fee_per_kb_change(ctx, args, gas_cost, config, tx_ctx),
         "increaseLockingCap" => governance::increase_locking_cap(ctx, args, gas_cost, config, tx_ctx),
-        "addLockWhitelistAddress" => governance::add_lock_whitelist_address(ctx, args, gas_cost, config, tx_ctx),
-        "addOneOffLockWhitelistAddress" => governance::add_one_off_lock_whitelist_address(ctx, args, gas_cost, config, tx_ctx),
-        "addUnlimitedLockWhitelistAddress" => governance::add_unlimited_lock_whitelist_address(ctx, args, gas_cost, config, tx_ctx),
-        "removeLockWhitelistAddress" => governance::remove_lock_whitelist_address(ctx, args, gas_cost, config, tx_ctx),
-        "setLockWhitelistDisableBlockDelay" => governance::set_lock_whitelist_disable_block_delay(ctx, args, gas_cost, config, tx_ctx),
+        "addLockWhitelistAddress" => governance::add_lock_whitelist_address(ctx, args, gas_cost, config, hardfork_cfg, tx_ctx),
+        "addOneOffLockWhitelistAddress" => governance::add_one_off_lock_whitelist_address(ctx, args, gas_cost, config, hardfork_cfg, tx_ctx),
+        "addUnlimitedLockWhitelistAddress" => governance::add_unlimited_lock_whitelist_address(ctx, args, gas_cost, config, hardfork_cfg, tx_ctx),
+        "removeLockWhitelistAddress" => governance::remove_lock_whitelist_address(ctx, args, gas_cost, config, hardfork_cfg, tx_ctx),
+        "setLockWhitelistDisableBlockDelay" => {
+            governance::set_lock_whitelist_disable_block_delay(ctx, args, gas_cost, config, hardfork_cfg, use_v2, tx_ctx)
+        }
 
         // Transaction-callable read-only
         "getActivePowpegRedeemScript" => governance::get_active_powpeg_redeem_script(ctx, gas_cost),
@@ -984,9 +986,11 @@ fn execute_method<CTX: crate::RskContextTr>(
         "getProposedFederationCreationTime" => getters::get_proposed_federation_creation_time(ctx, gas_cost),
         "getProposedFederationCreationBlockNumber" => getters::get_proposed_federation_creation_block_number(ctx, gas_cost),
         "getProposedFederatorPublicKeyOfType" => getters::get_proposed_federator_public_key_of_type(ctx, args, gas_cost),
-        "getLockWhitelistSize" => getters::get_lock_whitelist_size(ctx, gas_cost),
-        "getLockWhitelistAddress" => getters::get_lock_whitelist_address(ctx, args, gas_cost, config),
-        "getLockWhitelistEntryByAddress" => getters::get_lock_whitelist_entry_by_address(ctx, args, gas_cost, config),
+        "getLockWhitelistSize" => getters::get_lock_whitelist_size(ctx, gas_cost, hardfork_cfg),
+        "getLockWhitelistAddress" => getters::get_lock_whitelist_address(ctx, args, gas_cost, config, hardfork_cfg),
+        "getLockWhitelistEntryByAddress" => {
+            getters::get_lock_whitelist_entry_by_address(ctx, args, gas_cost, config, hardfork_cfg)
+        }
         "getBtcTxHashProcessedHeight" => getters::get_btc_tx_hash_processed_height(ctx, args, gas_cost),
         "isBtcTxHashAlreadyProcessed" => getters::is_btc_tx_hash_already_processed(ctx, args, gas_cost),
         "getBtcBlockchainInitialBlockHeight" => btc_chain::get_initial_block_height(gas_cost, config),

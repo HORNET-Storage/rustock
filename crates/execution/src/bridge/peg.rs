@@ -1464,14 +1464,16 @@ fn whitelist_allows_and_consume<CTX: crate::RskContextTr>(
     height: i32,
     rskip87: bool,
 ) -> bool {
-    // rskj `getLockWhitelist()` deserializes BOTH cells together, so reaching
-    // this function reads both even where the decision needs only one.
-    let (mut one_off, disable_h) = load_one_off_whitelist(ctx);
-    let unlimited = load_unlimited_whitelist(ctx);
-    let disabled = i64::from(height) > (disable_h as i64);
+    let mut whitelist = super::storage::LockWhitelist::load(ctx, rskip87);
+    let disabled = height > whitelist.disable_height;
 
-    let allowed = if let Some(pos) = one_off.iter().position(|(h, _)| h == sender_hash160) {
-        let allowed = disabled || amount <= one_off[pos].1;
+    let one_off = whitelist
+        .one_off
+        .iter()
+        .position(|(h, _)| h == sender_hash160);
+    let allowed = if let Some(pos) = one_off {
+        let entry_max = whitelist.one_off[pos].1;
+        let allowed = disabled || amount <= entry_max;
         if allowed {
             // A one-off entry is spent here and gone from the next block's
             // state, with nothing logged to say it was ever used.
@@ -1480,25 +1482,25 @@ fn whitelist_allows_and_consume<CTX: crate::RskContextTr>(
                 vec![
                     ("senderHash160", FieldValue::Bytes(sender_hash160.to_vec())),
                     ("amountSat", FieldValue::U64(amount)),
-                    ("entryMaxSat", FieldValue::U64(one_off[pos].1)),
+                    ("entryMaxSat", FieldValue::U64(entry_max)),
                     ("whitelistDisabled", FieldValue::Flag(disabled)),
                 ],
             );
             // rskj consumes the matching one-off entry only on success.
-            one_off.remove(pos);
+            whitelist.one_off.remove(pos);
         }
         allowed
     } else if disabled {
         true
     } else {
-        unlimited.contains(sender_hash160)
+        whitelist.unlimited.contains(sender_hash160)
     };
 
     // Unconditional, including on rejection: rskj's save() writes the
     // whitelist back because the call loaded it, not because it changed it.
     // See `save_lock_whitelist` -- this write is why testnet #6,602 has a
     // `lockWhitelist` cell at all.
-    super::storage::save_lock_whitelist(ctx, &one_off, disable_h, &unlimited, rskip87);
+    whitelist.save(ctx);
     allowed
 }
 
@@ -5919,6 +5921,9 @@ mod tests {
     fn an_unlimited_entry_survives_the_lock_it_authorises() {
         let mut ctx = queue_ctx();
         let user = [0x33u8; 20];
+        // Every save writes the one-off cell, so it is there beside the
+        // unlimited one on any chain.
+        store_one_off_whitelist(&mut ctx, &[], i32::MAX);
         store_unlimited_whitelist(&mut ctx, &[user]);
 
         assert!(whitelist_allows_and_consume(&mut ctx, &user, 1_000_000, 100, true));
@@ -5927,6 +5932,71 @@ mod tests {
         // And again: unlimited entries authorise repeatedly.
         assert!(whitelist_allows_and_consume(&mut ctx, &user, 1_000_000, 100, true));
         assert_eq!(load_unlimited_whitelist(&mut ctx), vec![user]);
+    }
+
+    /// rskj reads the unlimited cell only where the one-off cell exists
+    /// (`initializeLockWhitelist`), so without one an unlimited entry
+    /// authorises nothing, and the save writes the empty whitelist it read.
+    /// No chain holds that state, since every save writes the one-off cell.
+    #[test]
+    fn without_a_one_off_cell_the_unlimited_cell_is_not_read() {
+        let mut ctx = queue_ctx();
+        let user = [0x33u8; 20];
+        store_unlimited_whitelist(&mut ctx, &[user]);
+
+        assert!(!whitelist_allows_and_consume(
+            &mut ctx, &user, 1_000, 100, true
+        ));
+        assert_eq!(
+            to_hex(&bridge_load_bytes_named(&mut ctx, LOCK_WHITELIST_KEY)),
+            "c5847fffffff"
+        );
+        assert_eq!(
+            to_hex(&bridge_load_bytes_named(
+                &mut ctx,
+                UNLIMITED_LOCK_WHITELIST_KEY
+            )),
+            "c0"
+        );
+    }
+
+    /// Before RSKIP87 rskj reads the one-off cell alone, so an unlimited
+    /// entry authorises nothing there, and its cell is neither read nor
+    /// written.
+    #[test]
+    fn before_rskip87_the_unlimited_cell_is_not_read() {
+        let mut ctx = queue_ctx();
+        let user = [0x33u8; 20];
+        store_one_off_whitelist(&mut ctx, &[], i32::MAX);
+        store_unlimited_whitelist(&mut ctx, &[user]);
+
+        assert!(!whitelist_allows_and_consume(
+            &mut ctx, &user, 1_000, 100, false
+        ));
+        assert_eq!(load_unlimited_whitelist(&mut ctx), vec![user]);
+    }
+
+    /// The whitelist turns off only past its disable height (rskj
+    /// `height > disableBlockHeight`): at the height itself it still gates.
+    #[test]
+    fn at_its_disable_height_the_whitelist_still_gates() {
+        let mut ctx = queue_ctx();
+        store_one_off_whitelist(&mut ctx, &[], 50);
+
+        assert!(!whitelist_allows_and_consume(
+            &mut ctx,
+            &[0x99; 20],
+            1_000,
+            50,
+            true
+        ));
+        assert!(whitelist_allows_and_consume(
+            &mut ctx,
+            &[0x99; 20],
+            1_000,
+            51,
+            true
+        ));
     }
 
     /// Past the disable height the whitelist stops gating, but it is still
