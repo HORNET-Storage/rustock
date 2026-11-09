@@ -136,6 +136,55 @@ fn native_contract(_input: &[u8], _gas_limit: u64) -> Result<PrecompileOutput, P
     ))
 }
 
+/// ECRecover's address, 0x01.
+const ECRECOVER_ADDR: Address = Address::new(hex_addr("0000000000000000000000000000000000000001"));
+
+/// rskj's ECRecover (`PrecompiledContracts.ECRecover`), which parts from
+/// Ethereum's, the one revm runs, in two places:
+///
+/// - only the last byte of the `v` word counts: `isValid` reads `v[31]`, so
+///   a word whose other bytes aren't zero still recovers a key, where revm
+///   answers nothing;
+/// - a signature whose key is the point at infinity recovers the address
+///   rskj gives that key, the infinity sender, where revm answers nothing.
+///
+/// The rest is as Ethereum's: 3,000 gas, the input's first 128 bytes read,
+/// and nothing for a `v` byte other than 27 or 28, an r or s outside 1 to
+/// below the curve's order, or a key that doesn't recover. An input too
+/// short to hold the hash, `v` and r makes `execute`'s `System.arraycopy`
+/// throw, and it answers nothing for any exception; an s cut short ends in
+/// zeros.
+fn rsk_ecrecover_run(input: &[u8], gas_limit: u64) -> Result<PrecompileOutput, PrecompileError> {
+    const GAS: u64 = 3_000;
+    if gas_limit < GAS {
+        return Err(PrecompileError::OutOfGas);
+    }
+    let answer = ecrecover(input).map_or_else(Vec::new, |word| word.to_vec());
+    Ok(PrecompileOutput::new(GAS, answer.into()))
+}
+
+/// The word ECRecover answers, the recovered address at its end, or `None`
+/// for an empty answer. See [`rsk_ecrecover_run`].
+fn ecrecover(input: &[u8]) -> Option<[u8; 32]> {
+    if input.len() < 96 {
+        return None;
+    }
+    let v = input[63];
+    if v != 27 && v != 28 {
+        return None;
+    }
+    let mut hash = [0_u8; 32];
+    hash.copy_from_slice(&input[..32]);
+    let mut signature = [0_u8; 64];
+    signature[..32].copy_from_slice(&input[64..96]);
+    let s = &input[96..input.len().min(128)];
+    signature[32..32 + s.len()].copy_from_slice(s);
+    let address = rustock_core::types::transaction::recover_address(&hash, &signature, v - 27)?;
+    let mut word = [0_u8; 32];
+    word[12..].copy_from_slice(address.as_slice());
+    Some(word)
+}
+
 /// Secp256k1 point addition.
 /// Input: up to 128 bytes = [x1(32) | y1(32) | x2(32) | y2(32)], big-endian.
 /// Output: 64 bytes = [x(32) | y(32)].
@@ -247,9 +296,17 @@ pub fn rsk_precompiles(hardfork_cfg: &RskHardforkConfig, block_number: u64) -> P
     // rskj gates each precompile on its own RSKIP rather than Ethereum spec
     // buckets (PrecompiledContracts.getContractForAddress). From genesis:
     // 0x01-0x04 (ecrecover, sha256, ripemd160, identity) plus 0x05 modexp
-    // with EIP-198 (Byzantium) pricing.
+    // with EIP-198 (Byzantium) pricing. ECRecover is rskj's own, in place of
+    // revm's.
     let mut precompiles = Precompiles::new(PrecompileSpecId::HOMESTEAD).clone();
-    precompiles.extend([revm::precompile::modexp::BYZANTIUM]);
+    precompiles.extend([
+        Precompile::new(
+            PrecompileId::custom("rsk-ecrecover"),
+            ECRECOVER_ADDR,
+            rsk_ecrecover_run,
+        ),
+        revm::precompile::modexp::BYZANTIUM,
+    ]);
 
     // RSKIP137 (Papyrus200): BN128 add/mul/pairing, priced per EIP-1108
     // (Istanbul: 150 / 6000 / 45000 + 34000 per pair) from activation.
@@ -1258,6 +1315,102 @@ mod tests {
         // Standard Ethereum precompiles should also be present
         let ecrecover = Address::new(hex_addr("0000000000000000000000000000000000000001"));
         assert!(precompiles.contains(&ecrecover));
+    }
+
+    // -----------------------------------------------------------------------
+    // ECRecover, as rskj's
+    // -----------------------------------------------------------------------
+
+    /// The generator's x. Its y is even, so with recovery id 0 the point R
+    /// whose x is r is the generator itself.
+    const GENERATOR_X: [u8; 32] =
+        alloy_primitives::hex!("79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798");
+
+    /// ECRecover's input for the hash 1, `v`, r the generator's x and s =
+    /// `s`. The key is r⁻¹(sR − G), where R is G for v 27 and −G for 28.
+    fn ecrecover_input(v: u8, s: u8) -> Vec<u8> {
+        let mut input = vec![0_u8; 128];
+        input[31] = 1;
+        input[63] = v;
+        input[64..96].copy_from_slice(&GENERATOR_X);
+        input[127] = s;
+        input
+    }
+
+    fn rskj_ecrecover(input: &[u8]) -> Bytes {
+        rsk_ecrecover_run(input, 3_000).unwrap().bytes
+    }
+
+    fn ethereum_ecrecover(input: &[u8]) -> Bytes {
+        use revm::precompile::secp256k1::ec_recover_run;
+        ec_recover_run(input, 3_000).unwrap().bytes
+    }
+
+    /// For an ordinary signature rskj's ECRecover recovers what Ethereum's
+    /// does, reading 128 bytes and ending a short s in zeros.
+    #[test]
+    fn ecrecover_recovers_an_ordinary_key_as_ethereums_does() {
+        for v in [27, 28] {
+            let input = ecrecover_input(v, 2);
+            let key = rskj_ecrecover(&input);
+            assert_eq!(key.len(), 32, "v {v} recovers a key");
+            assert_eq!(key, ethereum_ecrecover(&input));
+            let mut longer = input.clone();
+            longer.extend([0xff; 32]);
+            assert_eq!(rskj_ecrecover(&longer), key, "only 128 bytes are read");
+        }
+        // s = 2^249, all in its first byte.
+        let mut short = ecrecover_input(27, 0);
+        short[96] = 2;
+        let whole = rskj_ecrecover(&short);
+        assert_eq!(whole.len(), 32);
+        assert_eq!(rskj_ecrecover(&short[..97]), whole);
+        assert_eq!(ethereum_ecrecover(&short[..97]), whole);
+
+        // Too short to hold r, a v of neither 27 nor 28, or no input: nothing.
+        assert!(rskj_ecrecover(&ecrecover_input(27, 2)[..95]).is_empty());
+        assert!(rskj_ecrecover(&ecrecover_input(29, 2)).is_empty());
+        assert!(rskj_ecrecover(&[]).is_empty());
+        assert!(matches!(
+            rsk_ecrecover_run(&[], 2_999),
+            Err(PrecompileError::OutOfGas)
+        ));
+    }
+
+    /// rskj's `isValid` reads only the last byte of the `v` word, so a word
+    /// with other bytes set still recovers the key. Ethereum's answers nothing.
+    #[test]
+    fn ecrecover_reads_only_the_last_byte_of_v() {
+        let clean = ecrecover_input(27, 2);
+        let mut dirty = clean.clone();
+        dirty[32] = 0x01;
+        dirty[50] = 0xff;
+        assert_eq!(rskj_ecrecover(&dirty), rskj_ecrecover(&clean));
+        assert!(ethereum_ecrecover(&dirty).is_empty());
+    }
+
+    /// With R = G and s = e = 1, sR = eG, and the key is the point at
+    /// infinity: rskj recovers the address it gives that key, from keccak256 of
+    /// nothing, where Ethereum's ECRecover answers nothing. With v 28, R is −G
+    /// and the key an ordinary one. The set from genesis runs rskj's.
+    #[test]
+    fn ecrecover_recovers_the_infinity_sender_as_rskj_does() {
+        let mut infinity = [0_u8; 32];
+        infinity[12..]
+            .copy_from_slice(rustock_core::types::transaction::INFINITY_SENDER.as_slice());
+        let infinity = Bytes::copy_from_slice(&infinity);
+        let input = ecrecover_input(27, 1);
+        assert_eq!(rskj_ecrecover(&input), infinity);
+        assert!(ethereum_ecrecover(&input).is_empty());
+
+        let ordinary = ecrecover_input(28, 1);
+        assert_ne!(rskj_ecrecover(&ordinary), infinity);
+        assert_eq!(rskj_ecrecover(&ordinary), ethereum_ecrecover(&ordinary));
+        assert_eq!(rskj_ecrecover(&ordinary).len(), 32);
+
+        let set = rsk_precompiles(&RskHardforkConfig::mainnet(), 0);
+        let ecrecover = set.get(&ECRECOVER_ADDR).unwrap();
+        assert_eq!(ecrecover.execute(&input, 3_000).unwrap().bytes, infinity);
     }
 
     #[test]

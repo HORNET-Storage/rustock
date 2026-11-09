@@ -277,6 +277,53 @@ fn recovers_infinity(signature: &[u8; 64], recovery_id: u8, hash: &[u8; 32]) -> 
     }
 }
 
+/// The key a signature recovers, as rskj recovers it: libsecp256k1's key, or
+/// the point at infinity where libsecp256k1 refuses a key that would have
+/// been it. `signature` is r then s, big-endian, and `recovery_id` 0 or 1.
+fn recover(hash: &[u8; 32], signature: &[u8; 64], recovery_id: u8) -> anyhow::Result<Recovered> {
+    // `from_u8_masked` takes the low two bits rather than rejecting an
+    // out-of-range id, which is safe only because every caller has already
+    // confined `recovery_id` to 0 or 1.
+    let recid = secp256k1::ecdsa::RecoveryId::from_u8_masked(recovery_id);
+    let compact = secp256k1::ecdsa::RecoverableSignature::from_compact(signature, recid)
+        .map_err(|e| anyhow::anyhow!("invalid signature: {e}"))?;
+    let message = secp256k1::Message::from_digest(*hash);
+    match secp_context().recover_ecdsa(message, &compact) {
+        Ok(key) => Ok(Recovered::Key(key)),
+        Err(_) if recovers_infinity(signature, recovery_id, hash) => Ok(Recovered::Infinity),
+        Err(e) => Err(anyhow::anyhow!("ECDSA recovery failed: {e}")),
+    }
+}
+
+/// The address of a key: the last 20 bytes of the keccak256 of its
+/// uncompressed encoding, past the leading byte that marks the form.
+fn address_of(key: &secp256k1::PublicKey) -> Address {
+    let pubkey_hash = Keccak256::digest(&key.serialize_uncompressed()[1..]);
+    Address::from_slice(&pubkey_hash[12..])
+}
+
+/// The address a signature recovers, as rskj's ECRecover precompile answers
+/// it: `ECDSASignature.validateComponents` holds r and s from 1 to below the
+/// curve's order, then `ECKey.getAddress` of `Secp256k1Service
+/// .signatureToKey`, which is [`INFINITY_SENDER`] for the point at infinity.
+/// `None` where rskj answers no address. `signature` is r then s,
+/// big-endian; `recovery_id` is `v - 27`, so 0 or 1.
+pub fn recover_address(hash: &[u8; 32], signature: &[u8; 64], recovery_id: u8) -> Option<Address> {
+    let order = U256::from_be_bytes(secp256k1::constants::CURVE_ORDER);
+    let (r, s) = signature.split_at(32);
+    let in_range = |half: &[u8]| {
+        let value = U256::from_be_slice(half);
+        !value.is_zero() && value < order
+    };
+    if recovery_id > 1 || !in_range(r) || !in_range(s) {
+        return None;
+    }
+    Some(match recover(hash, signature, recovery_id).ok()? {
+        Recovered::Key(key) => address_of(&key),
+        Recovered::Infinity => INFINITY_SENDER,
+    })
+}
+
 impl Transaction {
 
     /// Recover the sender address from the transaction signature.
@@ -295,12 +342,7 @@ impl Transaction {
     /// gives it, [`INFINITY_SENDER`].
     pub fn recover_sender(&self, chain_id: u64) -> anyhow::Result<Address> {
         Ok(match self.recover_key(chain_id)? {
-            // The leading byte is the uncompressed-form marker and is not part
-            // of the key the address is taken from.
-            Recovered::Key(key) => {
-                let pubkey_hash = Keccak256::digest(&key.serialize_uncompressed()[1..]);
-                Address::from_slice(&pubkey_hash[12..])
-            }
+            Recovered::Key(key) => address_of(&key),
             Recovered::Infinity => INFINITY_SENDER,
         })
     }
@@ -330,22 +372,7 @@ impl Transaction {
         let mut sig_bytes = [0u8; 64];
         sig_bytes[..32].copy_from_slice(&self.r.to_be_bytes::<32>());
         sig_bytes[32..].copy_from_slice(&self.s.to_be_bytes::<32>());
-
-        // `from_u8_masked` takes the low two bits rather than rejecting an
-        // out-of-range id, which is safe only because the branches above
-        // have already confined `recovery_id` to 0 or 1.
-        let recid = secp256k1::ecdsa::RecoveryId::from_u8_masked(recovery_id);
-        let signature = secp256k1::ecdsa::RecoverableSignature::from_compact(&sig_bytes, recid)
-            .map_err(|e| anyhow::anyhow!("invalid signature: {e}"))?;
-        let message = secp256k1::Message::from_digest(hash.0);
-
-        match secp_context().recover_ecdsa(message, &signature) {
-            Ok(key) => Ok(Recovered::Key(key)),
-            Err(_) if recovers_infinity(&sig_bytes, recovery_id, &hash.0) => {
-                Ok(Recovered::Infinity)
-            }
-            Err(e) => Err(anyhow::anyhow!("ECDSA recovery failed: {e}")),
-        }
+        recover(&hash.0, &sig_bytes, recovery_id)
     }
 
     pub fn is_eip155(&self, chain_id: u64) -> bool {
@@ -713,6 +740,46 @@ mod tests {
         tx.r = U256::from_be_bytes(secp256k1::constants::GENERATOR_X);
         tx.s = U256::ZERO;
         assert!(tx.recover_sender(33).is_err());
+    }
+
+    /// `recover_address`, as rskj's ECRecover answers: a key's address; the
+    /// infinity sender where sR = eG; and nothing for an r or s of 0 or the
+    /// curve's order or more, an id past 1, or an R that isn't on the curve.
+    #[test]
+    fn recover_address_answers_as_rskjs_ecrecover() {
+        use k256::ecdsa::SigningKey;
+        let key = SigningKey::from_slice(&[1u8; 32]).unwrap();
+        // Below the curve's order, so the hash is its own value modulo it.
+        let hash = [0x11_u8; 32];
+        let (signature, id) = key.sign_prehash_recoverable(&hash).unwrap();
+        let id = id.to_byte();
+        let mut ordinary = [0_u8; 64];
+        ordinary.copy_from_slice(&signature.to_bytes());
+        let point = key.verifying_key().to_encoded_point(false);
+        let address = Address::from_slice(&Keccak256::digest(&point.as_bytes()[1..])[12..]);
+        assert_eq!(recover_address(&hash, &ordinary, id), Some(address));
+        assert_eq!(recover_address(&hash, &ordinary, 2), None);
+
+        // R the generator, whose y is even, and s the hash: sR = eG.
+        let mut infinity = [0_u8; 64];
+        infinity[..32].copy_from_slice(&secp256k1::constants::GENERATOR_X);
+        infinity[32..].copy_from_slice(&hash);
+        assert_eq!(recover_address(&hash, &infinity, 0), Some(INFINITY_SENDER));
+        // With y odd R is -G, and the key an ordinary one.
+        let other = recover_address(&hash, &infinity, 1);
+        assert!(other.is_some_and(|other| other != INFINITY_SENDER));
+
+        let order = secp256k1::constants::CURVE_ORDER;
+        for (at, bad) in [(0, [0_u8; 32]), (32, [0_u8; 32]), (0, order), (32, order)] {
+            let mut signature = ordinary;
+            signature[at..at + 32].copy_from_slice(&bad);
+            assert_eq!(recover_address(&hash, &signature, id), None);
+        }
+        // 5³ + 7 has no square root modulo p.
+        let mut off_curve = [0_u8; 64];
+        off_curve[31] = 5;
+        off_curve[63] = 1;
+        assert_eq!(recover_address(&hash, &off_curve, 0), None);
     }
 }
 
