@@ -48,7 +48,10 @@ impl TxRelay {
         }
     }
 
-    fn tx_hash(data: &[u8]) -> B256 {
+    /// The keccak of a transaction's bytes as they came: the seen-set's key,
+    /// against the same bytes twice. The transaction's own hash is rskj's, of
+    /// the encoding it rebuilds, which the pool keys it by.
+    fn digest(data: &[u8]) -> B256 {
         B256::from_slice(&Keccak256::digest(data))
     }
 
@@ -83,11 +86,11 @@ impl TxRelay {
         let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
         let mut valid_txs = Vec::new();
         for tx_bytes in txs {
-            let hash = Self::tx_hash(tx_bytes);
-            if seen.get(&hash).is_some() {
+            let digest = Self::digest(tx_bytes);
+            if seen.get(&digest).is_some() {
                 continue;
             }
-            seen.put(hash, ());
+            seen.put(digest, ());
 
             if let Some(pool) = &self.pool {
                 let accepted = pool.add_transaction(tx_bytes);
@@ -108,12 +111,12 @@ impl TxRelay {
                     );
                 }
                 match accepted {
-                    Ok(_) => {
+                    Ok(hash) => {
                         self.announce_pending(hash);
                         valid_txs.push(tx_bytes.clone())
                     }
                     Err(e) => {
-                        trace!(tx_hash = %hash, err = %e, "Rejected incoming transaction");
+                        trace!(%digest, err = %e, "Rejected incoming transaction");
                     }
                 }
             } else {
@@ -125,15 +128,19 @@ impl TxRelay {
 
     /// Submit a raw transaction from the RPC layer. Returns the tx hash or an error.
     pub async fn submit_transaction(&self, raw_tx: Bytes) -> Result<B256, String> {
-        let hash = if let Some(pool) = &self.pool {
-            pool.add_transaction(&raw_tx).map_err(|e| format!("{e}"))?
-        } else {
-            Self::tx_hash(&raw_tx)
+        let hash = match &self.pool {
+            Some(pool) => pool.add_transaction(&raw_tx).map_err(|e| format!("{e}"))?,
+            None => {
+                use alloy_rlp::Decodable;
+                rustock_core::Transaction::decode(&mut raw_tx.as_ref())
+                    .map_err(|e| format!("RLP decode error: {e}"))?
+                    .tx_hash()
+            }
         };
 
         {
             let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
-            seen.put(hash, ());
+            seen.put(Self::digest(&raw_tx), ());
         }
         self.announce_pending(hash);
 

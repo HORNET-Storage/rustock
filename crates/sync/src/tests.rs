@@ -3762,10 +3762,33 @@ async fn test_tx_relay_submit_transaction() {
     peer_store.add_peer(peer_a, tx_a).await;
 
     let relay = TxRelay::new(peer_store);
-    let raw = Bytes::from(vec![0xca, 0xfe]);
-    let hash = relay.submit_transaction(raw).await.unwrap();
 
-    assert_ne!(hash, alloy_primitives::B256::ZERO);
+    // With no pool the relay still reads the transaction, to report the hash
+    // rskj gives it: one rskj cannot read is refused, and never broadcast.
+    let junk = Bytes::from(vec![0xca, 0xfe]);
+    assert!(relay.submit_transaction(junk).await.is_err());
+    assert!(
+        rx_a.try_recv().is_err(),
+        "what cannot be read is not broadcast"
+    );
+
+    let tx = rustock_core::Transaction {
+        nonce: 0,
+        gas_price: U256::from(1),
+        gas_limit: U256::from(21_000),
+        to: Bytes::from(vec![0x12; 20]),
+        value: U256::from(1),
+        input: Bytes::new(),
+        v: 27,
+        r: U256::from(1),
+        s: U256::from(1),
+        cached_rlp: None,
+    };
+    let mut raw = Vec::new();
+    alloy_rlp::Encodable::encode(&tx, &mut raw);
+    let hash = relay.submit_transaction(Bytes::from(raw)).await.unwrap();
+
+    assert_eq!(hash, tx.tx_hash());
     assert!(rx_a.try_recv().is_ok(), "peer should receive broadcast");
 }
 

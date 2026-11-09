@@ -1,9 +1,8 @@
 use alloy_primitives::{Address, B256, U256};
-use alloy_rlp::{Decodable, Encodable};
+use alloy_rlp::Decodable;
 use rustock_core::{Header, Transaction};
 use rustock_storage::BlockStore;
 use rustock_trie::{account_key, code_key, AccountState, TrieKeySlice, TrieNode, TrieStore};
-use sha3::{Digest, Keccak256};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::sync::{Arc, PoisonError, RwLock};
@@ -134,8 +133,8 @@ pub fn nonce_bytes_are_canonical(nonce: &[u8]) -> bool {
     true
 }
 
-/// The nonce's raw RLP payload, as the sender encoded it: the first item of
-/// the transaction list. `None` if the bytes are not a transaction list.
+/// The nonce's bytes: the payload of the first item of a transaction's
+/// encoding. `None` if the bytes are not a transaction list.
 fn raw_nonce_bytes(raw: &[u8]) -> Option<&[u8]> {
     let mut buf = raw;
     let list = alloy_rlp::Header::decode(&mut buf).ok()?;
@@ -164,7 +163,6 @@ pub enum PoolError {
     PoolFull,
     InvalidSignature(String),
     InsufficientFundsForPendingAndNew,
-    IsRemascTransaction,
     AccountExceedsQuota,
     RlpDecode(String),
     StoreError(String),
@@ -193,7 +191,6 @@ impl fmt::Display for PoolError {
             Self::InsufficientFundsForPendingAndNew => {
                 write!(f, "insufficient funds to pay for pending and new transactions")
             }
-            Self::IsRemascTransaction => write!(f, "transaction is a remasc transaction"),
             Self::AccountExceedsQuota => write!(f, "account exceeds quota"),
             Self::RlpDecode(e) => write!(f, "RLP decode error: {e}"),
             Self::StoreError(e) => write!(f, "store error: {e}"),
@@ -222,7 +219,6 @@ impl PoolError {
             Self::PoolFull => "pool-full",
             Self::InvalidSignature(_) => "invalid-signature",
             Self::InsufficientFundsForPendingAndNew => "insufficient-funds-pending",
-            Self::IsRemascTransaction => "remasc",
             Self::AccountExceedsQuota => "quota",
             Self::RlpDecode(_) => "rlp-decode",
             Self::StoreError(_) => "store-error",
@@ -489,28 +485,26 @@ impl TransactionPool {
         let tx = Transaction::decode(&mut &raw[..])
             .map_err(|e| PoolError::RlpDecode(format!("{e}")))?;
 
-        let hash = tx_hash(raw);
+        // rskj keys a transaction by its hash (`getHash`), of the encoding it
+        // rebuilds rather than of the bytes as sent (`Transaction::from_rskj`),
+        // and measures it by that encoding too (`getSize`).
+        let hash = tx.tx_hash();
+        let encoded = tx.rlp_for_trie();
+        let encoded_size = encoded.len();
 
-        // rskj `TxValidatorNonceEncodingValidator`, on the bytes as sent:
-        // the lenient decoder above has already dropped the leading zeros,
-        // and admitting such a transaction would key it by one hash and
-        // relay it under another.
-        if !raw_nonce_bytes(raw).is_some_and(nonce_bytes_are_canonical) {
+        // rskj `TxValidatorNonceEncodingValidator`, on the nonce's bytes as
+        // rskj holds them (`getNonce`), which that encoding keeps.
+        if !raw_nonce_bytes(&encoded).is_some_and(nonce_bytes_are_canonical) {
             return Err(PoolError::NonCanonicalNonce);
         }
-
-        let mut encoded = Vec::new();
-        tx.encode(&mut encoded);
-        let encoded_size = encoded.len();
 
         // A transaction offered twice -- re-broadcast, or seen by both a peer
         // and the RPC -- is recovered once. The write goes to the pool tier,
         // which is what execution reads when the block carrying it arrives.
-        let tx_hash_for_cache = tx.tx_hash();
         let cached = self
             .sender_cache
             .as_ref()
-            .and_then(|c| c.get_many(&[tx_hash_for_cache]).pop().flatten());
+            .and_then(|c| c.get_many(&[hash]).pop().flatten());
         let sender = match cached {
             Some(sender) => sender,
             None => {
@@ -520,7 +514,7 @@ impl TransactionPool {
                 if let Some(c) = &self.sender_cache {
                     c.put_many(
                         rustock_execution::sender_cache::Origin::Pool,
-                        [(tx_hash_for_cache, recovered)],
+                        [(hash, recovered)],
                     );
                 }
                 recovered
@@ -716,10 +710,9 @@ impl TransactionPool {
         // rskj `basicTxCost == 0`: a free Bridge transaction.
         let is_free = rules.is_some_and(|r| r.is_free_tx(tx, sender, header.number));
 
-        // 1. Not REMASC (`TxValidatorNotRemascTxValidator`)
-        if is_remasc_tx(tx) {
-            return Err(PoolError::IsRemascTransaction);
-        }
+        // 1. Not REMASC (`TxValidatorNotRemascTxValidator`): rskj refuses a
+        //    `RemascTransaction`, which only a block's last transaction is,
+        //    so never one offered alone.
 
         // 2. Size limit (`TX_MAX_SIZE`)
         if encoded_size > self.config.max_tx_size {
@@ -805,9 +798,7 @@ impl TransactionPool {
         let mut removed = 0u64;
         let mut inner = self.inner.write().unwrap_or_else(PoisonError::into_inner);
         for tx in transactions {
-            let mut buf = Vec::new();
-            tx.encode(&mut buf);
-            let hash = tx_hash(&buf);
+            let hash = tx.tx_hash();
             if Self::remove_by_hash(&mut inner, &hash, tx.nonce) {
                 removed += 1;
             }
@@ -1093,23 +1084,6 @@ fn tx_cost(tx: &Transaction) -> U256 {
     tx.value + tx.gas_price * tx.gas_limit
 }
 
-/// Compute the keccak256 hash of raw transaction bytes.
-pub fn tx_hash(raw: &[u8]) -> B256 {
-    B256::from_slice(&Keccak256::digest(raw))
-}
-
-/// Check if a transaction is a REMASC transaction.
-fn is_remasc_tx(tx: &Transaction) -> bool {
-    if tx.to.len() != 20 {
-        return false;
-    }
-    let remasc_bytes: [u8; 20] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 8];
-    tx.to.as_ref() == remasc_bytes
-        && tx.gas_price.is_zero()
-        && tx.gas_limit.is_zero()
-        && tx.value.is_zero()
-}
-
 /// Compute the intrinsic gas cost of a transaction (matching rskj).
 pub fn intrinsic_gas(tx: &Transaction) -> u64 {
     let base = if tx.to.is_empty() { 53_000u64 } else { 21_000u64 };
@@ -1127,8 +1101,10 @@ pub fn intrinsic_gas(tx: &Transaction) -> u64 {
 mod tests {
     use super::*;
     use alloy_primitives::{Address, Bloom, Bytes, U256};
+    use alloy_rlp::Encodable;
     use k256::ecdsa::SigningKey;
     use rustock_trie::MemoryTrieStore;
+    use sha3::{Digest, Keccak256};
     use tempfile::tempdir;
 
     fn test_config() -> PoolConfig {
@@ -1263,6 +1239,35 @@ mod tests {
         let mut buf = Vec::new();
         tx.encode(&mut buf);
         buf
+    }
+
+    /// A transaction signed for `chain_id` (not 0) over its six fields as
+    /// given, each already an RLP item, as rskj signs and sends what its own
+    /// builder writes: a zero gas limit, for one, is the byte 0x00 there,
+    /// where canonical RLP writes zero empty, and rskj cannot read empty.
+    fn rskj_signed(fields: &[u8], key: &SigningKey, chain_id: u64) -> Vec<u8> {
+        fn list(payload: &[u8]) -> Vec<u8> {
+            let mut out = Vec::new();
+            alloy_rlp::Header {
+                list: true,
+                payload_length: payload.len(),
+            }
+            .encode(&mut out);
+            out.extend_from_slice(payload);
+            out
+        }
+        let mut unsigned = fields.to_vec();
+        chain_id.encode(&mut unsigned);
+        unsigned.extend_from_slice(&[0x80, 0x80]);
+        let hash: [u8; 32] = Keccak256::digest(list(&unsigned)).into();
+        let (signature, recid): (k256::ecdsa::Signature, k256::ecdsa::RecoveryId) =
+            key.sign_prehash_recoverable(&hash).unwrap();
+        let sig_bytes = signature.to_bytes();
+        let mut signed = fields.to_vec();
+        (chain_id * 2 + 35 + u64::from(recid.to_byte())).encode(&mut signed);
+        U256::from_be_slice(&sig_bytes[..32]).encode(&mut signed);
+        U256::from_be_slice(&sig_bytes[32..]).encode(&mut signed);
+        list(&signed)
     }
 
     // ========== Account transaction rate limiting (rskj TxQuotaChecker) ==========
@@ -1843,25 +1848,37 @@ mod tests {
 
     // ========== rskj: checkRemascTxIsRejected ==========
 
+    /// rskj refuses a `RemascTransaction`, which only a block's last
+    /// transaction is. REMASC's own encoding, offered alone, carries no
+    /// signature, and is refused for that, as rskj refuses it on arrival
+    /// (`acceptTransactionSignature`). A signed transaction of its shape is
+    /// an ordinary transaction to the REMASC contract, and refused as any
+    /// other would be: for its zero gas price, below the block's minimum,
+    /// and at that minimum for a gas limit below a transfer's cost.
     #[test]
     fn test_remasc_tx_rejected() {
         let (pool, key, _addr) = setup_pool_with_account(U256::from(10u64.pow(18)), 0);
-        let remasc_addr: [u8; 20] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 8];
-        let mut tx = Transaction {
-            nonce: 0,
-            gas_price: U256::ZERO,
-            gas_limit: U256::ZERO,
-            to: Bytes::from(remasc_addr.to_vec()),
-            value: U256::ZERO,
-            input: Bytes::new(),
-            v: 0,
-            r: U256::ZERO,
-            s: U256::ZERO,
-            cached_rlp: None,
+        let remasc = Transaction::remasc(10);
+        let err = pool.add_transaction(&remasc.rlp_for_trie()).unwrap_err();
+        assert!(matches!(err, PoolError::InvalidSignature(_)), "{err}");
+
+        let remasc_shaped = |gas_price: &[u8]| {
+            let mut fields = vec![0x80]; // nonce 0
+            fields.extend_from_slice(gas_price);
+            fields.push(0x00); // gas limit zero, the byte 0x00 as in REMASC's
+            rustock_execution::precompiles::REMASC_ADDR
+                .as_slice()
+                .encode(&mut fields);
+            fields.extend_from_slice(&[0x80, 0x80]); // value 0, no data
+            rskj_signed(&fields, &key, 33)
         };
-        sign_tx(&mut tx, &key, 33);
-        let err = pool.add_transaction(&encode_tx(&tx)).unwrap_err();
-        assert!(matches!(err, PoolError::IsRemascTransaction));
+        let err = pool.add_transaction(&remasc_shaped(&[0x00])).unwrap_err();
+        assert!(matches!(err, PoolError::GasPriceTooLow), "{err}");
+
+        let mut minimum = Vec::new();
+        U256::from(59_240_000).encode(&mut minimum);
+        let err = pool.add_transaction(&remasc_shaped(&minimum)).unwrap_err();
+        assert!(matches!(err, PoolError::IntrinsicGasTooHigh), "{err}");
     }
 
     // ========== rskj: checkTxWithLowGasPriceIsRejected ==========
@@ -2088,7 +2105,7 @@ mod tests {
             let mut tx = make_tx(nonce, 59_240_000);
             sign_tx(&mut tx, &key, 33);
             let raw = encode_tx(&tx);
-            hashes.push(tx_hash(&raw));
+            hashes.push(tx.tx_hash());
             pool.add_transaction(&raw).expect("admitted");
         }
         assert_eq!(pool.pending_transactions().len(), 3);
@@ -2188,6 +2205,45 @@ mod tests {
         pool.add_transaction(&canonical).expect("the canonical form is fine");
     }
 
+    /// rskj keys a transaction by the encoding it rebuilds (`getEncoded`),
+    /// not by the bytes it came in: a gas price sent with a leading zero is
+    /// the same transaction as the one sent minimal, with the same hash, so
+    /// the second is already known.
+    #[test]
+    fn the_pool_keys_a_transaction_by_rskjs_hash() {
+        let (pool, key, _) = setup_pool_with_account(U256::from(10u64.pow(18)), 0);
+        let mut tx = make_tx(0, 59_240_000);
+        sign_tx(&mut tx, &key, 33);
+        let canonical = encode_tx(&tx);
+
+        // Splice the gas price item: `0x84 03 87 ee 40` becomes
+        // `0x85 00 03 87 ee 40`.
+        let mut buf = &canonical[..];
+        let list = alloy_rlp::Header::decode(&mut buf).unwrap();
+        assert_eq!(
+            buf[..6],
+            [0x80, 0x84, 0x03, 0x87, 0xee, 0x40],
+            "nonce 0, then the gas price"
+        );
+        let mut payload = vec![0x80, 0x85, 0x00, 0x03, 0x87, 0xee, 0x40];
+        payload.extend_from_slice(&buf[6..list.payload_length]);
+        let mut raw = Vec::new();
+        alloy_rlp::Header {
+            list: true,
+            payload_length: payload.len(),
+        }
+        .encode(&mut raw);
+        raw.extend_from_slice(&payload);
+
+        let hash = pool
+            .add_transaction(&raw)
+            .expect("rskj reads the gas price as 59,240,000");
+        assert_eq!(hash, tx.tx_hash(), "rskj's hash, of the minimal encoding");
+        assert_ne!(hash, B256::from_slice(&Keccak256::digest(&raw)));
+        let err = pool.add_transaction(&canonical).unwrap_err();
+        assert!(matches!(err, PoolError::AlreadyKnown), "got {err}");
+    }
+
     /// A free Bridge transaction, as rskj has them before `areBridgeTxsPaid`:
     /// the head is at 100, mainnet pays from 370,000, and the sender is one
     /// of the free ones.
@@ -2225,23 +2281,31 @@ mod tests {
 
     /// rskj `TxValidatorIntrinsicGasLimitValidatorTest.validIntrinsicGasPrice`,
     /// its `tx4`: a free Bridge transaction declaring no gas at all costs
-    /// nothing, so the zero limit covers it.
+    /// nothing, so the zero limit covers it. rskj's builder writes that zero
+    /// as the byte 0x00 (`BigIntegers.asUnsignedByteArray`), as here.
     #[test]
     fn valid_intrinsic_gas_price_for_a_free_bridge_tx_with_zero_gas_limit() {
+        let zero_gas = |key: &SigningKey| {
+            let mut fields = vec![0x80]; // nonce 0
+            U256::from(59_240_000).encode(&mut fields);
+            fields.push(0x00); // gas limit zero
+            rustock_execution::precompiles::BRIDGE_ADDR
+                .as_slice()
+                .encode(&mut fields);
+            fields.extend_from_slice(&[0x80, 0x80]); // value 0, no data
+            rskj_signed(&fields, key, 33)
+        };
         let (_, _, addr) = setup_pool_with_rules(U256::ZERO, 0, test_config(), None);
         let (pool, key, _) = setup_pool_with_rules(U256::ZERO, 0, test_config(), Some(free_bridge_rules(addr)));
-        let mut tx = bridge_tx(0, 0, &[]);
-        sign_tx(&mut tx, &key, 33);
-        pool.add_transaction(&encode_tx(&tx)).expect("free, zero gas");
+        pool.add_transaction(&zero_gas(&key))
+            .expect("free, zero gas");
 
         // Paid from 370,000 on: the same transaction is then over its own
         // intrinsic cost.
         let mut paid = free_bridge_rules(addr);
         paid.hardfork_cfg = rustock_execution::hardfork::RskHardforkConfig::all_active(33);
         let (pool, key, _) = setup_pool_with_rules(U256::ZERO, 0, test_config(), Some(paid));
-        let mut tx = bridge_tx(0, 0, &[]);
-        sign_tx(&mut tx, &key, 33);
-        let err = pool.add_transaction(&encode_tx(&tx)).unwrap_err();
+        let err = pool.add_transaction(&zero_gas(&key)).unwrap_err();
         assert!(matches!(err, PoolError::IntrinsicGasTooHigh), "got {err}");
     }
 
@@ -2281,6 +2345,9 @@ mod tests {
 
     // ========== Invalid signature ==========
 
+    /// A v with r and s left empty cannot be read, as rskj cannot build its
+    /// signature (`ECDSASignature.fromComponents` on no bytes); r and s of
+    /// zero, the byte 0x00 each, are read and refused as no signature.
     #[test]
     fn test_invalid_signature_rejected() {
         let (pool, _key, _addr) = setup_pool_with_account(U256::from(10u64.pow(18)), 0);
@@ -2288,8 +2355,15 @@ mod tests {
         tx.v = 27;
         tx.r = U256::ZERO;
         tx.s = U256::ZERO;
-        let err = pool.add_transaction(&encode_tx(&tx)).unwrap_err();
-        assert!(matches!(err, PoolError::InvalidSignature(_)));
+        let mut raw = encode_tx(&tx);
+        assert_eq!(raw[raw.len() - 3..], [0x1b, 0x80, 0x80]);
+        let err = pool.add_transaction(&raw).unwrap_err();
+        assert!(matches!(err, PoolError::RlpDecode(_)), "got {err}");
+
+        let at = raw.len() - 2;
+        raw[at..].copy_from_slice(&[0x00, 0x00]);
+        let err = pool.add_transaction(&raw).unwrap_err();
+        assert!(matches!(err, PoolError::InvalidSignature(_)), "got {err}");
     }
 
     // ========== Size limit ==========
@@ -2594,7 +2668,6 @@ mod tests {
         assert_eq!(PoolError::IntrinsicGasTooHigh.to_string(), "transaction's basic cost is above the gas limit");
         assert_eq!(PoolError::ReplacementGasPriceTooLow.to_string(), "gas price not enough to bump transaction");
         assert_eq!(PoolError::TxTooLarge.to_string(), "transaction's size is higher than defined maximum");
-        assert_eq!(PoolError::IsRemascTransaction.to_string(), "transaction is a remasc transaction");
         assert_eq!(
             PoolError::InsufficientFundsForPendingAndNew.to_string(),
             "insufficient funds to pay for pending and new transactions"

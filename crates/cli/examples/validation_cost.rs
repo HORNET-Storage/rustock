@@ -53,29 +53,20 @@ fn stats(mut us: Vec<f64>) -> (f64, f64, f64, f64) {
 ///
 /// Deliberately the same shape as the `k256` version in
 /// `crates/core/src/types/transaction.rs`, down to the keccak of the
-/// uncompressed key's tail, so the two are timed doing the same job.
+/// uncompressed key's tail, so the two are timed doing the same job. Only
+/// the recovery: every transaction timed has passed the network's rules for
+/// a signature in `recover_sender` first.
 fn recover_with_libsecp(
     secp: &bitcoin::secp256k1::Secp256k1<bitcoin::secp256k1::All>,
     tx: &Transaction,
-    chain_id: u64,
 ) -> Option<alloy_primitives::Address> {
     use bitcoin::secp256k1::ecdsa::{RecoverableSignature, RecoveryId};
     use bitcoin::secp256k1::Message;
     use sha3::{Digest, Keccak256};
 
-    let hash = tx.signing_hash(chain_id);
-    let recovery_id = if tx.is_eip155(chain_id) {
-        let rid = tx.v as i64 - chain_id as i64 * 2 - 35;
-        if !(0..=1).contains(&rid) {
-            return None;
-        }
-        rid as i32
-    } else {
-        if tx.v != 27 && tx.v != 28 {
-            return None;
-        }
-        (tx.v - 27) as i32
-    };
+    let hash = tx.signing_hash();
+    let (_, recovery_id) = tx.chain_and_recovery_id()?;
+    let recovery_id = i32::from(recovery_id);
 
     let mut sig_bytes = [0u8; 64];
     sig_bytes[..32].copy_from_slice(&tx.r.to_be_bytes::<32>());
@@ -163,8 +154,6 @@ fn main() -> Result<()> {
         }
     }
 
-    // Same care: `signing_hash` can go through `cached_rlp`.
-    //
     // Failures are timed separately rather than mixed in. A transaction
     // whose `v` is not a valid recovery id -- REMASC's, among others --
     // bails before touching the curve, in well under a microsecond, and
@@ -174,10 +163,8 @@ fn main() -> Result<()> {
     let mut recover_us = Vec::with_capacity(txs.len());
     let mut rejected_us = Vec::new();
     for tx in &txs {
-        let mut t = tx.clone();
-        t.cached_rlp = None;
         let at = Instant::now();
-        let ok = t.recover_sender(MAINNET_CHAIN_ID).is_ok();
+        let ok = tx.recover_sender(MAINNET_CHAIN_ID).is_ok();
         let us = at.elapsed().as_secs_f64() * 1e6;
         if ok { recover_us.push(us) } else { rejected_us.push(us) }
     }
@@ -192,11 +179,11 @@ fn main() -> Result<()> {
     let mut agreed = 0usize;
     let mut disagreed = 0usize;
     for tx in &txs {
-        let mut t = tx.clone();
-        t.cached_rlp = None;
-        let Ok(expected) = t.recover_sender(MAINNET_CHAIN_ID) else { continue };
+        let Ok(expected) = tx.recover_sender(MAINNET_CHAIN_ID) else {
+            continue;
+        };
         let at = Instant::now();
-        let got = recover_with_libsecp(&secp, &t, MAINNET_CHAIN_ID);
+        let got = recover_with_libsecp(&secp, tx);
         secp_us.push(at.elapsed().as_secs_f64() * 1e6);
         match got {
             Some(a) if a == expected => agreed += 1,

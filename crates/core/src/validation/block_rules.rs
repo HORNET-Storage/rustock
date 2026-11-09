@@ -19,16 +19,11 @@ pub(crate) const REMASC_ADDR: [u8; 20] = [
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0x00, 0x00, 0x08,
 ];
 
-/// rskj `RemascTransaction`: `to == REMASC_ADDR`, zero signature, zero gas
-/// limit. Same predicate `BlockProcessor::is_remasc_tx` uses to skip sender
-/// recovery.
-fn is_remasc_tx(tx: &crate::types::transaction::Transaction) -> bool {
-    tx.v == 0
-        && tx.r.is_zero()
-        && tx.s.is_zero()
-        && tx.gas_limit.is_zero()
-        && tx.to.len() == 20
-        && tx.to.as_ref() == REMASC_ADDR
+/// Whether `block`'s transaction at `index` is its REMASC transaction, which
+/// rskj makes a `RemascTransaction` (`Transaction.isRemascTransaction`): only
+/// the last can be.
+fn is_remasc(block: &Block, index: usize) -> bool {
+    block.transactions[index].is_remasc(index, block.transactions.len())
 }
 
 /// rskj `TxsMinGasPriceRule`: every non-REMASC transaction must pay at least
@@ -38,8 +33,8 @@ pub struct TxsMinGasPriceRule;
 impl BlockValidator for TxsMinGasPriceRule {
     fn validate_block(&self, block: &Block) -> Result<(), ValidationError> {
         let min = block.header.minimum_gas_price;
-        for tx in &block.transactions {
-            if is_remasc_tx(tx) {
+        for (index, tx) in block.transactions.iter().enumerate() {
+            if is_remasc(block, index) {
                 continue;
             }
             if tx.gas_price < min {
@@ -80,8 +75,8 @@ impl BlockValidator for BlockTxsMaxGasPriceRule {
             return Ok(());
         }
         let cap = min.saturating_mul(U256::from(Self::FOR_BLOCK_MULTIPLIER));
-        for tx in &block.transactions {
-            if is_remasc_tx(tx) {
+        for (index, tx) in block.transactions.iter().enumerate() {
+            if is_remasc(block, index) {
                 continue;
             }
             if tx.gas_price > cap {
@@ -101,8 +96,8 @@ pub struct RemascValidationRule;
 
 impl BlockValidator for RemascValidationRule {
     fn validate_block(&self, block: &Block) -> Result<(), ValidationError> {
-        match block.transactions.last() {
-            Some(tx) if is_remasc_tx(tx) => Ok(()),
+        match block.transactions.len().checked_sub(1) {
+            Some(last) if is_remasc(block, last) => Ok(()),
             _ => Err(ValidationError::RemascTxMissing),
         }
     }
@@ -211,18 +206,7 @@ mod tests {
     }
 
     fn remasc_tx() -> Transaction {
-        Transaction {
-            nonce: 0,
-            gas_price: U256::ZERO,
-            gas_limit: U256::ZERO,
-            to: Bytes::copy_from_slice(&REMASC_ADDR),
-            value: U256::ZERO,
-            input: Bytes::new(),
-            v: 0,
-            r: U256::ZERO,
-            s: U256::ZERO,
-            cached_rlp: None,
-        }
+        Transaction::remasc(9_000_000)
     }
 
     fn user_tx(gas_price: u64) -> Transaction {
@@ -258,9 +242,15 @@ mod tests {
             Err(ValidationError::TxGasPriceBelowMinimum { .. })
         ));
 
-        // The REMASC transaction pays nothing and is exempt.
+        // The REMASC transaction pays nothing and is exempt; one of its shape
+        // before the last is no REMASC transaction, and is not.
         let only_remasc = block_at(9_000_000, 100, vec![remasc_tx()]);
         assert!(TxsMinGasPriceRule.validate_block(&only_remasc).is_ok());
+        let early = block_at(9_000_000, 100, vec![remasc_tx(), user_tx(100), remasc_tx()]);
+        assert!(matches!(
+            TxsMinGasPriceRule.validate_block(&early),
+            Err(ValidationError::TxGasPriceBelowMinimum { .. })
+        ));
     }
 
     /// rskj `BlockTxsMaxGasPriceRule` + `TxGasPriceCap.FOR_BLOCK` (RSKIP252).

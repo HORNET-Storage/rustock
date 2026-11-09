@@ -1480,13 +1480,13 @@ impl BlockStore {
     /// Computes each transaction's hash from its RLP encoding.
     pub fn index_block_transactions(&self, block_hash: B256, transactions: &[Transaction]) -> Result<()> {
         for (i, tx) in transactions.iter().enumerate() {
-            // `tx.tx_hash()` hashes `rlp_for_trie()`, which returns the ORIGINAL
-            // bytes when they were cached at decode time. Re-encoding here
-            // instead would key the index by a hash that differs from the
-            // canonical one for any transaction whose RLP does not round-trip
-            // byte-for-byte -- and reproducing rskj's non-canonical encodings is
-            // exactly why `cached_rlp` exists. The index must be keyed by the
-            // hash callers actually have.
+            // `tx.tx_hash()` hashes `rlp_for_trie()`, the encoding rskj hashes
+            // the transaction by, kept when it was read. Re-encoding here
+            // instead would key the index by a hash that differs from rskj's
+            // for any transaction whose rskj encoding is not canonical RLP --
+            // and reproducing rskj's encodings is exactly why `cached_rlp`
+            // exists. The index must be keyed by the hash callers actually
+            // have.
             self.put_tx_index(tx.tx_hash(), block_hash, i as u32)?;
         }
         Ok(())
@@ -2979,21 +2979,22 @@ mod tests {
     /// callers pass to `eth_getTransactionReceipt` and the one
     /// `eth_getBlockByNumber` hands out.
     ///
-    /// `Transaction::tx_hash()` hashes `rlp_for_trie()`, which returns the
-    /// ORIGINAL bytes when they were cached at decode time. An earlier version
+    /// `Transaction::tx_hash()` hashes `rlp_for_trie()`, the encoding rskj
+    /// hashes the transaction by, kept when it was read. An earlier version
     /// of `index_block_transactions` re-encoded instead, so for any transaction
-    /// whose RLP does not round-trip byte-for-byte it stored a key nobody would
-    /// ever look up. Reproducing rskj's non-canonical encodings is precisely why
-    /// `cached_rlp` exists, so such transactions are expected, not hypothetical.
+    /// whose rskj encoding is not canonical RLP it stored a key nobody would
+    /// ever look up. rskj writes a zero gas price as the byte 0x00, as the
+    /// federators' free bridge transactions carry it, so such transactions are
+    /// expected, not hypothetical.
     #[test]
     fn index_block_transactions_keys_by_the_canonical_hash_not_a_reencode() {
         let dir = tempdir().unwrap();
         let store = BlockStore::open(dir.path()).unwrap();
         let block_hash = B256::repeat_byte(0xAB);
 
-        let mut tx = Transaction {
+        let tx = Transaction {
             nonce: 7,
-            gas_price: U256::from(1),
+            gas_price: U256::ZERO,
             gas_limit: U256::from(21_000),
             to: Bytes::copy_from_slice(Address::repeat_byte(0xCC).as_slice()),
             value: U256::from(5),
@@ -3003,14 +3004,16 @@ mod tests {
             s: U256::from(2),
             cached_rlp: None,
         };
-
-        // Bytes that deliberately differ from what re-encoding would produce,
-        // standing in for a transaction whose stored RLP is not reproducible.
         let mut reencoded = Vec::new();
         tx.encode(&mut reencoded);
+
+        // The same transaction as rskj writes it: its zero gas price, after
+        // the list's header and the nonce, the byte 0x00 rather than empty.
+        assert_eq!(reencoded[1..3], [0x07, 0x80]);
         let mut original = reencoded.clone();
-        original.push(0x00);
-        tx.cached_rlp = Some(original);
+        original[2] = 0x00;
+        let tx = <Transaction as alloy_rlp::Decodable>::decode(&mut original.as_slice()).unwrap();
+        assert_eq!(tx.rlp_for_trie(), original, "rskj keeps the byte");
 
         let canonical = tx.tx_hash();
         assert_ne!(

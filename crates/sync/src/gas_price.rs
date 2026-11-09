@@ -143,8 +143,8 @@ impl GasPriceTracker {
         inner.block_window[at] = Some(completeness);
         inner.block_idx += 1;
 
-        for tx in transactions {
-            if rustock_execution::BlockProcessor::is_remasc_tx(tx) {
+        for (index, tx) in transactions.iter().enumerate() {
+            if tx.is_remasc(index, transactions.len()) {
                 continue;
             }
             if inner.tx_idx == -1 {
@@ -234,9 +234,11 @@ impl GasPriceTracker {
                 .flatten()
                 .map(|(txs, _)| txs)
                 .unwrap_or_default();
+            let count = transactions.len();
             tx_count += transactions
                 .iter()
-                .filter(|t| !rustock_execution::BlockProcessor::is_remasc_tx(t))
+                .enumerate()
+                .filter(|(index, t)| !t.is_remasc(*index, count))
                 .count();
             let parent = header.parent_hash;
             let at_genesis = header.number == 0;

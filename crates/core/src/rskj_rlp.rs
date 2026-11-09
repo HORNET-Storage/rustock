@@ -56,6 +56,15 @@ pub fn decode2(data: &[u8]) -> Result<Vec<Element<'_>>, RlpError> {
     Ok(elements)
 }
 
+/// The first element `RLP.decode2` reads from `data`, and where the next one
+/// starts.
+pub fn first_element(data: &[u8]) -> Result<(Element<'_>, usize), RlpError> {
+    if data.is_empty() {
+        return Err(RlpError);
+    }
+    decode_element(data, 0)
+}
+
 /// `RLP.decodeElement`, with its lengths in Java `int`s.
 fn decode_element(data: &[u8], position: usize) -> Result<(Element<'_>, usize), RlpError> {
     let b0 = data[position];

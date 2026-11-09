@@ -11,26 +11,27 @@
 //!
 //! The key is `Transaction::tx_hash()`. A cache keyed by a hash is only sound
 //! if the hash separates every pair of transactions that could recover to
-//! different senders — so in particular it must separate two transactions that
-//! differ **only** in their `v` byte, since `v` selects both the signing hash
-//! (legacy or EIP-155) and the recovery id. Two wire forms that hashed alike
-//! but recovered differently would let the first one seen decide the sender of
-//! the second.
+//! different senders. Two transactions that hashed alike but recovered
+//! differently would let the first one seen decide the sender of the second.
 //!
-//! That separation holds, for two independent reasons, and
-//! `the_hash_separates_transactions_that_differ_only_in_v` in
-//! `rustock_core::types::transaction` pins it:
+//! The hash determines everything recovery reads, for three reasons, and
+//! `the_hash_follows_what_v_names` in `rustock_core::types::transaction`
+//! pins the second:
 //!
-//! - `v` is stored verbatim as a `u64` and re-encoded verbatim by
-//!   `#[derive(RlpEncodable)]`. Nothing reconstructs it from a chain id, so
-//!   the encode/decode round trip cannot fold two values onto one.
-//! - `tx_hash()` goes through `rlp_for_trie()`, which prefers `cached_rlp` —
-//!   the bytes as the peer sent them — and `Decodable::decode` always records
-//!   those. Two different wire forms therefore hash differently whatever the
-//!   fields decode to.
+//! - `tx_hash()` is the keccak of the encoding rskj hashes a transaction by
+//!   (`getEncoded`), kept when the transaction is read. Its first six items
+//!   are the fields rskj signs (`getEncodedRaw`), and its v is the one rskj
+//!   rebuilds from the chain id and the recovery id, with r and s after it.
+//! - Reading that v back gives the same chain id and recovery id, so one
+//!   encoding has one signing hash and one recovery id. The only v whose
+//!   rebuilt form would read differently are those naming a negative chain,
+//!   which the reader refuses: no network accepts them.
+//! - Only signed transactions are cached. An unsigned one has no sender to
+//!   remember, and REMASC's is set by its place in the block, not a key.
 //!
-//! Anything that changes either of those invalidates this cache, which is why
-//! both are stated here rather than left to be rediscovered.
+//! Anything that changes how the hash is formed, or what reading a
+//! transaction keeps, invalidates this cache, which is why both are stated
+//! here rather than left to be rediscovered.
 //!
 //! ## Two tiers, because the two origins are not alike
 //!

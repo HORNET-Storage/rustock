@@ -1499,7 +1499,8 @@ impl RskExecutor {
             // only when this run's container is the block itself: a sublist
             // run is measured against the sublist's limit, which the
             // partition validator enforces separately.
-            if !Self::is_remasc_tx(tx) && (whole_block || discard_unfitting.is_some()) {
+            let is_remasc = tx.is_remasc(i, transactions.len());
+            if !is_remasc && (whole_block || discard_unfitting.is_some()) {
                 let tx_gas_limit = tx.gas_limit.saturating_to::<u64>();
                 let fits = total_gas.saturating_add(tx_gas_limit) <= block_gas_limit;
                 let sender_dropped = dropped_senders.contains(sender);
@@ -1528,7 +1529,7 @@ impl RskExecutor {
                 }
             }
 
-            if Self::is_remasc_tx(tx) {
+            if is_remasc {
                 debug!(tx_index = i, "executing REMASC system call");
                 if traced.includes(i) {
                     // REMASC never enters the EVM here, so the tracer records
@@ -2118,19 +2119,6 @@ impl RskExecutor {
             && tx.to.as_ref() == crate::precompiles::BRIDGE_ADDR.as_slice()
             && !self.hardfork_cfg.has_are_bridge_txs_paid(block_number)
             && self.free_bridge_senders.contains(&sender)
-    }
-
-    /// Detect the REMASC synthetic transaction: v=0, r=0, s=0, gas_limit=0,
-    /// to=REMASC_ADDR. The gas_limit=0 check distinguishes real REMASC system
-    /// calls from normal transactions that happen to call REMASC with valid gas.
-    fn is_remasc_tx(tx: &rustock_core::Transaction) -> bool {
-        if tx.v != 0 || !tx.r.is_zero() || !tx.s.is_zero() {
-            return false;
-        }
-        if !tx.gas_limit.is_zero() {
-            return false;
-        }
-        tx.to.len() == 20 && tx.to.as_ref() == REMASC_ADDR.as_slice()
     }
 
     /// For contract creation transactions, compute the created address from
@@ -9232,15 +9220,7 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
         block_store.put_canonical_hash(1, processing_hash).unwrap();
 
         let header = dummy_header(4_001);
-        let remasc_tx = rustock_core::Transaction {
-            nonce: 0,
-            gas_price: U256::ZERO,
-            gas_limit: U256::ZERO,
-            to: Bytes::copy_from_slice(crate::precompiles::REMASC_ADDR.as_slice()),
-            value: U256::ZERO,
-            input: Bytes::new(),
-            v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
-        };
+        let remasc_tx = rustock_core::Transaction::remasc(header.number);
 
         let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
         let result = executor
@@ -9263,15 +9243,7 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
 
         // Block #1: REMASC returns early (pre-maturity) but still writes siblings.
         let header = dummy_header(1);
-        let remasc_tx = rustock_core::Transaction {
-            nonce: 0,
-            gas_price: U256::ZERO,
-            gas_limit: U256::ZERO,
-            to: Bytes::copy_from_slice(crate::precompiles::REMASC_ADDR.as_slice()),
-            value: U256::ZERO,
-            input: Bytes::new(),
-            v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
-        };
+        let remasc_tx = rustock_core::Transaction::remasc(header.number);
 
         let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
         let result = executor
@@ -10173,18 +10145,7 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
         header.beneficiary = Address::repeat_byte(0x99); // actual miner (not used for fee routing)
 
         // The REMASC system tx: unsigned, zero gas (rskj RemascTransaction).
-        let remasc_tx = rustock_core::Transaction {
-            nonce: 0,
-            gas_price: U256::from(0),
-            gas_limit: U256::ZERO,
-            to: Bytes::copy_from_slice(remasc_addr.as_slice()),
-            value: U256::ZERO,
-            input: Bytes::new(),
-            v: 0,
-            r: U256::ZERO,
-            s: U256::ZERO,
-            cached_rlp: None,
-        };
+        let remasc_tx = rustock_core::Transaction::remasc(header.number);
 
         // The rskj remasc tests run regtest with a NON-EMPTY genesis
         // federation (injected at construction); our regtest constants have
@@ -10389,18 +10350,7 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
         header.beneficiary = Address::repeat_byte(0x99);
 
         // The REMASC system tx: unsigned, zero gas (rskj RemascTransaction).
-        let remasc_tx = rustock_core::Transaction {
-            nonce: 0,
-            gas_price: U256::from(0),
-            gas_limit: U256::ZERO,
-            to: Bytes::copy_from_slice(remasc_addr.as_slice()),
-            value: U256::ZERO,
-            input: Bytes::new(),
-            v: 0,
-            r: U256::ZERO,
-            s: U256::ZERO,
-            cached_rlp: None,
-        };
+        let remasc_tx = rustock_core::Transaction::remasc(header.number);
 
         let executor = RskExecutor::new(
             RskHardforkConfig::all_active(33),
@@ -10725,18 +10675,7 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
         header.beneficiary = Address::repeat_byte(0x99);
 
         // The REMASC system tx: unsigned, zero gas (rskj RemascTransaction).
-        let remasc_tx = rustock_core::Transaction {
-            nonce: 0,
-            gas_price: U256::from(0),
-            gas_limit: U256::ZERO,
-            to: Bytes::copy_from_slice(remasc_addr.as_slice()),
-            value: U256::ZERO,
-            input: Bytes::new(),
-            v: 0,
-            r: U256::ZERO,
-            s: U256::ZERO,
-            cached_rlp: None,
-        };
+        let remasc_tx = rustock_core::Transaction::remasc(header.number);
 
         let executor = RskExecutor::new(
             RskHardforkConfig::all_active(33),

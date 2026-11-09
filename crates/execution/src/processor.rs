@@ -602,7 +602,7 @@ impl BlockProcessor {
             return false;
         };
         // An empty list is not evidence. Every RSK block carries the REMASC
-        // synthetic transaction (see `is_remasc_tx`), so a real block always
+        // synthetic transaction (see `Transaction::is_remasc`), so a real block always
         // has at least one receipt; an empty entry means something other than
         // a normal execution put it there. Refusing to skip can only cost a
         // re-execution, so the conservative answer is the right one.
@@ -1118,8 +1118,9 @@ impl BlockProcessor {
         transactions: &[Transaction],
         chain_id: u64,
     ) -> Result<Vec<Address>, ProcessError> {
+        let count = transactions.len();
         let one = |i: usize, tx: &Transaction| -> Result<Address, ProcessError> {
-            if Self::is_remasc_tx(tx) {
+            if tx.is_remasc(i, count) {
                 // REMASC carries no signature. rskj gives it the zero
                 // address too.
                 return Ok(Address::ZERO);
@@ -1142,11 +1143,14 @@ impl BlockProcessor {
             None => vec![None; transactions.len()],
         };
 
-        // `one`, but answering from the lookup above where it can.
+        // `one`, but answering from the lookup above where it can. Only a
+        // signed transaction's sender is cached, since its hash decides it
+        // (`Transaction::recover_key`); one with no signature has a sender only
+        // as REMASC, which its place in the block decides.
         let one = |i: usize, tx: &Transaction| -> Result<Address, ProcessError> {
             match known.get(i).copied().flatten() {
-                Some(address) => Ok(address),
-                None => one(i, tx),
+                Some(address) if tx.v != 0 => Ok(address),
+                _ => one(i, tx),
             }
         };
 
@@ -1167,12 +1171,13 @@ impl BlockProcessor {
         // harmless but would churn the LRU for no gain.
         if let Some(cache) = &self.sender_cache {
             cache.put_many(crate::sender_cache::Origin::Block,
-                senders
+                transactions
                     .iter()
+                    .zip(&senders)
                     .zip(&hashes)
                     .zip(&known)
-                    .filter(|((_, _), was_known)| was_known.is_none())
-                    .map(|((address, hash), _)| (*hash, *address)),
+                    .filter(|(((tx, _), _), was_known)| tx.v != 0 && was_known.is_none())
+                    .map(|(((_, address), hash), _)| (*hash, *address)),
             );
         }
         Ok(senders)
@@ -1211,23 +1216,6 @@ impl BlockProcessor {
             }
         }
         Ok(senders)
-    }
-
-    /// Detect the REMASC synthetic transaction appended to every RSK block.
-    /// Pattern: `to == REMASC_ADDR && v == 0 && r == 0 && s == 0 && gas_limit == 0`.
-    ///
-    /// Public because the gas-price tracker has to exclude it for the same
-    /// reason rskj does: REMASC carries no gas price and would drag the
-    /// percentile to zero.
-    pub fn is_remasc_tx(tx: &Transaction) -> bool {
-        if tx.v != 0 || !tx.r.is_zero() || !tx.s.is_zero() {
-            return false;
-        }
-        if !tx.gas_limit.is_zero() {
-            return false;
-        }
-        let remasc_bytes = crate::precompiles::REMASC_ADDR.as_slice();
-        tx.to.len() == 20 && tx.to.as_ref() == remasc_bytes
     }
 }
 
@@ -1987,19 +1975,8 @@ mod tests {
         };
         sign_tx(&mut transfer, &key, 33);
 
-        let remasc = Transaction {
-            nonce: 0,
-            gas_price: U256::ZERO,
-            gas_limit: U256::ZERO,
-            to: Bytes::copy_from_slice(crate::precompiles::REMASC_ADDR.as_slice()),
-            value: U256::ZERO,
-            input: Bytes::default(),
-            v: 0,
-            r: U256::ZERO,
-            s: U256::ZERO,
-            cached_rlp: None,
-        };
-        assert!(BlockProcessor::is_remasc_tx(&remasc), "the fixture must look like REMASC");
+        let remasc = Transaction::remasc(5);
+        assert!(remasc.is_remasc(1, 2), "the fixture must be REMASC");
 
         let block = Block {
             // Below REMASC's maturity, so the distribution has no processing
@@ -2742,102 +2719,37 @@ mod tests {
         ));
     }
 
-    // -----------------------------------------------------------------------
-    // REMASC detection tests — ported from rskj TransactionIsRemascTest.java
-    // -----------------------------------------------------------------------
-
-    fn make_remasc_tx() -> Transaction {
-        let remasc_addr = crate::precompiles::REMASC_ADDR;
-        Transaction {
-            nonce: 0,
-            gas_price: U256::ZERO,
-            gas_limit: U256::ZERO,
-            to: Bytes::copy_from_slice(remasc_addr.as_slice()),
-            value: U256::ZERO,
-            input: Bytes::new(),
-            v: 0,
-            r: U256::ZERO,
-            s: U256::ZERO,
-            cached_rlp: None,
-        }
-    }
-
-    /// Ported from rskj TransactionIsRemascTest.validRemascTransactionNullData
-    #[test]
-    fn rskj_valid_remasc_transaction_null_data() {
-        let tx = make_remasc_tx();
-        assert!(BlockProcessor::is_remasc_tx(&tx));
-    }
-
-    /// Ported from rskj TransactionIsRemascTest.validRemascTransactionEmptyData
-    #[test]
-    fn rskj_valid_remasc_transaction_empty_data() {
-        let mut tx = make_remasc_tx();
-        tx.input = Bytes::new();
-        assert!(BlockProcessor::is_remasc_tx(&tx));
-    }
-
-    /// Ported from rskj TransactionIsRemascTest.notRemascTransactionNotNullSig
-    #[test]
-    fn rskj_not_remasc_when_signed() {
-        let mut tx = make_remasc_tx();
-        tx.v = 27;
-        tx.r = U256::from(1);
-        tx.s = U256::from(1);
-        assert!(!BlockProcessor::is_remasc_tx(&tx));
-    }
-
-    /// Ported from rskj TransactionIsRemascTest.notRemascTransactionReceiverIsNotRemasc
-    #[test]
-    fn rskj_not_remasc_wrong_destination() {
-        let mut tx = make_remasc_tx();
-        tx.to = Bytes::copy_from_slice(Address::repeat_byte(0xAA).as_slice());
-        assert!(!BlockProcessor::is_remasc_tx(&tx));
-    }
-
-    /// Ported from rskj TransactionIsRemascTest.notRemascTransactionGasLimitIsNotZero
-    #[test]
-    fn rskj_not_remasc_nonzero_gas_limit() {
-        let mut tx = make_remasc_tx();
-        tx.gas_limit = U256::from(10);
-        assert!(!BlockProcessor::is_remasc_tx(&tx));
-    }
-
-    /// Ported from rskj TransactionIsRemascTest.notRemascTransactionGasPriceIsNotZero
-    #[test]
-    fn rskj_not_remasc_nonzero_gas_price() {
-        let mut tx = make_remasc_tx();
-        tx.gas_price = U256::from(10);
-        // gas_price alone doesn't disqualify — only v/r/s and gas_limit matter
-        // in our implementation (matching rskj's checkRemascTxZeroValues)
-        // rskj checks gas_price too, so this should NOT be remasc
-        // Let's verify our implementation matches: v=0, r=0, s=0, gas_limit=0
-        // but gas_price != 0. In rskj, checkRemascTxZeroValues checks gasPrice.
-        // Our is_remasc_tx doesn't check gas_price — this is a known difference.
-        // For compatibility, we note this but don't enforce it since REMASC
-        // txs on chain always have gas_price=0 along with gas_limit=0.
-    }
-
-    /// Ported from rskj TransactionIsRemascTest.notRemascTransactionValueIsNotZero
-    #[test]
-    fn rskj_not_remasc_nonzero_value() {
-        let mut tx = make_remasc_tx();
-        tx.value = U256::from(10);
-        // Similar to gas_price: our is_remasc_tx checks v/r/s/gas_limit/to
-        // but not value. Real REMASC txs always have value=0.
-        // The signature check (v=0 r=0 s=0) + gas_limit=0 + to=REMASC is sufficient.
-    }
-
-    /// Verify REMASC sender recovery yields Address::ZERO
+    /// REMASC's sender is the zero address, as rskj's `RemascTransaction`
+    /// gives it, and only as the block's last transaction: anywhere else it
+    /// is a transaction with no signature, which no block carries. Which
+    /// transactions are REMASC is `Transaction::is_remasc`, held to rskj's
+    /// `TransactionIsRemascTest` in core.
     #[test]
     fn rskj_remasc_sender_is_zero() {
-        let tx = make_remasc_tx();
         let processor = BlockProcessor::new(
             test_hardfork_cfg(),
             Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap()),
         );
-        let senders = processor.recover_senders(&[tx], 33).unwrap();
+        let remasc = Transaction::remasc(5);
+        let senders = processor
+            .recover_senders(std::slice::from_ref(&remasc), 33)
+            .unwrap();
         assert_eq!(senders[0], Address::ZERO);
+
+        let key = SigningKey::from_slice(&[23u8; 32]).unwrap();
+        let mut transfer = Transaction {
+            gas_limit: U256::from(21_000u64),
+            to: Bytes::copy_from_slice(Address::repeat_byte(0xEE).as_slice()),
+            ..Default::default()
+        };
+        sign_tx(&mut transfer, &key, 33);
+        let error = processor
+            .recover_senders(&[remasc, transfer], 33)
+            .unwrap_err();
+        assert!(
+            matches!(error, ProcessError::SenderRecovery { index: 0, .. }),
+            "{error}"
+        );
     }
 
     #[test]
@@ -3190,18 +3102,37 @@ mod sender_cache_integration {
     }
 
     /// REMASC carries no signature and is given the zero address. It must not
-    /// be cached as if it were a recovered sender -- every block has one, at
-    /// a different hash, and they would churn the LRU for nothing.
+    /// be cached as if it were a recovered sender: its place in the block,
+    /// not its hash, makes it REMASC, so the same bytes anywhere else are a
+    /// transaction with no signature, and refused. And every block has one, at
+    /// a different hash, which would churn the LRU for nothing.
     #[test]
     fn remasc_is_handled_without_consulting_the_signature() {
         let (mut txs, mut want) = block_of(3, 33);
-        txs.push(Transaction::remasc(100));
+        let remasc = Transaction::remasc(100);
+        txs.push(remasc.clone());
         want.push(Address::ZERO);
 
         let cache = Arc::new(SenderCache::new(1024, 1024));
         let p = processor(Some(cache.clone()));
         assert_eq!(p.recover_senders(&txs, 33).unwrap(), want);
-        assert_eq!(p.recover_senders(&txs, 33).unwrap(), want, "and again from the cache");
+        assert_eq!(
+            p.recover_senders(&txs, 33).unwrap(),
+            want,
+            "and again from the cache"
+        );
+        assert_eq!(
+            cache.get_many(&[remasc.tx_hash()]),
+            vec![None],
+            "REMASC is never cached"
+        );
+
+        txs.rotate_right(1);
+        let error = p.recover_senders(&txs, 33).unwrap_err();
+        assert!(
+            matches!(error, ProcessError::SenderRecovery { index: 0, .. }),
+            "{error}"
+        );
     }
 }
 

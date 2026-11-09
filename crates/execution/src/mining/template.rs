@@ -461,7 +461,7 @@ impl BlockTemplateBuilder {
             // REMASC closes the sequential sublist and is not placed by the
             // ordinary rule -- it is the block's last transaction by
             // definition.
-            if index + 1 == kept.len() && is_remasc(tx) {
+            if tx.is_remasc(index, kept.len()) {
                 partitioner.add_remasc(index, result.gas_used);
                 placed.push(index);
                 continue;
@@ -676,13 +676,6 @@ fn account_nonce(state_root: &TrieNode, store: &dyn TrieStore, addr: &Address) -
 /// transaction would give it a different hash and put a different
 /// transactions root in the header. rskj `RemascTransaction(long blockNumber)`
 /// with `Transaction.encode`.
-/// Whether `tx` is the REMASC system transaction, by shape.
-pub fn is_remasc(tx: &Transaction) -> bool {
-    tx.to.as_ref() == crate::precompiles::REMASC_ADDR.as_slice()
-        && tx.r.is_zero()
-        && tx.s.is_zero()
-}
-
 pub fn remasc_transaction(block_number: u64) -> Transaction {
     let nonce = block_number.saturating_sub(1);
     let to = Bytes::copy_from_slice(crate::precompiles::REMASC_ADDR.as_slice());

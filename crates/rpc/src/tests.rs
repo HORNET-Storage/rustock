@@ -934,56 +934,46 @@ fn setup_state_with_tx() -> (RpcState, tempfile::TempDir, B256) {
 /// can find -- a round trip through the production code, with nothing computed
 /// by hand in the test.
 ///
-/// This broke because three different hash implementations existed: the
-/// canonical `Transaction::tx_hash()` (which hashes the ORIGINAL bytes when
-/// cached at decode time) and two RPC-local helpers that re-encoded instead.
-/// The index is keyed by the canonical hash, so for every transaction whose RLP
-/// does not round-trip byte-for-byte -- about 42% of mainnet transactions when
-/// measured on the production node -- the RPC handed out a hash that it could
-/// not then resolve.
+/// This broke because three different hash implementations existed:
+/// `Transaction::tx_hash()`, which hashes the encoding rskj hashes the
+/// transaction by, kept at decode time, and two RPC-local helpers that
+/// re-encoded canonically instead. The index is keyed by `tx_hash()`, so for
+/// every transaction whose rskj encoding is not canonical RLP -- about 42% of
+/// mainnet transactions when measured on the production node -- the RPC
+/// handed out a hash that it could not then resolve.
 ///
-/// The fixture deliberately uses a transaction whose cached RLP differs from a
-/// re-encoding, and indexes it with `index_block_transactions`, the function the
-/// commit path uses, rather than calling `put_tx_index` by hand.
+/// The fixture deliberately uses a transaction whose rskj encoding differs
+/// from a canonical one, and indexes it with `index_block_transactions`, the
+/// function the commit path uses, rather than calling `put_tx_index` by hand.
 #[tokio::test]
 async fn reported_tx_hash_is_the_one_that_can_be_looked_up() {
     let tmp = tempfile::tempdir().unwrap();
     let store = Arc::new(BlockStore::open(tmp.path()).unwrap());
 
-    let mut tx = rustock_core::Transaction {
-        nonce: 0,
-        gas_price: U256::from(1),
-        gas_limit: U256::from(21_000),
-        to: alloy_primitives::Bytes::from(vec![0x12; 20]),
-        value: U256::from(1_000_000),
-        input: alloy_primitives::Bytes::default(),
-        v: 27,
-        r: U256::from(100),
-        s: U256::from(200),
-        cached_rlp: None,
-    };
-    // Non-canonical but perfectly decodable bytes: `r` carries a leading zero,
-    // which is what Java's BigInteger.toByteArray() produces for a positive
-    // number whose top bit is set. rustock decodes it leniently (see
-    // rlp_compat) to the same value, but re-encoding drops the zero -- so the
-    // stored bytes and a re-encoding hash differently. This is the real shape
-    // of the divergence, not a synthetic one.
+    // A zero gas price written as the byte 0x00, which rskj keeps
+    // (`encodeCoinNonNullZero`) where canonical RLP writes zero empty: the
+    // federators' free bridge transactions are written so.
     let mut payload: Vec<u8> = Vec::new();
     payload.push(0x80);                                   // nonce 0
-    payload.push(0x01);                                   // gas_price 1
+    payload.push(0x00);                                   // gas_price 0, the byte 0x00
     payload.extend_from_slice(&[0x82, 0x52, 0x08]);       // gas_limit 21000
     payload.push(0x94);                                   // to: 20-byte string
     payload.extend_from_slice(&[0x12; 20]);
     payload.extend_from_slice(&[0x83, 0x0f, 0x42, 0x40]); // value 1_000_000
     payload.push(0x80);                                   // input: empty
     payload.push(0x1b);                                   // v 27
-    payload.extend_from_slice(&[0x82, 0x00, 0x80]);       // r 128, WITH a leading zero
+    payload.push(0x64);                                   // r 100
     payload.extend_from_slice(&[0x81, 0xc8]);             // s 200
     let mut original = vec![0xc0 + payload.len() as u8];
     original.extend_from_slice(&payload);
 
-    tx.r = U256::from(128);
-    tx.cached_rlp = Some(original);
+    let tx = <rustock_core::Transaction as alloy_rlp::Decodable>::decode(&mut original.as_slice())
+        .unwrap();
+    assert_eq!(
+        tx.rlp_for_trie(),
+        original,
+        "rskj keeps these bytes as they are"
+    );
 
     let mut reencoded = Vec::new();
     alloy_rlp::Encodable::encode(&tx, &mut reencoded);

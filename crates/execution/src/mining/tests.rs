@@ -1567,10 +1567,20 @@ mod uncle_tests {
 
 mod partitioned_templates {
     use super::*;
-    use crate::mining::template::{PendingTransaction, PendingTransactionSource, is_remasc};
+    use crate::mining::template::{PendingTransaction, PendingTransactionSource};
     use k256::ecdsa::SigningKey;
     use rustock_core::Transaction;
     use sha3::Digest;
+
+    /// A mined block's transactions but the REMASC one that ends it.
+    fn but_remasc(transactions: &[Transaction]) -> &[Transaction] {
+        let (last, rest) = transactions.split_last().expect("a block ends with REMASC");
+        assert!(
+            last.is_remasc(rest.len(), transactions.len()),
+            "a block ends with REMASC"
+        );
+        rest
+    }
 
     /// A pool that hands out exactly what it was given, minus what the
     /// builder told it to evict, and remembers every eviction call.
@@ -1958,11 +1968,8 @@ mod partitioned_templates {
         let template = builder
             .build(std::slice::from_ref(&parent), Vec::new(), &pool)
             .expect("the template builds");
-        let senders: Vec<Address> = template
-            .block
-            .transactions
+        let senders: Vec<Address> = but_remasc(&template.block.transactions)
             .iter()
-            .filter(|tx| !is_remasc(tx))
             .map(|tx| tx.recover_sender(chain_id).unwrap())
             .collect();
         assert_eq!(senders, vec![address_of(first)], "only the first sender's transfer is in");
@@ -1992,11 +1999,8 @@ mod partitioned_templates {
             .build(std::slice::from_ref(&parent), Vec::new(), &pool)
             .expect("the template builds");
         assert_eq!(template.block.header.minimum_gas_price, U256::from(100));
-        let prices: Vec<U256> = template
-            .block
-            .transactions
+        let prices: Vec<U256> = but_remasc(&template.block.transactions)
             .iter()
-            .filter(|tx| !is_remasc(tx))
             .map(|tx| tx.gas_price)
             .collect();
         assert_eq!(prices, vec![U256::from(10_000)], "at the cap is in, over it is out");
@@ -2040,11 +2044,8 @@ mod partitioned_templates {
         let template = builder
             .build(std::slice::from_ref(&parent), Vec::new(), &pool)
             .expect("the template builds although one candidate is invalid");
-        let mined: Vec<Address> = template
-            .block
-            .transactions
+        let mined: Vec<Address> = but_remasc(&template.block.transactions)
             .iter()
-            .filter(|tx| !is_remasc(tx))
             .map(|tx| tx.recover_sender(chain_id).unwrap())
             .collect();
         assert_eq!(mined, vec![good.sender], "the good transfer is in, the refused one is not");

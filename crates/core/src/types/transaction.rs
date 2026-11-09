@@ -3,8 +3,6 @@ use alloy_rlp::{Decodable, Encodable, RlpEncodable};
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
 
-use crate::rlp_compat::{decode_u64_lenient, decode_u256_lenient};
-
 #[derive(Clone, Debug, Serialize, Deserialize, RlpEncodable)]
 pub struct Transaction {
     pub nonce: u64,
@@ -17,9 +15,11 @@ pub struct Transaction {
     pub r: U256,
     pub s: U256,
 
-    /// Original RLP bytes received from the peer. Java's RLP encoding differs
-    /// from Rust's canonical encoding (leading-zero BigIntegers), so we cache
-    /// the original bytes and use them for transactions_root computation.
+    /// The encoding rskj hashes a decoded transaction by and serves it in
+    /// (`Transaction.getEncoded`), which rskj rebuilds from the fields as it
+    /// holds them rather than keeping the bytes that came: see
+    /// [`Transaction::from_rskj`]. A transaction built here has none, and
+    /// encodes canonically, as rskj would.
     #[serde(skip)]
     #[rlp(skip)]
     pub cached_rlp: Option<Vec<u8>>,
@@ -59,37 +59,28 @@ impl Default for Transaction {
 }
 
 impl Decodable for Transaction {
+    /// The next transaction of a stream, as rskj reads a block's
+    /// (`BlockFactory.parseTxs`): the next RLP element as `RLP.decode2` cuts
+    /// it, whose `getRLPData` rskj hands to `new ImmutableTransaction(..)`.
+    /// That is a list's whole encoding but an item's payload, so a
+    /// transaction may come wrapped in a byte string; an empty item, rskj's
+    /// null, is refused.
     fn decode(buf: &mut &[u8]) -> alloy_rlp::Result<Self> {
-        let original = *buf;
-        let h = alloy_rlp::Header::decode(buf)?;
-        if !h.list {
-            return Err(alloy_rlp::Error::UnexpectedString);
-        }
-        let mut body = &buf[..h.payload_length];
-        *buf = &buf[h.payload_length..];
-
-        let consumed = original.len() - buf.len();
-        let cached = original[..consumed].to_vec();
-
-        Ok(Self {
-            nonce: decode_u64_lenient(&mut body)?,
-            gas_price: decode_u256_lenient(&mut body)?,
-            gas_limit: decode_u256_lenient(&mut body)?,
-            to: Bytes::decode(&mut body)?,
-            value: decode_u256_lenient(&mut body)?,
-            input: Bytes::decode(&mut body)?,
-            v: decode_u64_lenient(&mut body)?,
-            r: decode_u256_lenient(&mut body)?,
-            s: decode_u256_lenient(&mut body)?,
-            cached_rlp: Some(cached),
-        })
+        let (element, next) = crate::rskj_rlp::first_element(buf)
+            .map_err(|_| alloy_rlp::Error::Custom("malformed transaction RLP"))?;
+        let raw = element
+            .data()
+            .ok_or(alloy_rlp::Error::Custom("an empty transaction"))?;
+        let tx = Self::from_rskj(raw)?;
+        *buf = &buf[next..];
+        Ok(tx)
     }
 }
 
 impl Transaction {
-    /// Returns the RLP encoding to use for trie root computation.
-    /// Prefers the original bytes (from peer) to match Java's encoding;
-    /// falls back to re-encoding if no cached bytes are available.
+    /// The encoding the transactions root takes, and the hash: rskj's
+    /// (`getEncoded`) for a decoded transaction, and the canonical one, which
+    /// rskj's agrees with, for one built here.
     pub fn rlp_for_trie(&self) -> Vec<u8> {
         if let Some(ref cached) = self.cached_rlp {
             return cached.clone();
@@ -98,77 +89,188 @@ impl Transaction {
         self.encode(&mut buf);
         buf
     }
+
+    /// A transaction as rskj reads `raw` (`Transaction(byte[] rawData)`), with
+    /// the encoding rskj hashes it by.
+    ///
+    /// rskj reads `raw` as exactly one RLP list (`RLP.decodeList`) of exactly
+    /// nine elements, each by `getRLPData`. Nonce, gas limit and data keep
+    /// their bytes; gas price and value are unsigned numbers, the gas price
+    /// remembering whether it came empty; `to` is empty or 20 bytes; and `v`
+    /// is absent, for no signature, when r and s go unread, or one byte, when
+    /// r and s must be there.
+    ///
+    /// Refused here as well is what rskj reads but no block can carry, since
+    /// every transaction of a block passes `BlockTxsFieldsValidationRule`, and
+    /// no pool takes either:
+    /// - what `validate()` refuses: a nonce or gas limit of more than 32
+    ///   bytes, a gas price or value of 2^255 or more (`BigInteger
+    ///   .toByteArray` in 32 bytes), and r or s of more than 32 significant
+    ///   bytes; and an empty gas limit, on which it throws;
+    /// - a `v` that names a negative chain, below 34 but for 27 and 28, whose
+    ///   signature `acceptTransactionSignature` never takes;
+    /// - a nonce past 64 bits, which no account reaches.
+    ///
+    /// So a `v` here is never 0, which keeps meaning no signature.
+    ///
+    /// rskj hashes a transaction by an encoding it rebuilds from those fields
+    /// (`getEncoded`) rather than by `raw`, and that is the one kept: a nonce
+    /// of the one byte 0 goes empty and any other stays as it came; the gas
+    /// price stays empty if it came empty, and is otherwise minimal, or 0x00
+    /// for zero; the gas limit and data stay as they came; the value is
+    /// minimal, and empty for zero; `v` is rebuilt from the chain and
+    /// recovery id it names; r and s are minimal; and every length prefix is
+    /// canonical. The transaction's `v` is the one in that encoding, which
+    /// names the same chain and recovery id.
+    pub fn from_rskj(raw: &[u8]) -> alloy_rlp::Result<Self> {
+        use crate::rskj_rlp::Element;
+        let refuse = alloy_rlp::Error::Custom;
+        let elements = crate::rskj_rlp::decode2(raw).map_err(|_| refuse("malformed RLP"))?;
+        let [list] = elements.as_slice() else {
+            return Err(refuse("Expected one RLP item"));
+        };
+        let fields = list
+            .elements()
+            .map_err(|_| refuse("The decoded element wasn't a list"))?;
+        let [nonce, gas_price, gas_limit, to, value, input, v, r, s] = fields.as_slice() else {
+            return Err(refuse("A transaction must have exactly 9 elements"));
+        };
+        let nonce_bytes = nonce.data().unwrap_or_default();
+        if nonce_bytes.len() > 32 {
+            return Err(refuse("Nonce is not valid"));
+        }
+        let nonce = unsigned(nonce_bytes)
+            .and_then(|nonce| u64::try_from(nonce).ok())
+            .ok_or(refuse("a nonce past 64 bits"))?;
+        let gas_limit_bytes = match gas_limit.data() {
+            Some(bytes) if bytes.len() <= 32 => bytes,
+            _ => return Err(refuse("Gas Limit is not valid")),
+        };
+        let coin = |element: &Element, why| match element.data() {
+            None => Ok(U256::ZERO),
+            Some(bytes) => unsigned(bytes)
+                .filter(|coin| coin.bit_len() < 256)
+                .ok_or(refuse(why)),
+        };
+        let gas_price_came_empty = gas_price.data().is_none();
+        let gas_price = coin(gas_price, "Gas Price is not valid")?;
+        let value = coin(value, "Value is not valid")?;
+        let to = match to.data() {
+            None => Bytes::new(),
+            Some(address) if address.len() == 20 => Bytes::copy_from_slice(address),
+            Some(_) => return Err(refuse("An RSK address must be 20 bytes long")),
+        };
+        let input = input.data().unwrap_or_default();
+        let component =
+            |element: &Element, why| element.data().and_then(unsigned).ok_or(refuse(why));
+        let (v, r, s) = match v.data() {
+            None => (0, U256::ZERO, U256::ZERO),
+            Some(&[v]) => {
+                let (chain, recovery_id) =
+                    read_v(v).ok_or(refuse("a v that names a negative chain"))?;
+                (
+                    encoded_v(chain, recovery_id),
+                    component(r, "Signature R is not valid")?,
+                    component(s, "Signature S is not valid")?,
+                )
+            }
+            Some(_) => return Err(refuse("Signature V is invalid")),
+        };
+
+        // `getEncoded`: `Transaction.encode`, field by field.
+        let mut payload = Vec::with_capacity(raw.len());
+        let nonce_kept: &[u8] = if nonce_bytes == [0] { &[] } else { nonce_bytes };
+        nonce_kept.encode(&mut payload);
+        if gas_price_came_empty {
+            payload.push(alloy_rlp::EMPTY_STRING_CODE);
+        } else {
+            unsigned_bytes(gas_price).as_slice().encode(&mut payload);
+        }
+        gas_limit_bytes.encode(&mut payload);
+        to.as_ref().encode(&mut payload);
+        value
+            .to_be_bytes_trimmed_vec()
+            .as_slice()
+            .encode(&mut payload);
+        input.encode(&mut payload);
+        if v == 0 {
+            payload.extend_from_slice(&[alloy_rlp::EMPTY_STRING_CODE; 3]);
+        } else {
+            v.encode(&mut payload);
+            unsigned_bytes(r).as_slice().encode(&mut payload);
+            unsigned_bytes(s).as_slice().encode(&mut payload);
+        }
+        let mut encoding = Vec::with_capacity(payload.len() + 9);
+        alloy_rlp::Header {
+            list: true,
+            payload_length: payload.len(),
+        }
+        .encode(&mut encoding);
+        encoding.extend_from_slice(&payload);
+
+        Ok(Self {
+            nonce,
+            gas_price,
+            gas_limit: U256::from_be_slice(gas_limit_bytes),
+            to,
+            value,
+            input: Bytes::copy_from_slice(input),
+            v,
+            r,
+            s,
+            cached_rlp: Some(encoding),
+        })
+    }
 }
 
 impl Transaction {
-    /// Compute the signing hash for this transaction, dispatching based on `v`.
-    ///
-    /// EIP-155 transactions include `[chainId, 0, 0]` in the RLP; legacy ones do not.
-    pub fn signing_hash(&self, chain_id: u64) -> B256 {
-        if let Some(hash) = self.signing_hash_from_cached(chain_id) {
-            return hash;
-        }
-        if self.is_eip155(chain_id) {
-            self.signing_hash_eip155(chain_id)
-        } else {
-            self.signing_hash_legacy()
+    /// What this transaction's signature signs, rskj's `getRawHash`: by the
+    /// chain its `v` names, or by none.
+    pub fn signing_hash(&self) -> B256 {
+        match self.chain_and_recovery_id() {
+            Some((chain, _)) if chain != 0 => self.signing_hash_eip155(u64::from(chain)),
+            _ => self.signing_hash_legacy(),
         }
     }
 
-    /// Signing hash built from the ORIGINAL (network) encoding. rskj signs
-    /// over the raw decoded byte arrays (Transaction.getEncodedRaw), which
-    /// may use non-canonical zero encodings — e.g. a literal 0x00 byte for a
-    /// zero gasLimit. Re-encoding the parsed fields canonically changes the
-    /// hash and recovers the wrong sender, so the first six item encodings
-    /// are reused verbatim.
-    fn signing_hash_from_cached(&self, chain_id: u64) -> Option<B256> {
-        let cached = self.cached_rlp.as_ref()?;
-        let mut buf = cached.as_slice();
-        let header = alloy_rlp::Header::decode(&mut buf).ok()?;
-        if !header.list || buf.len() < header.payload_length {
-            return None;
-        }
-        let mut rest = &buf[..header.payload_length];
-        let mut inner = Vec::with_capacity(header.payload_length + 8);
-        for _ in 0..6 {
-            let item = take_rlp_item(&mut rest)?;
-            inner.extend_from_slice(item);
-        }
-        if self.is_eip155(chain_id) {
-            chain_id.encode(&mut inner);
-            0u8.encode(&mut inner);
-            0u8.encode(&mut inner);
-        }
-        Some(Self::rlp_wrap_and_hash(&inner))
-    }
-
-    /// EIP-155 signing hash: `keccak256(RLP([nonce, gasPrice, gasLimit, to, value, data, chainId, 0, 0]))`.
+    /// What a signature for the chain `chain_id` signs, rskj's
+    /// `getEncodedRaw` hashed: the six fields as rskj writes them, then the
+    /// chain id (`RLP.encodeByte`) and two empty items.
     pub fn signing_hash_eip155(&self, chain_id: u64) -> B256 {
-        let mut inner = Vec::with_capacity(256);
-        self.nonce.encode(&mut inner);
-        self.gas_price.encode(&mut inner);
-        self.gas_limit.encode(&mut inner);
-        self.to.encode(&mut inner);
-        self.value.encode(&mut inner);
-        self.input.encode(&mut inner);
+        let mut inner = self.signed_fields();
         chain_id.encode(&mut inner);
         0u8.encode(&mut inner);
         0u8.encode(&mut inner);
-
         Self::rlp_wrap_and_hash(&inner)
     }
 
-    /// Legacy (pre-EIP-155) signing hash: `keccak256(RLP([nonce, gasPrice, gasLimit, to, value, data]))`.
+    /// What a signature for no chain in particular signs, rskj's
+    /// `getEncodedRaw` hashed at chain 0: the six fields as rskj writes them.
     pub fn signing_hash_legacy(&self) -> B256 {
-        let mut inner = Vec::with_capacity(256);
+        Self::rlp_wrap_and_hash(&self.signed_fields())
+    }
+
+    /// The six fields a signature covers, each the RLP item rskj writes for it
+    /// (`Transaction.encode`): `cached_rlp`'s, for a transaction read from
+    /// bytes, and otherwise the fields' own, which are rskj's for fields that
+    /// came canonical. A zero gas limit of the one byte 0, which canonical RLP
+    /// writes empty, is why: mainnet's early bridge transactions carry one.
+    fn signed_fields(&self) -> Vec<u8> {
+        if let Some(fields) = self
+            .cached_rlp
+            .as_deref()
+            .and_then(|rlp| first_items(rlp, 6))
+        {
+            return fields.to_vec();
+        }
+        let mut inner = Vec::with_capacity(128 + self.input.len());
         self.nonce.encode(&mut inner);
         self.gas_price.encode(&mut inner);
         self.gas_limit.encode(&mut inner);
         self.to.encode(&mut inner);
         self.value.encode(&mut inner);
         self.input.encode(&mut inner);
-
-        Self::rlp_wrap_and_hash(&inner)
+        inner
     }
 
     fn rlp_wrap_and_hash(inner: &[u8]) -> B256 {
@@ -176,6 +278,56 @@ impl Transaction {
         alloy_rlp::Header { list: true, payload_length: inner.len() }.encode(&mut buf);
         buf.extend_from_slice(inner);
         B256::from_slice(&Keccak256::digest(&buf))
+    }
+
+    /// The chain this transaction's signature is for, 0 for none, and its
+    /// recovery id, as rskj reads them from `v` ([`read_v`]). `None` for no
+    /// signature, and for a `v` rskj takes no signature by: past a byte, or
+    /// naming a negative chain.
+    pub fn chain_and_recovery_id(&self) -> Option<(u8, u8)> {
+        u8::try_from(self.v).ok().and_then(read_v)
+    }
+
+    /// The gas this transaction gives, as rskj reads its gas limit's bytes
+    /// (`GasCost.toGas`): more than eight bytes, leading zeros or not, read
+    /// as `Long.MAX_VALUE`, which no block's gas fits
+    /// (`TransactionExecutor.gasIsValid`). `None` for eight bytes with the
+    /// top bit set, a negative `long`, on which rskj throws.
+    pub fn gas(&self) -> Option<u64> {
+        let bytes = self.gas_limit_bytes();
+        if bytes.len() > 8 {
+            return Some(i64::MAX as u64);
+        }
+        let gas = bytes
+            .iter()
+            .fold(0u64, |gas, byte| gas << 8 | u64::from(*byte));
+        i64::try_from(gas).is_ok().then_some(gas)
+    }
+
+    /// The gas limit's bytes as rskj holds them (`getGasLimit`): as they came,
+    /// leading zeros and all, for a transaction read from bytes.
+    fn gas_limit_bytes(&self) -> Vec<u8> {
+        self.cached_rlp
+            .as_deref()
+            .and_then(|rlp| list_item(rlp, 2))
+            .map_or_else(|| self.gas_limit.to_be_bytes_trimmed_vec(), <[u8]>::to_vec)
+    }
+
+    /// Whether this is the REMASC transaction of a block of `count`
+    /// transactions, at `index` (rskj: `Transaction.isRemascTransaction`): the
+    /// last, to REMASC, with no data and no signature, and value, gas limit
+    /// and gas price zero. Its gas limit has bytes, zero or not: rskj reads it
+    /// by `new BigInteger(1, getGasLimit())`, which throws on none, and the
+    /// block with it (`BlockFactory.parseTxs`).
+    pub fn is_remasc(&self, index: usize, count: usize) -> bool {
+        index + 1 == count
+            && self.to.as_ref() == crate::validation::block_rules::REMASC_ADDR
+            && self.input.is_empty()
+            && self.v == 0
+            && self.value.is_zero()
+            && self.gas_price.is_zero()
+            && self.gas_limit.is_zero()
+            && !self.gas_limit_bytes().is_empty()
     }
 }
 
@@ -191,6 +343,87 @@ fn take_rlp_item<'a>(buf: &mut &'a [u8]) -> Option<&'a [u8]> {
     let (item, rest) = start.split_at(total);
     *buf = rest;
     Some(item)
+}
+
+/// The payload of the RLP list `encoding`.
+fn list_payload(encoding: &[u8]) -> Option<&[u8]> {
+    let mut buf = encoding;
+    let header = alloy_rlp::Header::decode(&mut buf).ok()?;
+    if !header.list {
+        return None;
+    }
+    buf.get(..header.payload_length)
+}
+
+/// The first `count` items of the RLP list `encoding`, prefixes and all.
+fn first_items(encoding: &[u8], count: usize) -> Option<&[u8]> {
+    let payload = list_payload(encoding)?;
+    let mut rest = payload;
+    for _ in 0..count {
+        take_rlp_item(&mut rest)?;
+    }
+    Some(&payload[..payload.len() - rest.len()])
+}
+
+/// The payload of item `index` of the RLP list `encoding`.
+fn list_item(encoding: &[u8], index: usize) -> Option<&[u8]> {
+    let mut rest = list_payload(encoding)?;
+    for _ in 0..index {
+        take_rlp_item(&mut rest)?;
+    }
+    let mut item = take_rlp_item(&mut rest)?;
+    let header = alloy_rlp::Header::decode(&mut item).ok()?;
+    if header.list {
+        return None;
+    }
+    item.get(..header.payload_length)
+}
+
+/// A number from big-endian bytes, as Java's `new BigInteger(1, bytes)` reads
+/// them, where it fits 256 bits.
+fn unsigned(bytes: &[u8]) -> Option<U256> {
+    let first = bytes
+        .iter()
+        .position(|byte| *byte != 0)
+        .unwrap_or(bytes.len());
+    let significant = &bytes[first..];
+    (significant.len() <= 32).then(|| U256::from_be_slice(significant))
+}
+
+/// Bouncy Castle's `BigIntegers.asUnsignedByteArray`: a number's minimal
+/// big-endian bytes, and the one byte 0 for zero.
+fn unsigned_bytes(value: U256) -> Vec<u8> {
+    if value.is_zero() {
+        vec![0]
+    } else {
+        value.to_be_bytes_trimmed_vec()
+    }
+}
+
+/// What rskj reads from a signature's `v`: the chain the signature is for
+/// (`extractChainIdFromV`), 0 for none, which every network takes; and the
+/// recovery id, `getRealV` less 27. 27 and 28 name no chain; otherwise the
+/// chain is `(v - 35) / 2` in Java's `int` division, which truncates toward
+/// zero, so 34 to 36 name none either, and the real v is 28 for an even `v`
+/// and 27 for an odd one. `None` below 34 but for 27 and 28: a negative
+/// chain, which no network is.
+fn read_v(v: u8) -> Option<(u8, u8)> {
+    let recovery_id = u8::from(v.is_multiple_of(2));
+    match v {
+        27 | 28 | 34..=255 => Some((v.saturating_sub(35) / 2, recovery_id)),
+        _ => None,
+    }
+}
+
+/// The `v` rskj writes for a signature (`Transaction.rlpEncode`): its
+/// recovery id plus 27, or plus `chain * 2 + 35` for a chain.
+fn encoded_v(chain: u8, recovery_id: u8) -> u64 {
+    let base = if chain == 0 {
+        27
+    } else {
+        u64::from(chain) * 2 + 35
+    };
+    base + u64::from(recovery_id)
 }
 
 /// The verification context libsecp256k1 wants, built once per process.
@@ -326,7 +559,9 @@ pub fn recover_address(hash: &[u8; 32], signature: &[u8; 64], recovery_id: u8) -
 
 impl Transaction {
 
-    /// Recover the sender address from the transaction signature.
+    /// The sender of a transaction the network `chain_id` takes, as rskj
+    /// finds it: refused unless rskj would take the signature there
+    /// (`acceptTransactionSignature`, see [`Transaction::recover_key`]).
     ///
     /// RSK chain IDs: mainnet=30, testnet=31, regtest=33.
     ///
@@ -347,36 +582,37 @@ impl Transaction {
         })
     }
 
-    /// The key this transaction's signature recovers, as rskj recovers it.
+    /// The key this transaction's signature recovers, as rskj recovers it,
+    /// where the network `chain_id` takes the signature, as rskj's
+    /// `acceptTransactionSignature` takes it from every transaction of a
+    /// block but REMASC (`BlockTxsFieldsValidationRule`) and from every one
+    /// it is sent: a signature for no chain or for `chain_id`, with r from 1
+    /// to below the curve's order and s from 1 to below half of it.
     /// `recover_sender` and `btc_sender_hash160` both take it from here, so
     /// they cannot drift apart on what a signature means.
+    ///
+    /// A sender found here depends on nothing but the transaction's hash: the
+    /// encoding hashed holds the six fields and r and s, and its `v` names
+    /// the chain and recovery id, the same two for every `v` read here
+    /// ([`Transaction::from_rskj`]). So a cache of senders by hash is sound.
     fn recover_key(&self, chain_id: u64) -> anyhow::Result<Recovered> {
-        let hash = self.signing_hash(chain_id);
-
-        let recovery_id = if self.is_eip155(chain_id) {
-            // `is_eip155` holds `v` at `chain_id * 2 + 35` or more, so this is
-            // the id, or past 1. Unsigned: in an `i64`, a `v` of 2^63 or more
-            // went negative, and the subtraction overflowed.
-            let rid = self.v - (chain_id * 2 + 35);
-            if rid > 1 {
-                anyhow::bail!("invalid EIP-155 v value: {} for chain_id {}", self.v, chain_id);
-            }
-            rid as u8
-        } else {
-            if self.v != 27 && self.v != 28 {
-                anyhow::bail!("invalid legacy v value: {}", self.v);
-            }
-            (self.v - 27) as u8
+        let Some((chain, recovery_id)) = self.chain_and_recovery_id() else {
+            anyhow::bail!("no signature rskj takes: v {}", self.v);
         };
-
+        if chain != 0 && u64::from(chain) != chain_id {
+            anyhow::bail!("a signature for chain {chain}, not {chain_id}");
+        }
+        let order = U256::from_be_bytes(secp256k1::constants::CURVE_ORDER);
+        if self.r.is_zero() || self.r >= order {
+            anyhow::bail!("signature r out of range");
+        }
+        if self.s.is_zero() || self.s >= order >> 1 {
+            anyhow::bail!("signature s out of range, or in the curve order's upper half");
+        }
         let mut sig_bytes = [0u8; 64];
         sig_bytes[..32].copy_from_slice(&self.r.to_be_bytes::<32>());
         sig_bytes[32..].copy_from_slice(&self.s.to_be_bytes::<32>());
-        recover(&hash.0, &sig_bytes, recovery_id)
-    }
-
-    pub fn is_eip155(&self, chain_id: u64) -> bool {
-        self.v != 27 && self.v != 28 && self.v >= chain_id * 2 + 35
+        recover(&self.signing_hash().0, &sig_bytes, recovery_id)
     }
 
     /// Recover the compressed (33-byte) secp256k1 public key from the transaction signature.
@@ -433,7 +669,7 @@ mod tests {
             to: Bytes::from(vec![0x12; 20]),
             value: U256::from(1_000_000_000_000_000_000u64),
             input: Bytes::from(vec![0xde, 0xad, 0xbe, 0xef]),
-            v: 1,
+            v: 27,
             r: U256::from(123),
             s: U256::from(456),
             cached_rlp: None,
@@ -460,17 +696,18 @@ mod tests {
             s: U256::from(1),
             cached_rlp: None,
         };
-        assert!(tx.is_eip155(30));
+        assert_eq!(tx.chain_and_recovery_id(), Some((30, 0)));
 
-        let hash1 = tx.signing_hash(30);
-        let hash2 = tx.signing_hash(30);
-        assert_eq!(hash1, hash2, "signing hash should be deterministic");
-
+        let hash = tx.signing_hash();
+        assert_eq!(hash, tx.signing_hash_eip155(30), "v 95 signs for chain 30");
         let hash_direct = tx.signing_hash_eip155(31);
-        assert_ne!(hash1, hash_direct, "different chain_id should produce different hash");
+        assert_ne!(
+            hash, hash_direct,
+            "different chain_id should produce different hash"
+        );
 
         let legacy = tx.signing_hash_legacy();
-        assert_ne!(hash1, legacy, "EIP-155 hash differs from legacy hash");
+        assert_ne!(hash, legacy, "EIP-155 hash differs from legacy hash");
     }
 
     #[test]
@@ -488,25 +725,58 @@ mod tests {
             cached_rlp: None,
         };
 
-        let hash = tx.signing_hash(30);
-        assert_ne!(hash, B256::ZERO);
+        assert_eq!(
+            tx.signing_hash(),
+            tx.signing_hash_legacy(),
+            "v 27 signs for no chain"
+        );
     }
 
-    /// Two transactions that differ only in `v` must hash differently.
+    /// A transaction's hash is rskj's (`getHash`, of `getEncoded`), whose `v`
+    /// rskj rebuilds from the chain and recovery id it reads there. So every
+    /// `v` that names the same two hashes alike, as 35 does with 27, and any
+    /// two that name different ones hash apart.
     ///
-    /// The sender cache in `rustock_execution::sender_cache` is keyed by
-    /// `tx_hash()`, and `v` selects both the signing hash (legacy or
-    /// EIP-155) and the recovery id -- so two wire forms that hashed alike
-    /// but recovered differently would let whichever was seen first decide
-    /// the sender of the second.
-    ///
-    /// Two things keep them apart, and this checks both. `v` is stored
-    /// verbatim and re-encoded verbatim, so nothing reconstructs it from a
-    /// chain id and folds two values onto one; and `tx_hash` prefers
-    /// `cached_rlp`, the bytes as received, which differ anyway.
+    /// The sender cache in `rustock_execution::sender_cache` is keyed by this
+    /// hash: a hash that came with two readings of `v` would let whichever
+    /// was seen first decide the sender of the other.
     #[test]
-    fn the_hash_separates_transactions_that_differ_only_in_v() {
-        let base = Transaction {
+    fn the_hash_follows_what_v_names() {
+        let mut readings = std::collections::HashMap::new();
+        for v in 0..=255u8 {
+            let mut payload = vec![0x01, 0x01, 0x82, 0x52, 0x08, 0x94];
+            payload.extend_from_slice(&[0x11; 20]);
+            payload.extend_from_slice(&[0x82, 0x03, 0xe8, 0x80]);
+            // As a one-byte string, so that 0 is the byte 00, not empty.
+            [v].as_slice().encode(&mut payload);
+            payload.extend_from_slice(&[0x82, 0x12, 0x34, 0x82, 0x56, 0x78]);
+            let mut raw = Vec::new();
+            alloy_rlp::Header {
+                list: true,
+                payload_length: payload.len(),
+            }
+            .encode(&mut raw);
+            raw.extend_from_slice(&payload);
+
+            let read = Transaction::decode(&mut raw.as_slice());
+            let named = read_v(v);
+            assert_eq!(read.is_ok(), named.is_some(), "v {v}");
+            let Ok(tx) = read else { continue };
+            assert_eq!(
+                tx.chain_and_recovery_id(),
+                named,
+                "v {v} keeps what it names"
+            );
+            if let Some(other) = readings.insert(tx.tx_hash(), named) {
+                assert_eq!(other, named, "v {v} hashes as a v that names otherwise");
+            }
+        }
+        // 27 and 28, and 34 to 36, name no chain; 37 to 255 one each, two
+        // recovery ids apiece.
+        assert_eq!(readings.len(), 2 + 219);
+
+        // A transaction built here hashes as rskj would its encoding.
+        let built = Transaction {
             nonce: 1,
             gas_price: U256::from(1u64),
             gas_limit: U256::from(21_000u64),
@@ -518,27 +788,14 @@ mod tests {
             s: U256::from(0x5678u64),
             cached_rlp: None,
         };
-
-        // Every `v` a legacy or near-legacy wire form could carry, including
-        // the values either side of the canonical pair.
-        let mut seen = std::collections::HashMap::new();
-        for v in [0u64, 26, 27, 28, 29, 35, 36, 37, 38] {
-            let tx = Transaction { v, ..base.clone() };
-            if let Some(other) = seen.insert(tx.tx_hash(), v) {
-                panic!("v={v} and v={other} produce the same transaction hash");
-            }
-        }
-
-        // And again through a real decode, so the cached-bytes path is
-        // covered rather than only the re-encoding one.
         let mut encoded = Vec::new();
-        base.encode(&mut encoded);
+        built.encode(&mut encoded);
         let decoded = Transaction::decode(&mut encoded.as_slice()).unwrap();
-        assert!(decoded.cached_rlp.is_some(), "decode must record the wire bytes");
-        assert_eq!(decoded.v, 28, "v must survive the round trip unchanged");
+        assert_eq!(decoded.cached_rlp.as_deref(), Some(encoded.as_slice()));
+        assert_eq!(decoded, built);
         assert_eq!(
             decoded.tx_hash(),
-            base.tx_hash(),
+            built.tx_hash(),
             "the same bytes must hash the same whether decoded or built"
         );
     }
@@ -575,7 +832,7 @@ mod tests {
         tx.s = U256::from_be_slice(&sig_bytes[32..]);
         tx.v = chain_id * 2 + 35 + recid.to_byte() as u64;
 
-        // Now recover_sender uses signing_hash(chain_id) which checks v → EIP-155
+        // v names chain 33, so recover_sender checks the signature for it.
         let recovered = tx.recover_sender(chain_id).unwrap();
 
         let vk = signing_key.verifying_key();
@@ -587,10 +844,10 @@ mod tests {
         assert_eq!(recovered, expected_addr, "recovered sender should match signing key");
     }
 
-    /// Regression for mainnet block #457: rskj signs over the ORIGINAL field
-    /// byte arrays, which may use non-canonical zero encodings (the free
-    /// bridge txs encode gasLimit as a literal 0x00 byte). The signing hash
-    /// must reuse the original encoding, not a canonical re-encoding.
+    /// Regression for mainnet block #457: rskj signs over the fields as it
+    /// holds them, and keeps a gas limit's bytes as they came, so the free
+    /// bridge transactions' zero gas limit, the one byte 0, is signed as that
+    /// byte, where canonical RLP writes zero empty.
     #[test]
     fn test_recover_sender_with_noncanonical_zero_gas_limit() {
         use k256::ecdsa::SigningKey;
@@ -688,9 +945,11 @@ mod tests {
         assert_eq!(INFINITY_SENDER.as_slice(), &Keccak256::digest(b"")[12..]);
     }
 
-    /// A signature made so that sR = eG, with R the generator and s the
-    /// signing hash, recovers the point at infinity whatever the transaction;
-    /// the same r with y's other parity recovers an ordinary key.
+    /// A signature made so that sR = eG recovers the point at infinity
+    /// whatever the transaction: R the generator, whose y is even, and s the
+    /// signing hash e; or, where that s would be in the upper half rskj
+    /// refuses, R the generator's negation, whose y is odd, and s the order
+    /// less e. The same r with y's other parity recovers an ordinary key.
     #[test]
     fn a_signature_made_so_that_sr_is_eg_recovers_the_infinity_sender() {
         let mut tx = Transaction {
@@ -706,10 +965,16 @@ mod tests {
             cached_rlp: None,
         };
         let order = U256::from_be_bytes(secp256k1::constants::CURVE_ORDER);
-        tx.s = U256::from_be_bytes(tx.signing_hash_eip155(33).0) % order;
+        let e = U256::from_be_bytes(tx.signing_hash_eip155(33).0) % order;
+        if e < order >> 1 {
+            tx.s = e;
+        } else {
+            tx.v += 1;
+            tx.s = order - e;
+        }
         assert_eq!(tx.recover_sender(33).unwrap(), INFINITY_SENDER);
 
-        tx.v += 1;
+        tx.v = if tx.v == 101 { 102 } else { 101 };
         let other = tx.recover_sender(33).unwrap();
         assert_ne!(other, INFINITY_SENDER);
         assert!(tx.recover_compressed_pubkey(33).is_some());
@@ -971,9 +1236,11 @@ mod untrusted_input_tests {
                 let _ = tx.rlp_for_trie();
             }
         }
-        // None of these is a recovery id on any network; 2^63 and up once
-        // overflowed the sum that finds it.
-        for v in [0, 26, 29, 34, 94, 99, 100, 103, 1 << 31, 1 << 63, u64::MAX] {
+        // No network takes a signature by any of these: rskj reads no chain
+        // from 0, 26, 29 or past a byte (2^63 and up once overflowed the sum
+        // that found the recovery id), and 94, 99, 100 and 103 name chains
+        // 29, 32, 32 and 34.
+        for v in [0, 26, 29, 94, 99, 100, 103, 1 << 31, 1 << 63, u64::MAX] {
             let tx = Transaction {
                 v,
                 r: U256::from(1u64),
@@ -987,5 +1254,420 @@ mod untrusted_input_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod rskj_reading_tests {
+    use super::*;
+    use crate::validation::block_rules::REMASC_ADDR;
+    use alloy_primitives::U256;
+    use alloy_rlp::Decodable;
+
+    /// A list of items, each already its RLP.
+    fn list(items: &[Vec<u8>]) -> Vec<u8> {
+        let payload = items.concat();
+        let mut raw = Vec::new();
+        alloy_rlp::Header {
+            list: true,
+            payload_length: payload.len(),
+        }
+        .encode(&mut raw);
+        raw.extend_from_slice(&payload);
+        raw
+    }
+
+    /// A byte string's canonical RLP.
+    fn item(bytes: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        bytes.encode(&mut out);
+        out
+    }
+
+    /// A transfer's nine items as canonical RLP writes them, signed with v 27.
+    fn fields() -> Vec<Vec<u8>> {
+        vec![
+            item(&[0x05]),
+            item(&[0x01]),
+            item(&[0x52, 0x08]),
+            item(&[0x11; 20]),
+            item(&[0x03, 0xe8]),
+            item(&[]),
+            item(&[27]),
+            item(&[0x12, 0x34]),
+            item(&[0x56, 0x78]),
+        ]
+    }
+
+    fn with(at: usize, field: Vec<u8>) -> Vec<Vec<u8>> {
+        let mut fields = fields();
+        fields[at] = field;
+        fields
+    }
+
+    fn read(fields: &[Vec<u8>]) -> alloy_rlp::Result<Transaction> {
+        Transaction::decode(&mut list(fields).as_slice())
+    }
+
+    /// What rskj's `Transaction(byte[])` throws on, and what `validate()`
+    /// refuses in every block, is refused when read.
+    #[test]
+    fn what_rskj_cannot_take_is_refused_when_read() {
+        assert!(read(&fields()).is_ok());
+        let mut eight = fields();
+        eight.pop();
+        assert!(read(&eight).is_err(), "eight fields");
+        let mut ten = fields();
+        ten.push(item(&[]));
+        assert!(read(&ten).is_err(), "ten fields");
+        assert!(read(&with(3, item(&[0x11; 19]))).is_err(), "a 19-byte to");
+        assert!(read(&with(3, item(&[0x11; 21]))).is_err(), "a 21-byte to");
+        assert!(
+            read(&with(3, item(&[]))).unwrap().to.is_empty(),
+            "no to: a creation"
+        );
+        assert!(read(&with(6, item(&[0x00, 27]))).is_err(), "a two-byte v");
+        assert!(read(&with(7, item(&[]))).is_err(), "a v with no r");
+        assert!(read(&with(8, item(&[]))).is_err(), "a v with no s");
+        // No signature: r and s go unread.
+        let mut unsigned = with(6, item(&[]));
+        unsigned[7] = item(&[0xff; 40]);
+        let unsigned = read(&unsigned).unwrap();
+        assert_eq!(
+            (unsigned.v, unsigned.r, unsigned.s),
+            (0, U256::ZERO, U256::ZERO)
+        );
+
+        // `validate()`'s limits, and the nonce an account can reach.
+        assert!(
+            read(&with(0, item(&[0x01; 33]))).is_err(),
+            "a 33-byte nonce"
+        );
+        assert!(
+            read(&with(0, item(&[0x01; 9]))).is_err(),
+            "a nonce past 64 bits"
+        );
+        assert!(
+            read(&with(2, item(&[0x00; 33]))).is_err(),
+            "a 33-byte gas limit"
+        );
+        assert!(read(&with(2, item(&[]))).is_err(), "no gas limit");
+        let mut half = [0u8; 32];
+        half[0] = 0x80;
+        let mut below = [0xff; 32];
+        below[0] = 0x7f;
+        for (at, what) in [(1, "gas price"), (4, "value")] {
+            assert!(read(&with(at, item(&half))).is_err(), "a {what} of 2^255");
+            assert!(
+                read(&with(at, item(&below))).is_ok(),
+                "a {what} just below 2^255"
+            );
+        }
+        assert!(
+            read(&with(7, item(&[0x01; 33]))).is_err(),
+            "r of 33 significant bytes"
+        );
+        let padded = [&[0u8][..], &[0x01; 32]].concat();
+        assert!(
+            read(&with(7, item(&padded))).is_ok(),
+            "33 bytes, the first zero"
+        );
+
+        // A v that names a negative chain.
+        for v in [0u8, 1, 26, 29, 32, 33] {
+            assert!(read(&with(6, item(&[v]))).is_err(), "v {v}");
+        }
+    }
+
+    /// rskj hashes a transaction by an encoding it rebuilds from the fields
+    /// it holds (`getEncoded`), and that is the one kept.
+    #[test]
+    fn the_encoding_kept_is_the_one_rskj_hashes() {
+        assert_eq!(read(&fields()).unwrap().rlp_for_trie(), list(&fields()));
+        let cases = [
+            (
+                0,
+                item(&[0x00]),
+                item(&[]),
+                "a nonce of the one byte 0 goes empty",
+            ),
+            (
+                0,
+                item(&[0x00, 0x05]),
+                item(&[0x00, 0x05]),
+                "any other nonce stays",
+            ),
+            (1, item(&[0x00]), item(&[0x00]), "a zero gas price stays 00"),
+            (1, item(&[]), item(&[]), "an empty gas price stays empty"),
+            (
+                1,
+                item(&[0x00, 0x01]),
+                item(&[0x01]),
+                "a gas price is minimal",
+            ),
+            (
+                2,
+                item(&[0x00, 0x52, 0x08]),
+                item(&[0x00, 0x52, 0x08]),
+                "a gas limit stays",
+            ),
+            (
+                2,
+                item(&[0x00]),
+                item(&[0x00]),
+                "a zero gas limit of the one byte 0 stays",
+            ),
+            (4, item(&[0x00]), item(&[]), "a zero value goes empty"),
+            (
+                4,
+                item(&[0x00, 0x03, 0xe8]),
+                item(&[0x03, 0xe8]),
+                "a value is minimal",
+            ),
+            (
+                6,
+                item(&[35]),
+                item(&[27]),
+                "v 35 names no chain and recovery id 0",
+            ),
+            (
+                6,
+                item(&[34]),
+                item(&[28]),
+                "v 34 names no chain and recovery id 1",
+            ),
+            (6, item(&[36]), item(&[28]), "and so does 36"),
+            (
+                7,
+                item(&[0x00, 0x12, 0x34]),
+                item(&[0x12, 0x34]),
+                "r is minimal",
+            ),
+            (
+                8,
+                vec![0x81, 0x05],
+                item(&[0x05]),
+                "a single byte written long",
+            ),
+            (
+                5,
+                vec![0xb8, 0x02, 0xaa, 0xbb],
+                item(&[0xaa, 0xbb]),
+                "a long prefix, short data",
+            ),
+        ];
+        for (at, came, kept, what) in cases {
+            let tx = read(&with(at, came)).unwrap_or_else(|e| panic!("{what}: {e}"));
+            assert_eq!(tx.rlp_for_trie(), list(&with(at, kept)), "{what}");
+        }
+        // And the list's own prefix: a long one on a short list.
+        let payload = fields().concat();
+        let long = [&[0xf8, payload.len() as u8][..], &payload].concat();
+        let tx = Transaction::decode(&mut long.as_slice()).unwrap();
+        assert_eq!(tx.rlp_for_trie(), list(&fields()));
+    }
+
+    /// rskj reads each of a block's transactions by `getRLPData`, which for a
+    /// byte string is its payload: a transaction may come wrapped in one.
+    #[test]
+    fn a_transaction_may_come_wrapped_in_a_byte_string() {
+        let raw = list(&fields());
+        let stream = [item(&raw), raw].concat();
+        let mut buf = stream.as_slice();
+        let wrapped = Transaction::decode(&mut buf).unwrap();
+        let plain = Transaction::decode(&mut buf).unwrap();
+        assert!(buf.is_empty());
+        assert_eq!(wrapped.tx_hash(), plain.tx_hash());
+        assert!(
+            Transaction::decode(&mut [0x80].as_slice()).is_err(),
+            "an empty item"
+        );
+    }
+
+    /// rskj takes a signature (`acceptTransactionSignature`) for no chain or
+    /// for its own, with r from 1 to below the curve's order and s from 1 to
+    /// below half of it.
+    #[test]
+    fn a_signature_is_taken_as_rskj_takes_it() {
+        use k256::ecdsa::SigningKey;
+        let key = SigningKey::from_slice(&[9u8; 32]).unwrap();
+        let point = key.verifying_key().to_encoded_point(false);
+        let sender = Address::from_slice(&Keccak256::digest(&point.as_bytes()[1..])[12..]);
+        let unsigned = Transaction {
+            nonce: 5,
+            gas_price: U256::from(1u64),
+            gas_limit: U256::from(21_000u64),
+            to: Bytes::from(vec![0x11; 20]),
+            value: U256::from(1_000u64),
+            ..Default::default()
+        };
+        let sign = |hash: B256, base: u64| {
+            let (signature, id) = key.sign_prehash_recoverable(hash.as_slice()).unwrap();
+            let rs = signature.to_bytes();
+            Transaction {
+                v: base + u64::from(id.to_byte()),
+                r: U256::from_be_slice(&rs[..32]),
+                s: U256::from_be_slice(&rs[32..]),
+                ..unsigned.clone()
+            }
+        };
+        let order = U256::from_be_bytes(secp256k1::constants::CURVE_ORDER);
+
+        // For chain 30: taken there, and only there.
+        let for_30 = sign(unsigned.signing_hash_eip155(30), 95);
+        assert_eq!(for_30.recover_sender(30).unwrap(), sender);
+        assert!(for_30.recover_sender(31).is_err());
+        assert!(for_30.recover_sender(33).is_err());
+
+        // For no chain: taken on every network, by 27 or 28 and by 34 to 36.
+        let legacy = sign(unsigned.signing_hash_legacy(), 27);
+        for chain_id in [30, 31, 33] {
+            assert_eq!(legacy.recover_sender(chain_id).unwrap(), sender);
+        }
+        let others: &[u64] = if legacy.v == 27 { &[35] } else { &[34, 36] };
+        for &v in others {
+            let mut raw = Vec::new();
+            Transaction {
+                v,
+                ..legacy.clone()
+            }
+            .encode(&mut raw);
+            let read = Transaction::decode(&mut raw.as_slice()).unwrap();
+            assert_eq!(read.v, legacy.v, "v {v} is written as {}", legacy.v);
+            assert_eq!(read.tx_hash(), legacy.tx_hash());
+            assert_eq!(read.recover_sender(30).unwrap(), sender, "v {v}");
+        }
+
+        // The same signature with s in the upper half and the other
+        // recovery id: refused, though it is the same key's.
+        let high = Transaction {
+            v: 55 - legacy.v,
+            s: order - legacy.s,
+            ..legacy.clone()
+        };
+        assert!(high.recover_sender(30).is_err(), "s in the upper half");
+        let mut signature = [0u8; 64];
+        signature[..32].copy_from_slice(&high.r.to_be_bytes::<32>());
+        signature[32..].copy_from_slice(&high.s.to_be_bytes::<32>());
+        let hash = unsigned.signing_hash_legacy().0;
+        assert_eq!(
+            recover_address(&hash, &signature, (high.v - 27) as u8),
+            Some(sender)
+        );
+
+        // Half the order, rounded down, is already too high; r and s of 0, and
+        // r of the order, are refused too.
+        let half = Transaction {
+            s: order >> 1,
+            ..legacy.clone()
+        };
+        assert!(half.recover_sender(30).is_err());
+        for (r, s) in [
+            (U256::ZERO, legacy.s),
+            (order, legacy.s),
+            (legacy.r, U256::ZERO),
+        ] {
+            assert!(Transaction {
+                r,
+                s,
+                ..legacy.clone()
+            }
+            .recover_sender(30)
+            .is_err());
+        }
+        assert!(unsigned.recover_sender(30).is_err(), "no signature");
+    }
+
+    /// A transaction's gas is its gas limit's bytes as rskj's `GasCost.toGas`
+    /// reads them.
+    #[test]
+    fn gas_is_read_as_rskjs_to_gas() {
+        let gas = |bytes: &[u8]| read(&with(2, item(bytes))).unwrap().gas();
+        assert_eq!(gas(&[0x52, 0x08]), Some(21_000));
+        assert_eq!(gas(&[0x00]), Some(0));
+        assert_eq!(
+            gas(&[0, 0, 0, 0, 0, 0, 0x52, 0x08]),
+            Some(21_000),
+            "eight bytes"
+        );
+        let nine = [0, 0, 0, 0, 0, 0, 0, 0x52, 0x08];
+        assert_eq!(
+            gas(&nine),
+            Some(i64::MAX as u64),
+            "nine, though the number is small"
+        );
+        let max = [0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
+        assert_eq!(gas(&max), Some(i64::MAX as u64));
+        assert_eq!(gas(&[0x80, 0, 0, 0, 0, 0, 0, 0]), None, "a negative long");
+        let built = Transaction {
+            gas_limit: U256::from(21_000u64),
+            ..Default::default()
+        };
+        assert_eq!(built.gas(), Some(21_000));
+    }
+
+    /// rskj's `TransactionIsRemascTest`, on transactions read from bytes: the
+    /// REMASC transaction is a block's last, to the REMASC address, with no
+    /// data and no signature, and value, gas price and gas limit zero.
+    #[test]
+    fn remasc_is_rskjs_is_remasc_transaction() {
+        let remasc = |edit: &dyn Fn(&mut Vec<Vec<u8>>)| {
+            let mut fields = vec![
+                item(&[]),
+                item(&[0x00]),
+                item(&[0x00]),
+                item(&REMASC_ADDR),
+                item(&[]),
+                item(&[]),
+                item(&[]),
+                item(&[]),
+                item(&[]),
+            ];
+            edit(&mut fields);
+            read(&fields).unwrap()
+        };
+        assert!(
+            remasc(&|_| {}).is_remasc(6, 7),
+            "validRemascTransactionNullData"
+        );
+        assert!(
+            !remasc(&|_| {}).is_remasc(3, 7),
+            "notRemascTransactionNotLastTx"
+        );
+        let data = remasc(&|f| f[5] = item(&[1, 2, 3, 4]));
+        assert!(!data.is_remasc(6, 7), "notRemascTransactionNotEmptyData");
+        let signed = remasc(&|f| {
+            f[6] = item(&[27]);
+            f[7] = item(&[1]);
+            f[8] = item(&[1]);
+        });
+        assert!(!signed.is_remasc(6, 7), "notRemascTransactionNotNullSig");
+        let elsewhere = remasc(&|f| f[3] = item(&[0x22; 20]));
+        assert!(
+            !elsewhere.is_remasc(6, 7),
+            "notRemascTransactionReceiverIsNotRemasc"
+        );
+        let value = remasc(&|f| f[4] = item(&[10]));
+        assert!(!value.is_remasc(6, 7), "notRemascTransactionValueIsNotZero");
+        let price = remasc(&|f| f[1] = item(&[10]));
+        assert!(
+            !price.is_remasc(6, 7),
+            "notRemascTransactionGasPriceIsNotZero"
+        );
+        let limit = remasc(&|f| f[2] = item(&[10]));
+        assert!(
+            !limit.is_remasc(6, 7),
+            "notRemascTransactionGasLimitIsNotZero"
+        );
+
+        // An empty gas price reads as zero (`getGasPrice`); a gas limit with
+        // no bytes can't be read at all.
+        assert!(remasc(&|f| f[1] = item(&[])).is_remasc(6, 7));
+        assert!(Transaction::remasc(9).is_remasc(0, 1));
+        let built = Transaction {
+            to: Bytes::copy_from_slice(&REMASC_ADDR),
+            ..Default::default()
+        };
+        assert!(!built.is_remasc(0, 1), "a gas limit with no bytes");
     }
 }

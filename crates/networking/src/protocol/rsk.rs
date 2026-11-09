@@ -1077,22 +1077,21 @@ mod tests {
     use alloy_rlp::{Encodable, Decodable};
 
 
-    /// A REMASC transaction's zero fields are written as literal 0x00 bytes,
-    /// not RLP's empty string. Serving a canonical re-encoding changes the
-    /// transaction root and the receiving peer rejects the body.
+    /// A REMASC transaction's zero gas price and gas limit are written as the
+    /// byte 0x00, not RLP's empty string (`RemascTransaction`). Serving a
+    /// canonical re-encoding would change the transaction root, and the
+    /// receiving peer reject the body.
     #[test]
     fn a_remasc_body_keeps_the_bytes_its_header_commits_to() {
         use rustock_core::ordered_tx_trie_root;
 
-        let mut inner: Vec<u8> = vec![0x83, 0x8d, 0x5a, 0xd7, 0x00, 0x00, 0x94];
-        inner.extend_from_slice(&[0u8; 19]);
-        inner.push(0x08);
-        inner.extend_from_slice(&[0x00, 0x80, 0x00, 0x00, 0x00]);
-        let mut raw = Vec::new();
-        RlpHeader { list: true, payload_length: inner.len() }.encode(&mut raw);
-        raw.extend_from_slice(&inner);
-
+        let raw = Transaction::remasc(9_263_832).rlp_for_trie();
         let tx = Transaction::decode(&mut raw.as_slice()).unwrap();
+        assert_eq!(
+            tx.rlp_for_trie(),
+            raw,
+            "rskj's own encoding is the one kept"
+        );
         let before = ordered_tx_trie_root(std::slice::from_ref(&tx), true);
 
         let mut buf = Vec::new();

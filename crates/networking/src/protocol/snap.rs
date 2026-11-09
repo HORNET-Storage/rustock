@@ -649,20 +649,13 @@ fn a_remasc_body_survives_the_snap_wire() {
     use rustock_core::{ordered_tx_trie_root, Transaction};
     use alloy_rlp::Decodable;
 
-    // The REMASC transaction as rskj puts it on the wire: every numeric field
-    // zero, and gasPrice/gasLimit/value written as a literal 0x00 byte rather
-    // than RLP's empty string. Canonical RLP would write 0x80 for each.
-    // [nonce=0x8d5ad7, gasPrice=0x00, gasLimit=0x00, to=20B, value=0x00,
-    //  data=empty, v=0x00, r=0x00, s=0x00]
-    let mut inner: Vec<u8> = vec![0x83, 0x8d, 0x5a, 0xd7, 0x00, 0x00, 0x94];
-    inner.extend_from_slice(&hex_lit("0000000000000000000000000000000001000008"));
-    inner.extend_from_slice(&[0x00, 0x80, 0x00, 0x00, 0x00]);
-    let mut raw = Vec::new();
-    alloy_rlp::Header { list: true, payload_length: inner.len() }.encode(&mut raw);
-    raw.extend_from_slice(&inner);
-
+    // The REMASC transaction as rskj puts it on the wire (`RemascTransaction`
+    // with `getEncoded`): gas price and gas limit the byte 0x00 rather than
+    // RLP's empty string, which canonical RLP would write; value, data and
+    // the absent signature empty.
+    let raw = Transaction::remasc(9_263_832).rlp_for_trie();
     let tx = Transaction::decode(&mut raw.as_slice()).unwrap();
-    assert_eq!(tx.rlp_for_trie(), raw, "decoding keeps the original bytes");
+    assert_eq!(tx.rlp_for_trie(), raw, "decoding keeps rskj's encoding");
 
     let before = ordered_tx_trie_root(std::slice::from_ref(&tx), true);
 
@@ -677,10 +670,6 @@ fn a_remasc_body_survives_the_snap_wire() {
 
     let after = ordered_tx_trie_root(&decoded.transactions, true);
     assert_eq!(before, after, "the snap wire must not change the transaction root");
-}
-
-fn hex_lit(s: &str) -> Vec<u8> {
-    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
 }
 
     fn roundtrip(sub: RskSubMessage) -> RskSubMessage {
