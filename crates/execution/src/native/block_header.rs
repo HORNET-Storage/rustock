@@ -213,7 +213,8 @@ impl BlockHeader<'_> {
             Method::CoinbaseAddress => header.beneficiary.to_vec(),
             Method::BlockHash => hash.to_vec(),
             Method::MergedMiningTags => merged_mining_tags(header)?,
-            Method::MinGasPrice => big_integer_bytes(header.minimum_gas_price),
+            // `Coin.getBytes()`, of any size.
+            Method::MinGasPrice => header.minimum_gas_price_bytes().into_owned(),
             // The bytes as the header holds them: rskj never holds the gas
             // limit as a number (`KeptFields::gas_limit`).
             Method::GasLimit => header.gas_limit_bytes().into_owned(),

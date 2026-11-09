@@ -65,6 +65,28 @@ fn a_gas_limit_past_256_bits_prints_whole() {
     assert_eq!(notified["gasLimit"], json!(whole));
 }
 
+/// rskj prints a header's minimum gas price from `Coin.getBytes()`, so one
+/// past 256 bits, sign byte and all, prints whole, in a block and in a
+/// `newHeads` notification alike.
+#[test]
+fn a_minimum_gas_price_past_256_bits_prints_whole() {
+    let mut past = vec![0, 0x80];
+    past.extend_from_slice(&[0; 32]);
+    let header = Header {
+        minimum_gas_price: U256::MAX,
+        kept: Some(Box::new(rustock_core::types::header::KeptFields {
+            minimum_gas_price: Some(past.into()),
+            ..Default::default()
+        })),
+        ..test_header(1)
+    };
+    let whole = format!("0x80{}", "0".repeat(64));
+    let block = crate::helpers::BlockResultDto::from_header(&header, B256::ZERO, U256::ZERO);
+    assert_eq!(block.minimum_gas_price, whole);
+    let notified = crate::subscribe::header_dto(&header, B256::ZERO);
+    assert_eq!(notified["minimumGasPrice"], json!(whole));
+}
+
 fn setup_state() -> (RpcState, tempfile::TempDir) {
     setup_state_with(|store| store)
 }

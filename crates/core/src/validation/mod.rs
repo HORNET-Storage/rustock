@@ -80,7 +80,10 @@ pub enum ValidationError {
     VersionedBeforeRskip351 { number: u64 },
 
     #[error("Tx gas price {tx_gas_price} is below the block minimum {block_minimum}")]
-    TxGasPriceBelowMinimum { tx_gas_price: U256, block_minimum: U256 },
+    TxGasPriceBelowMinimum {
+        tx_gas_price: U256,
+        block_minimum: BigUint,
+    },
 
     #[error("Tx gas price {tx_gas_price} is above the cap {cap}")]
     TxGasPriceAboveCap { tx_gas_price: U256, cap: U256 },
@@ -91,8 +94,13 @@ pub enum ValidationError {
     #[error("Extra data is {got} bytes, over the {max}-byte maximum")]
     ExtraDataTooLarge { max: usize, got: usize },
 
+    /// Read whole, as rskj's `Coin`s.
     #[error("Minimum gas price {got} outside the allowed range [{lower}, {upper}]")]
-    MinGasPriceOutOfRange { lower: U256, upper: U256, got: U256 },
+    MinGasPriceOutOfRange {
+        lower: BigUint,
+        upper: BigUint,
+        got: BigUint,
+    },
 
     #[error("Uncle list has {got} entries, over the limit of {max}")]
     TooManyUncles { max: usize, got: usize },

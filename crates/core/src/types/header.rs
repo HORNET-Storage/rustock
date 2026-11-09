@@ -46,7 +46,8 @@ pub struct Header {
 
     /// What rskj read from this header that the fields above can't hold,
     /// kept so that it encodes and hashes as rskj writes it: see
-    /// [`KeptFields`]. `None` for every header an honest miner writes.
+    /// [`KeptFields`]. `None` for every header rskj's miner writes, until
+    /// its gas limit or minimum gas price passes 256 bits.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kept: Option<Box<KeptFields>>,
 
@@ -91,7 +92,8 @@ pub struct HeaderVersionFields {
 /// rskj keeps these as it reads them and writes them back the same way, so
 /// they are in the header's hash, and no rule refuses them where they can
 /// appear: a miner picks them. Each is kept only where it differs from
-/// what the typed field writes, so a header an honest miner wrote has none.
+/// what the typed field writes, so a header rskj's miner wrote has none,
+/// until its gas limit or minimum gas price passes 256 bits.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KeptFields {
     /// The gas limit's bytes, where they aren't how rskj's miner writes its
@@ -123,6 +125,13 @@ pub struct KeptFields {
     /// nothing bounds. `paid_fees` holds `U256::MAX`, which compares with
     /// any block's fees, doubled or not, as the value itself does.
     pub paid_fees: Option<Bytes>,
+    /// The minimum gas price past 256 bits, as rskj writes it back
+    /// (`toByteArray`). `PrevMinGasPriceRule` lets it rise 1% a block with
+    /// nothing above it, past 2^256 in about 16,000 blocks: no transaction
+    /// can pay it then, but blocks of REMASC alone go on.
+    /// `minimum_gas_price` holds `U256::MAX`, which no transaction's price
+    /// reaches either; see [`Header::minimum_gas_price_value`].
+    pub minimum_gas_price: Option<Bytes>,
 }
 
 /// rskj refuses the header: `BlockFactory.decodeHeader` can't read it, or
@@ -169,14 +178,21 @@ fn java_int(bytes: Option<&[u8]>) -> alloy_rlp::Result<u64> {
 }
 
 /// `new BigInteger(bytes)`, which reads the difficulty and the minimum gas
-/// price: two's complement, so a first byte from 0x80 up is negative.
-/// `None` for a negative value and for one past 256 bits.
-fn java_signed(bytes: &[u8]) -> Option<U256> {
+/// price, where it isn't negative: two's complement, so a first byte from
+/// 0x80 up is. Its bytes from the first that isn't zero.
+fn non_negative(bytes: &[u8]) -> Option<&[u8]> {
     if bytes.first().is_some_and(|byte| byte & 0x80 != 0) {
         return None;
     }
-    let value = significant(Some(bytes));
-    (value.len() <= 32).then(|| U256::from_be_slice(value))
+    Some(significant(Some(bytes)))
+}
+
+/// The difficulty, `new BigInteger(bytes)`. `None` for a negative value and
+/// for one past 256 bits.
+fn java_signed(bytes: &[u8]) -> Option<U256> {
+    non_negative(bytes)
+        .filter(|value| value.len() <= 32)
+        .map(U256::from_be_slice)
 }
 
 /// A hash rskj keeps as it read it: in `kept` unless it is 32 bytes.
@@ -253,6 +269,28 @@ fn read_gas_limit(bytes: &[u8]) -> (U256, Option<Bytes>) {
     let kept = (value.len() > 32 || bytes != java_signed_bytes(&gas_limit).as_slice())
         .then(|| Bytes::copy_from_slice(bytes));
     (gas_limit, kept)
+}
+
+/// A minimum gas price of `value`, its bytes without leading zeros, as the
+/// typed field holds it: the value, or `U256::MAX` past 256 bits with what
+/// rskj writes back there (`KeptFields::minimum_gas_price`).
+fn minimum_gas_price_of(value: &[u8]) -> (U256, Option<Bytes>) {
+    if value.len() > 32 {
+        return (U256::MAX, Some(Bytes::from(to_byte_array(value))));
+    }
+    (U256::from_be_slice(value), None)
+}
+
+/// `BigInteger.toByteArray()` of a value that isn't negative, from its
+/// bytes without leading zeros: with a sign byte where the top bit is set,
+/// and `[0]` for zero.
+fn to_byte_array(value: &[u8]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(value.len() + 1);
+    if value.first().is_none_or(|first| first & 0x80 != 0) {
+        bytes.push(0);
+    }
+    bytes.extend_from_slice(value);
+    bytes
 }
 
 impl Header {
@@ -463,7 +501,7 @@ impl Header {
             kept.and_then(|k| k.paid_fees.as_ref()),
             &self.paid_fees,
         );
-        java_signed_bytes(&self.minimum_gas_price).as_slice().encode(list);
+        self.minimum_gas_price_bytes()[..].encode(list);
         self.uncle_count.encode(list);
     }
 
@@ -639,12 +677,15 @@ impl Header {
                 U256::from_be_slice(value)
             }
         };
-        // `RLP.parseSignedCoinNonNullZero`: signed, and none is none.
-        // `PrevMinGasPriceRule` refuses none wherever rskj takes a header,
-        // and no parent's range holds a negative price or one past 256 bits.
-        let minimum_gas_price = field(14)?.and_then(java_signed).ok_or(refused(
-            "a minimum gas price that is none, negative or past 256 bits",
-        ))?;
+        // `RLP.parseSignedCoinNonNullZero`: signed, of any length, and none
+        // is none. `PrevMinGasPriceRule` refuses none wherever rskj takes a
+        // header, and no parent's range holds a negative price. Past 256
+        // bits it is kept: see `KeptFields::minimum_gas_price`.
+        let (minimum_gas_price, bytes) = field(14)?
+            .and_then(non_negative)
+            .map(minimum_gas_price_of)
+            .ok_or(refused("a minimum gas price that is none or negative"))?;
+        kept.minimum_gas_price = bytes;
         let uncle_count = java_int(field(15)?)?;
 
         // What is left is told apart by count, since nothing here knows the
@@ -859,14 +900,40 @@ impl Header {
     /// fewest bytes, with a sign byte where the top bit is set. Past 256
     /// bits, which the typed field can't hold, the bytes are kept.
     pub fn set_gas_limit(&mut self, value: &BigUint) {
-        let mut bytes = value.to_bytes_be();
-        if bytes[0] & 0x80 != 0 {
-            bytes.insert(0, 0);
-        }
-        let (gas_limit, written) = read_gas_limit(&bytes);
+        let (gas_limit, written) = read_gas_limit(&to_byte_array(&value.to_bytes_be()));
         self.gas_limit = gas_limit;
+        self.set_kept(|kept| kept.gas_limit = written);
+    }
+
+    /// The minimum gas price's bytes as rskj writes and returns them,
+    /// `Coin.getBytes()`, which is `toByteArray()`: what the BlockHeader
+    /// contract and the RPC answer, of any size.
+    pub fn minimum_gas_price_bytes(&self) -> Cow<'_, [u8]> {
+        match self.kept().and_then(|kept| kept.minimum_gas_price.as_ref()) {
+            Some(bytes) => Cow::Borrowed(bytes),
+            None => Cow::Owned(java_signed_bytes(&self.minimum_gas_price)),
+        }
+    }
+
+    /// The minimum gas price's whole value, as rskj's `Coin` holds it and
+    /// `PrevMinGasPriceRule` and its miner read it: of any size.
+    pub fn minimum_gas_price_value(&self) -> BigUint {
+        BigUint::from_bytes_be(&self.minimum_gas_price_bytes())
+    }
+
+    /// Sets the minimum gas price as rskj's miner writes it, `toByteArray()`:
+    /// past 256 bits, which the typed field can't hold, it is kept.
+    pub fn set_minimum_gas_price(&mut self, value: &BigUint) {
+        let (price, written) = minimum_gas_price_of(&value.to_bytes_be());
+        self.minimum_gas_price = price;
+        self.set_kept(|kept| kept.minimum_gas_price = written);
+    }
+
+    /// Changes what is kept, keeping nothing where nothing differs, and drops
+    /// the cached hashes, which a field set with it makes stale.
+    fn set_kept(&mut self, change: impl FnOnce(&mut KeptFields)) {
         let mut kept = self.kept.take().map(|kept| *kept).unwrap_or_default();
-        kept.gas_limit = written;
+        change(&mut kept);
         self.kept = (kept != KeptFields::default()).then(|| Box::new(kept));
         self.cached_hash = None;
         self.cached_hash_for_merged_mining = None;
@@ -1561,6 +1628,82 @@ mod tests {
         writes_back_as(&decoded, &items);
     }
 
+    /// rskj reads a minimum gas price of any length, which nothing bounds but
+    /// its parent's, and writes it back with `toByteArray`. Past 256 bits the
+    /// header keeps what it writes, without leading zeros and with a sign
+    /// byte where the top bit is set, and its value reads whole.
+    #[test]
+    fn a_minimum_gas_price_past_256_bits_is_kept() {
+        let two = BigUint::from(2u8);
+        let past = [&[1][..], &[0; 32]].concat();
+        let signed = [&[0, 0x80][..], &[0; 32]].concat();
+        for (spelled, written, value) in [
+            (past.clone(), &past, two.pow(256)),
+            ([&[0, 0][..], &past[..]].concat(), &past, two.pow(256)),
+            (signed.clone(), &signed, two.pow(263)),
+            ([&[0][..], &signed[..]].concat(), &signed, two.pow(263)),
+        ] {
+            let (mut items, decoded) = respelled(14, element(&spelled));
+            let decoded = decoded.unwrap();
+            assert_eq!(decoded.minimum_gas_price, U256::MAX);
+            assert_eq!(&decoded.minimum_gas_price_bytes()[..], &written[..]);
+            assert_eq!(decoded.minimum_gas_price_value(), value);
+            items[14] = element(written);
+            writes_back_as(&decoded, &items);
+        }
+        // The typed field's own largest value keeps nothing.
+        let top = respelled(14, element(&[&[0][..], &[0xff; 32]].concat()))
+            .1
+            .unwrap();
+        assert!(top.kept().is_none());
+        assert_eq!(top.minimum_gas_price_value(), two.pow(256) - 1u8);
+    }
+
+    /// rskj's miner writes a minimum gas price with `toByteArray`, and the
+    /// header holds what it wrote: past 256 bits as its bytes, and under that
+    /// in the typed field alone, leaving whatever else was kept.
+    #[test]
+    fn a_minimum_gas_price_is_set_as_rskjs_miner_writes_it() {
+        let two = BigUint::from(2u8);
+        let (mut items, header) = respelled(2, element(&[]));
+        let mut header = header.unwrap();
+        for (value, bytes, typed) in [
+            (
+                two.pow(256) + 5u8,
+                [&[1][..], &[0; 31], &[5]].concat(),
+                U256::MAX,
+            ),
+            (two.pow(263), [&[0, 0x80][..], &[0; 32]].concat(), U256::MAX),
+            (
+                two.pow(255),
+                [&[0, 0x80][..], &[0; 31]].concat(),
+                U256::from(1) << 255,
+            ),
+            (BigUint::from(0x80u8), vec![0, 0x80], U256::from(0x80)),
+            (BigUint::ZERO, vec![0], U256::ZERO),
+        ] {
+            header.set_minimum_gas_price(&value);
+            assert_eq!(&header.minimum_gas_price_bytes()[..], bytes, "{value}");
+            assert_eq!(header.minimum_gas_price, typed, "{value}");
+            assert_eq!(header.minimum_gas_price_value(), value);
+            assert!(header.kept().unwrap().null_coinbase, "the rest kept stays");
+            items[14] = element(&bytes);
+            let mut written = Vec::new();
+            header.encode(&mut written);
+            assert_eq!(written, list_of(&items));
+            assert_eq!(header.hash(), keccak256(&written), "no stale hash");
+            let read = Header::decode_with_hash(&mut written.as_slice()).unwrap();
+            assert_eq!(read.minimum_gas_price_value(), value);
+        }
+        assert!(header.kept().unwrap().minimum_gas_price.is_none());
+        // With nothing else kept, a price under 256 bits keeps nothing.
+        let mut plain = standard_test_header();
+        plain.set_minimum_gas_price(&two.pow(300));
+        assert!(plain.kept().is_some());
+        plain.set_minimum_gas_price(&BigUint::from(1_000u32));
+        assert!(plain.kept().is_none());
+    }
+
     /// What rskj can't read, or reads as a header no rule lets a block or an
     /// uncle have, is refused.
     #[test]
@@ -1573,7 +1716,11 @@ mod tests {
             (9, element(&[]), "no gas limit"),
             (14, element(&[]), "no minimum gas price"),
             (14, element(&[0xff]), "a negative minimum gas price"),
-            (14, element(&[1; 33]), "a minimum gas price past 256 bits"),
+            (
+                14,
+                element(&[0x80; 33]),
+                "a negative minimum gas price past 256 bits",
+            ),
         ] {
             assert!(respelled(index, spelling).1.is_err(), "{what}");
         }

@@ -10272,6 +10272,55 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
         assert_eq!(decoded, vec![0x03, 0x87, 0xEE, 0x40]);
     }
 
+    /// getMinGasPrice returns a minimum gas price past 256 bits whole, as
+    /// rskj's `Coin.getBytes()` does, where the typed field holds `U256::MAX`.
+    #[test]
+    fn test_block_header_get_min_gas_price_past_256_bits() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+
+        let sender = Address::repeat_byte(0xAA);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
+
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+
+        let mut parent = dummy_header(99);
+        parent.set_minimum_gas_price(&num_bigint::BigUint::from(2u8).pow(263));
+        let parent_hash = parent.hash();
+        block_store.put_header(&parent).unwrap();
+        block_store.put_canonical_hash(99, parent_hash).unwrap();
+
+        let mut header = dummy_header(100);
+        header.parent_hash = parent_hash;
+
+        let input = bh_input("getMinGasPrice(int256)", 0);
+        let tx = rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(100_000),
+            to: Bytes::copy_from_slice(crate::precompiles::BLOCK_HEADER_ADDR.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::from(input),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
+        };
+
+        let executor = RskExecutor::new(RskHardforkConfig::all_active(33), block_store);
+
+        let result = executor
+            .execute_tx(&header, &tx, sender, &root, store)
+            .unwrap();
+        assert!(result.success);
+        // 2^263, with the sign byte `toByteArray` writes.
+        assert_eq!(
+            decode_abi_bytes(&result.output),
+            [&[0, 0x80][..], &[0; 32]].concat()
+        );
+    }
+
     /// getGasLimit returns the parent's gas limit.
     #[test]
     fn test_block_header_get_gas_limit() {

@@ -8,6 +8,7 @@
 
 use alloy_primitives::{Address, B256, Bytes, U256, address, b256};
 use bitcoin::hashes::Hash as _;
+use num_bigint::BigUint;
 use rustock_core::config::{ActivationHeights, ChainConfig};
 use rustock_core::validation::merged_mining::{compress_coinbase, compute_coinbase_hash};
 use rustock_core::validation::{HeaderValidator, MergedMiningRule, ValidationError};
@@ -953,44 +954,65 @@ fn rebuilds_on_every_batch_when_there_is_no_candidate_to_compare_against() {
 /// rskj `increaseMgp`: 1000 toward 2000 steps to 1010.
 #[test]
 fn increase_mgp() {
-    assert_eq!(next_minimum_gas_price(U256::from(1000), Some(U256::from(2000))), U256::from(1010));
+    assert_eq!(
+        next_minimum_gas_price(&BigUint::from(1000u32), Some(U256::from(2000))),
+        BigUint::from(1010u32)
+    );
 }
 
 /// rskj `decreaseMGP`: 1000 toward 900 steps to 990.
 #[test]
 fn decrease_mgp() {
-    assert_eq!(next_minimum_gas_price(U256::from(1000), Some(U256::from(900))), U256::from(990));
+    assert_eq!(
+        next_minimum_gas_price(&BigUint::from(1000u32), Some(U256::from(900))),
+        BigUint::from(990u32)
+    );
 }
 
 /// rskj `mgpOnRage`: a target inside the 1% band is reached at once.
 #[test]
 fn mgp_on_range() {
-    assert_eq!(next_minimum_gas_price(U256::from(1000), Some(U256::from(995))), U256::from(995));
+    assert_eq!(
+        next_minimum_gas_price(&BigUint::from(1000u32), Some(U256::from(995))),
+        BigUint::from(995u32)
+    );
 }
 
 /// rskj `previousMgpEqualsTarget`.
 #[test]
 fn previous_mgp_equals_target() {
-    assert_eq!(next_minimum_gas_price(U256::from(1000), Some(U256::from(1000))), U256::from(1000));
+    assert_eq!(
+        next_minimum_gas_price(&BigUint::from(1000u32), Some(U256::from(1000))),
+        BigUint::from(1000u32)
+    );
 }
 
 /// rskj `previousValueIsZero`: 1% of nothing is one wei.
 #[test]
 fn previous_value_is_zero() {
-    assert_eq!(next_minimum_gas_price(U256::ZERO, Some(U256::from(1000))), U256::from(1));
+    assert_eq!(
+        next_minimum_gas_price(&BigUint::ZERO, Some(U256::from(1000))),
+        BigUint::from(1u32)
+    );
 }
 
 /// rskj `previousValueIsSmallTargetIsZero`: one wei can step down to zero.
 #[test]
 fn previous_value_is_small_target_is_zero() {
-    assert_eq!(next_minimum_gas_price(U256::from(1), Some(U256::ZERO)), U256::ZERO);
+    assert_eq!(
+        next_minimum_gas_price(&BigUint::from(1u32), Some(U256::ZERO)),
+        BigUint::ZERO
+    );
 }
 
 /// rskj `cantGetMGPtoBeNegative`: a negative target has no counterpart in
 /// an unsigned type; what is checked is that nothing steps below zero.
 #[test]
 fn cant_get_mgp_to_be_negative() {
-    assert_eq!(next_minimum_gas_price(U256::ZERO, Some(U256::ZERO)), U256::ZERO);
+    assert_eq!(
+        next_minimum_gas_price(&BigUint::ZERO, Some(U256::ZERO)),
+        BigUint::ZERO
+    );
 }
 
 /// rskj `GasLimitCalculator`: one step towards the target, at most a 1024th
@@ -1000,7 +1022,6 @@ fn cant_get_mgp_to_be_negative() {
 #[test]
 fn the_gas_limit_steps_a_1024th_at_any_size() {
     use super::template::next_gas_limit;
-    use num_bigint::BigUint;
     let step_by = |gas_limit: &BigUint, target: Option<U256>, divisor: u64| {
         let mut parent = header_at(1, B256::ZERO, B256::ZERO);
         parent.set_gas_limit(gas_limit);
@@ -1038,7 +1059,7 @@ fn the_gas_limit_steps_a_1024th_at_any_size() {
 fn a_template_on_a_gas_limit_past_256_bits_keeps_its_value() {
     use rustock_core::validation::{BlockParentGasLimitRule, ParentHeaderValidator};
     let mut fx = fixture(20);
-    let value = num_bigint::BigUint::from(2u8).pow(300);
+    let value = BigUint::from(2u8).pow(300);
     fx.parent.set_gas_limit(&value);
     let header = fx.build_on(&fx.parent).unwrap().block.header;
     assert_eq!(header.gas_limit_value(), value);
@@ -1047,6 +1068,57 @@ fn a_template_on_a_gas_limit_past_256_bits_keeps_its_value() {
         config: fx.chain_config.clone(),
     };
     assert_eq!(rule.validate_with_parent(&header, &fx.parent), Ok(()));
+}
+
+/// rskj's `MinimumGasPriceCalculator` steps from the parent's price read
+/// whole: past 256 bits, where the typed field holds `U256::MAX`, by exactly
+/// 1%, down towards any target a U256 can name.
+#[test]
+fn the_minimum_gas_price_steps_one_percent_at_any_size() {
+    let two = BigUint::from(2u8);
+    // 1% of 100 * 2^294 + 12,345 is 2^294 + 123.
+    let parent = two.pow(294) * 100u32 + 12_345u32;
+    let lower = two.pow(294) * 99u32 + 12_222u32;
+    assert_eq!(next_minimum_gas_price(&parent, Some(U256::ZERO)), lower);
+    assert_eq!(next_minimum_gas_price(&parent, Some(U256::MAX)), lower);
+    assert_eq!(next_minimum_gas_price(&parent, None), parent);
+    // Below 2^256 every target is a U256, so none steps past it.
+    let top = two.pow(256) - 1u8;
+    assert_eq!(next_minimum_gas_price(&(&top - 1u8), Some(U256::MAX)), top);
+}
+
+/// The template's filter holds transactions to the minimum, and past 256
+/// bits to `U256::MAX`, which no transaction's price reaches either. revm's
+/// base fee, the minimum cut to 64 bits, would refuse only those priced
+/// under 2^64, and a sender rich enough could pay more.
+#[test]
+fn past_256_bits_the_filter_holds_transactions_to_u256_max() {
+    use super::template::u256_or_max;
+    let two = BigUint::from(2u8);
+    assert_eq!(u256_or_max(&two.pow(300)), U256::MAX);
+    assert_eq!(u256_or_max(&(two.pow(256) - 1u8)), U256::MAX);
+    assert_eq!(
+        u256_or_max(&(two.pow(256) - 2u8)),
+        U256::MAX - U256::from(1)
+    );
+    assert_eq!(u256_or_max(&BigUint::from(1_000u32)), U256::from(1_000));
+}
+
+/// On a parent whose minimum gas price is past 256 bits, a template keeps the
+/// parent's value, as rskj's miner writes it, which the parent rule takes.
+#[test]
+fn a_template_on_a_minimum_gas_price_past_256_bits_keeps_its_value() {
+    use rustock_core::validation::{ParentHeaderValidator, PrevMinGasPriceRule};
+    let mut fx = fixture(20);
+    let value = BigUint::from(2u8).pow(300);
+    fx.parent.set_minimum_gas_price(&value);
+    let header = fx.build_on(&fx.parent).unwrap().block.header;
+    assert_eq!(header.minimum_gas_price_value(), value);
+    assert_eq!(header.minimum_gas_price, U256::MAX);
+    assert_eq!(
+        PrevMinGasPriceRule.validate_with_parent(&header, &fx.parent),
+        Ok(())
+    );
 }
 
 /// A coinbase tagged with a hash this node never handed out cannot be matched
@@ -2173,6 +2245,30 @@ mod partitioned_templates {
         assert_eq!(pool.pending().len(), 1);
     }
 
+    /// Past 256 bits no transaction can pay the minimum, which the filter
+    /// holds them to as `U256::MAX`: the template leaves out even one its
+    /// sender could afford, and the pool is told to drop it, as rskj's
+    /// `isLowGasPriced` has it.
+    #[test]
+    fn past_256_bits_the_minimum_leaves_every_transaction_out() {
+        let (builder, mut parent, keys, _, _) =
+            fixture_with_forks(1, RskHardforkConfig::all_active(33));
+        parent.set_minimum_gas_price(&BigUint::from(2u8).pow(300));
+        let affordable = transfer_with(
+            &keys[0],
+            Address::repeat_byte(0xE7),
+            0,
+            33,
+            1_000_000_000,
+            21_000,
+        );
+        let pool = Pool(vec![affordable.clone()]);
+        let template = builder
+            .build(std::slice::from_ref(&parent), Vec::new(), &pool)
+            .expect("builds");
+        assert_eq!(template.block.transactions.len(), 1, "REMASC alone");
+        assert_eq!(pool.evictions(), vec![vec![affordable.hash]]);
+    }
 }
 
 // ── RSKIP-252: the miner's own price ceiling ──────────────────────────

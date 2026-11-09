@@ -178,10 +178,7 @@ impl GasPriceTracker {
         };
         match inner.best_block_price {
             None => percentile,
-            Some(best) => {
-                let floor = best * U256::from(MULTIPLIER_NUM) / U256::from(MULTIPLIER_DEN);
-                percentile.max(floor)
-            }
+            Some(best) => percentile.max(times_multiplier(best)),
         }
     }
 
@@ -305,6 +302,17 @@ impl Inner {
     }
 }
 
+/// `value` times 1.1, truncated, as rskj's `BigDecimal` product is: exact
+/// while the answer fits in 256 bits, which multiplying by 11 first is not
+/// from 2^256 / 11 up. Past it, `U256::MAX`: no account can pay that for
+/// 21,000 gas, so the fee market, which needs full blocks, never works there.
+fn times_multiplier(value: U256) -> U256 {
+    let (num, den) = (U256::from(MULTIPLIER_NUM), U256::from(MULTIPLIER_DEN));
+    (value / den)
+        .saturating_mul(num)
+        .saturating_add(value % den * num / den)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -417,6 +425,16 @@ mod tests {
         // A floor below it does not.
         tracker.on_best_block(&header(3, 0, 6_800_000, 10));
         assert_eq!(tracker.gas_price(), U256::from(129));
+
+        // Exact near the top of 256 bits, where 11 times the minimum is not.
+        let mut best = header(4, 0, 6_800_000, 0);
+        best.minimum_gas_price = U256::from(1) << 253;
+        tracker.on_best_block(&best);
+        let expected: U256 =
+            "15921412270130976870741010438694587329824622891525577555425417801088055325491"
+                .parse()
+                .unwrap();
+        assert_eq!(tracker.gas_price(), expected, "2^253 * 1.1");
     }
 
     /// REMASC carries no gas price; counting it would drag the percentile to

@@ -10,7 +10,7 @@
 use alloy_primitives::{Address, B256, Bloom, Bytes, U256};
 use num_bigint::BigUint;
 use rustock_core::config::ChainConfig;
-use rustock_core::validation::{DifficultyRule, ValidationError};
+use rustock_core::validation::{DifficultyRule, PrevMinGasPriceRule, ValidationError};
 use rustock_core::{Block, Header, Transaction, ordered_tx_trie_root};
 use rustock_trie::{AccountState, TrieKeySlice, TrieNode, TrieStore, account_key};
 use std::collections::HashMap;
@@ -212,11 +212,19 @@ impl BlockTemplateBuilder {
             self.mining_config.gas_limit_target,
             self.chain_config.gas_limit_bound_divisor,
         );
-        let minimum_gas_price =
-            next_minimum_gas_price(parent.minimum_gas_price, self.mining_config.min_gas_price_target);
+        let minimum_gas_price = next_minimum_gas_price(
+            &parent.minimum_gas_price_value(),
+            self.mining_config.min_gas_price_target,
+        );
 
-        let (candidates, to_remove) =
-            self.select_transactions(pending, &state_root, minimum_gas_price, number);
+        // Past 256 bits the filter holds transactions to U256::MAX, which no
+        // transaction's price reaches, as none reaches the value.
+        let (candidates, to_remove) = self.select_transactions(
+            pending,
+            &state_root,
+            u256_or_max(&minimum_gas_price),
+            number,
+        );
         // rskj `BlockToMineBuilder.build`: `removePendingTransactions(txsToRemove)`
         // right after the filter, before anything executes.
         if !to_remove.is_empty() {
@@ -270,7 +278,8 @@ impl BlockTemplateBuilder {
             timestamp,
             extra_data: self.mining_config.extra_data.clone(),
             paid_fees: U256::ZERO,
-            minimum_gas_price,
+            // Written below, as rskj's miner writes it.
+            minimum_gas_price: U256::ZERO,
             uncle_count: ommers.len() as u64,
             umm_root,
             bitcoin_merged_mining_header: None,
@@ -281,6 +290,7 @@ impl BlockTemplateBuilder {
             kept: None,
         };
         header.set_gas_limit(&gas_limit);
+        header.set_minimum_gas_price(&minimum_gas_price);
 
         // The probe: execute the candidates once, in selection order, to
         // learn two things only execution can tell.
@@ -791,18 +801,24 @@ pub(super) fn next_gas_limit(parent: &Header, target: Option<U256>, divisor: u64
 /// rskj `MinimumGasPriceCalculator` (RSKIP-09) with `BlockGasPriceRange`: a
 /// child may move the minimum gas price by at most 1% of the parent's, or by
 /// one wei when 1% rounds to nothing. The parent's own value is always in
-/// range, so `None` -- inherit -- is always valid.
-pub fn next_minimum_gas_price(parent_price: U256, target: Option<U256>) -> U256 {
+/// range, so `None` -- inherit -- is always valid. rskj's miner takes the
+/// parent's price whole, a `Coin`, as the rule reads it: of any size.
+pub fn next_minimum_gas_price(parent_price: &BigUint, target: Option<U256>) -> BigUint {
     let Some(target) = target else {
-        return parent_price;
+        return parent_price.clone();
     };
-    let mut delta = parent_price / U256::from(100);
-    if delta.is_zero() {
-        delta = U256::from(1);
+    let (lower, upper) = PrevMinGasPriceRule::range(parent_price);
+    BigUint::from_bytes_be(&target.to_be_bytes::<32>()).clamp(lower, upper)
+}
+
+/// `value`, or `U256::MAX` past 256 bits, as a header's typed field holds it.
+pub(super) fn u256_or_max(value: &BigUint) -> U256 {
+    let bytes = value.to_bytes_be();
+    if bytes.len() > 32 {
+        U256::MAX
+    } else {
+        U256::from_be_slice(&bytes)
     }
-    let upper = parent_price + delta;
-    let lower = parent_price.saturating_sub(delta);
-    target.clamp(lower, upper)
 }
 
 /// rskj `DifficultyUtils.difficultyToTarget`, the validator's own, so that the

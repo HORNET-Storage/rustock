@@ -10,6 +10,7 @@ use super::{BlockValidator, HeaderValidator, ParentHeaderValidator, ValidationEr
 use crate::types::block::Block;
 use crate::types::header::Header;
 use alloy_primitives::U256;
+use num_bigint::BigUint;
 
 /// The REMASC contract address (`…01000008`), which the synthetic last
 /// transaction of every RSK block is sent to. Mirrors
@@ -28,6 +29,10 @@ fn is_remasc(block: &Block, index: usize) -> bool {
 
 /// rskj `TxsMinGasPriceRule`: every non-REMASC transaction must pay at least
 /// the block's `minimumGasPrice`. Unconditional — no activation gate.
+///
+/// A minimum past 256 bits is `U256::MAX` here. No transaction's price
+/// reaches either, since a block's transactions pay under 2^255
+/// (`Transaction::from_rskj`), so the rule decides as rskj's does.
 pub struct TxsMinGasPriceRule;
 
 impl BlockValidator for TxsMinGasPriceRule {
@@ -40,7 +45,7 @@ impl BlockValidator for TxsMinGasPriceRule {
             if tx.gas_price < min {
                 return Err(ValidationError::TxGasPriceBelowMinimum {
                     tx_gas_price: tx.gas_price,
-                    block_minimum: min,
+                    block_minimum: block.header.minimum_gas_price_value(),
                 });
             }
         }
@@ -138,20 +143,26 @@ impl HeaderValidator for ExtraDataRule {
 ///   upper = center + delta
 ///   lower = max(0, center - delta)
 /// ```
-/// and the header's value must lie in `[lower, upper]` inclusive.
+/// and the header's value must lie in `[lower, upper]` inclusive. rskj
+/// computes it in `Coin`, a `BigInteger`, and nothing bounds the price from
+/// above, so both are read whole, of any size.
 pub struct PrevMinGasPriceRule;
 
 impl PrevMinGasPriceRule {
     /// The inclusive `[lower, upper]` band a child's minimum gas price may
     /// occupy, given the parent's.
-    pub fn range(parent_min_gas_price: U256) -> (U256, U256) {
+    pub fn range(parent_min_gas_price: &BigUint) -> (BigUint, BigUint) {
         let center = parent_min_gas_price;
-        let mut delta = center / U256::from(100u64);
-        if delta.is_zero() {
-            delta = U256::from(1u64);
+        let mut delta = center / 100u32;
+        if delta == BigUint::ZERO {
+            delta = BigUint::from(1u32);
         }
-        let upper = center.saturating_add(delta);
-        let lower = center.saturating_sub(delta);
+        let upper = center + &delta;
+        let lower = if *center >= delta {
+            center - &delta
+        } else {
+            BigUint::ZERO
+        };
         (lower, upper)
     }
 }
@@ -161,8 +172,8 @@ impl ParentHeaderValidator for PrevMinGasPriceRule {
         if header.number == 0 {
             return Ok(());
         }
-        let (lower, upper) = Self::range(parent.minimum_gas_price);
-        let got = header.minimum_gas_price;
+        let (lower, upper) = Self::range(&parent.minimum_gas_price_value());
+        let got = header.minimum_gas_price_value();
         if got < lower || got > upper {
             return Err(ValidationError::MinGasPriceOutOfRange { lower, upper, got });
         }
@@ -319,15 +330,15 @@ mod tests {
     #[test]
     fn prev_min_gas_price_allows_one_percent_either_way() {
         // center 1000 -> delta 10 -> [990, 1010] inclusive.
-        let (lower, upper) = PrevMinGasPriceRule::range(U256::from(1000u64));
-        assert_eq!(lower, U256::from(990u64));
-        assert_eq!(upper, U256::from(1010u64));
+        let (lower, upper) = PrevMinGasPriceRule::range(&BigUint::from(1000u32));
+        assert_eq!(lower, BigUint::from(990u32));
+        assert_eq!(upper, BigUint::from(1010u32));
 
         // A zero parent still gets delta 1, so it can rise to 1 (and the lower
         // bound is clamped at zero rather than going negative).
-        let (lower, upper) = PrevMinGasPriceRule::range(U256::ZERO);
-        assert_eq!(lower, U256::ZERO);
-        assert_eq!(upper, U256::from(1u64));
+        let (lower, upper) = PrevMinGasPriceRule::range(&BigUint::ZERO);
+        assert_eq!(lower, BigUint::ZERO);
+        assert_eq!(upper, BigUint::from(1u32));
 
         let mut parent = bare_header(8_999_999);
         parent.minimum_gas_price = U256::from(1000u64);
@@ -349,6 +360,68 @@ mod tests {
             check(1011),
             Err(ValidationError::MinGasPriceOutOfRange { .. })
         ));
+    }
+
+    /// rskj computes the range in `BigInteger`, so it holds past 256 bits,
+    /// where the typed field holds `U256::MAX`: 1% either way, exactly.
+    #[test]
+    fn prev_min_gas_price_is_exact_past_256_bits() {
+        let two = BigUint::from(2u8);
+        let at = |number: u64, price: &BigUint| {
+            let mut header = bare_header(number);
+            header.set_minimum_gas_price(price);
+            header
+        };
+        let check = |parent: &BigUint, price: &BigUint| {
+            PrevMinGasPriceRule.validate_with_parent(&at(9_000_000, price), &at(8_999_999, parent))
+        };
+        // 1% of 100 * 2^294 + 12,345 is 2^294 + 123.
+        let parent = two.pow(294) * 100u32 + 12_345u32;
+        let lower = two.pow(294) * 99u32 + 12_222u32;
+        let upper = two.pow(294) * 101u32 + 12_468u32;
+        assert_eq!(
+            PrevMinGasPriceRule::range(&parent),
+            (lower.clone(), upper.clone())
+        );
+        for price in [&lower, &parent, &upper] {
+            assert_eq!(check(&parent, price), Ok(()));
+        }
+        assert_eq!(
+            check(&parent, &(&lower - 1u8)),
+            Err(ValidationError::MinGasPriceOutOfRange {
+                lower: lower.clone(),
+                upper: upper.clone(),
+                got: &lower - 1u8,
+            })
+        );
+        assert!(check(&parent, &(&upper + 1u8)).is_err());
+        // A parent under 2^256 that 100 divides: its child may rise past
+        // 2^256 by exactly 1%, and no further.
+        let parent = two.pow(256) - 36u8;
+        let upper = &parent / 100u32 * 101u32;
+        assert!(upper > two.pow(256));
+        assert_eq!(check(&parent, &upper), Ok(()));
+        assert!(check(&parent, &(&upper + 1u8)).is_err());
+    }
+
+    /// A minimum past 256 bits refuses every transaction but REMASC, as rskj's
+    /// does, and the refusal names the minimum whole.
+    #[test]
+    fn a_minimum_gas_price_past_256_bits_refuses_all_but_remasc() {
+        let minimum = BigUint::from(2u8).pow(300);
+        let mut block = block_at(9_000_000, 0, vec![remasc_tx()]);
+        block.header.set_minimum_gas_price(&minimum);
+        assert_eq!(TxsMinGasPriceRule.validate_block(&block), Ok(()));
+        let mut highest = user_tx(0);
+        highest.gas_price = (U256::from(1) << 255) - U256::from(1);
+        block.transactions.insert(0, highest.clone());
+        assert_eq!(
+            TxsMinGasPriceRule.validate_block(&block),
+            Err(ValidationError::TxGasPriceBelowMinimum {
+                tx_gas_price: highest.gas_price,
+                block_minimum: minimum,
+            })
+        );
     }
 }
 

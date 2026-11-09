@@ -218,7 +218,7 @@ impl BlockResultDto {
             gas_used: to_hex_u64(header.gas_used),
             timestamp: to_hex_u64(header.timestamp),
             extra_data: to_hex_bytes(&header.extra_data),
-            minimum_gas_price: to_hex_u256(&header.minimum_gas_price),
+            minimum_gas_price: to_hex_quantity_bytes(&header.minimum_gas_price_bytes()),
             transactions,
             uncles,
             size: to_hex_u64(size),

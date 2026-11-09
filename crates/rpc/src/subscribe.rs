@@ -233,7 +233,7 @@ pub(crate) fn header_dto(header: &Header, hash: B256) -> Value {
     out.insert("extraData".into(), Value::String(to_hex_bytes(header.extra_data.as_ref())));
     out.insert(
         "minimumGasPrice".into(),
-        Value::String(to_hex_u256(&header.minimum_gas_price)),
+        Value::String(to_hex_quantity_bytes(&header.minimum_gas_price_bytes())),
     );
     Value::Object(out)
 }
