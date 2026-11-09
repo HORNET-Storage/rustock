@@ -204,8 +204,12 @@ impl BlockProcessor {
 
     /// The chain's consensus constants, for a node whose chain is not exactly
     /// the one its chain id names: the configuration the rest of the node
-    /// validates headers with.
+    /// validates headers with, and whose sequential-sublist minimum sets the
+    /// gas limit of every sublist the executor holds transactions to.
     pub fn with_chain_config(mut self, config: Arc<rustock_core::config::ChainConfig>) -> Self {
+        self.executor = self
+            .executor
+            .with_min_sequential_set_gas_limit(config.min_sequential_set_gas_limit);
         self.chain_config = config;
         self
     }
@@ -360,23 +364,30 @@ impl BlockProcessor {
         // receipts root alone, which is how testnet #7,690,876 showed up.
         // Every earlier block verified because none of them actually split:
         // the edges field is present and empty from reed810 until here.
-        let sublist_starts: &[i16] = header
-            .version_fields
-            .as_ref()
-            .and_then(|v| v.edges.as_deref())
-            .unwrap_or(&[]);
+        //
+        // The edges count only where the block runs as its sublists
+        // (`runs_sublists`): rskj executes any other block as one list and
+        // never reads them.
+        let sublist_starts: &[i16] = if self.hardfork_cfg.runs_sublists(header.number) {
+            header
+                .version_fields
+                .as_ref()
+                .and_then(|v| v.edges.as_deref())
+                .unwrap_or(&[])
+        } else {
+            &[]
+        };
 
         // The sublists also have to be *independent*, and that is a rule the
         // validator applies rather than a property it may assume. Recording
         // is started only for a block that actually splits, so every block
         // mainnet has produced -- reed810 is unscheduled there, and the field
         // is absent or empty throughout -- pays nothing for it.
-        let check_collisions =
-            self.hardfork_cfg.has_rskip144(header.number) && !sublist_starts.is_empty();
+        let check_collisions = !sublist_starts.is_empty();
         if check_collisions {
             // No address is excluded on account of fees any more. The fees
-            // are postponed whenever RSKIP-144 is active -- which is whenever
-            // this check runs -- and settled once at the REMASC transaction,
+            // are postponed whenever the block runs as its sublists -- which
+            // is whenever this check runs -- and settled once at the REMASC transaction,
             // which is in the sequential set. So no parallel sublist writes
             // REMASC's account cell on their account, and excluding it would
             // only hide a genuine transfer to the Bridge's counterpart that
@@ -416,7 +427,7 @@ impl BlockProcessor {
         // whatever the call returned. Checked for every block that declares a
         // partition, not only one this node ran in parallel: it is a property
         // of the block, and running it on one thread does not make it true.
-        if !sublist_starts.is_empty() && self.hardfork_cfg.has_rskip144(header.number) {
+        if !sublist_starts.is_empty() {
             for (index, tx_result) in exec_result.tx_results.iter().enumerate() {
                 if !tx_result.reached_sequential_only {
                     continue;
@@ -765,8 +776,8 @@ impl BlockProcessor {
 
     /// The rules of [`Self::validate_block_rules`] that read only the block
     /// and its parent: the transaction gas price rules, REMASC's presence,
-    /// the extra data size and the minimum gas price range. No ancestry, no
-    /// merged-mining fields.
+    /// the extra data size, the sublist edges and the minimum gas price
+    /// range. No ancestry, no merged-mining fields.
     ///
     /// Split out for the miner, which runs them on the block it assembled
     /// before handing out work: these are the rules a block could break
@@ -780,8 +791,8 @@ impl BlockProcessor {
         parent: Option<&rustock_core::Header>,
     ) -> Result<(), ValidationError> {
         use rustock_core::validation::block_rules::{
-            BlockTxsMaxGasPriceRule, ExtraDataRule, PrevMinGasPriceRule, RemascValidationRule,
-            TxsMinGasPriceRule,
+            validate_tx_execution_sublists_edges, BlockTxsMaxGasPriceRule, ExtraDataRule,
+            PrevMinGasPriceRule, RemascValidationRule, TxsMinGasPriceRule,
         };
         use rustock_core::validation::{BlockValidator, HeaderValidator, ParentHeaderValidator};
 
@@ -796,6 +807,19 @@ impl BlockProcessor {
         RemascValidationRule.validate_block(block)?;
         // rskj ExtraDataRule -- unconditional, 32 bytes.
         ExtraDataRule::default().validate(&block.header)?;
+        // rskj ValidTxExecutionSublistsEdgesRule -- where the block runs as
+        // its sublists. Without it a block could partition itself in a way
+        // rskj refuses: edges out of order, past the end, or more of them
+        // than there are execution threads.
+        validate_tx_execution_sublists_edges(
+            block
+                .header
+                .version_fields
+                .as_ref()
+                .and_then(|v| v.edges.as_deref()),
+            block.transactions.len(),
+            self.hardfork_cfg.runs_sublists(block.header.number),
+        )?;
 
         if let Some(parent) = parent {
             // rskj PrevMinGasPriceRule -- unconditional.
@@ -1556,6 +1580,8 @@ mod tests {
         sign_tx(&mut tx, &key, chain_id);
 
         let mut header = dummy_header(8_000_000);
+        // Testnet's gas limit, so the parallel sublist has gas to hold it.
+        header.gas_limit = U256::from(12_000_000);
         header.version_fields = Some(rustock_core::types::header::HeaderVersionFields {
             version: 1,
             edges: Some(vec![1, 2]),
@@ -1566,12 +1592,186 @@ mod tests {
         let processor = BlockProcessor::new(RskHardforkConfig::testnet(), block_store);
         let out = processor.execute_block(&block, &root, store);
         assert!(
-            !matches!(
-                out,
-                Err(ProcessError::SequentialOnlyPrecompileInParallelSublist { .. })
-            ),
-            "a plain transfer reaches no precompile"
+            out.is_ok(),
+            "a plain transfer reaches no precompile: {:?}",
+            out.err()
         );
+    }
+
+    /// rskj `ValidTxExecutionSublistsEdgesRule` runs with the block's other
+    /// body rules, where the block runs as its sublists. A REMASC transaction
+    /// alone cannot be given a parallel sublist: the last transaction must
+    /// stay sequential.
+    #[test]
+    fn the_sublist_edges_are_checked_with_the_body_rules() {
+        let block = |edges: Option<Vec<i16>>| {
+            let mut header = dummy_header(8_000_000);
+            header.version_fields = Some(rustock_core::types::header::HeaderVersionFields {
+                version: 1,
+                edges,
+                base_event: None,
+            });
+            Block {
+                header,
+                transactions: vec![Transaction::remasc(8_000_000)],
+                ommers: vec![],
+            }
+        };
+        let processor = |cfg: RskHardforkConfig| {
+            let block_store =
+                Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+            BlockProcessor::new(cfg, block_store)
+        };
+
+        let testnet = processor(RskHardforkConfig::testnet());
+        assert!(matches!(
+            testnet.validate_block_body_rules(&block(Some(vec![1])), None),
+            Err(ValidationError::InvalidSublistEdges { .. })
+        ));
+        assert_eq!(
+            testnet.validate_block_body_rules(&block(Some(vec![])), None),
+            Ok(())
+        );
+        assert_eq!(
+            testnet.validate_block_body_rules(&block(None), None),
+            Ok(())
+        );
+
+        // With rskip351 moved off reed810, rskj runs the block as one list and
+        // never reads its edges.
+        let (moved, _) = RskHardforkConfig::testnet()
+            .with_rskj_overrides(&[], &[("rskip351".to_string(), None)])
+            .unwrap();
+        assert_eq!(
+            processor(moved).validate_block_body_rules(&block(Some(vec![1])), None),
+            Ok(())
+        );
+    }
+
+    /// The chain configuration's sequential minimum reaches the executor. On
+    /// regtest's 6,800,000, a 12,000,000-gas block's parallel sublists hold
+    /// 2,600,000 each; testnet's 10,000,000 leaves them 1,000,000.
+    #[test]
+    fn the_chain_configuration_sets_the_sublists_gas() {
+        let store: Arc<dyn TrieStore> = Arc::new(MemoryTrieStore::new());
+        let key = SigningKey::from_slice(&[5u8; 32]).unwrap();
+        let sender = sender_address(&key);
+        let root = put_account(
+            &TrieNode::empty(),
+            store.as_ref(),
+            &sender,
+            0,
+            U256::from(10u64).pow(U256::from(18)),
+        );
+        let mut tx = Transaction {
+            nonce: 0,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(2_600_000),
+            to: Bytes::copy_from_slice(Address::repeat_byte(0xBB).as_slice()),
+            value: U256::from(1),
+            input: Bytes::new(),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
+        };
+        sign_tx(&mut tx, &key, 31);
+        let mut header = dummy_header(8_000_000);
+        header.gas_limit = U256::from(12_000_000);
+        header.version_fields = Some(rustock_core::types::header::HeaderVersionFields {
+            version: 1,
+            edges: Some(vec![1]),
+            base_event: None,
+        });
+        let block = Block {
+            header,
+            transactions: vec![tx],
+            ommers: vec![],
+        };
+        let processor = || {
+            let block_store =
+                Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+            BlockProcessor::new(RskHardforkConfig::testnet(), block_store)
+        };
+
+        let err = processor()
+            .execute_block(&block, &root, store.clone())
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Too much gas used in this block or sublist"),
+            "{err}"
+        );
+        let regtest_minimum = Arc::new(rustock_core::config::ChainConfig {
+            min_sequential_set_gas_limit: 6_800_000,
+            ..rustock_core::config::ChainConfig::testnet()
+        });
+        let out = processor()
+            .with_chain_config(regtest_minimum)
+            .execute_block(&block, &root, store);
+        assert!(out.is_ok(), "{:?}", out.err());
+    }
+
+    /// A receipt's cumulative gas restarts with each sublist where the block
+    /// runs as its sublists, and nowhere else: with rskip351 moved off
+    /// reed810, rskj runs the same block as one list and counts across it.
+    #[test]
+    fn receipts_restart_their_gas_only_where_the_block_runs_as_sublists() {
+        let store: Arc<dyn TrieStore> = Arc::new(MemoryTrieStore::new());
+        let mut root = TrieNode::empty();
+        let mut transactions = Vec::new();
+        for seed in [3u8, 4] {
+            let key = SigningKey::from_slice(&[seed; 32]).unwrap();
+            let sender = sender_address(&key);
+            let rbtc = U256::from(10u64).pow(U256::from(18));
+            root = put_account(&root, store.as_ref(), &sender, 0, rbtc);
+            let mut tx = Transaction {
+                nonce: 0,
+                gas_price: U256::from(0),
+                gas_limit: U256::from(21_000),
+                to: Bytes::copy_from_slice(Address::repeat_byte(seed).as_slice()),
+                value: U256::from(1),
+                input: Bytes::new(),
+                v: 0,
+                r: U256::ZERO,
+                s: U256::ZERO,
+                cached_rlp: None,
+            };
+            sign_tx(&mut tx, &key, 31);
+            transactions.push(tx);
+        }
+        let mut header = dummy_header(8_000_000);
+        header.gas_limit = U256::from(12_000_000);
+        header.version_fields = Some(rustock_core::types::header::HeaderVersionFields {
+            version: 1,
+            edges: Some(vec![1]),
+            base_event: None,
+        });
+        let block = Block {
+            header,
+            transactions,
+            ommers: vec![],
+        };
+        let cumulative = |cfg: RskHardforkConfig| -> Vec<u64> {
+            let block_store =
+                Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+            BlockProcessor::new(cfg, block_store)
+                .execute_block(&block, &root, store.clone())
+                .unwrap()
+                .receipts
+                .iter()
+                .map(|r| r.cumulative_gas_used)
+                .collect()
+        };
+
+        assert_eq!(
+            cumulative(RskHardforkConfig::testnet()),
+            vec![21_000, 21_000]
+        );
+        let (moved, _) = RskHardforkConfig::testnet()
+            .with_rskj_overrides(&[], &[("rskip351".to_string(), None)])
+            .unwrap();
+        assert_eq!(cumulative(moved), vec![21_000, 42_000]);
     }
 
     /// A block whose first transaction calls the Bridge, with `edges` as
@@ -1611,6 +1811,8 @@ mod tests {
         sign_tx(&mut tx, &key, chain_id);
 
         let mut header = dummy_header(8_000_000);
+        // Testnet's gas limit, so a parallel sublist has gas to hold the call.
+        header.gas_limit = U256::from(12_000_000);
         if let Some(edges) = edges {
             header.version_fields = Some(rustock_core::types::header::HeaderVersionFields {
                 version: 1,

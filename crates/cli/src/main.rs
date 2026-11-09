@@ -3391,7 +3391,8 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         // built-in federation, so the first payout (block 15 on regtest)
         // reached a state root no node with the right constants reproduces.
         let mut miner_processor =
-            rustock_execution::BlockProcessor::new(hardfork_cfg.clone(), store.clone());
+            rustock_execution::BlockProcessor::new(hardfork_cfg.clone(), store.clone())
+                .with_chain_config(config.clone());
         if let Some(cache) = &btc_block_cache {
             miner_processor = miner_processor.with_btc_block_cache(cache.clone());
         }

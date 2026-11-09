@@ -8,6 +8,7 @@ use revm::context::{BlockEnv, TxEnv};
 use revm::primitives::TxKind;
 use revm::primitives::hardfork::SpecId;
 use rustock_core::Header;
+use crate::executor::ExecutionError;
 use crate::hardfork::RskHardforkConfig;
 use crate::precompiles::REMASC_ADDR;
 
@@ -44,11 +45,26 @@ pub fn block_env_from_header(header: &Header, hardfork_cfg: &RskHardforkConfig) 
 /// Build a revm `TxEnv` from an RSK transaction.
 ///
 /// RSK transactions are legacy-only (no EIP-1559/EIP-2930/EIP-4844).
+///
+/// Two transactions are refused rather than cut to fit. One whose gas limit
+/// rskj cannot read as gas: `GasCost.toGas` throws on eight bytes with the
+/// top bit set. And one priced at 2^128 or more, which revm's `TxEnv` cannot
+/// hold; rskj carries the price as a `BigInteger`, but no balance on mainnet
+/// or testnet covers it even at 21,000 gas, so there rskj refuses the
+/// transaction too ("Not enough cash").
 pub fn tx_env_from_rsk_tx(
     tx: &rustock_core::Transaction,
     sender: Address,
     _hardfork_cfg: &RskHardforkConfig,
-) -> TxEnv {
+) -> Result<TxEnv, ExecutionError> {
+    let gas_limit = tx.gas().ok_or_else(|| {
+        ExecutionError::Evm(format!(
+            "gas limit {} is not gas: eight bytes with the top bit set",
+            tx.gas_limit
+        ))
+    })?;
+    let gas_price = u128::try_from(tx.gas_price)
+        .map_err(|_| ExecutionError::Evm(format!("gas price {} is 2^128 or more", tx.gas_price)))?;
     let kind = if tx.to.is_empty() {
         TxKind::Create
     } else {
@@ -58,11 +74,11 @@ pub fn tx_env_from_rsk_tx(
         TxKind::Call(Address::from(addr_bytes))
     };
 
-    TxEnv {
+    Ok(TxEnv {
         tx_type: 0, // legacy
         caller: sender,
-        gas_limit: tx.gas_limit.to::<u64>(),
-        gas_price: tx.gas_price.to::<u128>(),
+        gas_limit,
+        gas_price,
         kind,
         value: tx.value,
         data: Bytes::copy_from_slice(&tx.input),
@@ -73,7 +89,7 @@ pub fn tx_env_from_rsk_tx(
         blob_hashes: Vec::new(),
         max_fee_per_blob_gas: 0,
         authorization_list: Vec::new(),
-    }
+    })
 }
 
 #[cfg(test)]
@@ -155,7 +171,7 @@ mod tests {
         };
 
         let sender = Address::repeat_byte(0xBB);
-        let env = tx_env_from_rsk_tx(&tx, sender, &cfg);
+        let env = tx_env_from_rsk_tx(&tx, sender, &cfg).unwrap();
 
         assert_eq!(env.caller, sender);
         assert_eq!(env.nonce, 5);
@@ -181,9 +197,55 @@ mod tests {
         };
 
         let sender = Address::repeat_byte(0xCC);
-        let env = tx_env_from_rsk_tx(&tx, sender, &cfg);
+        let env = tx_env_from_rsk_tx(&tx, sender, &cfg).unwrap();
 
         assert!(matches!(env.kind, TxKind::Create));
         assert_eq!(env.data.len(), 5);
+    }
+
+    /// What revm's `TxEnv` cannot hold is refused, never cut to fit and
+    /// never a panic: a gas limit rskj cannot read as gas, and a price of
+    /// 2^128 or more. A gas limit past eight bytes reads as rskj reads it,
+    /// `Long.MAX_VALUE`, which no block's gas then fits.
+    #[test]
+    fn what_the_evm_cannot_carry_is_refused() {
+        let cfg = RskHardforkConfig::mainnet();
+        let tx = |gas_limit: U256, gas_price: U256| rustock_core::Transaction {
+            nonce: 0,
+            gas_price,
+            gas_limit,
+            to: AlBytes::from(vec![0xAA; 20]),
+            value: U256::ZERO,
+            input: AlBytes::new(),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
+        };
+        let env = |gas_limit, gas_price| {
+            tx_env_from_rsk_tx(&tx(gas_limit, gas_price), Address::ZERO, &cfg)
+        };
+        let one = U256::from(1u64);
+
+        assert!(env(one << 63, one).is_err(), "eight bytes, top bit set");
+        assert_eq!(
+            env((one << 63) - one, one).unwrap().gas_limit,
+            i64::MAX as u64
+        );
+        assert_eq!(
+            env(one << 64, one).unwrap().gas_limit,
+            i64::MAX as u64,
+            "nine bytes"
+        );
+        assert_eq!(env(U256::MAX, one).unwrap().gas_limit, i64::MAX as u64);
+
+        assert!(env(U256::from(21_000), one << 128).is_err());
+        assert!(env(U256::from(21_000), U256::MAX).is_err());
+        assert_eq!(
+            env(U256::from(21_000), U256::from(u128::MAX))
+                .unwrap()
+                .gas_price,
+            u128::MAX
+        );
     }
 }

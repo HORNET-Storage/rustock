@@ -211,6 +211,10 @@ pub struct RskExecutor {
     /// sublists -- which is every block on a chain where RSKIP-144 is
     /// unscheduled.
     execution_threads: usize,
+    /// rskj `Constants.getMinSequentialSetGasLimit`: the gas the sequential
+    /// sublist is guaranteed where a block runs as its sublists, and with it
+    /// the gas limit of every sublist (`BlockUtils.getSublistGasLimit`).
+    min_sequential_set_gas_limit: u64,
 }
 
 impl RskExecutor {
@@ -247,6 +251,15 @@ impl RskExecutor {
         self
     }
 
+    /// The gas the sequential sublist is guaranteed (rskj
+    /// `Constants.getMinSequentialSetGasLimit`), for a chain whose constants
+    /// are not those of the network its id names. The default is that
+    /// network's: 10,000,000 on mainnet and testnet, 6,800,000 on regtest.
+    pub fn with_min_sequential_set_gas_limit(mut self, gas: u64) -> Self {
+        self.min_sequential_set_gas_limit = gas;
+        self
+    }
+
     pub fn execution_threads(&self) -> usize {
         self.execution_threads
     }
@@ -275,6 +288,7 @@ impl RskExecutor {
         };
         let bridge_constants = bridge_constants_for(hardfork_cfg.chain_id);
         let free_bridge_senders = free_bridge_senders(&bridge_constants);
+        let min_sequential_set_gas_limit = min_sequential_set_gas_limit_for(hardfork_cfg.chain_id);
         Self {
             hardfork_cfg,
             block_store,
@@ -285,6 +299,7 @@ impl RskExecutor {
             // Sequential unless a caller asks otherwise, so an executor built
             // by a tool or a test behaves as it always has.
             execution_threads: 1,
+            min_sequential_set_gas_limit,
         }
     }
 
@@ -354,7 +369,7 @@ impl RskExecutor {
     ) -> Result<TxExecutionResult, ExecutionError> {
         let spec_id = self.hardfork_cfg.spec_id(header.number);
         let block_env = block_env_from_header(header, &self.hardfork_cfg);
-        let tx_env = tx_env_from_rsk_tx(tx, sender, &self.hardfork_cfg);
+        let tx_env = tx_env_from_rsk_tx(tx, sender, &self.hardfork_cfg)?;
         let db = RskDatabase::new(state_root.clone(), trie_store.clone(), self.block_store.clone());
 
         let cfg = make_cfg_env(spec_id, self.hardfork_cfg.chain_id, self.hardfork_cfg.has_rskip544(header.number));
@@ -489,7 +504,7 @@ impl RskExecutor {
     ) -> Result<(TxExecutionResult, crate::tracer::ProgramTrace), ExecutionError> {
         let spec_id = self.hardfork_cfg.spec_id(header.number);
         let block_env = block_env_from_header(header, &self.hardfork_cfg);
-        let tx_env = tx_env_from_rsk_tx(tx, sender, &self.hardfork_cfg);
+        let tx_env = tx_env_from_rsk_tx(tx, sender, &self.hardfork_cfg)?;
         let db = RskDatabase::new(state_root.clone(), trie_store.clone(), self.block_store.clone());
 
         let cfg = make_cfg_env(spec_id, self.hardfork_cfg.chain_id, self.hardfork_cfg.has_rskip544(header.number));
@@ -660,7 +675,7 @@ impl RskExecutor {
     ) -> Result<(TxExecutionResult, crate::gas_estimator::EstimateTelemetry), ExecutionError> {
         let spec_id = self.hardfork_cfg.spec_id(header.number);
         let block_env = block_env_from_header(header, &self.hardfork_cfg);
-        let tx_env = tx_env_from_rsk_tx(tx, sender, &self.hardfork_cfg);
+        let tx_env = tx_env_from_rsk_tx(tx, sender, &self.hardfork_cfg)?;
         let db = RskDatabase::new(state_root.clone(), trie_store.clone(), self.block_store.clone());
 
         let cfg = make_cfg_env(spec_id, self.hardfork_cfg.chain_id, self.hardfork_cfg.has_rskip544(header.number));
@@ -997,16 +1012,18 @@ impl RskExecutor {
         // With one there is nothing to run concurrently *with*, and a single
         // run over the whole block reaches the same state for less.
         //
-        // RSKIP-144 is also required, and not only because a header cannot
-        // carry edges without it. Running the sublists separately is sound
-        // *because* the fees are postponed: credited per transaction, every
-        // sublist would add its own fees to REMASC's balance as read from
-        // the state they all start from, and committing them in order keeps
-        // the last one rather than the sum. The block would silently lose a
-        // sublist's fees.
+        // The block must also run as its sublists (`runs_sublists`), and not
+        // only because a header cannot carry edges without RSKIP-144. Running
+        // the sublists separately is sound *because* the fees are postponed:
+        // credited per transaction, every sublist would add its own fees to
+        // REMASC's balance as read from the state they all start from, and
+        // committing them in order keeps the last one rather than the sum.
+        // The block would silently lose a sublist's fees. Where rskj runs a
+        // block as one list, its edges decide nothing, and it runs as one
+        // list here too.
         if self.execution_threads <= 1
             || parallel.len() < 2
-            || !self.hardfork_cfg.has_rskip144(header.number)
+            || !self.hardfork_cfg.runs_sublists(header.number)
         {
             return self.run_sublist(
                 header,
@@ -1383,11 +1400,12 @@ impl RskExecutor {
         );
 
         // rskj builds every sublist executor with `postponeFeePayment = true`
-        // once RSKIP-144 is active (`TransactionListExecutor`), accumulates
-        // the fees, and credits the block's whole total to REMASC just before
-        // the REMASC transaction runs
-        // (`addFeesToRemascIfEnabled`). Before RSKIP-144 it credits per
-        // transaction, which is what this node did at every height.
+        // where a block runs as its sublists (`TransactionListExecutor`),
+        // accumulates the fees, and credits the block's whole total to REMASC
+        // just before the REMASC transaction runs
+        // (`addFeesToRemascIfEnabled`). Run as one list (`executeInternal`),
+        // it credits per transaction, which is what this node did at every
+        // height.
         //
         // The end state is identical -- the same total reaches the same
         // account before anything can observe it, REMASC being last. What
@@ -1397,7 +1415,7 @@ impl RskExecutor {
         // It is also what makes parallel sublists mergeable at all: crediting
         // per transaction has every sublist writing REMASC's account cell,
         // and those writes would have to be summed rather than merged.
-        let postpone_fees = self.hardfork_cfg.has_rskip144(header.number);
+        let postpone_fees = self.hardfork_cfg.runs_sublists(header.number);
         let mut remasc_tx_seen = false;
         // Whether this run ends the block. Only the run that does may settle
         // fees nobody claimed; a parallel sublist ends without reaching the
@@ -1405,12 +1423,25 @@ impl RskExecutor {
         // its fees once on its own account and again when the sequential
         // sublist settles the block's total.
         let ends_the_block = range.end == transactions.len();
-        // Whether this run is the whole block as one, with nothing before or
-        // after it. Only then is the block's gas limit the container a
-        // transaction has to fit in (see the fit rule below); a sublist's
-        // container is the sublist's own limit, which this run does not know.
-        let whole_block = run_maintenance && ends_the_block;
-        let block_gas_limit = header.gas_limit.saturating_to::<u64>();
+        // rskj `TransactionExecutor.init` holds each transaction's gas limit
+        // to a container (`gasIsValid`, below): the block's gas limit or,
+        // where the block runs as its sublists, the gas limit of the sublist
+        // that runs it (`BlockUtils.getSublistGasLimit`).
+        let sublists = self.hardfork_cfg.runs_sublists(header.number);
+        let edges: &[i16] = header
+            .version_fields
+            .as_ref()
+            .and_then(|v| v.edges.as_deref())
+            .unwrap_or(&[]);
+        let block_gas = block_gas_limit(header);
+        let (parallel_gas, sequential_gas) = crate::mining::partition::sublist_gas_limits(
+            block_gas.unwrap_or_default(),
+            rustock_core::validation::block_rules::TX_EXECUTION_THREADS as u64,
+            self.min_sequential_set_gas_limit,
+        );
+        // The sublist whose container the last transaction was held to, and
+        // `total_gas` when that container began.
+        let mut container: Option<(Option<crate::collision::SublistId>, u64)> = None;
         // Mining mode only: senders with a dropped transaction. Their later
         // ones cannot execute (the nonce is now out of sequence) and rskj's
         // `executeAndFill` discards them on the nonce check; dropping them
@@ -1487,33 +1518,84 @@ impl RskExecutor {
             crate::rsk_instructions::set_transaction_index(i as u64);
 
             // rskj `TransactionExecutor.gasIsValid`: a transaction's gas
-            // **limit** must fit in the container's limit minus the gas
-            // **used** before it. The two quantities differ on purpose -- a
-            // sender's over-provisioned limit costs the block nothing once
-            // the transaction has run -- and the rule is consensus: in rskj a
-            // transaction that does not fit is invalid, and a block carrying
-            // one is rejected ("Too much gas used in this block"). Mining
-            // mode drops it instead, as rskj's `executeAndFill` does.
+            // **limit** must fit in its container's limit minus the gas
+            // **used** before it in that container. The two quantities
+            // differ on purpose -- a sender's over-provisioned limit costs
+            // the block nothing once the transaction has run -- and the rule
+            // is consensus: in rskj a transaction that does not fit is
+            // invalid, and a block carrying one is rejected ("Too much gas
+            // used in this block or sublist"). Mining mode drops it instead,
+            // as rskj's `executeAndFill` does.
             //
-            // REMASC declares no gas and is exempt by construction. Checked
-            // only when this run's container is the block itself: a sublist
-            // run is measured against the sublist's limit, which the
-            // partition validator enforces separately.
+            // Where the block runs as its sublists, the container is the
+            // transaction's sublist, and the count restarts with each one.
+            // On testnet's 12,000,000-gas blocks a parallel sublist has
+            // 1,000,000 and the sequential one 10,000,000; at 10,000,000 or
+            // less, the parallel sublists have nothing at all. REMASC declares
+            // no gas and so fits, unless what ran before it has already
+            // overflowed its container, as in rskj.
+            //
+            // The miner places transactions in sublists only after this run,
+            // so it holds each one to what any placement needs: the block's
+            // gas less all that ran before it, and the larger sublist's gas.
+            // rskj's miner, placing as it executes, holds it to the larger
+            // sublist less what its sequential sublist has used
+            // (`executeForMiningAfterRSKIP144`).
             let is_remasc = tx.is_remasc(i, transactions.len());
-            if !is_remasc && (whole_block || discard_unfitting.is_some()) {
-                let tx_gas_limit = tx.gas_limit.saturating_to::<u64>();
-                let fits = total_gas.saturating_add(tx_gas_limit) <= block_gas_limit;
-                let sender_dropped = dropped_senders.contains(sender);
-                if !fits || sender_dropped {
+            let Some(block_gas) = block_gas else {
+                // rskj throws reading it (`GasCost.toGas`), and the block is
+                // not imported.
+                return Err(ExecutionError::Evm(format!(
+                    "the block's gas limit {} is not gas: eight bytes with the top bit set",
+                    header.gas_limit
+                )));
+            };
+            let mining = discard_unfitting.is_some();
+            let (container_used, container_limit) = if mining {
+                (total_gas, block_gas)
+            } else {
+                let sublist = sublists
+                    .then(|| crate::collision::sublist_of(i, edges))
+                    .flatten();
+                let since = match container {
+                    Some((running, since)) if running == sublist => since,
+                    _ => {
+                        container = Some((sublist, total_gas));
+                        total_gas
+                    }
+                };
+                let limit = match (sublists, sublist) {
+                    (false, _) => block_gas,
+                    (true, Some(_)) => parallel_gas,
+                    (true, None) => sequential_gas,
+                };
+                (total_gas - since, limit)
+            };
+            let fits = |gas: u64| {
+                gas_fits(gas, container_used, container_limit)
+                    && !(mining && sublists && gas > parallel_gas.max(sequential_gas))
+            };
+            let tx_gas = match tx.gas() {
+                Some(gas) if fits(gas) && (is_remasc || !dropped_senders.contains(sender)) => gas,
+                unfit => {
+                    let available = container_limit.saturating_sub(container_used);
                     if let Some(dropped) = discard_unfitting.as_deref_mut() {
                         debug!(
                             tx_index = i,
-                            tx_gas_limit,
-                            available = block_gas_limit.saturating_sub(total_gas),
-                            sender_dropped,
+                            tx_gas = ?unfit,
+                            available,
+                            sender_dropped = dropped_senders.contains(sender),
                             "mining: dropping a transaction that does not fit the block"
                         );
-                        dropped.unfitting.push(i);
+                        // A gas limit rskj cannot read throws, and its miner
+                        // reports the transaction as invalid for the pool to
+                        // forget (`invalidTransactions`). One that only does
+                        // not fit stays pending.
+                        if unfit.is_some() {
+                            dropped.unfitting.push(i);
+                        } else {
+                            dropped.invalid.push(i);
+                        }
                         dropped_senders.insert(*sender);
                         {
                             use revm::context_interface::ContextTr;
@@ -1521,13 +1603,16 @@ impl RskExecutor {
                         }
                         continue;
                     }
-                    return Err(ExecutionError::Evm(format!(
-                        "Too much gas used in this block: available in block: {} tx sent: {}",
-                        block_gas_limit.saturating_sub(total_gas),
-                        tx_gas_limit
-                    )));
+                    return Err(ExecutionError::Evm(match unfit {
+                        Some(gas) => format!(
+                            "Too much gas used in this block or sublist: available: {available} tx sent: {gas}"
+                        ),
+                        None => format!(
+                            "transaction {i}'s gas limit is not gas: eight bytes with the top bit set"
+                        ),
+                    }));
                 }
-            }
+            };
 
             if is_remasc {
                 debug!(tx_index = i, "executing REMASC system call");
@@ -1709,7 +1794,7 @@ impl RskExecutor {
                         + tx.input.iter()
                             .map(|b| if *b == 0 { 4u64 } else { 68 })
                             .sum::<u64>();
-                    let limit = tx.gas_limit.to::<u64>();
+                    let limit = tx_gas;
                     if limit >= required {
                         // gasUsed may exceed the limit; that is consensus here.
                         (required.saturating_add(basic), true)
@@ -1807,7 +1892,7 @@ impl RskExecutor {
                 // An invisible exception charges the full gas limit
                 // (rskj TransactionExecutionSummary.getFee when failed).
                 let fee_gas = if invisible_exception {
-                    tx.gas_limit.to::<u64>()
+                    tx_gas
                 } else {
                     gas_used
                 };
@@ -1852,7 +1937,25 @@ impl RskExecutor {
                 continue;
             }
 
-            let tx_env = tx_env_from_rsk_tx(tx, *sender, &self.hardfork_cfg);
+            let tx_env = match tx_env_from_rsk_tx(tx, *sender, &self.hardfork_cfg) {
+                Ok(env) => env,
+                // A gas price this node's EVM cannot carry; see
+                // `tx_env_from_rsk_tx`. The miner drops it as one the EVM
+                // refused.
+                Err(e) if discard_unfitting.is_some() => {
+                    debug!(tx_index = i, error = %e, "mining: dropping a transaction the EVM cannot carry");
+                    if let Some(drops) = discard_unfitting.as_deref_mut() {
+                        drops.invalid.push(i);
+                    }
+                    dropped_senders.insert(*sender);
+                    {
+                        use revm::context_interface::ContextTr;
+                        evm.ctx.chain_mut().raw_storage.discard_tx();
+                    }
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
 
             // Per-tx precompile marker tracking: drained below only if the
             // transaction commits (rskj cacheTrack rollback drops markers).
@@ -2003,7 +2106,7 @@ impl RskExecutor {
             // Mirror what RskHandler paid REMASC: the full gas limit on an
             // invisible exception, the spent gas otherwise.
             let fee_gas = if invisible_flag.load(std::sync::atomic::Ordering::Relaxed) {
-                tx.gas_limit.to::<u64>()
+                tx_gas
             } else {
                 gas_used
             };
@@ -2256,6 +2359,40 @@ pub fn free_bridge_senders(constants: &crate::bridge::constants::BridgeConstants
         .chain(constants.authorized_free_tx_keys.iter())
         .filter_map(|hex| rsk_address_from_pubkey_hex(hex))
         .collect()
+}
+
+/// rskj `Constants.getMinSequentialSetGasLimit` on the network a chain id
+/// names, as [`bridge_constants_for`] picks its Bridge constants.
+fn min_sequential_set_gas_limit_for(chain_id: u64) -> u64 {
+    use rustock_core::config::ChainConfig;
+    match chain_id {
+        crate::hardfork::RSK_MAINNET_CHAIN_ID => ChainConfig::mainnet(),
+        crate::hardfork::RSK_TESTNET_CHAIN_ID => ChainConfig::testnet(),
+        _ => ChainConfig::regtest(),
+    }
+    .min_sequential_set_gas_limit
+}
+
+/// A block's gas limit as rskj reads it, `GasCost.toGas(getGasLimit())`:
+/// past eight bytes it is `Long.MAX_VALUE`, and eight bytes with the top
+/// bit set make a negative `long`, which rskj refuses by throwing.
+pub(crate) fn block_gas_limit(header: &Header) -> Option<u64> {
+    match u64::try_from(header.gas_limit) {
+        Err(_) => Some(i64::MAX as u64),
+        Ok(gas) => i64::try_from(gas).is_ok().then_some(gas),
+    }
+}
+
+/// rskj `TransactionExecutor.gasIsValid`, the half that reads the
+/// container: a transaction's gas limit must fit in what the transactions
+/// before it left of the container. The sum caps at `Long.MAX_VALUE`
+/// (`GasCost.add`), and reaching the cap is refused whatever the container.
+/// The other half, that the limit covers the intrinsic cost, is the EVM's
+/// own check.
+fn gas_fits(tx_gas: u64, used: u64, container: u64) -> bool {
+    const LONG_MAX: u64 = i64::MAX as u64;
+    let cumulative = tx_gas.saturating_add(used).min(LONG_MAX);
+    cumulative <= container && cumulative != LONG_MAX
 }
 
 /// Derives an RSK address from a secp256k1 public key in SEC1 hex
@@ -6486,6 +6623,9 @@ mod tests {
             edges: Some(vec![1, 2]),
             base_event: None,
         });
+        // Testnet's gas limit: each parallel sublist gets 1,000,000 of it. At
+        // 10,000,000 or less they would get none, and no block could split.
+        header.gas_limit = U256::from(12_000_000);
 
         let transactions: Vec<(rustock_core::Transaction, Address)> = (0..3)
             .map(|i| {
@@ -6573,6 +6713,7 @@ mod tests {
         );
 
         let mut header = dummy_header(8_000_000);
+        header.gas_limit = U256::from(12_000_000); // testnet's, room in every sublist
         header.version_fields = Some(rustock_core::types::header::HeaderVersionFields {
             version: 1,
             edges: Some(vec![1, 2]),
@@ -6620,6 +6761,288 @@ mod tests {
             collision.key,
             rustock_trie::account_key(&sender),
             "the nonce is what connects them, and it lives in the account cell"
+        );
+    }
+
+    /// Transfers of 1,000 wei, each from a sender of its own with the gas
+    /// limit given, in a testnet block above reed810 -- so one that runs as
+    /// its sublists -- with `block_gas` and `edges`.
+    #[allow(clippy::type_complexity)]
+    fn transfers(
+        gas_limits: &[u64],
+        block_gas: u64,
+        edges: &[i16],
+    ) -> (
+        Header,
+        Vec<(rustock_core::Transaction, Address)>,
+        TrieNode,
+        Arc<dyn TrieStore>,
+    ) {
+        let store: Arc<dyn TrieStore> = Arc::new(MemoryTrieStore::new());
+        let mut root = TrieNode::empty();
+        let mut transactions = Vec::new();
+        for (i, &gas) in gas_limits.iter().enumerate() {
+            let sender = Address::repeat_byte(0x10 + i as u8);
+            let rbtc = U256::from(10u64).pow(U256::from(18));
+            root = put_account(&root, store.as_ref(), &sender, 0, rbtc);
+            let tx = rustock_core::Transaction {
+                nonce: 0,
+                gas_price: U256::from(1),
+                gas_limit: U256::from(gas),
+                to: Bytes::copy_from_slice(Address::repeat_byte(0xA0 + i as u8).as_slice()),
+                value: U256::from(1_000),
+                input: Bytes::new(),
+                v: 0,
+                r: U256::ZERO,
+                s: U256::ZERO,
+                cached_rlp: None,
+            };
+            transactions.push((tx, sender));
+        }
+        let mut header = dummy_header(8_000_000); // testnet reed810 is 7,139,600
+        header.gas_limit = U256::from(block_gas);
+        header.version_fields = Some(rustock_core::types::header::HeaderVersionFields {
+            version: 1,
+            edges: Some(edges.to_vec()),
+            base_event: None,
+        });
+        (header, transactions, root, store)
+    }
+
+    fn execute(
+        executor: RskExecutor,
+        (header, transactions, root, store): (
+            Header,
+            Vec<(rustock_core::Transaction, Address)>,
+            TrieNode,
+            Arc<dyn TrieStore>,
+        ),
+    ) -> Result<BlockExecutionResult, ExecutionError> {
+        executor.execute_block(&header, &transactions, &root, store)
+    }
+
+    fn testnet_executor(threads: usize) -> RskExecutor {
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        RskExecutor::new(RskHardforkConfig::testnet(), block_store).with_execution_threads(threads)
+    }
+
+    fn too_much_gas(result: Result<BlockExecutionResult, ExecutionError>) -> bool {
+        matches!(result, Err(e) if e.to_string().contains("Too much gas used in this block or sublist"))
+    }
+
+    /// rskj `TransactionExecutor.gasIsValid` against the sublist's limit
+    /// (`BlockUtils.getSublistGasLimit`), not the block's. Testnet's
+    /// 12,000,000 gas gives each of the two parallel sublists 1,000,000 and
+    /// the sequential one 10,000,000, on one thread or on two.
+    #[test]
+    fn a_transaction_is_held_to_its_own_sublists_gas() {
+        for threads in [1, 2] {
+            // Sublist 0 is tx0, sublist 1 is tx1, and tx2 is sequential.
+            let exact = transfers(&[1_000_000, 1_000_000, 10_000_000], 12_000_000, &[1, 2]);
+            assert!(
+                execute(testnet_executor(threads), exact).is_ok(),
+                "each fills its own sublist exactly ({threads} threads)"
+            );
+            let parallel = transfers(&[1_000_001, 21_000, 21_000], 12_000_000, &[1, 2]);
+            assert!(
+                too_much_gas(execute(testnet_executor(threads), parallel)),
+                "{threads} threads"
+            );
+            // The block's 12,000,000 has room; the sequential sublist does not.
+            let sequential = transfers(&[21_000, 21_000, 10_000_001], 12_000_000, &[1, 2]);
+            assert!(
+                too_much_gas(execute(testnet_executor(threads), sequential)),
+                "{threads} threads"
+            );
+        }
+    }
+
+    /// The count restarts with each sublist: what one used is not taken from
+    /// another's gas, and within one, what ran is.
+    #[test]
+    fn each_sublist_counts_only_the_gas_its_own_transactions_used() {
+        // tx0 and tx1 share parallel sublist 0. tx0 uses 21,000 of its
+        // 1,000,000, so tx1 may declare 979,000 and no more.
+        let shared = transfers(&[21_000, 979_000, 21_000], 12_000_000, &[2]);
+        assert!(execute(testnet_executor(1), shared).is_ok());
+        let shared = transfers(&[21_000, 979_001, 21_000], 12_000_000, &[2]);
+        assert!(too_much_gas(execute(testnet_executor(1), shared)));
+        // Apart, tx1 has its sublist to itself.
+        let apart = transfers(&[21_000, 1_000_000, 21_000], 12_000_000, &[1, 2]);
+        assert!(execute(testnet_executor(1), apart).is_ok());
+    }
+
+    /// rskj gives the parallel sublists nothing on a block of 10,000,000 gas
+    /// or less, testnet's sequential minimum, so such a block cannot split
+    /// however little its transactions declare.
+    #[test]
+    fn at_ten_million_gas_or_less_a_parallel_sublist_holds_nothing() {
+        let split = transfers(&[21_000, 21_000], 10_000_000, &[1]);
+        assert!(too_much_gas(execute(testnet_executor(1), split)));
+        let whole = transfers(&[21_000, 21_000], 10_000_000, &[]);
+        assert!(execute(testnet_executor(1), whole).is_ok());
+    }
+
+    /// Where rskip351 is moved off reed810, rskj runs an RSKIP-144 block as
+    /// one list (`executeInternal`): the block's gas is the container and the
+    /// edges decide nothing.
+    #[test]
+    fn a_block_run_as_one_list_is_held_to_the_blocks_gas() {
+        let (moved, _) = RskHardforkConfig::testnet()
+            .with_rskj_overrides(&[], &[("rskip351".to_string(), None)])
+            .unwrap();
+        assert!(moved.has_rskip144(8_000_000) && !moved.runs_sublists(8_000_000));
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let executor = RskExecutor::new(moved, block_store).with_execution_threads(2);
+        let block = || transfers(&[2_000_000, 21_000, 21_000], 12_000_000, &[1, 2]);
+        assert!(execute(executor, block()).is_ok());
+        assert!(
+            too_much_gas(execute(testnet_executor(2), block())),
+            "as testnet ships"
+        );
+    }
+
+    /// A gas limit past eight bytes reads as rskj reads it, `Long.MAX_VALUE`,
+    /// which no block's gas fits; eight bytes with the top bit set throw in
+    /// rskj. Either way the block is refused, and nothing panics.
+    #[test]
+    fn a_gas_limit_rskj_reads_past_any_block_is_refused() {
+        let one = U256::from(1u64);
+        for (gas_limit, refusal) in [
+            (one << 64, "Too much gas used"),
+            (U256::MAX, "Too much gas used"),
+            (one << 63, "is not gas"),
+        ] {
+            let (header, mut transactions, root, store) = transfers(&[21_000], 12_000_000, &[]);
+            transactions[0].0.gas_limit = gas_limit;
+            let err =
+                execute(testnet_executor(1), (header, transactions, root, store)).unwrap_err();
+            assert!(err.to_string().contains(refusal), "{gas_limit}: {err}");
+        }
+    }
+
+    /// A price of 2^128 or more is beyond revm's `TxEnv`. No balance on a real
+    /// network covers it, so rskj refuses the transaction too; here the block
+    /// is refused rather than the node panicking.
+    #[test]
+    fn a_gas_price_past_the_evm_is_refused() {
+        let (header, mut transactions, root, store) = transfers(&[21_000], 12_000_000, &[]);
+        transactions[0].0.gas_price = U256::from(1u64) << 128;
+        let err = execute(testnet_executor(1), (header, transactions, root, store)).unwrap_err();
+        assert!(err.to_string().contains("2^128"), "{err}");
+    }
+
+    /// The miner places transactions only after running them, so it holds each
+    /// to what any placement needs: the block's gas less what ran, and the
+    /// larger sublist's gas -- on testnet's 12,000,000 the sequential
+    /// 10,000,000. A gas limit rskj cannot read is reported as invalid, for
+    /// the pool to forget, and one that only does not fit as unfitting.
+    #[test]
+    fn the_miner_drops_what_no_sublist_could_hold() {
+        let (header, mut transactions, root, store) =
+            transfers(&[10_000_001, 21_000, 21_000, 21_000], 12_000_000, &[]);
+        transactions[2].0.gas_limit = U256::from(1u64) << 63;
+        transactions[3].0.gas_limit = U256::from(1u64) << 64;
+        let (result, drops) = testnet_executor(1)
+            .execute_block_for_mining(&header, &transactions, &root, store.clone())
+            .unwrap();
+        assert_eq!(drops.unfitting, vec![0, 3]);
+        assert_eq!(drops.invalid, vec![2]);
+        assert_eq!(result.tx_results.len(), 1);
+
+        // Where the block runs as one list, the block's gas is all there is.
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let (_, drops) = RskExecutor::new(RskHardforkConfig::mainnet(), block_store)
+            .execute_block_for_mining(&header, &transactions[..2], &root, store)
+            .unwrap();
+        assert!(drops.is_empty(), "{drops:?}");
+    }
+
+    /// The sequential sublist's minimum decides every sublist's gas. Regtest's
+    /// 6,800,000 leaves a 12,000,000 block's parallel sublists 2,600,000 each,
+    /// against 1,000,000 under testnet's 10,000,000.
+    #[test]
+    fn the_sequential_minimum_sets_the_parallel_sublists_gas() {
+        let block = || transfers(&[2_600_000, 21_000], 12_000_000, &[1]);
+        assert!(too_much_gas(execute(testnet_executor(1), block())));
+        let executor = testnet_executor(1).with_min_sequential_set_gas_limit(6_800_000);
+        assert!(execute(executor, block()).is_ok());
+        let over = transfers(&[2_600_001, 21_000], 12_000_000, &[1]);
+        let executor = testnet_executor(1).with_min_sequential_set_gas_limit(6_800_000);
+        assert!(too_much_gas(execute(executor, over)));
+    }
+
+    /// rskj's `GasCost`: a gas limit past eight bytes reads as
+    /// `Long.MAX_VALUE` and one of eight with the top bit set does not read
+    /// at all; and `gasIsValid` refuses a sum that reaches `Long.MAX_VALUE`
+    /// (`GasCost.add` caps there) even where the container is no smaller.
+    #[test]
+    fn gas_reads_and_fits_as_rskj_counts_it() {
+        const LONG_MAX: u64 = i64::MAX as u64;
+        let one = U256::from(1u64);
+        let header = |gas_limit: U256| Header {
+            gas_limit,
+            ..dummy_header(1)
+        };
+        assert_eq!(
+            block_gas_limit(&header(U256::from(12_000_000))),
+            Some(12_000_000)
+        );
+        assert_eq!(block_gas_limit(&header((one << 63) - one)), Some(LONG_MAX));
+        assert_eq!(block_gas_limit(&header(one << 63)), None);
+        assert_eq!(block_gas_limit(&header(one << 64)), Some(LONG_MAX));
+        assert_eq!(block_gas_limit(&header(U256::MAX)), Some(LONG_MAX));
+
+        assert!(gas_fits(1_000_000, 0, 1_000_000));
+        assert!(!gas_fits(1_000_001, 0, 1_000_000));
+        assert!(!gas_fits(1, 1_000_000, 1_000_000));
+        assert!(gas_fits(LONG_MAX - 1, 0, LONG_MAX));
+        assert!(
+            !gas_fits(LONG_MAX, 0, LONG_MAX),
+            "reaching the cap is refused"
+        );
+        assert!(!gas_fits(1, LONG_MAX - 1, LONG_MAX));
+        assert!(
+            !gas_fits(LONG_MAX, LONG_MAX, u64::MAX),
+            "the sum caps, it does not wrap"
+        );
+    }
+
+    /// Run as one list, rskj credits each fee to REMASC as its transaction
+    /// ends -- `executeInternal`'s executors do not postpone -- so a later
+    /// transaction sees it. Run as sublists, the fees wait for the REMASC
+    /// transaction. Only a transaction that reads REMASC's balance can tell.
+    #[test]
+    fn fees_wait_for_remasc_only_where_the_block_runs_as_sublists() {
+        // BALANCE(REMASC), returned as one word.
+        let mut code = vec![0x73];
+        code.extend_from_slice(crate::precompiles::REMASC_ADDR.as_slice());
+        code.extend_from_slice(&[0x31, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3]);
+        let reader = Address::repeat_byte(0xCC);
+        let seen = |cfg: RskHardforkConfig| -> U256 {
+            let (header, mut transactions, root, store) =
+                transfers(&[21_000, 100_000], 12_000_000, &[]);
+            let root = put_account_with_code(&root, store.as_ref(), &reader, 1, U256::ZERO, &code);
+            transactions[1].0.to = Bytes::copy_from_slice(reader.as_slice());
+            let block_store =
+                Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+            let result = RskExecutor::new(cfg, block_store)
+                .execute_block(&header, &transactions, &root, store)
+                .unwrap();
+            let read = &result.tx_results[1];
+            assert!(read.success);
+            assert_eq!(read.output.len(), 32);
+            U256::from_be_slice(&read.output)
+        };
+
+        assert_eq!(seen(RskHardforkConfig::testnet()), U256::ZERO, "postponed");
+        let (moved, _) = RskHardforkConfig::testnet()
+            .with_rskj_overrides(&[], &[("rskip351".to_string(), None)])
+            .unwrap();
+        assert_eq!(
+            seen(moved),
+            U256::from(21_000),
+            "tx0's fee, at a gas price of 1"
         );
     }
 

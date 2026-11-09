@@ -843,6 +843,21 @@ impl RskHardforkConfig {
             .is_some_and(|h| block_number >= h)
     }
 
+    /// Whether a block runs as its sublists: rskj's
+    /// `areActive(RSKIP351, RSKIP144)`, which picks
+    /// `BlockExecutor.executeParallel` over `executeInternal`.
+    ///
+    /// Everything the sublists bring turns on with this, not with RSKIP-144
+    /// alone: the fees postponed to the REMASC transaction, each sublist's
+    /// own gas limit, the edges rule, the collision check, and receipts
+    /// whose gas restarts at each sublist. The two predicates coincide on
+    /// every network rskj ships; they part only where a `consensusRules`
+    /// override moves rskip351 off reed810, and rskj then executes the
+    /// block as one list, edges or not.
+    pub fn runs_sublists(&self, block_number: u64) -> bool {
+        self.has_rskip144(block_number) && self.has_rskip351(block_number)
+    }
+
     /// RSKIP502: the union bridge's seven Bridge methods (reed810).
     ///
     /// Not an ordinal comparison, for `has_rskip144`'s reason: mainnet
@@ -958,7 +973,7 @@ fn upgrade_to_spec_id(upgrade: RskNetworkUpgrade) -> SpecId {
 mod fee_settlement_tests {
     use super::*;
 
-    /// Postponing the gas fee to the REMASC transaction is gated on
+    /// Postponing the gas fee to the REMASC transaction needs
     /// RSKIP-144, and RSKIP-144 is unscheduled on mainnet. So every mainnet
     /// block credits the fee inside the transaction that paid it, as it
     /// always has, and this change cannot reach the chain this node follows.
@@ -1413,6 +1428,21 @@ mod override_tests {
         assert!(!cfg.has_rskip144(8_000_000));
         assert!(!cfg.has_rskip535(8_000_000));
         assert_eq!(cfg.active_upgrade(7_604_200), RskNetworkUpgrade::Vetiver900);
+    }
+
+    /// rskj picks `executeParallel` by RSKIP-351 and RSKIP-144 together.
+    /// Moving rskip351 alone runs testnet's RSKIP-144 blocks as one list.
+    #[test]
+    fn a_block_runs_as_its_sublists_only_under_both_rules() {
+        let testnet = RskHardforkConfig::testnet();
+        assert!(!testnet.runs_sublists(7_139_599));
+        assert!(testnet.runs_sublists(7_139_600));
+        assert!(!RskHardforkConfig::mainnet().runs_sublists(9_003_580));
+        let (moved, _) = RskHardforkConfig::testnet()
+            .with_rskj_overrides(&[], &[h("rskip351", -1)])
+            .unwrap();
+        assert!(moved.has_rskip144(8_000_000));
+        assert!(!moved.runs_sublists(8_000_000));
     }
 }
 

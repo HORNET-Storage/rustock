@@ -78,11 +78,11 @@ invisible_exception: Arc<AtomicBool>,
     /// Accumulate the fee instead of crediting it to the beneficiary.
     ///
     /// rskj builds every sublist executor with `postponeFeePayment = true`
-    /// once RSKIP-144 is active, and settles the block's whole fee total into
-    /// REMASC just before the REMASC transaction
-    /// (`TransactionListExecutor.addFeesToRemascIfEnabled`). Before RSKIP-144
-    /// it credits per transaction (`postponeFeePayment = false`), which is
-    /// what this node always did.
+    /// where a block runs as its sublists (RSKIP-144 with RSKIP-351), and
+    /// settles the block's whole fee total into REMASC just before the REMASC
+    /// transaction (`TransactionListExecutor.addFeesToRemascIfEnabled`). Run
+    /// as one list it credits per transaction (`postponeFeePayment = false`),
+    /// which is what this node always did.
     ///
     /// The end state is the same either way -- the same total reaches the
     /// same account before anything can observe it, since REMASC is the last
@@ -236,7 +236,7 @@ where
         use revm::context_interface::{Block, Transaction};
         if self.postpone_fees {
             // The executor accumulates the same total and settles it at the
-            // REMASC transaction, as rskj does once RSKIP-144 is active.
+            // REMASC transaction, as rskj does where a block runs as its sublists.
             return Ok(());
         }
         if !self.invisible_exception.load(Ordering::Relaxed) {

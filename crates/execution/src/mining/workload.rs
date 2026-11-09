@@ -579,11 +579,18 @@ impl Workload {
         chain_config.chain_id = self.chain_id as u8;
         chain_config.min_difficulty = U256::from(1);
         chain_config.max_gas_limit = block_gas_limit.max(1);
-        let processor = Arc::new(BlockProcessor::new(hardfork_cfg.clone(), block_store.clone()));
+        // The miner and the validator on the same constants: the sequential
+        // sublist's minimum sets every sublist's gas limit, which the
+        // validator holds the miner's partition to.
+        let chain_config = Arc::new(chain_config);
+        let processor = Arc::new(
+            BlockProcessor::new(hardfork_cfg.clone(), block_store.clone())
+                .with_chain_config(chain_config.clone()),
+        );
         let builder = BlockTemplateBuilder::new(
             processor,
             trie_store.clone(),
-            Arc::new(chain_config),
+            chain_config.clone(),
             hardfork_cfg.clone(),
             MiningConfig {
                 coinbase_address: Address::repeat_byte(0xC0),
@@ -606,7 +613,8 @@ impl Workload {
             .map(|i| crate::collision::sublist_of(i, &edges))
             .collect();
 
-        let validator = BlockProcessor::new(hardfork_cfg, block_store);
+        let validator =
+            BlockProcessor::new(hardfork_cfg, block_store).with_chain_config(chain_config);
         let parent_state = builder
             .load_state_root(parent.state_root)
             .map_err(|e| format!("loading the parent state: {e}"))?;

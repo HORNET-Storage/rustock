@@ -300,7 +300,7 @@ impl BlockTemplateBuilder {
         // to partition, and the final execution below is the one that counts.
         let partitioned = if has_candidates {
             let (kept, partitioned, invalid) =
-                self.probe_and_partition(number, gas_limit, transactions, &header, &state_root)?;
+                self.probe_and_partition(number, transactions, &header, &state_root)?;
             transactions = kept;
             header.transactions_root = ordered_tx_trie_root(&transactions, rskip126);
             // rskj `BlockToMineBuilder.build`: "Evicting {} invalid
@@ -368,8 +368,9 @@ impl BlockTemplateBuilder {
         })
     }
 
-    /// Execute the candidates once, keep the ones that fit, and under
-    /// RSKIP-144 place the kept ones in sublists, as rskj's miner does.
+    /// Execute the candidates once, keep the ones that fit, and where the
+    /// block runs as its sublists place the kept ones in them, as rskj's
+    /// miner does.
     ///
     /// `transactions` is the selection in price order, REMASC last. The
     /// first element of the result is what survived: every candidate the
@@ -377,11 +378,11 @@ impl BlockTemplateBuilder {
     /// being refused by the EVM (see
     /// [`crate::RskExecutor::execute_block_for_mining`]), is gone, in the
     /// order the rest already had. The second is the partition, `None` when
-    /// the block declares none: RSKIP-144 inactive, or the partition came
-    /// out all-sequential, which rskj spells as an empty edges array and we
-    /// spell as no extension at all. The third is the indices, into
-    /// `transactions`, of the candidates the EVM refused: the pool should
-    /// hear about those.
+    /// the block declares none: it does not run as its sublists, or the
+    /// partition came out all-sequential, which rskj spells as an empty
+    /// edges array and we spell as no extension at all. The third is the
+    /// indices, into `transactions`, of the candidates the EVM refused: the
+    /// pool should hear about those.
     ///
     /// The placement is an approximation on purpose: a transaction is placed
     /// from an execution against the accumulating sequential state, while
@@ -391,12 +392,11 @@ impl BlockTemplateBuilder {
     fn probe_and_partition(
         &self,
         number: u64,
-        gas_limit: U256,
         transactions: Vec<Transaction>,
         header: &Header,
         state_root: &TrieNode,
     ) -> Result<(Vec<Transaction>, Option<Partitioned>, Vec<usize>), TemplateError> {
-        let rskip144 = self.hardfork_cfg.has_rskip144(number);
+        let sublists = self.hardfork_cfg.runs_sublists(number);
         let chain_id = self.hardfork_cfg.chain_id;
         let with_senders: Vec<(Transaction, Address)> = transactions
             .iter()
@@ -406,7 +406,7 @@ impl BlockTemplateBuilder {
             })
             .collect();
 
-        if rskip144 {
+        if sublists {
             crate::collision::start_per_transaction(crate::collision::write_semantics(number));
         }
         let executed = self.processor.executor().execute_block_for_mining(
@@ -417,7 +417,11 @@ impl BlockTemplateBuilder {
         );
         // Taken whether or not execution succeeded, so a failure cannot leave
         // this probe's keys behind for the next template.
-        let touched = if rskip144 { crate::collision::finish() } else { None };
+        let touched = if sublists {
+            crate::collision::finish()
+        } else {
+            None
+        };
         let (executed, dropped) = executed?;
         if !dropped.is_empty() {
             tracing::debug!(
@@ -441,14 +445,22 @@ impl BlockTemplateBuilder {
         debug_assert_eq!(kept.len(), executed.tx_results.len(), "one result per executed transaction");
         let kept_transactions: Vec<Transaction> = kept.iter().map(|(_, tx, _)| tx.clone()).collect();
 
-        if !rskip144 {
+        if !sublists {
             return Ok((kept_transactions, None, invalid));
         }
         let touched = touched.unwrap_or_default();
 
+        // The probe has just read the block's gas limit as rskj reads it,
+        // and one it could not read failed the probe.
+        let block_gas = crate::executor::block_gas_limit(header).ok_or_else(|| {
+            crate::executor::ExecutionError::Evm(format!(
+                "the block's gas limit {} is not gas",
+                header.gas_limit
+            ))
+        })?;
         let mut partitioner = crate::mining::partition::SublistPartitioner::new(
             rustock_core::validation::block_rules::TX_EXECUTION_THREADS,
-            gas_limit.saturating_to::<u64>(),
+            block_gas,
             self.chain_config.min_sequential_set_gas_limit,
         );
 
@@ -467,10 +479,14 @@ impl BlockTemplateBuilder {
                 continue;
             }
 
+            // rskj places by the gas limit as gas (`GasCost.toGas`). Every
+            // transaction the probe kept reads as gas: one that does not was
+            // dropped as invalid.
+            let Some(gas_limit) = tx.gas() else { continue };
             let keys = touched.keys(*probe_index);
             let footprint = crate::mining::partition::TxFootprint {
                 sender: *sender,
-                gas_limit: tx.gas_limit.saturating_to::<u64>(),
+                gas_limit,
                 gas_used: result.gas_used,
                 reads: keys.map(|k| k.read().iter().cloned().collect()).unwrap_or_default(),
                 writes: keys.map(|k| k.written().iter().cloned().collect()).unwrap_or_default(),
