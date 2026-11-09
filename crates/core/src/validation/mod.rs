@@ -19,8 +19,9 @@ pub enum ValidationError {
     #[error("Failed to read system time")]
     SystemTimeError,
 
+    /// `limit` is the gas limit's low 64 bits, as `ValidGasUsedRule` reads it.
     #[error("Gas used {used} exceeds gas limit {limit}")]
-    GasUsedExceedsLimit { used: u64, limit: u64 },
+    GasUsedExceedsLimit { used: u64, limit: i64 },
 
     #[error("Gas limit overflows u64")]
     GasLimitOverflow,

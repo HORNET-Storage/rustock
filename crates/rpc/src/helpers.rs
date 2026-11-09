@@ -26,6 +26,17 @@ pub fn to_hex_bytes(v: &[u8]) -> String {
     format!("0x{}", hex::encode(v))
 }
 
+/// Formats raw bytes as a quantity, as rskj's `HexUtils.toQuantityJsonHex`
+/// does: their hex without its leading zero digits, and `0x0` for none.
+/// rskj prints the gas limit so, from the bytes it holds.
+pub fn to_hex_quantity_bytes(v: &[u8]) -> String {
+    let digits = hex::encode(v);
+    match digits.trim_start_matches('0') {
+        "" => "0x0".to_string(),
+        digits => format!("0x{digits}"),
+    }
+}
+
 /// Parses a 0x-prefixed hex string to a B256. Returns None on failure.
 pub fn parse_b256(s: &str) -> Option<B256> {
     s.parse::<B256>().ok()
@@ -203,7 +214,7 @@ impl BlockResultDto {
             logs_bloom: to_hex_bytes(header.logs_bloom.as_ref()),
             difficulty: to_hex_u256(&header.difficulty),
             total_difficulty: to_hex_u256(&total_difficulty),
-            gas_limit: to_hex_u256(&header.gas_limit),
+            gas_limit: to_hex_quantity_bytes(&header.gas_limit_bytes()),
             gas_used: to_hex_u64(header.gas_used),
             timestamp: to_hex_u64(header.timestamp),
             extra_data: to_hex_bytes(&header.extra_data),
@@ -333,6 +344,22 @@ mod tests {
     fn test_to_hex_u256() {
         assert_eq!(to_hex_u256(&U256::ZERO), "0x0");
         assert_eq!(to_hex_u256(&U256::from(0xff)), "0xff");
+    }
+
+    /// rskj's `HexUtils.toQuantityJsonHex`: leading zero digits go, a sign
+    /// byte's included, and nothing left is `0x0`.
+    #[test]
+    fn bytes_print_as_a_quantity() {
+        assert_eq!(to_hex_quantity_bytes(&[]), "0x0");
+        assert_eq!(to_hex_quantity_bytes(&[0, 0]), "0x0");
+        assert_eq!(to_hex_quantity_bytes(&[0x00, 0xb7, 0x1b, 0x00]), "0xb71b00");
+        assert_eq!(to_hex_quantity_bytes(&[0x09, 0x00]), "0x900");
+        let mut past = vec![1];
+        past.extend_from_slice(&[0; 32]);
+        assert_eq!(
+            to_hex_quantity_bytes(&past),
+            format!("0x1{}", "0".repeat(64))
+        );
     }
 
     #[test]

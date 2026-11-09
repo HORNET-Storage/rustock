@@ -994,6 +994,32 @@ fn cant_get_mgp_to_be_negative() {
     assert_eq!(next_minimum_gas_price(U256::ZERO, Some(U256::ZERO)), U256::ZERO);
 }
 
+/// rskj `GasLimitCalculator`: one step towards the target, at most a 1024th
+/// of the parent's, which near the top of 256 bits stops there rather than
+/// wrapping round to a gas limit no parent allows.
+#[test]
+fn the_gas_limit_steps_a_1024th_and_stops_at_the_top() {
+    use super::template::next_gas_limit;
+    let parent = |gas_limit: U256| Header {
+        gas_limit,
+        ..header_at(1, B256::ZERO, B256::ZERO)
+    };
+    let start = U256::from(1_024_000);
+    assert_eq!(
+        next_gas_limit(&parent(start), Some(U256::MAX)),
+        U256::from(1_025_000)
+    );
+    assert_eq!(
+        next_gas_limit(&parent(start), Some(U256::ZERO)),
+        U256::from(1_023_000)
+    );
+    assert_eq!(next_gas_limit(&parent(start), None), start);
+    assert_eq!(
+        next_gas_limit(&parent(U256::MAX - U256::from(1)), Some(U256::MAX)),
+        U256::MAX
+    );
+}
+
 /// A coinbase tagged with a hash this node never handed out cannot be matched
 /// to a block, and the message has to say which of the two reasons it is.
 #[test]

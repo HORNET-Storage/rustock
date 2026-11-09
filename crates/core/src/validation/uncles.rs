@@ -33,9 +33,7 @@ pub const UNCLE_GENERATION_LIMIT: u64 = 7;
 ///
 /// Not the trunk header rules: rskj holds no uncle to the minimum gas limit
 /// or the 32-byte extra-data cap, so an uncle may carry either and still be
-/// one. `GasUsedRule` reads the gas limit as a `u64` where rskj's
-/// `ValidGasUsedRule` reads Java's `longValue`; the two part only above
-/// 2^63, which the parent rule's bound keeps out of an uncle's reach.
+/// one.
 pub fn rsk_header_rules(config: Arc<ChainConfig>) -> Vec<Box<dyn HeaderValidator>> {
     vec![
         Box::new(HeaderLayoutRule { config: config.clone() }),

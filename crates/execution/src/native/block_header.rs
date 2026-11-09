@@ -214,7 +214,9 @@ impl BlockHeader<'_> {
             Method::BlockHash => hash.to_vec(),
             Method::MergedMiningTags => merged_mining_tags(header)?,
             Method::MinGasPrice => big_integer_bytes(header.minimum_gas_price),
-            Method::GasLimit => rlp_bytes(header.gas_limit),
+            // The bytes as the header holds them: rskj never holds the gas
+            // limit as a number (`KeptFields::gas_limit`).
+            Method::GasLimit => header.gas_limit_bytes().into_owned(),
             Method::GasUsed => big_integer_bytes(U256::from(header.gas_used)),
             Method::Difficulty => big_integer_bytes(header.difficulty),
             Method::BitcoinHeader => {
@@ -299,16 +301,15 @@ fn non_empty(field: &Option<Bytes>) -> Option<&[u8]> {
 /// big-endian form, with a leading zero byte when the first one's top bit
 /// is set, and `[0]` for zero.
 fn big_integer_bytes(value: U256) -> Vec<u8> {
-    let mut bytes = rlp_bytes(value);
+    let mut bytes = shortest_bytes(value);
     if bytes.first().is_none_or(|first| first & 0x80 != 0) {
         bytes.insert(0, 0);
     }
     bytes
 }
 
-/// A header field as its RLP holds it, which `GetGasLimit` returns as it is:
-/// the shortest big-endian form, empty for zero.
-fn rlp_bytes(value: U256) -> Vec<u8> {
+/// The shortest big-endian form, empty for zero.
+fn shortest_bytes(value: U256) -> Vec<u8> {
     let bytes = value.to_be_bytes::<32>();
     let start = bytes.iter().position(|b| *b != 0).unwrap_or(32);
     bytes[start..].to_vec()
@@ -671,13 +672,11 @@ mod tests {
         assert!(matches!(merged_mining_tags(&block), Err(Failure::Threw(_))));
     }
 
-    /// rskj's `BlockHeaderContractTest` constants (a gas limit of 3,000,000,
-    /// no gas used, a minimum gas price and difficulty of 1, 3 with uncles),
-    /// the sign byte `BigInteger` adds before a set top bit, and the gas
-    /// limit's raw form, which takes none.
+    /// rskj's `BlockHeaderContractTest` constants (no gas used, a minimum gas
+    /// price and difficulty of 1, 3 with uncles), and the sign byte
+    /// `BigInteger` adds before a set top bit.
     #[test]
     fn numbers_are_written_as_java_writes_them() {
-        assert_eq!(rlp_bytes(U256::from(3_000_000)), vec![0x2D, 0xC6, 0xC0]);
         assert_eq!(big_integer_bytes(U256::ZERO), vec![0]);
         assert_eq!(big_integer_bytes(U256::from(1)), vec![1]);
         assert_eq!(big_integer_bytes(U256::from(3)), vec![3]);
@@ -697,7 +696,37 @@ mod tests {
         let mut max = vec![0];
         max.extend_from_slice(&[0xFF; 32]);
         assert_eq!(big_integer_bytes(U256::MAX), max);
-        assert_eq!(rlp_bytes(U256::from(10_000_000)), vec![0x98, 0x96, 0x80]);
-        assert_eq!(rlp_bytes(U256::ZERO), Vec::<u8>::new());
+        assert_eq!(
+            shortest_bytes(U256::from(10_000_000)),
+            vec![0x98, 0x96, 0x80]
+        );
+        assert_eq!(shortest_bytes(U256::ZERO), Vec::<u8>::new());
+    }
+
+    /// `getGasLimit` returns the gas limit's bytes as the header holds them:
+    /// 12,000,000 as rskj's miner writes it, with a sign byte, as testnet's
+    /// blocks carry it, and bytes another miner wrote as they were written.
+    #[test]
+    fn the_gas_limit_comes_back_as_its_bytes() {
+        let nine = vec![0, 0, 0, 0, 0, 0, 0xB7, 0x1B, 0x00];
+        for (kept, bytes) in [
+            (None, vec![0x00, 0xB7, 0x1B, 0x00]),
+            (Some(nine.clone()), nine),
+        ] {
+            let (_dir, blocks, hashes) = chain_with(2, |block| {
+                block.gas_limit = U256::from(12_000_000);
+                block.kept = kept.clone().map(|gas_limit: Vec<u8>| {
+                    Box::new(rustock_core::types::header::KeptFields {
+                        gas_limit: Some(gas_limit.into()),
+                        ..Default::default()
+                    })
+                });
+            });
+            let get = input("getGasLimit(int256)", &[int(0)]);
+            assert!(matches!(
+                call(&at(&blocks, &hashes, 2), &get, 1_000_000),
+                Outcome::Returned { output, .. } if output[..] == encode_bytes(&bytes)[..]
+            ));
+        }
     }
 }

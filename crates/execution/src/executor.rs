@@ -16,7 +16,7 @@ use std::sync::Arc;
 use tracing::debug;
 
 use crate::database::RskDatabase;
-use crate::env::{block_env_from_header, tx_env_from_rsk_tx};
+use crate::env::{block_env_from_header, header_fits_program_invoke, tx_env_from_rsk_tx};
 use crate::hardfork::RskHardforkConfig;
 use crate::precompiles::{rsk_precompiles, BridgeTxContext, RskPrecompileProvider, REMASC_ADDR};
 
@@ -431,7 +431,7 @@ impl RskExecutor {
             !self.hardfork_cfg.has_rskip191(header.number),
             &extcodesize_max_precompiles,
             &extcodehash_precompiles,
-            header.beneficiary,
+            crate::rsk_instructions::BlockWords::of(header),
         );
 
         let exec_out = {
@@ -446,7 +446,8 @@ impl RskExecutor {
                 pre_rskip150_precompiles,
                 active_precompiles,
                 self.hardfork_cfg.has_rskip171(header.number),
-            );
+            )
+            .failing_programs(!header_fits_program_invoke(header));
             let out = handler
                 .run(&mut evm)
                 .map_err(|e: revm::context::result::EVMError<_>| {
@@ -568,7 +569,7 @@ impl RskExecutor {
             !self.hardfork_cfg.has_rskip191(header.number),
             &extcodesize_max_precompiles,
             &extcodehash_precompiles,
-            header.beneficiary,
+            crate::rsk_instructions::BlockWords::of(header),
         );
 
         let exec_out = {
@@ -582,7 +583,8 @@ impl RskExecutor {
                 pre_rskip150_precompiles,
                 active_precompiles,
                 self.hardfork_cfg.has_rskip171(header.number),
-            );
+            )
+            .failing_programs(!header_fits_program_invoke(header));
             use revm::inspector::InspectorHandler;
             let out = handler
                 .inspect_run(&mut evm)
@@ -739,7 +741,7 @@ impl RskExecutor {
             !self.hardfork_cfg.has_rskip191(header.number),
             &extcodesize_max_precompiles,
             &extcodehash_precompiles,
-            header.beneficiary,
+            crate::rsk_instructions::BlockWords::of(header),
         );
 
         let exec_out = {
@@ -753,7 +755,8 @@ impl RskExecutor {
                 pre_rskip150_precompiles,
                 active_precompiles,
                 self.hardfork_cfg.has_rskip171(header.number),
-            );
+            )
+            .failing_programs(!header_fits_program_invoke(header));
             use revm::inspector::InspectorHandler;
             let out = handler
                 .inspect_run(&mut evm)
@@ -1396,7 +1399,7 @@ impl RskExecutor {
             !self.hardfork_cfg.has_rskip191(header.number),
             &extcodesize_max_precompiles,
             &extcodehash_precompiles,
-            header.beneficiary,
+            crate::rsk_instructions::BlockWords::of(header),
         );
 
         // rskj builds every sublist executor with `postponeFeePayment = true`
@@ -1433,7 +1436,10 @@ impl RskExecutor {
             .as_ref()
             .and_then(|v| v.edges.as_deref())
             .unwrap_or(&[]);
-        let block_gas = block_gas_limit(header);
+        let block_gas = header.gas_limit_as_gas();
+        // Where rskj can't build a program from this header, every
+        // transaction that runs code fails (`RskHandler::failing_programs`).
+        let fails_programs = !header_fits_program_invoke(header);
         let (parallel_gas, sequential_gas) = crate::mining::partition::sublist_gas_limits(
             block_gas.unwrap_or_default(),
             rustock_core::validation::block_rules::TX_EXECUTION_THREADS as u64,
@@ -1546,8 +1552,8 @@ impl RskExecutor {
                 // rskj throws reading it (`GasCost.toGas`), and the block is
                 // not imported.
                 return Err(ExecutionError::Evm(format!(
-                    "the block's gas limit {} is not gas: eight bytes with the top bit set",
-                    header.gas_limit
+                    "the block's gas limit 0x{} is not gas: eight bytes with the top bit set",
+                    alloy_primitives::hex::encode(header.gas_limit_bytes())
                 )));
             };
             let mining = discard_unfitting.is_some();
@@ -2025,7 +2031,8 @@ impl RskExecutor {
                 active_precompiles.clone(),
                 self.hardfork_cfg.has_rskip171(header.number),
             )
-            .postponing_fees(postpone_fees);
+            .postponing_fees(postpone_fees)
+            .failing_programs(fails_programs);
                 // `inspect_run` for the one transaction being traced, `run`
                 // for every other -- and `run` is the same code path an EVM
                 // built without an inspector takes, because revm carries the
@@ -2371,16 +2378,6 @@ fn min_sequential_set_gas_limit_for(chain_id: u64) -> u64 {
         _ => ChainConfig::regtest(),
     }
     .min_sequential_set_gas_limit
-}
-
-/// A block's gas limit as rskj reads it, `GasCost.toGas(getGasLimit())`:
-/// past eight bytes it is `Long.MAX_VALUE`, and eight bytes with the top
-/// bit set make a negative `long`, which rskj refuses by throwing.
-pub(crate) fn block_gas_limit(header: &Header) -> Option<u64> {
-    match u64::try_from(header.gas_limit) {
-        Err(_) => Some(i64::MAX as u64),
-        Ok(gas) => i64::try_from(gas).is_ok().then_some(gas),
-    }
 }
 
 /// rskj `TransactionExecutor.gasIsValid`, the half that reads the
@@ -6973,26 +6970,13 @@ mod tests {
         assert!(too_much_gas(execute(executor, over)));
     }
 
-    /// rskj's `GasCost`: a gas limit past eight bytes reads as
-    /// `Long.MAX_VALUE` and one of eight with the top bit set does not read
-    /// at all; and `gasIsValid` refuses a sum that reaches `Long.MAX_VALUE`
-    /// (`GasCost.add` caps there) even where the container is no smaller.
+    /// rskj's `GasCost`: `gasIsValid` refuses a sum that reaches
+    /// `Long.MAX_VALUE` (`GasCost.add` caps there) even where the container
+    /// is no smaller. A block's gas limit reads as gas from its bytes
+    /// (`Header::gas_limit_as_gas`): the next test.
     #[test]
-    fn gas_reads_and_fits_as_rskj_counts_it() {
+    fn gas_fits_as_rskj_counts_it() {
         const LONG_MAX: u64 = i64::MAX as u64;
-        let one = U256::from(1u64);
-        let header = |gas_limit: U256| Header {
-            gas_limit,
-            ..dummy_header(1)
-        };
-        assert_eq!(
-            block_gas_limit(&header(U256::from(12_000_000))),
-            Some(12_000_000)
-        );
-        assert_eq!(block_gas_limit(&header((one << 63) - one)), Some(LONG_MAX));
-        assert_eq!(block_gas_limit(&header(one << 63)), None);
-        assert_eq!(block_gas_limit(&header(one << 64)), Some(LONG_MAX));
-        assert_eq!(block_gas_limit(&header(U256::MAX)), Some(LONG_MAX));
 
         assert!(gas_fits(1_000_000, 0, 1_000_000));
         assert!(!gas_fits(1_000_001, 0, 1_000_000));
@@ -7007,6 +6991,168 @@ mod tests {
             !gas_fits(LONG_MAX, LONG_MAX, u64::MAX),
             "the sum caps, it does not wrap"
         );
+    }
+
+    /// rskj holds a block's transactions to its gas limit read as gas from
+    /// its bytes (`GasCost.toGas`): the same 12,000,000 written in nine is
+    /// `Long.MAX_VALUE`, and leaves every sublist room for more.
+    #[test]
+    fn a_block_holds_its_transactions_to_its_gas_limit_read_from_its_bytes() {
+        let block = || transfers(&[21_000, 21_000, 10_000_001], 12_000_000, &[1, 2]);
+        assert!(too_much_gas(execute(testnet_executor(1), block())));
+        let (mut header, transactions, root, store) = block();
+        header.kept = Some(Box::new(rustock_core::types::header::KeptFields {
+            gas_limit: Some(Bytes::from(vec![0, 0, 0, 0, 0, 0, 0xb7, 0x1b, 0x00])),
+            ..Default::default()
+        }));
+        assert!(execute(testnet_executor(1), (header, transactions, root, store)).is_ok());
+    }
+
+    /// GASLIMIT and BASEFEE push the header's values whole, as rskj's program
+    /// holds them (`DataWord`s), where revm's block holds `u64`s.
+    #[test]
+    fn gaslimit_and_basefee_push_the_whole_values() {
+        // Runtime: GASLIMIT; PUSH1 0; MSTORE; BASEFEE; PUSH1 32; MSTORE;
+        // PUSH1 64; PUSH1 0; RETURN.
+        let runtime: Vec<u8> = vec![
+            0x45, 0x60, 0x00, 0x52, 0x48, 0x60, 0x20, 0x52, 0x60, 0x40, 0x60, 0x00, 0xf3,
+        ];
+        // Init: CODECOPY the 13-byte runtime and RETURN it.
+        let mut init = vec![
+            0x60, 0x0d, 0x60, 0x0c, 0x60, 0x00, 0x39, 0x60, 0x0d, 0x60, 0x00, 0xf3,
+        ];
+        init.extend_from_slice(&runtime);
+
+        let gas_limit = (U256::from(1) << 64) + U256::from(5);
+        let price = (U256::from(1) << 64) + U256::from(7);
+        // lovell700, where BASEFEE is active.
+        let header = Header {
+            gas_limit,
+            minimum_gas_price: price,
+            ..dummy_header(7_338_024)
+        };
+        let store = Arc::new(MemoryTrieStore::new());
+        let sender = Address::repeat_byte(0x45);
+        let rich = U256::from(10u64).pow(U256::from(30));
+        let root = put_account(&TrieNode::empty(), store.as_ref(), &sender, 0, rich);
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+        let tx = |nonce: u64, to: Bytes, input: Vec<u8>| rustock_core::Transaction {
+            nonce,
+            gas_price: price,
+            gas_limit: U256::from(1_000_000),
+            to,
+            value: U256::ZERO,
+            input: Bytes::from(input),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
+        };
+        let deployed = executor
+            .execute_block(
+                &header,
+                &[(tx(0, Bytes::new(), init), sender)],
+                &root,
+                store.clone(),
+            )
+            .expect("deploy block");
+        assert!(deployed.tx_results[0].success);
+        let root = crate::state::apply_state_changes(
+            &root,
+            store.as_ref(),
+            &deployed.state_changes,
+            &deployed.markers,
+        );
+        let contract = Bytes::copy_from_slice(sender.create(0).as_slice());
+        let called = executor
+            .execute_block(
+                &header,
+                &[(tx(1, contract, Vec::new()), sender)],
+                &root,
+                store,
+            )
+            .expect("call block");
+        let output = &called.tx_results[0].output;
+        assert_eq!(U256::from_be_slice(&output[..32]), gas_limit);
+        assert_eq!(U256::from_be_slice(&output[32..]), price);
+    }
+
+    /// rskj builds a program's invocation from the block's header for each
+    /// transaction that runs code, and throws where a field is past 32
+    /// bytes. Nothing catches it: the block is not imported, and a miner
+    /// leaves the transaction out. A transaction that runs no code builds
+    /// none.
+    #[test]
+    fn a_header_past_a_programs_words_fails_what_runs_code() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let sender = Address::repeat_byte(0x46);
+        let rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&TrieNode::empty(), store.as_ref(), &sender, 0, rbtc);
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+        let tx = |to: Bytes, input: &[u8]| rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::ZERO,
+            gas_limit: U256::from(1_000_000),
+            to,
+            value: U256::ZERO,
+            input: Bytes::copy_from_slice(input),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
+        };
+        // A creation whose code is STOP, one with no code, and a transfer.
+        let runs_code = tx(Bytes::new(), &[0x00]);
+        let creates_nothing = tx(Bytes::new(), &[]);
+        let transfer = tx(
+            Bytes::copy_from_slice(Address::repeat_byte(0x47).as_slice()),
+            &[],
+        );
+
+        let one = U256::from(1);
+        for (header, fits) in [
+            (
+                Header {
+                    gas_limit: (one << 255) - one,
+                    ..dummy_header(892_000)
+                },
+                true,
+            ),
+            // 2^255 takes a sign byte: 33 bytes.
+            (
+                Header {
+                    gas_limit: one << 255,
+                    ..dummy_header(892_000)
+                },
+                false,
+            ),
+            (
+                Header {
+                    difficulty: one << 255,
+                    ..dummy_header(892_000)
+                },
+                false,
+            ),
+        ] {
+            let run = |tx: &rustock_core::Transaction| {
+                executor.execute_block(&header, &[(tx.clone(), sender)], &root, store.clone())
+            };
+            assert_eq!(run(&runs_code).is_ok(), fits);
+            assert!(run(&creates_nothing).is_ok());
+            assert!(run(&transfer).is_ok());
+            let (mined, drops) = executor
+                .execute_block_for_mining(
+                    &header,
+                    &[(runs_code.clone(), sender)],
+                    &root,
+                    store.clone(),
+                )
+                .expect("a miner leaves the transaction out");
+            assert_eq!(mined.tx_results.len(), usize::from(fits));
+            assert_eq!(drops.invalid, if fits { vec![] } else { vec![0] });
+        }
     }
 
     /// Run as one list, rskj credits each fee to REMASC as its transaction

@@ -43,6 +43,28 @@ fn test_header(number: u64) -> Header {
     }
 }
 
+/// rskj prints a header's gas limit from the bytes it holds
+/// (`HexUtils.toQuantityJsonHex`), so one past 256 bits prints whole, in a
+/// block and in a `newHeads` notification alike.
+#[test]
+fn a_gas_limit_past_256_bits_prints_whole() {
+    let mut past = vec![1];
+    past.extend_from_slice(&[0; 32]);
+    let header = Header {
+        gas_limit: U256::MAX,
+        kept: Some(Box::new(rustock_core::types::header::KeptFields {
+            gas_limit: Some(past.into()),
+            ..Default::default()
+        })),
+        ..test_header(1)
+    };
+    let whole = format!("0x1{}", "0".repeat(64));
+    let block = crate::helpers::BlockResultDto::from_header(&header, B256::ZERO, U256::ZERO);
+    assert_eq!(block.gas_limit, whole);
+    let notified = crate::subscribe::header_dto(&header, B256::ZERO);
+    assert_eq!(notified["gasLimit"], json!(whole));
+}
+
 fn setup_state() -> (RpcState, tempfile::TempDir) {
     setup_state_with(|store| store)
 }

@@ -114,14 +114,23 @@ impl ParentHeaderValidator for TimestampRule {
     }
 }
 
+/// rskj `ValidGasUsedRule`: a header's gas used may not pass its gas limit,
+/// which it reads as `new BigInteger(1, bytes).longValue()`, the low 64
+/// bits as a `long`. Where they are 2^63 or more that `long` is negative,
+/// and no gas used fits under it, not even none.
 pub struct GasUsedRule;
 impl HeaderValidator for GasUsedRule {
     fn validate(&self, header: &Header) -> Result<(), ValidationError> {
-        let gas_limit = gas_limit_as_u64(header.gas_limit)?;
-        if header.gas_used > gas_limit {
+        let limit = header.gas_limit_low_long();
+        // rskj reads the gas used exactly, so it is a `long` and never
+        // negative.
+        if i64::try_from(header.gas_used)
+            .ok()
+            .is_none_or(|used| used > limit)
+        {
             return Err(ValidationError::GasUsedExceedsLimit {
                 used: header.gas_used,
-                limit: gas_limit,
+                limit,
             });
         }
         Ok(())

@@ -1,6 +1,7 @@
 use alloy_primitives::{Address, Bloom, B256, U256, Bytes};
 use alloy_rlp::Encodable;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,12 +94,10 @@ pub struct HeaderVersionFields {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KeptFields {
     /// The gas limit's bytes, where they aren't how rskj's miner writes its
-    /// value (`BigInteger.toByteArray`): more leading zeros, no sign byte,
-    /// or none at all. rskj never holds the gas limit as a number. It
-    /// compares its value with the parent's, but `GasCost.toGas` reads
-    /// more than eight bytes as `Long.MAX_VALUE`, `DataWord.valueOf`
-    /// refuses more than 32, and the BlockHeader contract returns the
-    /// bytes. `gas_limit` holds the value, or `U256::MAX` past 256 bits.
+    /// value (`BigInteger.toByteArray`): more leading zeros, or no sign
+    /// byte. rskj never holds the gas limit as a number, and each of its
+    /// readers reads the bytes its own way: see [`Header::gas_limit_bytes`].
+    /// `gas_limit` holds the value, or `U256::MAX` past 256 bits.
     pub gas_limit: Option<Bytes>,
     /// An empty coinbase, which rskj reads as its null address, an
     /// `RskAddress` of no bytes, and writes back empty. `beneficiary`
@@ -229,6 +228,15 @@ fn java_signed_bytes(value: &U256) -> Vec<u8> {
     }
     out.extend_from_slice(&be[start..]);
     out
+}
+
+/// `new BigInteger(1, bytes).longValue()`: the low 64 bits of the unsigned
+/// value, as a two's-complement `long`.
+fn low_long(bytes: &[u8]) -> i64 {
+    let low = &bytes[bytes.len().saturating_sub(8)..];
+    let mut word = [0u8; 8];
+    word[8 - low.len()..].copy_from_slice(low);
+    i64::from_be_bytes(word)
 }
 
 impl Header {
@@ -430,10 +438,7 @@ impl Header {
         }
         java_signed_bytes(&self.difficulty).as_slice().encode(list);
         self.number.encode(list);
-        match kept.and_then(|k| k.gas_limit.as_ref()) {
-            Some(bytes) => bytes.encode(list),
-            None => java_signed_bytes(&self.gas_limit).as_slice().encode(list),
-        }
+        self.gas_limit_bytes()[..].encode(list);
         self.gas_used.encode(list);
         self.timestamp.encode(list);
         self.extra_data.encode(list);
@@ -595,8 +600,11 @@ impl Header {
             "a difficulty that is none, negative or past 256 bits",
         ))?;
         // rskj keeps the gas limit's bytes: see `KeptFields::gas_limit`.
+        // None is null to it, and every rule that reads a header's gas limit
+        // throws on null (`new BigInteger(1, getGasLimit())`): a block's
+        // `GasLimitRule` and an uncle's `ValidGasUsedRule`, for two.
         let gas_limit = {
-            let bytes = field(9)?.unwrap_or_default();
+            let bytes = field(9)?.ok_or(refused("no gas limit"))?;
             let value = significant(Some(bytes));
             let gas_limit = if value.len() > 32 {
                 U256::MAX
@@ -797,6 +805,38 @@ impl Header {
     /// What rskj kept of this header that the typed fields can't hold.
     pub fn kept(&self) -> Option<&KeptFields> {
         self.kept.as_deref()
+    }
+
+    /// The gas limit's bytes, as rskj holds them (`getGasLimit`): as they
+    /// came, or as its miner writes the value. Its readers read them
+    /// differently: the BlockHeader contract returns them, `GasCost.toGas`
+    /// and `ValidGasUsedRule` read them as below, a program's invocation
+    /// can't hold more than 32 (`DataWord.valueOf`), and the rules that
+    /// compare it with the parent's read the whole value.
+    pub fn gas_limit_bytes(&self) -> Cow<'_, [u8]> {
+        match self.kept().and_then(|kept| kept.gas_limit.as_ref()) {
+            Some(bytes) => Cow::Borrowed(bytes),
+            None => Cow::Owned(java_signed_bytes(&self.gas_limit)),
+        }
+    }
+
+    /// The gas limit as gas, `GasCost.toGas`, which is how rskj holds a
+    /// block's transactions to it: more than eight bytes are
+    /// `Long.MAX_VALUE` whatever they hold, and eight with the top bit set
+    /// are a negative `long`, which it throws on (`None`).
+    pub fn gas_limit_as_gas(&self) -> Option<u64> {
+        let bytes = self.gas_limit_bytes();
+        if bytes.len() > 8 {
+            return Some(i64::MAX as u64);
+        }
+        u64::try_from(low_long(&bytes)).ok()
+    }
+
+    /// The gas limit as `ValidGasUsedRule` reads it,
+    /// `new BigInteger(1, bytes).longValue()`: its low 64 bits, as a
+    /// two's-complement `long`.
+    pub fn gas_limit_low_long(&self) -> i64 {
+        low_long(&self.gas_limit_bytes())
     }
 
     /// Whether this header's uncles hash is `hash`. rskj compares the bytes
@@ -1187,7 +1227,6 @@ mod tests {
             (&[0x00, 0x98, 0x96, 0x80][..], 10_000_000u64, false),
             (&[0x98, 0x96, 0x80], 10_000_000, true),
             (&[0, 0, 0, 0x98, 0x96, 0x80], 10_000_000, true),
-            (&[], 0, true),
         ] {
             let (items, decoded) = respelled(9, element(bytes));
             let decoded = decoded.unwrap();
@@ -1202,6 +1241,36 @@ mod tests {
         assert_eq!(decoded.gas_limit, U256::MAX);
         assert_eq!(decoded.kept().unwrap().gas_limit, Some(Bytes::from(past)));
         writes_back_as(&decoded, &items);
+    }
+
+    /// Each of rskj's readers reads the gas limit's bytes its own way:
+    /// `GasCost.toGas` takes more than eight as `Long.MAX_VALUE` and throws
+    /// on eight with the top bit set, and `ValidGasUsedRule` keeps the low
+    /// 64 bits as a `long`.
+    #[test]
+    fn the_gas_limit_reads_as_each_of_rskjs_readers_reads_it() {
+        const LONG_MAX: u64 = i64::MAX as u64;
+        let past = [&[1][..], &[0; 31], &[1]].concat();
+        for (bytes, gas, long) in [
+            // As rskj's miner writes 10,000,000.
+            (&[0x00, 0x98, 0x96, 0x80][..], Some(10_000_000), 10_000_000),
+            // The same value in nine bytes.
+            (
+                &[0, 0, 0, 0, 0, 0, 0x98, 0x96, 0x80],
+                Some(LONG_MAX),
+                10_000_000,
+            ),
+            // 2^63 in eight bytes, and as rskj's miner writes it.
+            (&[0x80, 0, 0, 0, 0, 0, 0, 0], None, i64::MIN),
+            (&[0, 0x80, 0, 0, 0, 0, 0, 0, 0], Some(LONG_MAX), i64::MIN),
+            // Past 256 bits, held only as bytes.
+            (&past, Some(LONG_MAX), 1),
+        ] {
+            let header = respelled(9, element(bytes)).1.unwrap();
+            assert_eq!(&header.gas_limit_bytes()[..], bytes);
+            assert_eq!(header.gas_limit_as_gas(), gas, "{bytes:02x?}");
+            assert_eq!(header.gas_limit_low_long(), long, "{bytes:02x?}");
+        }
     }
 
     /// rskj reads an empty coinbase as its null address, and anything but
@@ -1407,6 +1476,7 @@ mod tests {
             (7, element(&[]), "no difficulty"),
             (7, element(&[0x80]), "a negative difficulty"),
             (7, element(&[1; 33]), "a difficulty past 256 bits"),
+            (9, element(&[]), "no gas limit"),
             (14, element(&[]), "no minimum gas price"),
             (14, element(&[0xff]), "a negative minimum gas price"),
             (14, element(&[1; 33]), "a minimum gas price past 256 bits"),

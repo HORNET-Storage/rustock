@@ -56,7 +56,9 @@ pub fn eth_estimate_gas(id: Value, params: &Value, state: &RpcState) -> JsonRpcR
     let sender = call_req.from.unwrap_or(Address::ZERO);
     let executor = RskExecutor::new(hardfork_cfg, state.store.clone());
 
-    let gas_cap = call_req.gas.unwrap_or(header.gas_limit.to::<u64>());
+    let gas_cap = call_req
+        .gas
+        .unwrap_or(header.gas_limit.saturating_to::<u64>());
 
     let mut tx = build_call_tx(&call_req, &header, &root, sender, state);
     tx.gas_limit = U256::from(gas_cap);

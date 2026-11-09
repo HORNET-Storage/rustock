@@ -116,6 +116,11 @@ invisible_exception: Arc<AtomicBool>,
     /// account — preserving the prior call's 32-byte output sent it down a
     /// different branch and out of gas).
     rskip171_active: bool,
+    /// Fail a transaction as it starts to run code. rskj can't build its
+    /// program's invocation from the block's header
+    /// (`env::header_fits_program_invoke`), throws, and catches nothing:
+    /// the block is not imported, and a miner leaves the transaction out.
+    fail_programs: bool,
     _phantom: core::marker::PhantomData<(CTX, ERROR, FRAME)>,
 }
 
@@ -142,6 +147,13 @@ impl<CTX, ERROR, FRAME> RskHandler<CTX, ERROR, FRAME> {
         self
     }
 
+    /// Fail every transaction that runs code, where rskj can't build its
+    /// program from the block's header. See the field.
+    pub fn failing_programs(mut self, fail: bool) -> Self {
+        self.fail_programs = fail;
+        self
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn with_rskip125(
         empty_create_on_unpayable_deposit: bool,
@@ -162,6 +174,7 @@ impl<CTX, ERROR, FRAME> RskHandler<CTX, ERROR, FRAME> {
             rskip171_active,
             // Per-transaction, as before RSKIP-144; `postponing_fees` opts in.
             postpone_fees: false,
+            fail_programs: false,
             _phantom: core::marker::PhantomData,
         }
     }
@@ -340,9 +353,25 @@ where
         evm: &mut Self::Evm,
         first_frame_input: FrameInit,
     ) -> Result<FrameResult, Self::Error> {
+        // rskj builds a program's invocation only for a transaction that runs
+        // code (`TransactionExecutor.call` and `create`); revm opens a frame
+        // for a creation with no data too, which runs nothing.
+        let runs_code = match &first_frame_input.frame_input {
+            revm::interpreter::interpreter_action::FrameInput::Create(inputs) => {
+                !inputs.init_code().is_empty()
+            }
+            _ => true,
+        };
         let res = evm.frame_init(first_frame_input)?;
         if let ItemOrResult::Result(frame_result) = res {
             return Ok(frame_result);
+        }
+        if self.fail_programs && runs_code {
+            return Err(ERROR::from_string(
+                "rskj can't build this transaction's program: a field of the \
+                 block's header is past 32 bytes"
+                    .into(),
+            ));
         }
         // Top-level CREATE transaction: rskj's TransactionExecutor.create never
         // bumps the nonce (even post-RSKIP125), so it stays 0.

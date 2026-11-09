@@ -31,15 +31,37 @@ pub fn block_env_from_header(header: &Header, hardfork_cfg: &RskHardforkConfig) 
         number: U256::from(header.number),
         beneficiary: REMASC_ADDR,
         timestamp: U256::from(header.timestamp),
-        // RSK stores gas_limit as U256 but revm expects u64
-        gas_limit: header.gas_limit.to::<u64>(),
+        // revm reads this for GASLIMIT, which `rsk_instructions` replaces to
+        // push the whole value, and to hold a transaction's gas limit to the
+        // block's. rskj holds it to the gas limit read as gas
+        // (`GasCost.toGas`), or to its sublist's, which the executor checks
+        // first. A gas limit that isn't gas fails its block before any
+        // transaction runs.
+        gas_limit: header.gas_limit_as_gas().unwrap_or(u64::MAX),
         difficulty: header.difficulty,
-        // RSK uses minimum_gas_price instead of EIP-1559 basefee.
-        basefee: header.minimum_gas_price.to::<u64>(),
+        // RSK uses minimum_gas_price instead of EIP-1559 basefee. revm reads
+        // it for BASEFEE, which `rsk_instructions` replaces to push the
+        // whole value, and to hold a transaction's gas price to at least
+        // this: cut to fit, it is still no more than a valid one's.
+        basefee: header.minimum_gas_price.saturating_to(),
         prevrandao,
         blob_excess_gas_and_price: None,
         ..Default::default()
     }
+}
+
+/// Whether rskj can build a program's invocation from this header, as it
+/// does for each transaction that runs code (`ProgramInvokeFactoryImpl`).
+/// It puts the gas limit's bytes, and the difficulty's and the minimum gas
+/// price's `toByteArray`, each in a `DataWord`, and `DataWord.valueOf`
+/// throws past 32 bytes: a gas limit written in more than 32, or a
+/// difficulty or minimum gas price of 2^255 or more, which takes a sign
+/// byte. Nothing catches it: the block is not imported, and a miner leaves
+/// the transaction out.
+pub fn header_fits_program_invoke(header: &Header) -> bool {
+    header.gas_limit_bytes().len() <= 32
+        && header.difficulty.bit_len() < 256
+        && header.minimum_gas_price.bit_len() < 256
 }
 
 /// Build a revm `TxEnv` from an RSK transaction.
@@ -151,6 +173,62 @@ mod tests {
         let header = dummy_header(1_000_000); // pre-Papyrus, maps to BYZANTIUM
         let env = block_env_from_header(&header, &cfg);
         assert!(env.prevrandao.is_none());
+    }
+
+    /// Past 64 bits nothing panics: the gas limit is held as gas
+    /// (`GasCost.toGas`) and the minimum gas price cut to fit, while GASLIMIT
+    /// and BASEFEE push both whole (`rsk_instructions`).
+    #[test]
+    fn header_values_past_64_bits_are_held_as_revm_can() {
+        let cfg = RskHardforkConfig::mainnet();
+        let past = U256::from(1) << 64;
+        let header = Header {
+            gas_limit: past,
+            minimum_gas_price: past,
+            ..dummy_header(7_500_000)
+        };
+        let env = block_env_from_header(&header, &cfg);
+        assert_eq!(env.gas_limit, i64::MAX as u64);
+        assert_eq!(env.basefee, u64::MAX);
+    }
+
+    /// rskj's program holds the gas limit's bytes, and the difficulty's and
+    /// the minimum gas price's `toByteArray`, each in a `DataWord` of 32.
+    #[test]
+    fn a_program_holds_the_headers_words_in_32_bytes() {
+        let one = U256::from(1);
+        let below = (one << 255) - one;
+        let fits = |header: Header| header_fits_program_invoke(&header);
+        assert!(fits(Header {
+            gas_limit: below,
+            difficulty: below,
+            minimum_gas_price: below,
+            ..dummy_header(1)
+        }));
+        // 2^255 takes a sign byte, which makes 33.
+        assert!(!fits(Header {
+            gas_limit: one << 255,
+            ..dummy_header(1)
+        }));
+        assert!(!fits(Header {
+            difficulty: one << 255,
+            ..dummy_header(1)
+        }));
+        assert!(!fits(Header {
+            minimum_gas_price: one << 255,
+            ..dummy_header(1)
+        }));
+        // The gas limit counts as written: one in 33 bytes is past.
+        let mut written = vec![0; 33];
+        written[32] = 1;
+        assert!(!fits(Header {
+            gas_limit: one,
+            kept: Some(Box::new(rustock_core::types::header::KeptFields {
+                gas_limit: Some(written.into()),
+                ..Default::default()
+            })),
+            ..dummy_header(1)
+        }));
     }
 
     #[test]

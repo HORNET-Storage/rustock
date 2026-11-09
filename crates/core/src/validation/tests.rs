@@ -174,6 +174,24 @@ fn test_gas_used_rule() {
 
     header.gas_used = 110;
     assert!(matches!(rule.validate(&header), Err(ValidationError::GasUsedExceedsLimit { .. })));
+
+    // rskj reads the gas limit's low 64 bits as a `long`. From 2^63 that is
+    // negative, and nothing fits under it, not even no gas.
+    header.gas_limit = U256::from(1u64 << 63);
+    header.gas_used = 0;
+    assert_eq!(
+        rule.validate(&header),
+        Err(ValidationError::GasUsedExceedsLimit {
+            used: 0,
+            limit: i64::MIN
+        })
+    );
+    // Past 2^64 only the low 64 bits count.
+    header.gas_limit = (U256::from(1) << 64) + U256::from(100);
+    header.gas_used = 100;
+    assert!(rule.validate(&header).is_ok());
+    header.gas_used = 101;
+    assert!(rule.validate(&header).is_err());
 }
 
 #[test]

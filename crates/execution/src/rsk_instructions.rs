@@ -72,20 +72,51 @@ thread_local! {
     /// rskj's `OpCode.COINBASE` returns the actual miner. Set by `install`.
     static REAL_COINBASE: core::cell::Cell<Address> =
         const { core::cell::Cell::new(Address::ZERO) };
+    /// The block's gas limit and minimum gas price, whole, which GASLIMIT and
+    /// BASEFEE push. rskj's program holds each in a `DataWord`
+    /// (`ProgramInvokeImpl`), where revm's block holds a `u64`. Set by
+    /// `install`.
+    static GAS_LIMIT: core::cell::Cell<U256> = const { core::cell::Cell::new(U256::ZERO) };
+    static MINIMUM_GAS_PRICE: core::cell::Cell<U256> =
+        const { core::cell::Cell::new(U256::ZERO) };
     /// Whether [`install`] has run on *this* thread.
     ///
-    /// The three entries above are consensus configuration living in
-    /// thread-local storage, and an unset one reads as a perfectly plausible
-    /// value: no precompile gets RSKIP90's `EXTCODESIZE`, no precompile gets
-    /// the empty-code `EXTCODEHASH`, and `COINBASE` pushes `0x0`. When
-    /// RSKIP-144 sublists began running on worker threads, configuring on one
-    /// thread and executing on another would have produced a state root no
-    /// other node reaches, with nothing failing to compile and no test
-    /// noticing.
+    /// The entries above are consensus configuration living in thread-local
+    /// storage, and an unset one reads as a perfectly plausible value: no
+    /// precompile gets RSKIP90's `EXTCODESIZE`, no precompile gets the
+    /// empty-code `EXTCODEHASH`, and `COINBASE`, `GASLIMIT` and `BASEFEE`
+    /// push `0x0`. When RSKIP-144 sublists began running on worker threads,
+    /// configuring on one thread and executing on another would have
+    /// produced a state root no other node reaches, with nothing failing to
+    /// compile and no test noticing.
     ///
     /// So the rule is that an EVM is configured on the thread that will use
     /// it, and this is what lets the rule be checked instead of trusted.
     static CONFIGURED: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+/// What the block's header gives the opcodes that read it, as rskj's
+/// program holds it (`ProgramInvokeImpl`).
+#[derive(Clone, Copy, Debug)]
+pub struct BlockWords {
+    /// COINBASE's: the block's real miner (see `REAL_COINBASE`).
+    pub coinbase: Address,
+    /// GASLIMIT's: the gas limit's whole value.
+    pub gas_limit: U256,
+    /// BASEFEE's: the minimum gas price's whole value.
+    pub minimum_gas_price: U256,
+}
+
+impl BlockWords {
+    /// The words `header` gives. Past 32 bytes no program runs at all (see
+    /// `env::header_fits_program_invoke`), so none needs more.
+    pub fn of(header: &rustock_core::Header) -> Self {
+        Self {
+            coinbase: header.beneficiary,
+            gas_limit: header.gas_limit,
+            minimum_gas_price: header.minimum_gas_price,
+        }
+    }
 }
 
 /// Whether this thread has had an instruction table installed on it.
@@ -131,6 +162,8 @@ pub fn set_transaction_index(index: u64) {
 ///
 /// `dupn_swapn_txindex_enabled` is RSKIP191's absence: before iris300 rskj
 /// runs RSK's own DUPN, SWAPN and TXINDEX.
+///
+/// `block` is what the block's header gives COINBASE, GASLIMIT and BASEFEE.
 pub fn install<WIRE, HOST>(
     instructions: &mut EthInstructions<WIRE, HOST>,
     extcodehash_enabled: bool,
@@ -143,7 +176,7 @@ pub fn install<WIRE, HOST>(
     dupn_swapn_txindex_enabled: bool,
     extcodesize_max_precompiles: &[Address],
     extcodehash_precompiles: &[Address],
-    real_coinbase: Address,
+    block: BlockWords,
 ) where
     WIRE: InterpreterTypes,
     HOST: Host,
@@ -330,11 +363,19 @@ pub fn install<WIRE, HOST>(
     // rskj `OpCode.COINBASE` returns the block's real miner; rustock keeps
     // `block.beneficiary = REMASC_ADDR` (for gas-fee routing) so the default
     // COINBASE would return REMASC. Push the real coinbase instead.
-    REAL_COINBASE.with(|c| c.set(real_coinbase));
+    REAL_COINBASE.with(|c| c.set(block.coinbase));
+    // GASLIMIT and BASEFEE push the whole values, which revm's block cuts to
+    // a `u64` (see `GAS_LIMIT`).
+    GAS_LIMIT.with(|c| c.set(block.gas_limit));
+    MINIMUM_GAS_PRICE.with(|c| c.set(block.minimum_gas_price));
     CONFIGURED.with(|c| c.set(true));
     instructions.insert_instruction(
         opcode::COINBASE,
         Instruction::new(rsk_coinbase::<WIRE, HOST>, 2),
+    );
+    instructions.insert_instruction(
+        opcode::GASLIMIT,
+        Instruction::new(rsk_gaslimit::<WIRE, HOST>, 2),
     );
 
     // RSK's own opcodes, which RSKIP191 (iris300) removed. Before it rskj's VM
@@ -502,14 +543,15 @@ fn rsk_push0<WIRE: InterpreterTypes, H: Host + ?Sized>(
 }
 
 /// BASEFEE (RSKIP412, arrowhead600) without revm's LONDON spec check: pushes
-/// the block's base fee, which in rustock carries RSK's `minimumGasPrice`
-/// (`env.rs`: `basefee: header.minimum_gas_price`). rskj `VM.doBASEFEE` pushes
-/// `program.getMinimumGasPrice()` verbatim. Static gas (2, BASE_TIER) comes
-/// from the instruction table entry installed in `install`.
+/// the block's minimum gas price, whole. rskj `VM.doBASEFEE` pushes
+/// `program.getMinimumGasPrice()`, a `DataWord`, where revm's block holds a
+/// `u64`. Static gas (2, BASE_TIER) comes from the instruction table entry
+/// installed in `install`.
 fn rsk_basefee<WIRE: InterpreterTypes, H: Host + ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
 ) {
-    if !context.interpreter.stack.push(U256::from(context.host.basefee())) {
+    assert_configured("MINIMUM_GAS_PRICE");
+    if !context.interpreter.stack.push(MINIMUM_GAS_PRICE.with(|c| c.get())) {
         context.interpreter.halt_overflow();
     }
 }
@@ -600,6 +642,18 @@ fn rsk_coinbase<WIRE: InterpreterTypes, H: Host + ?Sized>(
     assert_configured("REAL_COINBASE");
     let coinbase = REAL_COINBASE.with(|c| c.get());
     if !context.interpreter.stack.push(U256::from_be_bytes(coinbase.into_word().0)) {
+        context.interpreter.halt_overflow();
+    }
+}
+
+/// GASLIMIT pushing the block's gas limit whole. rskj `VM.doGASLIMIT` pushes
+/// `program.getGasLimit()`, a `DataWord` of the header's bytes, where
+/// revm's block holds the limit as gas, a `u64`. See `GAS_LIMIT`.
+fn rsk_gaslimit<WIRE: InterpreterTypes, H: Host + ?Sized>(
+    context: InstructionContext<'_, H, WIRE>,
+) {
+    assert_configured("GAS_LIMIT");
+    if !context.interpreter.stack.push(GAS_LIMIT.with(|c| c.get())) {
         context.interpreter.halt_overflow();
     }
 }
@@ -782,6 +836,8 @@ fn traced_all<WIRE: InterpreterTypes, HOST: Host>(
             }
         }
         opcode::SELFDESTRUCT => rsk_selfdestruct(context),
+        opcode::COINBASE => rsk_coinbase(context),
+        opcode::GASLIMIT => rsk_gaslimit(context),
         opcode::EXTCODEHASH if !EXTCODEHASH_ENABLED.with(|f| f.get()) => {
             invalid_opcode(context)
         }
@@ -1329,11 +1385,16 @@ mod thread_affinity_tests {
                 false,
                 &[Address::new([0x01; 20])],
                 &[Address::new([0x01; 20])],
-                Address::new([0xbb; 20]),
+                BlockWords {
+                    coinbase: Address::new([0xbb; 20]),
+                    gas_limit: U256::from(6_800_000),
+                    minimum_gas_price: U256::from(60_000_000),
+                },
             );
             (
                 is_configured_on_this_thread(),
                 REAL_COINBASE.with(|c| c.get()),
+                GAS_LIMIT.with(|c| c.get()),
                 EXTCODESIZE_MAX_PRECOMPILES.with(|p| p.borrow().len()),
             )
         })
@@ -1342,7 +1403,7 @@ mod thread_affinity_tests {
 
         assert_eq!(
             child_saw,
-            (true, Address::new([0xbb; 20]), 1),
+            (true, Address::new([0xbb; 20]), U256::from(6_800_000), 1),
             "the thread that installed sees its own configuration"
         );
         assert!(

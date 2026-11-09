@@ -453,10 +453,10 @@ impl BlockTemplateBuilder {
 
         // The probe has just read the block's gas limit as rskj reads it,
         // and one it could not read failed the probe.
-        let block_gas = crate::executor::block_gas_limit(header).ok_or_else(|| {
+        let block_gas = header.gas_limit_as_gas().ok_or_else(|| {
             crate::executor::ExecutionError::Evm(format!(
-                "the block's gas limit {} is not gas",
-                header.gas_limit
+                "the block's gas limit 0x{} is not gas",
+                alloy_primitives::hex::encode(header.gas_limit_bytes())
             ))
         })?;
         let mut partitioner = crate::mining::partition::SublistPartitioner::new(
@@ -763,14 +763,14 @@ fn timestamp_for_child(parent_timestamp: u64) -> u64 {
 /// The consensus rule is only that a child's gas limit stays within
 /// `parent / 1024` of the parent's, so inheriting it unchanged -- which is
 /// what `None` does -- is always valid. rskj `GasLimitCalculator`.
-fn next_gas_limit(parent: &Header, target: Option<U256>) -> U256 {
+pub(super) fn next_gas_limit(parent: &Header, target: Option<U256>) -> U256 {
     let parent_limit = parent.gas_limit;
     let Some(target) = target else {
         return parent_limit;
     };
     let delta = parent_limit / U256::from(1024);
     if target > parent_limit {
-        target.min(parent_limit + delta)
+        target.min(parent_limit.saturating_add(delta))
     } else {
         target.max(parent_limit.saturating_sub(delta))
     }
