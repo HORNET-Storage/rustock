@@ -40,6 +40,7 @@ pub(crate) fn dummy_header(number: u64, parent: B256, difficulty: U256) -> Heade
         bitcoin_merged_mining_coinbase_transaction: None,
         cached_hash: None,
         cached_hash_for_merged_mining: None,
+        kept: None,
     }
 }
 
@@ -7642,8 +7643,20 @@ fn compressed(
         bitcoin_merged_mining_coinbase_transaction: Some(Bytes::new()),
         cached_hash: None,
         cached_hash_for_merged_mining: None,
+        kept: None,
         ..header
     }
+}
+
+/// A store that reads headers as a node of a chain with RSKIP-351 from block
+/// 1 does, rskj's regtest: there a header sent compressed holds the
+/// commitment to its extension in its logs bloom's slot.
+fn rskip351_store() -> Arc<BlockStore> {
+    Arc::new(
+        BlockStore::open(tempfile::tempdir().unwrap().path())
+            .unwrap()
+            .with_activations(rustock_core::config::ActivationHeights::regtest()),
+    )
 }
 
 /// A service over `store` with one peer, `asked`, connected.
@@ -7666,7 +7679,7 @@ async fn service_with_a_peer(store: Arc<BlockStore>, asked: B512) -> SyncService
 /// and the batch carries the completed header to execution.
 #[tokio::test]
 async fn a_compressed_header_is_stored_with_the_extension_that_came_beside_its_body() {
-    let store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+    let store = rskip351_store();
     let genesis = dummy_header(0, B256::ZERO, U256::from(1));
     store.update_head(&genesis, U256::from(1)).unwrap();
     let extension = an_extension(77);
@@ -7765,7 +7778,7 @@ async fn a_compressed_header_is_stored_with_the_extension_that_came_beside_its_b
 /// header for execution.
 #[tokio::test]
 async fn a_followed_compressed_header_takes_the_extension_that_came_beside_its_body() {
-    let store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+    let store = rskip351_store();
     let genesis = dummy_header(0, B256::ZERO, U256::from(1));
     store.update_head(&genesis, U256::from(1)).unwrap();
     let extension = an_extension(3);
@@ -7820,7 +7833,7 @@ impl ExternalBlockSource for EveryBody {
 /// keeps its body.
 #[tokio::test]
 async fn a_body_stored_without_its_header_extension_is_asked_for_again() {
-    let store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+    let store = rskip351_store();
     let genesis = dummy_header(0, B256::ZERO, U256::from(1));
     store.update_head(&genesis, U256::from(1)).unwrap();
     let b1 = compressed(derivable_header(1, genesis.hash()), &an_extension(5));
@@ -7866,7 +7879,7 @@ async fn a_body_stored_without_its_header_extension_is_asked_for_again() {
 /// bloom, and asks for it again.
 #[tokio::test]
 async fn follow_mode_asks_again_for_a_body_stored_without_its_header_extension() {
-    let store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+    let store = rskip351_store();
     let genesis = dummy_header(0, B256::ZERO, U256::from(1));
     store.update_head(&genesis, U256::from(1)).unwrap();
     store.put_body(genesis.hash(), &[], &[]).unwrap();
@@ -7905,7 +7918,7 @@ async fn a_served_body_carries_its_header_extension() {
     use rustock_networking::protocol::rsk::BodyRequest;
     use rustock_networking::protocol::{P2pHandler, P2pMessage, RskMessage, RskSubMessage};
 
-    let store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+    let store = rskip351_store();
     let extension = an_extension(9);
     let whole = compressed(dummy_header(1, B256::ZERO, U256::from(1)), &extension)
         .with_extension(&extension)

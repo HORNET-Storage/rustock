@@ -31,6 +31,7 @@ fn header(number: u64, parent: B256) -> Header {
         bitcoin_merged_mining_coinbase_transaction: None,
         cached_hash: None,
         cached_hash_for_merged_mining: None,
+        kept: None,
     }
 }
 

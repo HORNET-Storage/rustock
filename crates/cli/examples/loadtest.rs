@@ -885,6 +885,7 @@ fn bench_header(number: u64, parent_hash: B256, state_root: B256, edges: Vec<i16
         bitcoin_merged_mining_coinbase_transaction: None,
         cached_hash: None,
         cached_hash_for_merged_mining: None,
+        kept: None,
     }
 }
 

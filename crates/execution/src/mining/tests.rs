@@ -91,6 +91,7 @@ fn header_at(number: u64, parent_hash: B256, state_root: B256) -> Header {
         bitcoin_merged_mining_coinbase_transaction: None,
         cached_hash: None,
         cached_hash_for_merged_mining: None,
+        kept: None,
     }
 }
 

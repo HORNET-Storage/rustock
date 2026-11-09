@@ -1,7 +1,7 @@
 use crate::server::{dispatch_for_test, RpcState};
 use crate::types::*;
 use alloy_primitives::{Address, Bloom, B256, U256, Bytes};
-use rustock_core::config::ChainConfig;
+use rustock_core::config::{ActivationHeights, ChainConfig};
 use rustock_core::types::header::Header;
 use rustock_networking::peers::PeerStore;
 use rustock_storage::BlockStore;
@@ -39,12 +39,23 @@ fn test_header(number: u64) -> Header {
         bitcoin_merged_mining_coinbase_transaction: None,
         cached_hash: None,
         cached_hash_for_merged_mining: None,
+        kept: None,
     }
 }
 
 fn setup_state() -> (RpcState, tempfile::TempDir) {
+    setup_state_with(|store| store)
+}
+
+/// [`setup_state`] over a store that reads headers as a testnet node's does,
+/// under testnet's heights: for a test that holds testnet's headers.
+fn setup_testnet_state() -> (RpcState, tempfile::TempDir) {
+    setup_state_with(|store| store.with_activations(ActivationHeights::testnet()))
+}
+
+fn setup_state_with(store: impl FnOnce(BlockStore) -> BlockStore) -> (RpcState, tempfile::TempDir) {
     let tmp = tempfile::tempdir().unwrap();
-    let store = Arc::new(BlockStore::open(tmp.path()).unwrap());
+    let store = Arc::new(store(BlockStore::open(tmp.path()).unwrap()));
 
     let header = test_header(42);
     store.update_head(&header, U256::from(42_000)).unwrap();
@@ -6374,10 +6385,11 @@ const TESTNET_FROM_PEERS: &str = concat!(
     "352ad0c0b7e56a1ba4fcac4da0d7693e516ef40a007e0c7000000000",
 );
 
-/// A header as the network reads one.
+/// A header as testnet's nodes read one.
 fn testnet_header(hex: &str) -> Header {
     let bytes = hex::decode(hex).unwrap();
-    Header::decode_with_hash(&mut bytes.as_slice()).unwrap()
+    Header::decode_with_hash_and_activations(&mut bytes.as_slice(), &ActivationHeights::testnet())
+        .unwrap()
 }
 
 /// A header in full, as hex.
@@ -6527,7 +6539,7 @@ async fn raw_blocks_give_a_run_of_the_chain_oldest_first() {
 /// held.
 #[tokio::test]
 async fn a_testnet_block_comes_with_its_header_compressed() {
-    let (state, _tmp) = setup_state();
+    let (state, _tmp) = setup_testnet_state();
     follow(&state.store, &testnet_header(TESTNET_FULL));
     assert_eq!(
         blocks_of(raw_blocks(&state, "0x7e0c99", "0x7e0c99").await),
@@ -6608,8 +6620,9 @@ async fn raw_blocks_stop_before_a_block_not_held_whole_or_not_following() {
     assert_eq!(blocks_of(raw_blocks(&state, "0x64", "0x68").await).len(), 2);
     assert!(blocks_of(raw_blocks(&state, "0x66", "0x68").await).is_empty());
 
-    // It holds them only compressed, as no block carries an uncle.
-    let (state, _tmp) = setup_state();
+    // It holds them only compressed, as no block carries an uncle: a store
+    // reading them as a testnet node's does.
+    let (state, _tmp) = setup_testnet_state();
     let hashes = follow_run(
         &state.store,
         100..=104,

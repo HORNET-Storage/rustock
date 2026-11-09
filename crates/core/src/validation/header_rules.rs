@@ -161,8 +161,10 @@ impl HeaderValidator for GasLimitBoundsRule {
 ///   regtest has `rskipUMM = 1`, and both regtests are read here, rustock's
 ///   own and one imported from rskj.
 /// - No RSKIP351 fields where RSKIP351 is inactive, as it is on mainnet: no
-///   version, edges or base event after the UMM root, and a 256-byte logs
-///   bloom rather than the extension's commitment in its place.
+///   version, edges or base event after the UMM root, and no commitment to
+///   an extension in the logs bloom's place. The decoder reads whatever is
+///   there as the bloom, of any length, as rskj does, so only a header built
+///   here could hold one.
 ///
 /// An uncle is read the same way, at its own height.
 pub struct HeaderLayoutRule {

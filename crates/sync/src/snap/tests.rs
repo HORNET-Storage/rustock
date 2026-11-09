@@ -630,6 +630,7 @@ fn server_fixture(n: usize) -> (Arc<rustock_storage::BlockStore>, Peer, u64) {
         bitcoin_merged_mining_coinbase_transaction: None,
         cached_hash: None,
         cached_hash_for_merged_mining: None,
+        kept: None,
     };
     let hash = header.hash();
     store.put_header(&header).expect("put header");
@@ -1151,6 +1152,7 @@ fn put_checkpoint(store: &Arc<rustock_storage::BlockStore>, number: u64, root: B
         bitcoin_merged_mining_coinbase_transaction: None,
         cached_hash: None,
         cached_hash_for_merged_mining: None,
+        kept: None,
     };
     let hash = header.hash();
     store.put_header(&header).expect("put header");

@@ -1484,6 +1484,7 @@ mod tests {
                 bitcoin_merged_mining_coinbase_transaction: None,
                 cached_hash: None,
                 cached_hash_for_merged_mining: None,
+                kept: None,
             }
         }
 
@@ -1554,6 +1555,7 @@ mod tests {
             bitcoin_merged_mining_coinbase_transaction: None,
             cached_hash: None,
             cached_hash_for_merged_mining: None,
+            kept: None,
         };
 
         let resp = BodyResponse {
@@ -1924,6 +1926,7 @@ mod headers_with_uncles_tests {
             bitcoin_merged_mining_coinbase_transaction: None,
             cached_hash: None,
             cached_hash_for_merged_mining: None,
+            kept: None,
         }
     }
 

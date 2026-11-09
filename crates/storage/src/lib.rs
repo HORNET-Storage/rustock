@@ -23,6 +23,7 @@ pub use flat_trie_store::FlatTrieStore;
 pub use epoch_backend::TrieEngine;
 
 use rocksdb::{DB, Options, ColumnFamilyDescriptor, WriteBatch};
+use rustock_core::config::ActivationHeights;
 use rustock_core::{Block, Header, Receipt, Transaction};
 use alloy_primitives::{B256, U256};
 use alloy_rlp::{Decodable, Encodable, Header as RlpHeader};
@@ -164,6 +165,8 @@ pub struct BlockStore {
     /// the freezer holds is also in `CF_HEADERS`, so this only ever changes how
     /// fast a header is found, never whether it is found.
     freezer: std::sync::RwLock<Option<Arc<crate::freezer::Freezer>>>,
+    /// The heights headers are read under: see [`BlockStore::with_activations`].
+    activations: Option<ActivationHeights>,
 }
 
 /// RocksDB settings for a bulk import.
@@ -325,7 +328,11 @@ impl BlockStore {
             DB::open_cf_for_read_only(&opts, path.as_ref(), existing, false)
                 .context("Failed to open RocksDB read-only")?
         };
-        Ok(Self { db: Arc::new(db), freezer: std::sync::RwLock::new(None) })
+        Ok(Self {
+            db: Arc::new(db),
+            freezer: std::sync::RwLock::new(None),
+            activations: None,
+        })
     }
 
     fn open_with<P: AsRef<Path>>(path: P, tuning: Option<ImportTuning>) -> Result<Self> {
@@ -365,7 +372,35 @@ impl BlockStore {
         ];
 
         let db = DB::open_cf_descriptors(&opts, path, cfs).context("Failed to open RocksDB")?;
-        Ok(Self { db: Arc::new(db), freezer: std::sync::RwLock::new(None) })
+        Ok(Self {
+            db: Arc::new(db),
+            freezer: std::sync::RwLock::new(None),
+            activations: None,
+        })
+    }
+
+    /// This store reading its headers under `activations` rather than the
+    /// process-wide heights ([`ActivationHeights::install`]), as a node of the
+    /// chain they belong to does: for a test that holds another chain's
+    /// headers. Whether a header's slot 6 holds its logs bloom or the
+    /// commitment to its extension, for one, depends on them, as it does for
+    /// rskj's store, which reads through its `BlockFactory`.
+    pub fn with_activations(mut self, activations: ActivationHeights) -> Self {
+        self.activations = Some(activations);
+        self
+    }
+
+    /// The heights this store reads headers under.
+    fn activations(&self) -> &ActivationHeights {
+        match &self.activations {
+            Some(activations) => activations,
+            None => ActivationHeights::current(),
+        }
+    }
+
+    /// A stored header, read under this store's heights.
+    fn read_header(&self, buf: &mut &[u8]) -> alloy_rlp::Result<Header> {
+        Header::decode_with_activations(buf, self.activations())
     }
 
     /// Scans the headers column family for the highest block number.
@@ -385,7 +420,7 @@ impl BlockStore {
                 continue;
             }
             let mut slice: &[u8] = &v;
-            if let Ok(h) = Header::decode(&mut slice) {
+            if let Ok(h) = self.read_header(&mut slice) {
                 if best.is_none_or(|(n, _)| h.number > n) {
                     best = Some((h.number, B256::from_slice(&k)));
                 }
@@ -507,7 +542,7 @@ impl BlockStore {
             // The header is keyed by the hash the node computed for it, which
             // for genesis and for Java-encoded headers is not the hash of a
             // re-encoding. Index under the stored key, never a recomputed one.
-            let number = match Header::decode(&mut value.as_ref()) {
+            let number = match self.read_header(&mut value.as_ref()) {
                 Ok(h) => h.number,
                 Err(e) => {
                     warn!(
@@ -550,7 +585,7 @@ impl BlockStore {
         let bytes = self.db.get_cf(self.cf(CF_HEADERS)?, hash.as_slice())
             .context("Failed to read header")?;
         if let Some(b) = bytes {
-            return Ok(Some(Header::decode(&mut b.as_slice())?));
+            return Ok(Some(self.read_header(&mut b.as_slice())?));
         }
 
         // Not in the database. It may have been frozen and then deleted, in
@@ -605,7 +640,7 @@ impl BlockStore {
         let one = |h: &B256| -> Option<Header> {
             let cf = self.cf(CF_HEADERS).ok()?;
             let bytes = self.db.get_cf(cf, h.as_slice()).ok()??;
-            Header::decode(&mut bytes.as_slice()).ok()
+            self.read_header(&mut bytes.as_slice()).ok()
         };
 
         let threads = read_threads();
@@ -1360,7 +1395,7 @@ impl BlockStore {
                 let mut ommers_buf = &body[..ommers_h.payload_length];
                 let mut ommers = Vec::new();
                 while !ommers_buf.is_empty() {
-                    ommers.push(Header::decode(&mut ommers_buf)?);
+                    ommers.push(self.read_header(&mut ommers_buf)?);
                 }
 
                 Ok(Some((transactions, ommers)))
@@ -1388,7 +1423,7 @@ impl BlockStore {
         let mut ommers_buf = &body[..ommers_h.payload_length];
         let mut ommers = Vec::new();
         while !ommers_buf.is_empty() {
-            ommers.push(Header::decode(&mut ommers_buf)?);
+            ommers.push(self.read_header(&mut ommers_buf)?);
         }
         Ok(Some(ommers))
     }
@@ -2073,6 +2108,70 @@ mod tests {
             bitcoin_merged_mining_coinbase_transaction: None,
             cached_hash: None,
             cached_hash_for_merged_mining: None,
+            kept: None,
+        }
+    }
+
+    /// A store reads its headers under its chain's heights, the process's
+    /// unless set: where RSKIP-351 is active, slot 6 of a header held
+    /// compressed is the commitment to its extension, and before it the
+    /// same bytes are the logs bloom, as rskj's `BlockFactory` reads them.
+    /// The freezer reads its own alike.
+    #[test]
+    fn a_store_reads_headers_under_its_chains_heights() {
+        use rustock_core::config::ActivationHeights;
+        let mut commitment = vec![0xe2, 0x01, 0xa0];
+        commitment.extend_from_slice(&[0x55; 32]);
+        let mut slot = Vec::new();
+        commitment.as_slice().encode(&mut slot);
+        let compressed = Header {
+            extension_data: Some(Bytes::from(slot)),
+            ..dummy_header(1)
+        };
+        let hash = compressed.hash();
+        // rskj's regtest has RSKIP-351 from block 1.
+        let regtest = ActivationHeights::regtest();
+
+        let dir = tempdir().unwrap();
+        {
+            let store = BlockStore::open(dir.path())
+                .unwrap()
+                .with_activations(regtest.clone());
+            store.put_header(&compressed).unwrap();
+            store
+                .put_body(hash, &[], std::slice::from_ref(&compressed))
+                .unwrap();
+            assert_eq!(store.header(hash).unwrap(), Some(compressed.clone()));
+            assert_eq!(store.uncles(hash).unwrap(), Some(vec![compressed.clone()]));
+        }
+        // This process's heights are mainnet's, which has no RSKIP-351.
+        let store = BlockStore::open(dir.path()).unwrap();
+        let read = store.header(hash).unwrap().unwrap();
+        assert_eq!(read.extension_data, None);
+        assert_eq!(read.hash(), hash, "the same bytes, the same header");
+
+        let frozen = tempdir().unwrap();
+        let freezer = crate::freezer::Freezer::open(frozen.path())
+            .unwrap()
+            .with_activations(regtest);
+        freezer.put(1, &compressed).unwrap();
+        freezer
+            .put_uncles(1, std::slice::from_ref(&compressed))
+            .unwrap();
+        freezer.sync().unwrap();
+        let read_back = |freezer: crate::freezer::Freezer| {
+            let header = freezer.header(1).unwrap().unwrap();
+            [header, freezer.uncles(1).unwrap().unwrap().remove(0)]
+        };
+        let committed = read_back(freezer);
+        let bloom = read_back(crate::freezer::Freezer::open(frozen.path()).unwrap());
+        for (header, uncle) in [(&committed[0], &committed[1]), (&bloom[0], &bloom[1])] {
+            assert_eq!(header.extension_data, uncle.extension_data);
+        }
+        assert!(committed[0].extension_data.is_some());
+        assert_eq!(bloom[0].extension_data, None);
+        for header in committed.iter().chain(&bloom) {
+            assert_eq!(header.hash(), hash);
         }
     }
 

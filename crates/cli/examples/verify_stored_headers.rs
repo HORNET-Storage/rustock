@@ -14,7 +14,15 @@
 //! It also counts blocks no later than their parent, which rskj's trunk
 //! takes and its relay would not: zero is what an honest chain shows.
 //!
-//! Usage: verify_stored_headers <data-dir> [lowest-block] [highest-block]
+//! And it hashes each header as rustock writes it back, which is how rskj
+//! hashes one, against the hash it is stored under, which the header above
+//! it names: a header read in a form rustock can't write back the same
+//! would hash as another block.
+//!
+//! The chain is mainnet's unless named, and its heights are installed
+//! before any header is read, as the node does.
+//!
+//! Usage: verify_stored_headers [--testnet] <data-dir> [lowest-block] [highest-block]
 
 use alloy_primitives::B256;
 use anyhow::Context;
@@ -29,6 +37,15 @@ use std::time::Instant;
 
 /// How many failing block numbers to keep per rule.
 const EXAMPLES: usize = 8;
+
+/// A header that hashes, as rustock writes it back, to another hash than
+/// the one it is stored under.
+#[derive(Debug)]
+#[allow(dead_code)] // Read through `Debug`, by `record`.
+struct Rehashed {
+    stored: B256,
+    computed: B256,
+}
 
 #[derive(Default)]
 struct Failures {
@@ -102,10 +119,19 @@ fn carry(
 }
 
 fn main() -> anyhow::Result<()> {
-    let mut args = std::env::args().skip(1);
-    let dir = args
-        .next()
-        .context("usage: verify_stored_headers <data-dir> [lowest-block] [highest-block]")?;
+    let mut args = std::env::args().skip(1).peekable();
+    let testnet = args.next_if_eq("--testnet").is_some();
+    let dir = args.next().context(
+        "usage: verify_stored_headers [--testnet] <data-dir> [lowest-block] [highest-block]",
+    )?;
+    let lowest = args.next();
+    let highest = args.next();
+    let config = Arc::new(if testnet {
+        ChainConfig::testnet()
+    } else {
+        ChainConfig::mainnet()
+    });
+    config.activation_heights.clone().install();
     let store = BlockStore::open_read_only(&dir)?;
     // A snapshot-synced node indexes by number only the window it fetched
     // bodies for, and answers every height below from the freezer.
@@ -123,20 +149,13 @@ fn main() -> anyhow::Result<()> {
     let head = store
         .header(head_hash)?
         .context("the head header is missing")?;
-    let lowest: u64 = args
-        .next()
-        .map(|s| s.parse())
-        .transpose()?
-        .unwrap_or(1)
-        .max(1);
-    let highest: u64 = args
-        .next()
+    let lowest: u64 = lowest.map(|s| s.parse()).transpose()?.unwrap_or(1).max(1);
+    let highest: u64 = highest
         .map(|s| s.parse())
         .transpose()?
         .unwrap_or(head.number);
     anyhow::ensure!(lowest <= highest, "#{lowest} is above #{highest}");
 
-    let config = Arc::new(ChainConfig::mainnet());
     let wasabi100 = config.activation_heights.wasabi100;
     let verifier = HeaderVerifier::default_rsk(config.clone());
     let threads = std::thread::available_parallelism()
@@ -144,7 +163,8 @@ fn main() -> anyhow::Result<()> {
         .unwrap_or(4);
     let span = (highest - lowest + 1).div_ceil(threads);
     println!(
-        "store {dir}\n  head #{}\n  verifying #{highest} down to #{lowest} on {threads} threads",
+        "store {dir}, chain {}\n  head #{}\n  verifying #{highest} down to #{lowest} on {threads} threads",
+        config.chain_id,
         head.number
     );
 
@@ -162,6 +182,8 @@ fn main() -> anyhow::Result<()> {
     // And those below orchid that answer for it with a Bitcoin header, whose
     // coinbase a bitcoinj partial merkle tree proves.
     let trees = AtomicU64::new(0);
+    // Headers hashed as rustock writes them back, against their keys.
+    let rehashed = AtomicU64::new(0);
     let started = Instant::now();
 
     std::thread::scope(|scope| -> anyhow::Result<()> {
@@ -177,14 +199,30 @@ fn main() -> anyhow::Result<()> {
             let (store, verifier, config, failures, checked, not_later, orphaned, missing) = (
                 &store, &verifier, &config, &failures, &checked, &not_later, &orphaned, &missing,
             );
-            let (fork_checked, fallback, trees) = (&fork_checked, &fallback, &trees);
+            let (fork_checked, fallback, trees, rehashed) =
+                (&fork_checked, &fallback, &trees, &rehashed);
             workers.push(scope.spawn(move || -> anyhow::Result<()> {
+                // A header read under `stored`, hashed as rustock writes it.
+                // Not genesis: rskj's `GenesisHeader` writes its difficulty
+                // with the leading zero its spec gives it, which no decoder
+                // keeps, and its hash is known instead
+                // (`ChainConfig::known_genesis_hash`).
+                let rehash = |header: &Header, stored: B256| {
+                    if header.number == 0 {
+                        return;
+                    }
+                    let computed = header.hash();
+                    if computed != stored {
+                        record(failures, header.number, &Rehashed { stored, computed });
+                    }
+                    rehashed.fetch_add(1, Ordering::Relaxed);
+                };
                 // The highest block from `number` down to this range's bottom
                 // that the store holds, counting the numbers it does not.
                 let held_from = |mut number: u64| -> anyhow::Result<Option<rustock_core::Header>> {
                     loop {
                         let found = match store.canonical_hash(number)? {
-                            Some(hash) => store.header(hash)?,
+                            Some(hash) => store.header(hash)?.inspect(|h| rehash(h, hash)),
                             None => None,
                         };
                         if found.is_some() {
@@ -204,7 +242,9 @@ fn main() -> anyhow::Result<()> {
                 // this walk reaches after it: each header is held till then.
                 let mut window: VecDeque<Header> = VecDeque::new();
                 let below = loop {
-                    let parent = store.header(header.parent_hash)?;
+                    let parent = store
+                        .header(header.parent_hash)?
+                        .inspect(|p| rehash(p, header.parent_hash));
                     if merged_mining::is_fallback_mined(&header, config) {
                         fallback.fetch_add(1, Ordering::Relaxed);
                     } else if header.number < config.activation_heights.orchid {
@@ -299,6 +339,10 @@ fn main() -> anyhow::Result<()> {
     println!(
         "  merge-mined below orchid, their partial merkle trees checked: {}",
         trees.into_inner()
+    );
+    println!(
+        "  hashed as rustock writes them back, against the hash each is stored under: {}",
+        rehashed.into_inner()
     );
     let expected = highest - lowest + 1;
     anyhow::ensure!(

@@ -27,11 +27,17 @@ impl<'a> Element<'a> {
     /// `getRLPData`: none for an empty item, and a list's whole encoding,
     /// which is never empty.
     pub fn data(&self) -> Option<&'a [u8]> {
-        let bytes = match *self {
+        let bytes = self.raw_data();
+        (!bytes.is_empty()).then_some(bytes)
+    }
+
+    /// `getRLPRawData`: an item's payload, empty rather than none for an
+    /// empty item, and a list's whole encoding.
+    pub fn raw_data(&self) -> &'a [u8] {
+        match *self {
             Element::Item(payload) => payload,
             Element::List { encoding, .. } => encoding,
-        };
-        (!bytes.is_empty()).then_some(bytes)
+        }
     }
 
     /// A list's elements, decoded as `RLPList.checkElements` decodes them.

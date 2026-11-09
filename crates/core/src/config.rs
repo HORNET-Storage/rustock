@@ -354,6 +354,7 @@ impl ChainConfig {
                 bitcoin_merged_mining_coinbase_transaction: Some(Bytes::from_static(&[0x00])),
                 cached_hash: None,
                 cached_hash_for_merged_mining: None,
+                kept: None,
             },
             31 => Header {
                 parent_hash: B256::ZERO,
@@ -380,6 +381,7 @@ impl ChainConfig {
                 bitcoin_merged_mining_coinbase_transaction: None,
                 cached_hash: None,
                 cached_hash_for_merged_mining: None,
+                kept: None,
             },
             _ => Header {
                 parent_hash: B256::ZERO,
@@ -418,6 +420,7 @@ impl ChainConfig {
                 bitcoin_merged_mining_coinbase_transaction: None,
                 cached_hash: None,
                 cached_hash_for_merged_mining: None,
+                kept: None,
             },
         }
     }

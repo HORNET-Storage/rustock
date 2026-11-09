@@ -72,6 +72,7 @@ fn header(number: u64, parent: B256, state_root: B256, difficulty: u64) -> Heade
         bitcoin_merged_mining_coinbase_transaction: None,
         cached_hash: None,
         cached_hash_for_merged_mining: None,
+        kept: None,
     }
 }
 

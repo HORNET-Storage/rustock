@@ -245,6 +245,7 @@ impl GenesisSpec {
             ),
             cached_hash: Some(self.hash()),
             cached_hash_for_merged_mining: None,
+            kept: None,
         }
     }
 }

@@ -624,7 +624,7 @@ impl BlockProcessor {
             &receipts,
             self.hardfork_cfg.has_unitrie_state_root(header.number),
         );
-        root == header.receipts_root
+        header.has_receipts_root(root)
     }
 
     /// Trace one transaction of a block, by re-executing the block.
@@ -905,7 +905,7 @@ impl BlockProcessor {
             &block.transactions,
             self.hardfork_cfg.has_unitrie_state_root(header.number),
         );
-        if computed_tx_root != header.transactions_root {
+        if !header.has_transactions_root(computed_tx_root) {
             return Err(ProcessError::TransactionsRootMismatch {
                 header: header.transactions_root,
                 computed: computed_tx_root,
@@ -913,7 +913,7 @@ impl BlockProcessor {
         }
 
         let computed_ommers_hash = compute_ommers_hash(&block.ommers);
-        if computed_ommers_hash != header.ommers_hash {
+        if !header.has_ommers_hash(computed_ommers_hash) {
             return Err(ProcessError::OmmersHashMismatch {
                 header: header.ommers_hash,
                 computed: computed_ommers_hash,
@@ -953,7 +953,7 @@ impl BlockProcessor {
         }
 
         if self.hardfork_cfg.has_unitrie_state_root(header.number) {
-            if result.state_root_hash != header.state_root {
+            if !header.has_state_root(result.state_root_hash) {
                 return Err(ProcessError::StateRootMismatch {
                     header: header.state_root,
                     computed: result.state_root_hash,
@@ -991,7 +991,7 @@ impl BlockProcessor {
             }
         }
 
-        if result.receipts_root != header.receipts_root {
+        if !header.has_receipts_root(result.receipts_root) {
             // Dump computed receipts to help pinpoint the diverging transaction.
             for (i, r) in result.receipts.iter().enumerate() {
                 debug!(
@@ -1015,7 +1015,7 @@ impl BlockProcessor {
             });
         }
 
-        if result.logs_bloom != header.logs_bloom {
+        if !header.has_logs_bloom(&result.logs_bloom) {
             return Err(ProcessError::LogsBloomMismatch);
         }
 
@@ -1310,6 +1310,7 @@ mod tests {
             bitcoin_merged_mining_coinbase_transaction: None,
             cached_hash: None,
             cached_hash_for_merged_mining: None,
+            kept: None,
         }
     }
 

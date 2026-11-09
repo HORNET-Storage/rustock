@@ -65,6 +65,7 @@
 
 use alloy_primitives::B256;
 use anyhow::{anyhow, bail, Context, Result};
+use rustock_core::config::ActivationHeights;
 use rustock_core::Header;
 use alloy_rlp::Encodable;
 use std::fs::{File, OpenOptions};
@@ -286,6 +287,8 @@ pub struct Freezer {
     uncles: Mutex<Writable>,
     /// Opened by [`Freezer::open_read_only`]: every write is refused.
     read_only: bool,
+    /// The heights headers are read under: see [`Freezer::with_activations`].
+    activations: Option<ActivationHeights>,
 }
 
 /// File-name stems for the two parallel stores.
@@ -321,7 +324,25 @@ impl Freezer {
             write: Mutex::new(headers),
             uncles: Mutex::new(uncles),
             read_only: true,
+            activations: None,
         })
+    }
+
+    /// This freezer reading its headers under `activations` rather than the
+    /// process-wide heights, as
+    /// [`BlockStore::with_activations`](crate::BlockStore::with_activations)
+    /// does.
+    pub fn with_activations(mut self, activations: ActivationHeights) -> Self {
+        self.activations = Some(activations);
+        self
+    }
+
+    /// The heights this freezer reads headers under.
+    fn activations(&self) -> &ActivationHeights {
+        match &self.activations {
+            Some(activations) => activations,
+            None => ActivationHeights::current(),
+        }
     }
 
     /// Refuses a write to a freezer opened read-only. Rolling to a new data
@@ -380,6 +401,7 @@ impl Freezer {
             write: Mutex::new(headers),
             uncles: Mutex::new(uncles),
             read_only: false,
+            activations: None,
         })
     }
 
@@ -632,7 +654,7 @@ impl Freezer {
         let mut out = Vec::new();
         while !body.is_empty() {
             out.push(
-                Header::decode_with_hash(&mut body)
+                Header::decode_with_hash_and_activations(&mut body, self.activations())
                     .map_err(|e| anyhow!("decoding frozen uncle for #{number}: {e:?}"))?,
             );
         }
@@ -732,7 +754,8 @@ impl Freezer {
 
             for i in slots {
                 let e = entries[i];
-                out[i] = decode_header(&buf[(e.start - lo) as usize..(e.end - lo) as usize]);
+                let bytes = &buf[(e.start - lo) as usize..(e.end - lo) as usize];
+                out[i] = decode_header(bytes, self.activations());
             }
         }
 
@@ -850,9 +873,8 @@ fn furthest_end(index: &mut File, end_number: u64, file: u16) -> Result<u32> {
     Ok(furthest)
 }
 
-fn decode_header(bytes: &[u8]) -> Option<Header> {
-    use alloy_rlp::Decodable;
-    Header::decode(&mut &bytes[..]).ok()
+fn decode_header(bytes: &[u8], activations: &ActivationHeights) -> Option<Header> {
+    Header::decode_with_activations(&mut &bytes[..], activations).ok()
 }
 
 #[cfg(test)]
@@ -890,6 +912,7 @@ pub(crate) mod tests {
             bitcoin_merged_mining_coinbase_transaction: None,
             cached_hash: None,
             cached_hash_for_merged_mining: None,
+            kept: None,
         }
     }
 
