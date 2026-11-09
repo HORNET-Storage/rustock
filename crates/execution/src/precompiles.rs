@@ -185,6 +185,166 @@ fn ecrecover(input: &[u8]) -> Option<[u8; 32]> {
     Some(word)
 }
 
+/// ModExp's address, 0x05.
+const MODEXP_ADDR: Address = Address::new(hex_addr("0000000000000000000000000000000000000005"));
+
+/// rskj's ModExp (`PrecompiledContracts.BigIntegerModexp`): EIP-198's price
+/// and arithmetic, with the lengths read as rskj reads them.
+///
+/// revm's modexp takes a length at its full width. rskj takes it as a Java
+/// int (`DataWord.intValueSafe`), so that 2^31 or more counts as
+/// `Integer.MAX_VALUE`, and answers nothing when an offset passes an int
+/// (`Math.addExact`) or an argument passes what a `BigInteger` holds, 2^31 - 1
+/// bits. The two agree on every call that affords less than about 10^8 gas:
+/// the cheapest call past those limits, an exponent of 2^28 bytes with a
+/// one-byte base and modulus, costs 107,374,182.
+fn rsk_modexp_run(input: &[u8], gas_limit: u64) -> Result<PrecompileOutput, PrecompileError> {
+    let gas = modexp::gas_for_data(input);
+    if gas > gas_limit {
+        return Err(PrecompileError::OutOfGas);
+    }
+    Ok(PrecompileOutput::new(gas, modexp::execute(input)?.into()))
+}
+
+/// rskj's `BigIntegerModexp`, step by step.
+mod modexp {
+    use revm::precompile::PrecompileError;
+
+    /// Where the base starts, after the three lengths.
+    const ARGS_OFFSET: i32 = 96;
+
+    /// The most bits a `BigInteger` holds.
+    const BIG_INTEGER_BITS: u64 = i32::MAX as u64;
+
+    /// `getGasForData`: EIP-198's price, at most `Long.MAX_VALUE`
+    /// (`GasCost.toGas`).
+    pub(super) fn gas_for_data(data: &[u8]) -> u64 {
+        let [base_len, exp_len, mod_len] = lengths(data);
+        let mult_complexity = mult_complexity(base_len.max(mod_len) as u64);
+        let exp_high_bytes = match ARGS_OFFSET.checked_add(base_len) {
+            Some(offset) => parse_bytes(data, offset, exp_len.min(32)),
+            None => Vec::new(),
+        };
+        let adjusted = adjusted_exponent_length(&exp_high_bytes, exp_len);
+        let gas = u128::from(mult_complexity) * u128::from(adjusted.max(1)) / 20;
+        gas.min(i64::MAX as u128) as u64
+    }
+
+    /// `execute`: the result left-padded to the modulus's length, or nothing
+    /// where an `ArithmeticException` ends it.
+    pub(super) fn execute(data: &[u8]) -> Result<Vec<u8>, PrecompileError> {
+        let [base_len, exp_len, mod_len] = lengths(data);
+        if base_len == 0 && mod_len == 0 {
+            return Ok(Vec::new());
+        }
+        // `Math.addExact` throws past an int.
+        let Some(exp_offset) = ARGS_OFFSET.checked_add(base_len) else {
+            return Ok(Vec::new());
+        };
+        let Some(mod_offset) = exp_offset.checked_add(exp_len) else {
+            return Ok(Vec::new());
+        };
+        let args = [
+            (ARGS_OFFSET, base_len),
+            (exp_offset, exp_len),
+            (mod_offset, mod_len),
+        ];
+        // `new BigInteger(1, bytes)` throws past its bits. rskj reads each
+        // argument whole first; here each is measured before any is read.
+        if args
+            .iter()
+            .any(|&(offset, len)| bit_length(data, offset, len) > BIG_INTEGER_BITS)
+        {
+            return Ok(Vec::new());
+        }
+        let mut answer = vec![0; mod_len as usize];
+        // A modulus of zero answers zeros.
+        if bit_length(data, mod_offset, mod_len) == 0 {
+            return Ok(answer);
+        }
+        let [base, exp, modulus] = args.map(|(offset, len)| parse_bytes(data, offset, len));
+        let result = revm::precompile::crypto().modexp(&base, &exp, &modulus)?;
+        let result = &result[result.iter().take_while(|&&byte| byte == 0).count()..];
+        let Some(start) = answer.len().checked_sub(result.len()) else {
+            return Err(PrecompileError::Fatal(
+                "modexp answered more than its modulus holds".into(),
+            ));
+        };
+        answer[start..].copy_from_slice(result);
+        Ok(answer)
+    }
+
+    /// `parseLen` of the three lengths, each word read as
+    /// `DataWord.intValueSafe` reads it: 2^31 or more is `Integer.MAX_VALUE`.
+    fn lengths(data: &[u8]) -> [i32; 3] {
+        [0, 1, 2].map(|index| {
+            let mut word = [0u8; 32];
+            let bytes = parse_bytes(data, 32 * index, 32);
+            word[..bytes.len()].copy_from_slice(&bytes);
+            let low = i32::from_be_bytes([word[28], word[29], word[30], word[31]]);
+            if word[..28].iter().any(|&byte| byte != 0) || low < 0 {
+                i32::MAX
+            } else {
+                low
+            }
+        })
+    }
+
+    /// `ByteUtil.parseBytes`: `len` bytes of `data` from `offset`, zeros past
+    /// its end, and none at all from past its end or for `len` zero.
+    fn parse_bytes(data: &[u8], offset: i32, len: i32) -> Vec<u8> {
+        let (offset, len) = (offset as usize, len as usize);
+        if offset >= data.len() || len == 0 {
+            return Vec::new();
+        }
+        let mut bytes = vec![0; len];
+        let present = (data.len() - offset).min(len);
+        bytes[..present].copy_from_slice(&data[offset..offset + present]);
+        bytes
+    }
+
+    /// How many bits the number `parse_bytes(data, offset, len)` reads holds,
+    /// found without reading it: its highest byte is one of `data`'s, the rest
+    /// being the zeros it is padded with.
+    fn bit_length(data: &[u8], offset: i32, len: i32) -> u64 {
+        let (offset, len) = (offset as usize, len as usize);
+        let present = data.get(offset..).unwrap_or_default();
+        let present = &present[..present.len().min(len)];
+        match present.iter().position(|&byte| byte != 0) {
+            None => 0,
+            Some(i) => 8 * (len - i) as u64 - u64::from(present[i].leading_zeros()),
+        }
+    }
+
+    /// `getMultComplexity`. `x` is at most 2^31 - 1, so `x * x` fits, as in
+    /// rskj's long arithmetic.
+    fn mult_complexity(x: u64) -> u64 {
+        let x2 = x * x;
+        if x <= 64 {
+            x2
+        } else if x <= 1024 {
+            x2 / 4 + 96 * x - 3072
+        } else {
+            x2 / 16 + 480 * x - 199_680
+        }
+    }
+
+    /// `getAdjustedExponentLength`: the index of the highest bit among the
+    /// exponent's first 32 bytes, and 8 for each byte after them.
+    fn adjusted_exponent_length(exp_high_bytes: &[u8], exp_len: i32) -> u64 {
+        let leading_zeros = match exp_high_bytes.iter().position(|&byte| byte != 0) {
+            None => 8 * exp_high_bytes.len(),
+            Some(i) => 8 * i + exp_high_bytes[i].leading_zeros() as usize,
+        };
+        let highest_bit = (8 * exp_high_bytes.len() - leading_zeros).saturating_sub(1) as u64;
+        if exp_len <= 32 {
+            highest_bit
+        } else {
+            8 * (exp_len as u64 - 32) + highest_bit
+        }
+    }
+}
+
 /// Secp256k1 point addition.
 /// Input: up to 128 bytes = [x1(32) | y1(32) | x2(32) | y2(32)], big-endian.
 /// Output: 64 bytes = [x(32) | y(32)].
@@ -295,9 +455,8 @@ pub fn rsk_precompiles(hardfork_cfg: &RskHardforkConfig, block_number: u64) -> P
 
     // rskj gates each precompile on its own RSKIP rather than Ethereum spec
     // buckets (PrecompiledContracts.getContractForAddress). From genesis:
-    // 0x01-0x04 (ecrecover, sha256, ripemd160, identity) plus 0x05 modexp
-    // with EIP-198 (Byzantium) pricing. ECRecover is rskj's own, in place of
-    // revm's.
+    // 0x01-0x04 (ecrecover, sha256, ripemd160, identity) plus 0x05 modexp,
+    // EIP-198's. ECRecover and ModExp are rskj's own, in place of revm's.
     let mut precompiles = Precompiles::new(PrecompileSpecId::HOMESTEAD).clone();
     precompiles.extend([
         Precompile::new(
@@ -305,7 +464,11 @@ pub fn rsk_precompiles(hardfork_cfg: &RskHardforkConfig, block_number: u64) -> P
             ECRECOVER_ADDR,
             rsk_ecrecover_run,
         ),
-        revm::precompile::modexp::BYZANTIUM,
+        Precompile::new(
+            PrecompileId::custom("rsk-modexp"),
+            MODEXP_ADDR,
+            rsk_modexp_run,
+        ),
     ]);
 
     // RSKIP137 (Papyrus200): BN128 add/mul/pairing, priced per EIP-1108
@@ -1119,13 +1282,7 @@ fn run_precompile(
             output: output.bytes,
         },
         Err(PrecompileError::Fatal(reason)) => Outcome::Fatal(reason),
-        // rskj's ModExp reads a length no int holds as `Integer.MAX_VALUE`
-        // (`DataWord.intValueSafe`), which prices the call above 10^16 gas.
-        Err(error)
-            if error.is_oog() || matches!(error, PrecompileError::ModexpEip7823LimitSize) =>
-        {
-            Outcome::OutOfGas
-        }
+        Err(error) if error.is_oog() => Outcome::OutOfGas,
         Err(error) => match required {
             // `BN128PrecompiledContract.safeExecute`: before RSKIP197 a point
             // BN128 refuses gets an answer with no bytes.
@@ -1331,6 +1488,171 @@ mod tests {
                 output: Bytes::from_static(b"abc")
             }
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // ModExp, as rskj's BigIntegerModexp
+    // -----------------------------------------------------------------------
+
+    /// A modexp input: the base, exponent and modulus lengths as words, then
+    /// `rest`.
+    fn modexp_input(lengths: [alloy_primitives::U256; 3], rest: &[u8]) -> Vec<u8> {
+        let mut input: Vec<u8> = lengths
+            .iter()
+            .flat_map(|len| len.to_be_bytes::<32>())
+            .collect();
+        input.extend_from_slice(rest);
+        input
+    }
+
+    fn run_modexp(input: &[u8], gas: u64) -> Result<PrecompileOutput, PrecompileError> {
+        rsk_precompiles(&RskHardforkConfig::mainnet(), 0)
+            .get(&MODEXP_ADDR)
+            .expect("modexp is a genesis precompile")
+            .execute(input, gas)
+    }
+
+    /// EIP-198's examples: 3^(p - 1) mod p is 1 for secp256k1's prime p, and
+    /// 0^(p - 1) mod p is 0, each for 13,056 gas -- a 32-byte modulus,
+    /// squared, times the exponent's top bit, 255, over 20.
+    #[test]
+    fn modexp_answers_eip198s_examples() {
+        use alloy_primitives::{hex, U256};
+        let exponent = hex!("fffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2e");
+        let p = hex!("fffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2f");
+        let (one, thirty_two) = (U256::from(1), U256::from(32));
+
+        let input = modexp_input(
+            [one, thirty_two, thirty_two],
+            &[&[3u8][..], &exponent[..], &p[..]].concat(),
+        );
+        let mut answer = [0u8; 32];
+        answer[31] = 1;
+        let out = run_modexp(&input, 13_056).unwrap();
+        assert_eq!((out.gas_used, out.bytes.as_ref()), (13_056, &answer[..]));
+
+        let input = modexp_input(
+            [U256::ZERO, thirty_two, thirty_two],
+            &[exponent, p].concat(),
+        );
+        let out = run_modexp(&input, 13_056).unwrap();
+        assert_eq!((out.gas_used, out.bytes.as_ref()), (13_056, &[0u8; 32][..]));
+        assert!(matches!(
+            run_modexp(&input, 13_055),
+            Err(PrecompileError::OutOfGas)
+        ));
+    }
+
+    /// Where every length fits an int and every argument a `BigInteger`,
+    /// rskj's ModExp is EIP-198's, revm's: the same price and the same
+    /// answer, for lengths each side of 64 and of 1,024 bytes and inputs cut
+    /// short of what their lengths declare.
+    #[test]
+    fn modexp_is_eip198s_within_rskjs_limits() {
+        use alloy_primitives::U256;
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for case in 0..300 {
+            let mut len = || {
+                if next() % 20 == 0 {
+                    1_000 + next() % 100
+                } else {
+                    next() % 70
+                }
+            };
+            let lengths = [len(), len(), len()];
+            let declared: u64 = lengths.iter().sum();
+            let rest: Vec<u8> = (0..next() % (declared + 16))
+                .map(|_| next() as u8)
+                .collect();
+            let input = modexp_input(lengths.map(U256::from), &rest);
+
+            let ours = run_modexp(&input, u64::MAX).unwrap();
+            let eip198 = revm::precompile::modexp::byzantium_run(&input, u64::MAX).unwrap();
+            assert_eq!(
+                (ours.gas_used, &ours.bytes),
+                (eip198.gas_used, &eip198.bytes),
+                "case {case}: lengths {lengths:?}"
+            );
+            if ours.gas_used > 0 {
+                let short = run_modexp(&input, ours.gas_used - 1);
+                assert!(
+                    matches!(short, Err(PrecompileError::OutOfGas)),
+                    "case {case}"
+                );
+            }
+        }
+    }
+
+    /// rskj reads a length as a Java int, one of 2^31 or more as
+    /// `Integer.MAX_VALUE`. An exponent 2^32 bytes long is priced as one of
+    /// 2^31 - 1 bytes, and with a one-byte base and modulus the call answers
+    /// nothing, the modulus starting past an int. revm prices the length it
+    /// was given, and runs out of gas.
+    #[test]
+    fn modexp_reads_a_length_as_a_java_int() {
+        use alloy_primitives::U256;
+        let one = U256::from(1);
+        let input = modexp_input([one, one << 32, one], &[2, 1]);
+        // The exponent's top bit among its first 32 bytes is bit 248:
+        // 8 * (2^31 - 1 - 32) + 248 = 17,179,869,168, over 20.
+        let out = run_modexp(&input, 858_993_458).unwrap();
+        assert_eq!((out.gas_used, out.bytes.len()), (858_993_458, 0));
+        assert!(matches!(
+            run_modexp(&input, 858_993_457),
+            Err(PrecompileError::OutOfGas)
+        ));
+        assert!(matches!(
+            revm::precompile::modexp::byzantium_run(&input, 858_993_458),
+            Err(PrecompileError::OutOfGas)
+        ));
+
+        // A base no int holds: (2^31 - 1)^2 / 16 + 480 (2^31 - 1) - 199,680,
+        // over 20. No call with such a base or modulus costs less.
+        let input = modexp_input([one << 255, U256::ZERO, U256::ZERO], &[]);
+        let out = run_modexp(&input, 14_411_570_333_761_358).unwrap();
+        assert_eq!((out.gas_used, out.bytes.len()), (14_411_570_333_761_358, 0));
+        // The price stops at Long.MAX_VALUE.
+        let input = modexp_input([U256::MAX; 3], &[]);
+        assert_eq!(
+            run_modexp(&input, u64::MAX).unwrap().gas_used,
+            i64::MAX as u64
+        );
+    }
+
+    /// rskj's `execute` answers nothing for an `ArithmeticException`: an
+    /// offset past an int (`Math.addExact`), or an argument past what a
+    /// `BigInteger` holds, 2^31 - 1 bits. The cheapest call to reach either
+    /// is an exponent of 2^28 bytes whose top bit is set, 107,374,182 gas;
+    /// with the bit below it the exponent fits, and the zero modulus past the
+    /// input's end answers a zero byte.
+    #[test]
+    fn modexp_answers_nothing_where_rskj_throws() {
+        use alloy_primitives::U256;
+        let one = U256::from(1);
+        let two_28 = one << 28;
+        for (top, answer) in [(0x80, &[][..]), (0x40, &[0][..])] {
+            let input = modexp_input([one, two_28, one], &[2, top]);
+            let out = run_modexp(&input, 107_374_182).unwrap();
+            assert_eq!(
+                (out.gas_used, out.bytes.as_ref()),
+                (107_374_182, answer),
+                "{top:#x}"
+            );
+            // The base, the same way, at whatever price.
+            let input = modexp_input([two_28, one, one], &[top]);
+            let out = run_modexp(&input, u64::MAX).unwrap();
+            assert_eq!(out.bytes.as_ref(), answer, "base {top:#x}");
+        }
+        // The modulus would start at 2^31, past an int. The exponent is all
+        // zeros, which a `BigInteger` holds whatever their number.
+        let input = modexp_input([one, U256::from(i32::MAX as u64 - 96), one], &[2]);
+        assert!(run_modexp(&input, u64::MAX).unwrap().bytes.is_empty());
     }
 
     #[test]
