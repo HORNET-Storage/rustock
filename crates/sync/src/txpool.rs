@@ -632,22 +632,17 @@ impl TransactionPool {
         // invalid transaction consume an honest account's virtual gas.
         {
             let accounts = TrieAccountView::new(head_header.state_root, &*self.trie_store);
-            let ctx = crate::quota::QuotaContext {
-                block_gas_limit: head_header.gas_limit.try_into().unwrap_or(u64::MAX),
-                block_min_gas_price: head_header
-                    .minimum_gas_price
-                    .try_into()
-                    .unwrap_or(u64::MAX),
-                // rskj supplies the average only when the fee market is
-                // working -- `isFeeMarketWorking()` false takes its
-                // `createSkippingGasPriceFactor` branch, which pins the
-                // low-gas-price factor to 1. On a chain with spare capacity
-                // that is the usual path on rskj too; the difference is that
-                // it recovers when blocks fill up, which this now does.
-                avg_gas_price: self.gas_price.as_ref().and_then(|t| {
-                    t.is_fee_market_working().then(|| t.gas_price().try_into().unwrap_or(u64::MAX))
-                }),
-            };
+            // rskj supplies the average only when the fee market is working --
+            // `isFeeMarketWorking()` false takes its
+            // `createSkippingGasPriceFactor` branch, which pins the
+            // low-gas-price factor to 1. On a chain with spare capacity that
+            // is the usual path on rskj too; the difference is that it
+            // recovers when blocks fill up, which this now does.
+            let avg_gas_price = self
+                .gas_price
+                .as_ref()
+                .and_then(|t| t.is_fee_market_working().then(|| t.gas_price()));
+            let ctx = crate::quota::QuotaContext::of(&head_header, avg_gas_price);
             let receiver = (tx.to.len() == 20).then(|| Address::from_slice(tx.to.as_ref()));
             let accepted = self
                 .quota
@@ -1085,7 +1080,7 @@ impl crate::quota::AccountView for TrieAccountView<'_> {
 fn tx_facts(tx: &Transaction, encoded_size: usize) -> crate::quota::TxFacts {
     crate::quota::TxFacts {
         nonce: tx.nonce,
-        gas_limit: tx.gas_limit.try_into().unwrap_or(u64::MAX),
+        gas_limit: tx.gas_limit,
         gas_price: tx.gas_price,
         size: encoded_size,
     }
