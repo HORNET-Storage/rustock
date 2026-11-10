@@ -3489,6 +3489,512 @@ async fn test_new_block_hashes_same_hash_ignored() {
     assert!(rx.try_recv().is_err(), "Should not request headers for same hash");
 }
 
+// -- Announcing and relaying new blocks, as rskj's `MessageVisitor` does ----
+
+/// A node following the tip from genesis, with peers 1 to `peers`
+/// connected, and each peer's inbox, to read what it was sent.
+struct TipNode {
+    service: SyncService,
+    manager: Arc<SyncManager>,
+    store: Arc<BlockStore>,
+    genesis: B256,
+    inboxes: Vec<(
+        B512,
+        mpsc::Receiver<rustock_networking::protocol::P2pMessage>,
+    )>,
+    _dir: tempfile::TempDir,
+}
+
+async fn tip_node(peers: u8) -> TipNode {
+    tip_node_verifying(peers, HeaderVerifier::new()).await
+}
+
+/// [`tip_node`], with the header rules `verifier` holds.
+async fn tip_node_verifying(peers: u8, verifier: HeaderVerifier) -> TipNode {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let mut inboxes = Vec::new();
+    for n in 1..=peers {
+        let (tx, rx) = mpsc::channel(rustock_networking::peers::PEER_CHANNEL_CAPACITY);
+        peer_store.add_peer(B512::repeat_byte(n), tx).await;
+        inboxes.push((B512::repeat_byte(n), rx));
+    }
+    let manager = Arc::new(SyncManager::new(
+        store.clone(),
+        Arc::new(verifier),
+        peer_store.clone(),
+    ));
+    let (_event_tx, event_rx) = mpsc::unbounded_channel();
+    let mut service = SyncService::new(manager.clone(), peer_store, event_rx);
+    service.state = SyncState::Following;
+    TipNode {
+        service,
+        manager,
+        store,
+        genesis: genesis.hash(),
+        inboxes,
+        _dir: dir,
+    }
+}
+
+fn whole(header: Header) -> rustock_core::Block {
+    rustock_core::Block {
+        header,
+        transactions: Vec::new(),
+        ommers: Vec::new(),
+    }
+}
+
+/// Every message a peer was sent, drained.
+fn sent(
+    inbox: &mut mpsc::Receiver<rustock_networking::protocol::P2pMessage>,
+) -> Vec<rustock_networking::protocol::RskSubMessage> {
+    let mut out = Vec::new();
+    while let Ok(message) = inbox.try_recv() {
+        match message {
+            rustock_networking::protocol::P2pMessage::RskMessage(m) => out.push(m.sub_message),
+            other => panic!("sent {other:?}"),
+        }
+    }
+    out
+}
+
+/// The blocks a peer was told of, and nothing else sent to it.
+fn told_of(
+    inbox: &mut mpsc::Receiver<rustock_networking::protocol::P2pMessage>,
+) -> Vec<BlockIdentifier> {
+    let mut out = Vec::new();
+    for message in sent(inbox) {
+        match message {
+            rustock_networking::protocol::RskSubMessage::NewBlockHashes(ids) => out.extend(ids),
+            other => panic!("sent {other:?}"),
+        }
+    }
+    out
+}
+
+/// rskj `MessageVisitor.apply(BlockMessage)`: a whole block a peer sends at
+/// the tip is taken, and announced to the peers not known to hold it -- not to
+/// the peer that sent it, nor to one that said it had it. A request still
+/// out for its body is dropped, so the answer cannot buffer it again.
+#[tokio::test]
+async fn a_whole_block_at_the_tip_is_taken_and_relayed_to_the_peers_that_lack_it() {
+    let mut node = tip_node(3).await;
+    let (sender, other, holder) = (
+        B512::repeat_byte(1),
+        B512::repeat_byte(2),
+        B512::repeat_byte(3),
+    );
+    let b1 = dummy_header(1, node.genesis, U256::from(1));
+    let hash = b1.hash();
+    node.manager.note_block_holder(hash, holder);
+    node.service
+        .pending_follow_bodies
+        .insert(9, (hash, b1.clone(), Instant::now(), other));
+
+    node.service.on_new_block(sender, whole(b1)).await;
+
+    assert!(
+        !node.service.pending_follow_bodies.contains_key(&9),
+        "the request for its body is dropped"
+    );
+
+    assert!(
+        node.store.header(hash).unwrap().is_some(),
+        "its header is stored"
+    );
+    assert!(node.store.body(hash).unwrap().is_some(), "and its body");
+    assert_eq!(node.store.head().unwrap(), Some(hash), "it is the new head");
+    assert_eq!(
+        node.service.follow_buffer.get(&1).map(|entry| entry.0),
+        Some(hash),
+        "and waits to run"
+    );
+    assert_eq!(
+        node.service.body_providers.get(&1),
+        Some(&sender),
+        "the sender is credited once it runs"
+    );
+    for (id, inbox) in &mut node.inboxes {
+        let told = told_of(inbox);
+        if *id == other {
+            assert_eq!(told, vec![BlockIdentifier { hash, number: 1 }]);
+        } else {
+            assert!(told.is_empty(), "{id:?} holds the block and was told of it");
+        }
+    }
+}
+
+/// rskj relays a block it does not make its best too (`IMPORTED_NOT_BEST`):
+/// a miner may name it as an uncle. It is kept, not run. Sent here as the
+/// sync service receives it, as an event.
+#[tokio::test]
+async fn a_block_beside_the_chain_is_kept_and_relayed_but_not_run() {
+    let mut node = tip_node(3).await;
+    let b1 = dummy_header(1, node.genesis, U256::from(1));
+    node.service
+        .on_new_block(B512::repeat_byte(1), whole(b1.clone()))
+        .await;
+    for (_, inbox) in &mut node.inboxes {
+        let _ = sent(inbox);
+    }
+
+    let sibling = fork_header(1, node.genesis, U256::from(1), 0xee);
+    let hash = sibling.hash();
+    node.service
+        .handle_event(crate::SyncEvent::NewBlock {
+            peer: B512::repeat_byte(2),
+            block: Box::new(whole(sibling)),
+        })
+        .await;
+
+    assert!(node.store.header(hash).unwrap().is_some());
+    assert!(node.store.body(hash).unwrap().is_some(), "kept whole");
+    assert_eq!(
+        node.store.head().unwrap(),
+        Some(b1.hash()),
+        "the head stays"
+    );
+    assert_eq!(
+        node.service.follow_buffer.get(&1).map(|entry| entry.0),
+        Some(b1.hash()),
+        "the canonical block is the one that runs"
+    );
+    for (id, inbox) in &mut node.inboxes {
+        let told = told_of(inbox);
+        if *id == B512::repeat_byte(2) {
+            assert!(told.is_empty(), "the sender was told of its own block");
+        } else {
+            assert_eq!(told, vec![BlockIdentifier { hash, number: 1 }], "{id:?}");
+        }
+    }
+}
+
+/// rskj's guards on a block a peer sends (`MessageVisitor.apply`): genesis,
+/// further above the best block than a skeleton reaches, so far below it that
+/// it can be no block's uncle, held already, or sent while syncing. None of
+/// them is stored or relayed; nor is a block whose body is not its header's,
+/// or whose header fails its rules. Each case passes every guard but its own.
+#[tokio::test]
+async fn what_a_node_cannot_use_is_neither_taken_nor_relayed() {
+    // The executed head at #10, so a block below #3 can be no block's uncle.
+    let at_ten = || async {
+        let node = tip_node(2).await;
+        let h10 = dummy_header(10, B256::repeat_byte(0x10), U256::from(1));
+        node.store.put_header(&h10).unwrap();
+        node.store.set_exec_head(h10.hash(), B256::ZERO).unwrap();
+        node
+    };
+    let sender = B512::repeat_byte(1);
+    let unseen = |node: &mut TipNode, hash: B256, what: &str| {
+        assert!(node.store.header(hash).unwrap().is_none(), "{what}: stored");
+        for (id, inbox) in &mut node.inboxes {
+            assert!(sent(inbox).is_empty(), "{what}: {id:?} was sent something");
+        }
+    };
+
+    let mut node = tip_node(2).await;
+    let genesis_again = fork_header(0, B256::ZERO, U256::from(1), 0x01);
+    let hash = genesis_again.hash();
+    node.service
+        .on_new_block(sender, whole(genesis_again))
+        .await;
+    unseen(&mut node, hash, "genesis");
+
+    let mut node = at_ten().await;
+    let too_far = dummy_header(10 + 3_841, B256::repeat_byte(0x22), U256::from(1));
+    let hash = too_far.hash();
+    node.service.on_new_block(sender, whole(too_far)).await;
+    unseen(&mut node, hash, "too far ahead");
+
+    let mut node = at_ten().await;
+    let too_old = dummy_header(2, B256::repeat_byte(0x33), U256::from(1));
+    let hash = too_old.hash();
+    node.service.on_new_block(sender, whole(too_old)).await;
+    unseen(&mut node, hash, "too old for an uncle");
+
+    let mut node = tip_node(2).await;
+    node.service.state = SyncState::DownloadingSkeleton {
+        peer: sender,
+        peer_best: 99,
+        connection_point: 0,
+    };
+    let b1 = dummy_header(1, node.genesis, U256::from(1));
+    let hash = b1.hash();
+    node.service.on_new_block(sender, whole(b1)).await;
+    unseen(&mut node, hash, "while syncing");
+
+    let mut node = tip_node(2).await;
+    let b1 = dummy_header(1, node.genesis, U256::from(1));
+    let hash = b1.hash();
+    let mut not_its_body = whole(b1);
+    not_its_body
+        .ommers
+        .push(dummy_header(0, B256::repeat_byte(0x44), U256::from(1)));
+    node.service.on_new_block(sender, not_its_body).await;
+    unseen(&mut node, hash, "a body that is not the header's");
+
+    // On genesis, but numbered #5: `BlockNumberRule` refuses it.
+    let mut node = tip_node_verifying(
+        2,
+        HeaderVerifier::new().with_parent_rule(rustock_core::validation::BlockNumberRule),
+    )
+    .await;
+    let misnumbered = dummy_header(5, node.genesis, U256::from(1));
+    let hash = misnumbered.hash();
+    node.service.on_new_block(sender, whole(misnumbered)).await;
+    unseen(&mut node, hash, "a header its rules refuse");
+
+    let mut node = tip_node(3).await;
+    let b1 = dummy_header(1, node.genesis, U256::from(1));
+    node.service.on_new_block(sender, whole(b1.clone())).await;
+    for (_, inbox) in &mut node.inboxes {
+        let _ = sent(inbox);
+    }
+    node.service
+        .on_new_block(B512::repeat_byte(2), whole(b1))
+        .await;
+    for (id, inbox) in &mut node.inboxes {
+        assert!(
+            sent(inbox).is_empty(),
+            "held already: {id:?} was sent something"
+        );
+    }
+}
+
+/// A block that builds on the executed head goes on to execution, as a
+/// fetched body does (`drain_follow_buffer`).
+#[tokio::test]
+async fn a_whole_block_on_the_executed_head_is_handed_to_execution() {
+    let mut node = tip_node(1).await;
+    node.store.set_exec_head(node.genesis, B256::ZERO).unwrap();
+    let b1 = dummy_header(1, node.genesis, U256::from(1));
+    node.service
+        .on_new_block(B512::repeat_byte(1), whole(b1))
+        .await;
+    assert!(node.service.follow_buffer.is_empty(), "left waiting");
+}
+
+/// rskj `NodeBlockProcessor.processNewBlockHashesMessage`: the peer that
+/// announces a block is remembered as holding it, so the block is not
+/// relayed back to it; not for a block further ahead than a skeleton
+/// reaches, nor for one held here already.
+#[tokio::test]
+async fn an_announcer_is_remembered_for_the_blocks_it_could_be_asked_for() {
+    let mut node = tip_node(1).await;
+    let h10 = dummy_header(10, B256::repeat_byte(0x10), U256::from(1));
+    node.store.put_header(&h10).unwrap();
+    node.store.put_body(h10.hash(), &[], &[]).unwrap();
+    node.store.set_exec_head(h10.hash(), B256::ZERO).unwrap();
+    let announcer = B512::repeat_byte(1);
+    let (edge, beyond) = (B256::repeat_byte(0x61), B256::repeat_byte(0x62));
+    node.service
+        .on_new_block_hashes(
+            announcer,
+            vec![
+                BlockIdentifier {
+                    hash: edge,
+                    number: 10 + 3_840,
+                },
+                BlockIdentifier {
+                    hash: beyond,
+                    number: 10 + 3_841,
+                },
+                BlockIdentifier {
+                    hash: h10.hash(),
+                    number: 10,
+                },
+            ],
+        )
+        .await;
+    assert!(
+        node.manager.block_holders(edge).contains(&announcer),
+        "a skeleton ahead"
+    );
+    assert!(
+        node.manager.block_holders(beyond).is_empty(),
+        "beyond a skeleton"
+    );
+    assert!(
+        node.manager.block_holders(h10.hash()).is_empty(),
+        "held here"
+    );
+}
+
+/// A `BlockMessage` is handed whole to the sync service, with its sender,
+/// and nothing is sent back.
+#[tokio::test]
+async fn a_block_a_peer_sends_is_handed_to_the_sync_service() {
+    use rustock_networking::protocol::{P2pHandler, P2pMessage, RskMessage, RskSubMessage};
+
+    let dir = tempdir().unwrap();
+    let manager = Arc::new(SyncManager::new(
+        Arc::new(BlockStore::open(dir.path()).unwrap()),
+        Arc::new(HeaderVerifier::new()),
+        Arc::new(rustock_networking::peers::PeerStore::new()),
+    ));
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let handler = SyncHandler::new(manager, event_tx);
+    let sender = B512::repeat_byte(4);
+    let block = whole(dummy_header(1, B256::repeat_byte(1), U256::from(1)));
+    let message = P2pMessage::RskMessage(RskMessage::new(RskSubMessage::Block(Box::new(
+        block.clone(),
+    ))));
+    assert!(handler.handle_message(sender, &message).is_none());
+    let Ok(crate::SyncEvent::NewBlock { peer, block: got }) = event_rx.try_recv() else {
+        panic!("not handed on as a new block");
+    };
+    assert_eq!(peer, sender);
+    assert_eq!(got.hash(), block.hash());
+}
+
+/// The edges of rskj's two distance guards are taken: a block a whole
+/// skeleton above the best one, and one just young enough to be an uncle. Each
+/// has no parent here, so each is taken as an announcement of itself: its
+/// headers are asked of the sender, and nothing is relayed.
+#[tokio::test]
+async fn a_block_at_the_edge_of_either_guard_is_taken() {
+    for number in [10 + 3_840, 3] {
+        let mut node = tip_node(2).await;
+        let h10 = dummy_header(10, B256::repeat_byte(0x10), U256::from(1));
+        node.store.put_header(&h10).unwrap();
+        node.store.set_exec_head(h10.hash(), B256::ZERO).unwrap();
+        let orphan = dummy_header(number, B256::repeat_byte(0x55), U256::from(1));
+        node.service
+            .on_new_block(B512::repeat_byte(1), whole(orphan))
+            .await;
+        let (_, inbox) = &mut node.inboxes[0];
+        assert!(
+            matches!(
+                sent(inbox).as_slice(),
+                [rustock_networking::protocol::RskSubMessage::BlockHeadersRequest(_)]
+            ),
+            "#{number}: its headers are asked of the sender"
+        );
+        let (_, other) = &mut node.inboxes[1];
+        assert!(
+            sent(other).is_empty(),
+            "#{number}: relayed without its parent"
+        );
+    }
+}
+
+/// A block fetched at the tip, header then body, is announced once it is
+/// whole, to the peers not known to hold it: not to the peer that sent the
+/// body, nor to the one that announced it. Once, however often it arrives.
+#[tokio::test]
+async fn a_body_fetched_at_the_tip_is_relayed_once_to_the_peers_that_lack_it() {
+    let mut node = tip_node(3).await;
+    let (provider, announcer, other) = (
+        B512::repeat_byte(1),
+        B512::repeat_byte(2),
+        B512::repeat_byte(3),
+    );
+    let b1 = dummy_header(1, node.genesis, U256::from(1));
+    let hash = b1.hash();
+    node.manager
+        .handle_headers_response(vec![b1.clone()], provider)
+        .unwrap();
+    node.service
+        .on_new_block_hashes(announcer, vec![BlockIdentifier { hash, number: 1 }])
+        .await;
+    for request in [7u64, 8] {
+        node.service
+            .pending_follow_bodies
+            .insert(request, (hash, b1.clone(), Instant::now(), provider));
+        node.service
+            .on_body_response(provider, request, Vec::new(), Vec::new(), None)
+            .await;
+    }
+
+    assert!(node.store.body(hash).unwrap().is_some());
+    for (id, inbox) in &mut node.inboxes {
+        let told = told_of(inbox);
+        if *id == other {
+            assert_eq!(told, vec![BlockIdentifier { hash, number: 1 }], "told once");
+        } else {
+            assert!(told.is_empty(), "{id:?} holds the block and was told of it");
+        }
+    }
+}
+
+/// rskj `NodeBlockProcessor.processGetBlock`: a block asked for by hash is
+/// sent whole, and its asker is remembered as holding it. Nothing for a block
+/// not held whole, or held only compressed, which has no full form to send.
+#[tokio::test]
+async fn a_block_asked_for_by_hash_is_sent_whole_and_its_asker_remembered() {
+    use rustock_networking::protocol::{P2pHandler, P2pMessage, RskMessage, RskSubMessage};
+
+    let handler_over = |store: Arc<BlockStore>| {
+        let manager = Arc::new(SyncManager::new(
+            store,
+            Arc::new(HeaderVerifier::new()),
+            Arc::new(rustock_networking::peers::PeerStore::new()),
+        ));
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        (SyncHandler::new(manager.clone(), event_tx), manager)
+    };
+    let ask = |hash| P2pMessage::RskMessage(RskMessage::new(RskSubMessage::GetBlock(hash)));
+    let asker = B512::repeat_byte(5);
+
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    let b1 = dummy_header(1, genesis.hash(), U256::from(1));
+    let hash = b1.hash();
+    let headless = dummy_header(2, hash, U256::from(1));
+    store.put_header(&b1).unwrap();
+    store.put_header(&headless).unwrap();
+    store.put_body(hash, &[], &[]).unwrap();
+    let (handler, manager) = handler_over(store);
+
+    let Some(P2pMessage::RskMessage(answer)) = handler.handle_message(asker, &ask(hash)) else {
+        panic!("a block held whole is sent");
+    };
+    let RskSubMessage::Block(block) = answer.sub_message else {
+        panic!("sent as a block");
+    };
+    assert_eq!(block.hash(), hash);
+    assert!(
+        manager.block_holders(hash).contains(&asker),
+        "the asker holds it now"
+    );
+    for (missing, what) in [
+        (B256::repeat_byte(0x77), "not held"),
+        (headless.hash(), "held without its body"),
+    ] {
+        assert!(
+            handler.handle_message(asker, &ask(missing)).is_none(),
+            "{what}"
+        );
+        assert!(
+            manager.block_holders(missing).is_empty(),
+            "{what}: the asker remembered"
+        );
+    }
+
+    let store = rskip351_store();
+    let held_compressed = compressed(
+        dummy_header(1, genesis.hash(), U256::from(1)),
+        &an_extension(3),
+    );
+    let hash = held_compressed.hash();
+    store.put_header(&held_compressed).unwrap();
+    store.put_body(hash, &[], &[]).unwrap();
+    let (handler, manager) = handler_over(store);
+    assert!(
+        handler.handle_message(asker, &ask(hash)).is_none(),
+        "held compressed"
+    );
+    assert!(
+        manager.block_holders(hash).is_empty(),
+        "held compressed: the asker remembered"
+    );
+}
+
 #[tokio::test]
 async fn test_reorg_via_headers_response_higher_td() {
     let dir = tempdir().unwrap();

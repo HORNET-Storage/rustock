@@ -327,6 +327,11 @@ pub(crate) const STATUS_REFRESH: Duration = Duration::from_secs(10);
 /// Matches RSKj's `longSyncLimit` (default 24).
 const LONG_SYNC_LIMIT: u64 = 24;
 
+/// How far above its best block rskj takes a block a peer names or sends:
+/// `syncConfiguration.getChunkSize() * getMaxSkeletonChunks()`, 192 x 20
+/// (`NodeBlockProcessor.isAdvancedBlock`, `BlockSyncService.preprocessBlock`).
+const SYNC_MAX_DISTANCE: u64 = 192 * MAX_SKELETON_CHUNKS as u64;
+
 /// How far below an orphaned head to retreat when the fork point cannot be
 /// computed, because the branch that replaced us was never downloaded.
 ///
@@ -3545,6 +3550,7 @@ impl SyncService {
                 | SyncEvent::SkeletonResponse { .. }
                 | SyncEvent::BlockHashResponse { .. }
                 | SyncEvent::NewBlockHashes { .. }
+                | SyncEvent::NewBlock { .. }
                 | SyncEvent::SnapStatusResponse { .. }
                 | SyncEvent::SnapChunkResponse { .. }
                 | SyncEvent::SnapBlocksResponse { .. } => {
@@ -3583,7 +3589,8 @@ impl SyncService {
                 | SyncEvent::SnapBlocksResponse { .. } => true,
                 SyncEvent::BodyResponse { .. }
                 | SyncEvent::BlockHashResponse { .. }
-                | SyncEvent::NewBlockHashes { .. } => false,
+                | SyncEvent::NewBlockHashes { .. }
+                | SyncEvent::NewBlock { .. } => false,
             };
             if !claimed {
                 trace!(
@@ -3676,6 +3683,9 @@ impl SyncService {
             }
             SyncEvent::NewBlockHashes { peer, identifiers } => {
                 self.on_new_block_hashes(peer, identifiers).await;
+            }
+            SyncEvent::NewBlock { peer, block } => {
+                self.on_new_block(peer, *block).await;
             }
         }
     }
@@ -4141,6 +4151,14 @@ impl SyncService {
         let our_height = self.our_head_number();
 
         for id in &identifiers {
+            // rskj `processNewBlockHashesMessage` (L107-119): the announcer
+            // holds each block it names that is not too far ahead and not
+            // held here.
+            if id.number <= self.executed_number().saturating_add(SYNC_MAX_DISTANCE)
+                && !self.holds_block(id.hash)
+            {
+                self.manager.note_block_holder(id.hash, peer);
+            }
             if id.number > our_height {
                 // New block ahead of our tip — request it
                 let metadata = rustock_networking::peers::PeerMetadata {
@@ -4185,6 +4203,149 @@ impl SyncService {
                 self.request_headers_from(&peer, id.hash, count).await;
             }
         }
+    }
+
+    /// The height of the executed best block: rskj's
+    /// `blockchain.getBestBlock().getNumber()`, which its guards on a block a
+    /// peer names or sends measure from.
+    fn executed_number(&self) -> u64 {
+        let store = &self.manager.store;
+        store
+            .exec_head()
+            .ok()
+            .flatten()
+            .and_then(|(hash, _)| store.header(hash).ok().flatten())
+            .map_or(0, |header| header.number)
+    }
+
+    /// Whether this node holds the block whole, header and body: rskj's
+    /// `hasBlockInSomeBlockchain`, whose store holds only whole blocks.
+    fn holds_block(&self, hash: B256) -> bool {
+        let store = &self.manager.store;
+        matches!(store.header(hash), Ok(Some(_))) && matches!(store.body(hash), Ok(Some(_)))
+    }
+
+    /// Announces a block taken from a peer to the peers not known to hold it:
+    /// rskj `MessageVisitor.tryRelayBlock` (L258-263), which relays only while
+    /// it has no better block to sync. Called only while following the tip,
+    /// this node's counterpart. See [`crate::announce::relay_block`].
+    async fn relay_block(&self, hash: B256, number: u64) {
+        let holders = self.manager.block_holders(hash);
+        crate::announce::relay_block(&self.peer_store, &holders, hash, number).await;
+    }
+
+    /// A whole block a peer sent: rskj `MessageVisitor.apply(BlockMessage)`
+    /// (L83-122) through `AsyncNodeBlockProcessor.processBlock` (L83-126),
+    /// rskj's default (`peer.fastBlockPropagation`), on this node's follow
+    /// path.
+    ///
+    /// rskj drops a block that is genesis, further above its best block than a
+    /// skeleton reaches, too far below it to be any block's uncle, or held
+    /// already; remembers that the sender holds it; checks its header, against
+    /// its parent too; and then relays it and queues it to be connected, best
+    /// or not. Here the body is held to its header's commitments, the header is
+    /// verified and stored as any header at the tip is (the same rules, the
+    /// extra data's size among them), the block is relayed, and it is executed
+    /// once it is the canonical block at its height. A block whose parent this
+    /// node lacks is taken as an announcement of it: the headers up to it are
+    /// asked of the sender, where rskj asks it for the missing block.
+    pub(crate) async fn on_new_block(&mut self, peer: B512, block: Block) {
+        // rskj processes it while syncing too, but relays nothing then
+        // (`hasBetterBlockToSync`); this node takes nothing unasked at the tip
+        // until it follows it, as with an announcement.
+        if !matches!(self.state, SyncState::Following) {
+            trace!(
+                target: "rustock::sync",
+                "Ignoring block #{} from {:?}: sync in progress",
+                block.header.number,
+                &peer.0[..4]
+            );
+            return;
+        }
+        let number = block.header.number;
+        let best = self.executed_number();
+        // rskj `isGenesis`, `isAdvancedBlock` and `canBeIgnoredForUnclesRewards`
+        // (`blockNumber < best - uncleGenerationLimit`), in that order.
+        if number == 0
+            || number > best.saturating_add(SYNC_MAX_DISTANCE)
+            || number.saturating_add(rustock_core::validation::uncles::UNCLE_GENERATION_LIMIT)
+                < best
+        {
+            return;
+        }
+        let hash = block.hash();
+        if self.holds_block(hash) {
+            return;
+        }
+        // `BlockSyncService.preprocessBlock` (L97-99).
+        self.manager.note_block_holder(hash, peer);
+
+        let Block {
+            header,
+            transactions,
+            ommers,
+        } = block;
+        if let Some(what) = crate::body_check::body_mismatch(&header, &transactions, &ommers) {
+            self.charge_bad_body(peer, number, what);
+            return;
+        }
+        let before_height = self.our_head_number();
+        let before_hash = self.manager.store.head().ok().flatten();
+        match self
+            .manager
+            .handle_headers_response(vec![header.clone()], peer)
+        {
+            Ok(ingested) if ingested.rejected > 0 => {
+                if let Some(scoring) = &self.scoring {
+                    scoring.record_peer(peer, rustock_networking::scoring::EventType::InvalidBlock);
+                }
+                return;
+            }
+            Ok(ingested) if ingested.unlinked > 0 => {
+                self.on_new_block_hashes(peer, vec![BlockIdentifier { hash, number }])
+                    .await;
+                return;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                warn!(
+                    target: "rustock::sync",
+                    "Could not store the header of #{number} from {:?}: {e:?}",
+                    &peer.0[..4]
+                );
+                return;
+            }
+        }
+        if let Err(e) = self.manager.store.put_body(hash, &transactions, &ommers) {
+            error!(target: "rustock::sync", "Failed to store the body of #{number}: {e:?}");
+            return;
+        }
+        self.relay_block(hash, number).await;
+
+        // A block beside the chain is kept, and relayed, for a miner to name
+        // as an uncle; only the canonical one is executed.
+        if self.manager.store.canonical_hash(number).ok().flatten() != Some(hash) {
+            return;
+        }
+        let after_height = self.our_head_number();
+        if self.manager.store.head().ok().flatten() != before_hash {
+            if after_height > before_height {
+                info!(target: "rustock::sync", "New tip: #{after_height}");
+            } else {
+                info!(
+                    target: "rustock::sync",
+                    "Reorg: #{before_height} -> #{after_height} (new head {hash:?})"
+                );
+            }
+        }
+        // Buffered as a fetched body is, in place of any request still out
+        // for it, whose answer would buffer the block again after it ran.
+        self.pending_follow_bodies
+            .retain(|_, pending| pending.0 != hash);
+        self.body_providers.insert(number, peer);
+        self.follow_buffer
+            .insert(number, (hash, header, transactions, ommers));
+        self.drain_follow_buffer().await;
     }
 
     /// In Following state, periodically check if we've fallen too far behind
@@ -5133,12 +5294,21 @@ impl SyncService {
                     };
                     self.body_providers.insert(header.number, peer);
 
+                    let new_block = !self.holds_block(hash);
                     if let Err(e) = self.manager.store.put_body(hash, &transactions, &uncles) {
                         error!(
                             target: "rustock::sync",
                             "Failed to store follow-mode body for {:?}: {:?}", hash, e
                         );
                         return;
+                    }
+                    // rskj remembers the peer a block came from
+                    // (`BlockSyncService.preprocessBlock`) and, once the block is
+                    // whole and its header holds against its parent, announces it
+                    // to the peers that lack it (`MessageVisitor.tryRelayBlock`).
+                    self.manager.note_block_holder(hash, peer);
+                    if new_block {
+                        self.relay_block(hash, header.number).await;
                     }
                     debug!(
                         target: "rustock::sync",

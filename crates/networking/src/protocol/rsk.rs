@@ -1,6 +1,6 @@
 use alloy_rlp::{Decodable, Encodable, RlpDecodable, RlpEncodable, Header as RlpHeader};
 use alloy_primitives::{B256, Bytes, U256};
-use rustock_core::{Header, Transaction};
+use rustock_core::{Block, Header, Transaction};
 use rustock_core::types::header::HeaderForm;
 use rustock_core::types::header_extension::BlockHeaderExtension;
 use rustock_core::rlp_compat::{decode_u8_lenient, decode_u64_lenient, decode_u256_lenient, decode_u32_lenient};
@@ -284,6 +284,14 @@ pub struct SkeletonResponse {
 #[repr(u8)]
 pub enum RskMessageType {
     Status = 1,
+    /// A whole block: rskj `BlockMessage`, which a node sends to some of its
+    /// peers when it mines one (`ChannelManagerImpl.broadcastBlock`) and to a
+    /// peer that asks for one by hash (`NodeBlockProcessor.processGetBlock`).
+    Block = 2,
+    /// A whole block asked for by its hash: rskj `GetBlockMessage`, which a
+    /// node sends to the peer that announced a block it does not hold
+    /// (`NodeBlockProcessor.processNewBlockHashesMessage`).
+    GetBlock = 3,
     NewBlockHashes = 6,
     Transactions = 7,
     BlockHashRequest = 8,
@@ -366,6 +374,8 @@ impl Decodable for BlockRange {
 #[derive(Debug, Clone)]
 pub enum RskSubMessage {
     Status(RskStatus),
+    Block(Box<Block>),
+    GetBlock(B256),
     BlockHashRequest(BlockHashRequest),
     BlockHeadersRequest(BlockHeadersRequest),
     BlockHeadersResponse(BlockHeadersResponse),
@@ -392,6 +402,8 @@ impl RskSubMessage {
     pub fn message_type(&self) -> RskMessageType {
         match self {
             RskSubMessage::Status(_) => RskMessageType::Status,
+            RskSubMessage::Block(_) => RskMessageType::Block,
+            RskSubMessage::GetBlock(_) => RskMessageType::GetBlock,
             RskSubMessage::BlockHashRequest(_) => RskMessageType::BlockHashRequest,
             RskSubMessage::BlockHeadersRequest(_) => RskMessageType::BlockHeadersRequest,
             RskSubMessage::BlockHeadersResponse(_) => RskMessageType::BlockHeadersResponse,
@@ -672,8 +684,54 @@ impl RskSubMessage {
             RskSubMessage::SnapChunkResponse(m) => out.extend_from_slice(&m.encode_body()),
             RskSubMessage::SnapBlocksRequest(m) => out.extend_from_slice(&m.encode_body()),
             RskSubMessage::SnapBlocksResponse(m) => out.extend_from_slice(&m.encode_body()),
-            RskSubMessage::NewBlockHashes(_) | RskSubMessage::Unknown(_) => {
-                // Receive-only messages are not encoded/sent
+            RskSubMessage::Block(block) => {
+                // rskj `BlockMessage.getEncodedMessage`:
+                // `RLP.encodeList(RLP.encode(block.getEncoded()))`, the block's own
+                // encoding as the one string in a list.
+                let mut payload = Vec::new();
+                Bytes::from(snap::encode_block(block)).encode(&mut payload);
+                RlpHeader {
+                    list: true,
+                    payload_length: payload.len(),
+                }
+                .encode(out);
+                out.extend_from_slice(&payload);
+            }
+            RskSubMessage::GetBlock(hash) => {
+                // rskj `GetBlockMessage.getEncodedMessage`: the hash, alone in a list.
+                let mut payload = Vec::new();
+                hash.encode(&mut payload);
+                RlpHeader {
+                    list: true,
+                    payload_length: payload.len(),
+                }
+                .encode(out);
+                out.extend_from_slice(&payload);
+            }
+            RskSubMessage::NewBlockHashes(identifiers) => {
+                // rskj `NewBlockHashesMessage.encode`: a list of
+                // `BlockIdentifier.getEncoded`, each `[hash, number]`.
+                let mut payload = Vec::new();
+                for identifier in identifiers {
+                    let mut pair = Vec::new();
+                    identifier.hash.encode(&mut pair);
+                    identifier.number.encode(&mut pair);
+                    RlpHeader {
+                        list: true,
+                        payload_length: pair.len(),
+                    }
+                    .encode(&mut payload);
+                    payload.extend_from_slice(&pair);
+                }
+                RlpHeader {
+                    list: true,
+                    payload_length: payload.len(),
+                }
+                .encode(out);
+                out.extend_from_slice(&payload);
+            }
+            RskSubMessage::Unknown(_) => {
+                // A type this node does not know is never sent.
             }
         }
     }
@@ -762,6 +820,26 @@ impl Decodable for RskMessage {
                     status.earliest_block = Some(decode_u64_lenient(&mut list_body)?);
                 }
                 RskSubMessage::Status(status)
+            }
+            2 => {
+                // rskj `MessageType.BLOCK_MESSAGE`: the block's own encoding, the
+                // one string in a list, read whole (`BlockFactory.decodeBlock`).
+                let list_h = RlpHeader::decode(&mut body_params)?;
+                if !list_h.list || body_params.len() < list_h.payload_length {
+                    return Err(alloy_rlp::Error::Custom("malformed block message"));
+                }
+                let mut list_body = &body_params[..list_h.payload_length];
+                let encoded = Bytes::decode(&mut list_body)?;
+                RskSubMessage::Block(Box::new(snap::decode_block(&mut encoded.as_ref())?))
+            }
+            3 => {
+                // rskj `MessageType.GET_BLOCK_MESSAGE`: the hash, alone in a list.
+                let list_h = RlpHeader::decode(&mut body_params)?;
+                if !list_h.list || body_params.len() < list_h.payload_length {
+                    return Err(alloy_rlp::Error::Custom("malformed get-block message"));
+                }
+                let mut list_body = &body_params[..list_h.payload_length];
+                RskSubMessage::GetBlock(B256::decode(&mut list_body)?)
             }
             9 => {
                 let list_h = RlpHeader::decode(&mut body_params)?;
@@ -1914,7 +1992,7 @@ mod headers_with_uncles_tests {
     use super::*;
     use alloy_primitives::Address;
 
-    fn plain(number: u64, difficulty: u64) -> Header {
+    pub(super) fn plain(number: u64, difficulty: u64) -> Header {
         Header {
             number,
             parent_hash: B256::repeat_byte(number as u8),
@@ -1955,7 +2033,7 @@ mod headers_with_uncles_tests {
         HeaderWithUncles { header, uncles: entry.uncles }
     }
 
-    fn roundtrip(sub: RskSubMessage) -> RskSubMessage {
+    pub(super) fn roundtrip(sub: RskSubMessage) -> RskSubMessage {
         let mut buf = Vec::new();
         RskMessage::new(sub).encode(&mut buf);
         RskMessage::decode(&mut buf.as_slice()).expect("decodes").sub_message
@@ -2217,6 +2295,13 @@ mod headers_with_uncles_tests {
                 id: 5,
                 entries: vec![with_uncles(10, 1000, vec![plain(9, 700)])],
             }),
+            RskSubMessage::Block(Box::new(rustock_core::Block {
+                header: plain(11, 1100),
+                transactions: vec![tx.clone()],
+                ommers: vec![plain(10, 1000)],
+            })),
+            RskSubMessage::GetBlock(B256::repeat_byte(6)),
+            RskSubMessage::NewBlockHashes(vec![identifier(1), identifier(2)]),
         ];
 
         let mut messages: Vec<(String, Vec<u8>)> = seeds
@@ -2228,8 +2313,8 @@ mod headers_with_uncles_tests {
                 (kind, bytes)
             })
             .collect();
-        // rustock never sends NewBlockHashes, so its encoder writes nothing for
-        // it; this is the list of [hash, number] pairs an rskj node sends.
+        // And the list of [hash, number] pairs an rskj node sends, built by
+        // hand rather than by this node's encoder.
         let mut pairs = Vec::new();
         for n in 1..=3u8 {
             let mut pair = Vec::new();
@@ -2377,5 +2462,137 @@ mod difficulty_encoding_tests {
         status.encode(&mut buf);
         let back = RskStatus::decode(&mut buf.as_slice()).expect("decodes");
         assert_eq!(back.total_difficulty, Some(td));
+    }
+}
+
+/// The three messages rskj announces and hands over new blocks with, as rskj
+/// writes them: built here by hand from its encoders, not by this node's.
+#[cfg(test)]
+mod block_message_tests {
+    use super::headers_with_uncles_tests::{plain, roundtrip};
+    use super::*;
+
+    /// RLP's string: one byte below 0x80 stands for itself.
+    fn string(bytes: &[u8]) -> Vec<u8> {
+        if let [byte] = bytes {
+            if *byte < 0x80 {
+                return vec![*byte];
+            }
+        }
+        let mut out = Vec::new();
+        RlpHeader {
+            list: false,
+            payload_length: bytes.len(),
+        }
+        .encode(&mut out);
+        out.extend_from_slice(bytes);
+        out
+    }
+
+    fn list(payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        RlpHeader {
+            list: true,
+            payload_length: payload.len(),
+        }
+        .encode(&mut out);
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// `Message.getEncoded`: `[type, string(params)]`, inside the list
+    /// `RskMessage.encode` adds.
+    fn frame(kind: u8, params: &[u8]) -> Vec<u8> {
+        let mut message = string(&[kind]);
+        message.extend(string(params));
+        list(&list(&message))
+    }
+
+    fn written(sub: RskSubMessage) -> Vec<u8> {
+        let mut out = Vec::new();
+        RskMessage::new(sub).encode(&mut out);
+        out
+    }
+
+    /// `NewBlockHashesMessage.encode`: a list of `BlockIdentifier.getEncoded`,
+    /// each `RLP.encodeList(encodeElement(hash), encodeBigInteger(number))`.
+    #[test]
+    fn new_block_hashes_are_written_as_rskj_writes_them() {
+        let identifiers = vec![
+            BlockIdentifier {
+                hash: B256::repeat_byte(0x11),
+                number: 0x7f,
+            },
+            BlockIdentifier {
+                hash: B256::repeat_byte(0x22),
+                number: 9_348_613,
+            },
+        ];
+        let mut pairs = Vec::new();
+        for identifier in &identifiers {
+            let number = identifier.number.to_be_bytes();
+            let first = number.iter().position(|b| *b != 0).unwrap_or(number.len());
+            let mut pair = string(identifier.hash.as_slice());
+            pair.extend(string(&number[first..]));
+            pairs.extend(list(&pair));
+        }
+        assert_eq!(
+            written(RskSubMessage::NewBlockHashes(identifiers.clone())),
+            frame(6, &list(&pairs))
+        );
+        let RskSubMessage::NewBlockHashes(back) =
+            roundtrip(RskSubMessage::NewBlockHashes(identifiers.clone()))
+        else {
+            panic!("read back as another message");
+        };
+        assert_eq!(back, identifiers);
+    }
+
+    /// `BlockMessage.getEncodedMessage`: `RLP.encodeList(RLP.encode(
+    /// block.getEncoded()))`, the block as the one string in a list, which
+    /// `MessageType.BLOCK_MESSAGE` hands whole to `BlockFactory.decodeBlock`.
+    #[test]
+    fn a_block_is_written_as_rskj_writes_it() {
+        let block = Block {
+            header: Header {
+                uncle_count: 1,
+                ..plain(7, 700)
+            },
+            transactions: Vec::new(),
+            ommers: vec![plain(6, 600)],
+        };
+        assert_eq!(
+            written(RskSubMessage::Block(Box::new(block.clone()))),
+            frame(2, &list(&string(&snap::encode_block(&block))))
+        );
+        let RskSubMessage::Block(back) = roundtrip(RskSubMessage::Block(Box::new(block.clone())))
+        else {
+            panic!("read back as another message");
+        };
+        assert_eq!(back.hash(), block.hash());
+        assert_eq!(back.ommers.len(), 1);
+        assert_eq!(back.ommers[0].hash(), block.ommers[0].hash());
+    }
+
+    /// `GetBlockMessage.getEncodedMessage`: `RLP.encodeList(encodeElement(hash))`.
+    #[test]
+    fn a_block_request_is_written_as_rskj_writes_it() {
+        let hash = B256::repeat_byte(0x33);
+        assert_eq!(
+            written(RskSubMessage::GetBlock(hash)),
+            frame(3, &list(&string(hash.as_slice())))
+        );
+        let RskSubMessage::GetBlock(back) = roundtrip(RskSubMessage::GetBlock(hash)) else {
+            panic!("read back as another message");
+        };
+        assert_eq!(back, hash);
+    }
+
+    /// rskj's numbers for the two types, which no other message uses.
+    #[test]
+    fn the_block_messages_have_rskjs_type_numbers() {
+        assert_eq!(RskMessageType::Block as u8, 2);
+        assert_eq!(RskMessageType::GetBlock as u8, 3);
+        assert_eq!(RskMessageType::NewBlockHashes as u8, 6);
     }
 }

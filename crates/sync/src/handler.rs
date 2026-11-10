@@ -301,6 +301,39 @@ impl SyncHandler {
         )))
     }
 
+    /// Answer a `GetBlockMessage` with the whole block: rskj
+    /// `NodeBlockProcessor.processGetBlock` (L147-157), which answers from any
+    /// chain it holds, and first remembers that the asker holds the block now,
+    /// so it is not announced back to it.
+    ///
+    /// A peer sends one to the node that announced a block it lacks
+    /// (`processNewBlockHashesMessage`), so without an answer this node's
+    /// announcements could not be followed. A block whose header this node
+    /// holds compressed has no full form to send, and one without its body is
+    /// not whole; neither is answered, as rskj answers nothing for a block it
+    /// lacks.
+    fn serve_get_block(&self, peer: B512, hash: alloy_primitives::B256) -> Option<P2pMessage> {
+        let store = &self.manager.store;
+        let header = store.header(hash).ok()??;
+        if !self.may_serve(header.number) || header.extension_data.is_some() {
+            return None;
+        }
+        let (transactions, ommers) = store.body(hash).ok()??;
+        self.manager.note_block_holder(hash, peer);
+        trace!(
+            target: "rustock::sync",
+            "Serving block #{} {:?} to {:?}",
+            header.number, hash, &peer.0[..4]
+        );
+        Some(P2pMessage::RskMessage(RskMessage::new(
+            RskSubMessage::Block(Box::new(rustock_core::Block {
+                header,
+                transactions,
+                ommers,
+            })),
+        )))
+    }
+
     /// Respond to a BlockHeadersRequest by walking backwards from the given
     /// hash, collecting up to `count` headers (same logic as rskj).
     fn serve_headers_request(
@@ -613,6 +646,12 @@ impl P2pHandler for SyncHandler {
                         identifiers: blocks.clone(),
                     });
                 }
+                RskSubMessage::Block(block) => {
+                    let _ = self.event_tx.send(SyncEvent::NewBlock {
+                        peer: id,
+                        block: block.clone(),
+                    });
+                }
 
                 RskSubMessage::BodyResponse(r) => {
                     trace!(
@@ -648,6 +687,9 @@ impl P2pHandler for SyncHandler {
                 }
                 RskSubMessage::BodyRequest(r) => {
                     return self.serve_body_request(r.id, r.hash);
+                }
+                RskSubMessage::GetBlock(hash) => {
+                    return self.serve_get_block(id, *hash);
                 }
 
                 // --- Snapshot sync ---

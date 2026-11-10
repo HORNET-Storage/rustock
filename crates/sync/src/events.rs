@@ -51,6 +51,12 @@ pub enum SyncEvent {
         peer: B512,
         identifiers: Vec<BlockIdentifier>,
     },
+    /// A whole block a peer sent unasked, as rskj sends one it mined
+    /// (`BlockMessage`), or in answer to a `GetBlockMessage`.
+    NewBlock {
+        peer: B512,
+        block: Box<Block>,
+    },
 
     /// A peer's offer of a state it can serve. The blocks are unverified:
     /// their headers still have to be checked back to a block this node

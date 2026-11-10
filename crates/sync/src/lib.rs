@@ -1,3 +1,5 @@
+pub mod announce;
+mod block_nodes;
 pub mod execution_commit;
 pub mod import;
 pub mod sampler;
@@ -23,6 +25,7 @@ pub mod txpool;
 pub mod watchdog;
 
 // Re-exports for external consumers
+pub use announce::{broadcast_block, on_mined};
 pub use events::SyncEvent;
 pub use handler::SyncHandler;
 pub use manager::SyncManager;

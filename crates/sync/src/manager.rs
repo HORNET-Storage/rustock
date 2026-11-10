@@ -50,6 +50,10 @@ pub struct SyncManager {
     /// header difficulty. Bounded, because it is an optimisation and a peer
     /// could otherwise grow it without limit.
     proven: Mutex<HashMap<B256, U256>>,
+    /// The peers known to hold each block heard of lately, so that a block
+    /// is announced only to the peers that lack it. See
+    /// [`crate::block_nodes`].
+    block_nodes: Mutex<crate::block_nodes::BlockNodes>,
 }
 
 /// How many proved cumulative difficulties to keep. A skeleton chunk is 192
@@ -70,6 +74,7 @@ impl SyncManager {
             unlinked: Mutex::new(UnlinkedHeaders::new()),
             uncle_guard: Mutex::new(crate::uncle_guard::UncleGuard::new()),
             proven: Mutex::new(HashMap::new()),
+            block_nodes: Mutex::new(crate::block_nodes::BlockNodes::new()),
         }
     }
 
@@ -468,6 +473,24 @@ impl SyncManager {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clear_peer(peer);
+    }
+
+    /// Remembers that `peer` holds `block`: rskj
+    /// `BlockNodeInformation.addBlockToNode`.
+    pub(crate) fn note_block_holder(&self, block: B256, peer: B512) {
+        self.block_nodes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .add(block, peer);
+    }
+
+    /// The peers known to hold `block`: rskj
+    /// `BlockNodeInformation.getNodesByBlock`.
+    pub(crate) fn block_holders(&self, block: B256) -> std::collections::HashSet<B512> {
+        self.block_nodes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .nodes(block)
     }
 
     /// Helper to create a headers request message.

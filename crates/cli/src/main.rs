@@ -3402,20 +3402,28 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
             hardfork_cfg.clone(),
             mining_config,
         );
-        let chain = Arc::new(rustock_execution::mining::StoreChainAccess::with_flush_every(
-            store.clone(),
-            trie_store_for_pool.clone(),
-            // What the sync service's import path does for a block that
-            // arrived from a peer, done here for one this node mined.
-            Some({
-                let pool = pool.clone();
-                Arc::new(move |block: &rustock_core::Block| {
-                    pool.remove_mined(&block.transactions);
-                    pool.evict_outdated(block.header.number);
-                })
-            }),
-            args.flush_every,
-        ));
+        // What the sync service's import path does for a block that arrived
+        // from a peer, done here for one this node mined; then what rskj's
+        // `EthereumImpl.addNewMinedBlock` does with a mined block once it is
+        // stored, best or not: send it to the peers.
+        let on_committed: Arc<dyn Fn(&rustock_core::Block) + Send + Sync> = {
+            let pool = pool.clone();
+            let broadcast =
+                rustock_sync::on_mined(peer_store.clone(), tokio::runtime::Handle::current());
+            Arc::new(move |block: &rustock_core::Block| {
+                pool.remove_mined(&block.transactions);
+                pool.evict_outdated(block.header.number);
+                broadcast(block);
+            })
+        };
+        let chain = Arc::new(
+            rustock_execution::mining::StoreChainAccess::with_flush_every(
+                store.clone(),
+                trie_store_for_pool.clone(),
+                Some(on_committed),
+                args.flush_every,
+            ),
+        );
         let mut server = rustock_execution::MinerServer::new(
             builder,
             chain,
