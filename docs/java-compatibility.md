@@ -5,6 +5,12 @@ consensus- or protocol-load-bearing because of a **language or implementation
 artifact of `rskj`** — things a spec-following client could implement
 "correctly" and still fork from the network.
 
+**If you are asking "how does the RSK EVM differ from other EVMs", start at
+[`rsk-evm-consensus-rules.md`](./rsk-evm-consensus-rules.md)** — the same
+material stated as rules and organised by EVM subsystem (gas schedule, account
+existence, call semantics, block context) rather than by the nature of the
+quirk. It is a view over the files below and cites their § numbers.
+
 The catalogue is split by the *nature* of each quirk:
 
 - [`quirks-java-artifacts.md`](./quirks-java-artifacts.md) — behaviors hidden in

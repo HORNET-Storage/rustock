@@ -27,12 +27,14 @@ usage.
 |---|---|
 | [`powpeg_signature_audit`](../crates/cli/examples/powpeg_signature_audit.rs) | Did a PowPeg functionary ever submit a signature the Bridge refused? |
 | [`federation_intervals`](../crates/cli/examples/federation_intervals.rs) | Which PowPeg functionary keys were active over which block range. |
+| [`block_fees`](../crates/cli/examples/block_fees.rs) | What did a block's transactions pay in fees? Reads `paidFees` from the header rather than summing receipts or reading REMASC payouts; parallel, `--verify` checks it against the receipts sum. |
 | [`bridge_events`](../crates/cli/examples/bridge_events.rs) | Query the Bridge event index: every occurrence of one event, in block order. |
 | [`bridge_method`](../crates/cli/examples/bridge_method.rs) | Identify a Bridge method from its 4-byte ABI selector, using the node's own table rather than a guess. |
 | [`bridge_subtree`](../crates/cli/examples/bridge_subtree.rs) | How big is the Bridge's storage subtree, and how much of it is missing from a chunk? |
 | [`pegin_refunds`](../crates/cli/examples/pegin_refunds.rs) | Did the Bridge's peg-in refund path ever execute on mainnet? |
 | [`scan_pegin_calls`](../crates/cli/examples/scan_pegin_calls.rs) | Find `registerBtcTransaction` calls by reading blocks, without executing them. |
 | [`scan_silent`](../crates/cli/examples/scan_silent.rs) | Read the silent-decision store: what the Bridge decided without logging it. |
+| [`flyover_find`](../crates/cli/examples/flyover_find.rs) | At which block did the Bridge register each Flyover peg-in? Binary-searches the `fastBridgeFederationInformation` slot, which is absent before registration and present after — ~24 probes per address instead of replaying the chain. |
 | [`flyover_registry`](../crates/cli/examples/flyover_registry.rs) | Did the Bridge register this flyover address, and under which derivation? One trie read per address, no replay — and it separates "never registered" from "this store is pruned and cannot say". |
 | [`legacy_events`](../crates/cli/examples/legacy_events.rs) | Query the peg events reconstructed for the era the Bridge logged nothing, and merge them with the node's real event index into one history. |
 | [`check_supply`](../crates/cli/examples/check_supply.rs) | Replay canonical blocks and report any that do not conserve the native supply, changing nothing on disk. |
@@ -126,6 +128,14 @@ usage.
 | tool | what it answers |
 |---|---|
 | [`check_alerts_config`](../crates/cli/examples/check_alerts_config.rs) | Validate a peg-out alert configuration without starting a node or sending mail: parse it, resolve `${NAME}` references against the env file, and report what would happen. Secrets are never printed — only whether they resolved and how long they are. |
+
+## How the RSK EVM differs from other EVMs
+
+[`rsk-evm-consensus-rules.md`](rsk-evm-consensus-rules.md) states the rules
+themselves — gas schedule, account existence without EIP-161, call semantics,
+block context — organised by EVM subsystem and naming no client. It is a view
+over the `java-compatibility.md` catalogue and cites its § numbers for the
+derivations.
 
 ## Flyover peg-ins leave no event
 
