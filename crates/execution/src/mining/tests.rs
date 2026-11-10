@@ -2845,8 +2845,8 @@ fn the_commit_hook_runs_once_the_block_is_the_head() {
     );
 }
 
-/// The thread mines on its clock: at a 100 ms median (the floor), a second
-/// of running yields several blocks, and stopping ends it.
+/// The thread mines on its clock: at a 100 ms median (the floor), it yields
+/// several blocks, and stopping ends it.
 #[test]
 fn a_timed_miner_mines_blocks_on_its_own() {
     let fx = fixture_without_pow(20, 10, Arc::new(MemoryTrieStore::new()));
@@ -2855,22 +2855,49 @@ fn a_timed_miner_mines_blocks_on_its_own() {
         std::time::Duration::from_millis(100),
         Pow::Skip,
     );
+    // The thread takes its own handle on the server, the only one taken from
+    // here on: the count is one higher while it runs and falls back when it
+    // ends.
+    let without_thread = Arc::strong_count(&fx.server);
     assert!(!miner.is_running());
     miner.start();
     miner.start(); // idempotent: one thread, not two
     assert!(miner.is_running());
-    std::thread::sleep(std::time::Duration::from_millis(1_500));
+    assert_eq!(
+        Arc::strong_count(&fx.server),
+        without_thread + 1,
+        "one thread, not two"
+    );
+
+    // Waits for the blocks, not a fixed time: a loaded machine builds them
+    // slower than the clock asks for.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while miner.mined() < 3 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "only {} blocks in 60 s at a 100 ms median",
+            miner.mined()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
     miner.stop();
     assert!(!miner.is_running());
-    std::thread::sleep(std::time::Duration::from_millis(300));
+    // The thread finishes the block in flight, if any, and ends.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while Arc::strong_count(&fx.server) > without_thread {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "still running 60 s after stop"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    // Pairs with the release in the thread's dropping its handle, so all it
+    // did before is seen here.
+    std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
 
     let mined = miner.mined();
-    assert!(mined >= 3, "only {mined} blocks in 1.5 s at a 100 ms median");
     let head = fx.store.header(fx.store.head().unwrap().unwrap()).unwrap().unwrap();
-    assert_eq!(head.number, 20 + mined);
-    let after = miner.mined();
-    std::thread::sleep(std::time::Duration::from_millis(400));
-    assert_eq!(miner.mined(), after, "still mining after stop");
+    assert_eq!(head.number, 20 + mined, "the head is the last block it counted");
 }
 
 /// A header whose recomputed hash is not the hash it is stored under: what a
