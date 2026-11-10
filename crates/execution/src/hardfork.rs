@@ -722,9 +722,11 @@ impl RskHardforkConfig {
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Iris300
     }
 
-    /// RSKIP171: a CALL/CREATE that runs no new frame resets the caller's
+    /// RSKIP171: a CALL that opens no new frame resets the caller's
     /// returnDataBuffer (canonical EIP-211), instead of preserving the prior
-    /// call's output as pre-iris rskj did (Iris300).
+    /// call's output as pre-iris rskj did (Iris300). Only rskj's call paths
+    /// run that clean-up (`Program.cleanReturnDataBuffer`): a creation that
+    /// runs no init code leaves the buffer as it was at every height.
     pub fn has_rskip171(&self, block_number: u64) -> bool {
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Iris300
     }

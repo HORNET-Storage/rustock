@@ -5140,6 +5140,62 @@ mod tests {
         );
     }
 
+    /// A CREATE that rskj's `Program.createContract` refuses before it builds
+    /// a program -- here for a value its creator hasn't got -- leaves the
+    /// creator's returnDataBuffer as it was, before iris300 and after: the
+    /// refusal returns before `getProgramResult` resets the buffer, and
+    /// RSKIP171's `cleanReturnDataBuffer` is only on the call paths.
+    /// RETURNDATASIZE after it still reports the previous call's 32 bytes.
+    #[test]
+    fn test_refused_create_keeps_return_data_buffer_at_every_height() {
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let sender = Address::repeat_byte(0xAC);
+        // Source: RETURN 32 zero bytes.
+        let source = Address::repeat_byte(0xB8);
+        let source_code = [0x60, 0x20, 0x60, 0x00, 0xf3];
+        // Main: CALL source; POP; CREATE(1 wei, no code); POP;
+        //       SSTORE(0, RETURNDATASIZE); STOP.
+        let main = Address::repeat_byte(0xB9);
+        let mut main_code = vec![
+            0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x73,
+        ];
+        main_code.extend_from_slice(source.as_slice());
+        main_code.extend_from_slice(&[0x62, 0x0f, 0x42, 0x40, 0xf1, 0x50]);
+        main_code.extend_from_slice(&[0x60, 0x00, 0x60, 0x00, 0x60, 0x01, 0xf0, 0x50]);
+        main_code.extend_from_slice(&[0x3d, 0x60, 0x00, 0x55, 0x00]);
+
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = put_account(&TrieNode::empty(), store.as_ref(), &sender, 0, one_rbtc);
+        let root =
+            put_account_with_code(&root, store.as_ref(), &source, 1, U256::ZERO, &source_code);
+        let root = put_account_with_code(&root, store.as_ref(), &main, 1, U256::ZERO, &main_code);
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+        // Before iris300 (#3,614,800) and after it.
+        for number in [3_000_000u64, 3_616_094] {
+            let call = plain_tx(0, &main, U256::ZERO);
+            let r = executor
+                .execute_block(
+                    &dummy_header(number),
+                    &[(call, sender)],
+                    &root,
+                    store.clone(),
+                )
+                .expect("block");
+            assert!(r.tx_results[0].success, "#{number}");
+            let size = r
+                .state_changes
+                .get(&main)
+                .and_then(|a| a.storage.get(&U256::ZERO))
+                .map_or(U256::ZERO, |s| s.present_value);
+            assert_eq!(
+                size,
+                U256::from(32),
+                "#{number}: RETURNDATASIZE after the refused CREATE"
+            );
+        }
+    }
+
     /// Regression for mainnet #1,661,324: rskj's VM.doCODESIZE (RSKIP90, orchid)
     /// reports EXTCODESIZE of an active precompile as 2^256-1. A proxy that
     /// guards `extcodesize(impl) != 0` before forwarding to the BlockHeader

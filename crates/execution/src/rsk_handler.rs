@@ -690,22 +690,27 @@ where
                             // previous buffer (mainnet #2,669,886: RETURNDATASIZE
                             // after a value transfer to an empty account still
                             // reports the prior call's 32-byte output).
-                            // For CREATE only the pre-checks (depth/endowment)
-                            // return before rskj's reset.
                             // RSKIP171 (iris300): cleanReturnDataBuffer now
                             // fires on every no-frame call, so the pre-iris
                             // preservation is disabled and revm's EIP-211
                             // clearing stands.
-                            let rskj_preserves = !self.rskip171_active
-                                && match &result {
-                                    FrameResult::Call(_) => callee
-                                        .is_some_and(|c| !self.active_precompiles.contains(&c)),
-                                    FrameResult::Create(outcome) => matches!(
-                                        outcome.instruction_result(),
-                                        InstructionResult::CallTooDeep
-                                            | InstructionResult::OutOfFunds
-                                    ),
-                                };
+                            // A CREATE that `createContract` refuses before it
+                            // builds a program (depth, endowment, an address in
+                            // use) keeps the buffer at every height: RSKIP171's
+                            // clean-up is only on the call paths.
+                            let rskj_preserves = match &result {
+                                FrameResult::Call(_) => {
+                                    !self.rskip171_active
+                                        && callee
+                                            .is_some_and(|c| !self.active_precompiles.contains(&c))
+                                }
+                                FrameResult::Create(outcome) => matches!(
+                                    outcome.instruction_result(),
+                                    InstructionResult::CallTooDeep
+                                        | InstructionResult::OutOfFunds
+                                        | InstructionResult::CreateCollision
+                                ),
+                            };
                             if rskj_preserves {
                                 use revm::interpreter::interpreter_types::ReturnData;
                                 preserved_return_buffer = Some(
