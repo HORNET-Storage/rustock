@@ -712,7 +712,7 @@ pub fn note_storage_write_attempt(addr: Address, key: B256) {
 /// Writes only: the read side of that overlay has no hook, which leaves a
 /// sublist that merely *reads* Bridge state unrecorded. That is the one
 /// remaining place where our sets are narrower than rskj's.
-pub fn record_raw_writes(writes: &[crate::raw_storage::RawWrite]) {
+pub fn record_raw_writes<'a>(writes: impl IntoIterator<Item = &'a crate::raw_storage::RawWrite>) {
     with_sublist(|rec| {
         for (addr, cell, _) in writes {
             if rec.excluded.contains(addr) {

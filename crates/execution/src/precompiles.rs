@@ -656,8 +656,10 @@ pub struct RskPrecompileProvider {
     aborts_caller: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Precompiles successfully called during the current transaction. rskj
     /// writes the contract storage-prefix marker (`setupContract`) on every
-    /// successful precompile call; the executor drains this after each tx and
-    /// applies the markers to the trie if the tx committed.
+    /// successful precompile call, in the call's own track; the executor
+    /// drains this after each tx and applies the markers to the trie if the
+    /// tx committed. A frame that fails takes its calls back off it
+    /// (`RskHandler`), as rskj rolls that track back with the frame's.
     called_precompiles: std::sync::Arc<std::sync::Mutex<Vec<Address>>>,
     /// Set when this transaction reaches REMASC or the Bridge. See
     /// [`RskPrecompileProvider::reached_sequential_only_slot`].

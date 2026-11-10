@@ -12,19 +12,17 @@
 //! Commit discipline mirrors rskj's repository tracks:
 //! - per precompile call: `commit_call` on method success, `discard_call` on
 //!   failure (rskj commits the call's child track only on success);
+//! - per frame of contract code: `RskHandler` takes `frame_start` as a frame
+//!   opens and calls `revert_frame` if it fails, since rskj rolls back the
+//!   track of a call or create that reverts or fails, with what the
+//!   precompiles it called committed into it;
 //! - per transaction: `begin_tx` / `discard_tx` (a failed tx reverts all of
 //!   its calls' committed writes);
-//! - but a kept write (`put_kept`) stays through both: what rskj writes
-//!   straight into the repository a transaction's own call to a precompile
-//!   was given, which `TransactionExecutor.go` commits however the call
-//!   ended, even after a throw or running out of gas.
-//!
-//! Known limitation (consciously accepted): if a contract internally calls a
-//! state-writing bridge method, the bridge call succeeds, and the CALLER
-//! frame later reverts, rskj rolls the bridge writes back with the parent
-//! track while this overlay keeps them. No pre-wasabi mainnet block does
-//! this; the per-block orchid state-root check would halt right at such a
-//! block if one existed.
+//! - but a kept write (`put_kept`) stays through all of these: what rskj
+//!   writes straight into the repository a transaction's own call to a
+//!   precompile was given, which `TransactionExecutor.go` commits however
+//!   the call ended, even after a throw or running out of gas. That call
+//!   runs no frame, so no frame takes one back.
 use alloy_primitives::{Address, B256, U256};
 use rustock_trie::{storage_key, TrieKeySlice, TrieNode, TrieStore};
 use std::sync::Arc;
@@ -64,6 +62,10 @@ pub struct RawStorage {
     kept: Vec<RawWrite>,
     /// How many of `kept` are in `committed` already.
     kept_committed: usize,
+    /// The current transaction's writes that a failed frame took back
+    /// ([`RawStorage::revert_frame`]): gone from the state, but written all
+    /// the same as far as RSKIP-144 is concerned ([`RawStorage::tx_writes`]).
+    reverted: Vec<RawWrite>,
     /// Read-through to the parent block's state.
     reader: Option<(Arc<dyn TrieStore>, TrieNode)>,
 }
@@ -140,12 +142,28 @@ impl RawStorage {
         self.kept_committed = self.kept.len();
     }
 
+    /// Where the writes made under a frame of contract code that opens now
+    /// begin, for [`RawStorage::revert_frame`].
+    pub fn frame_start(&self) -> usize {
+        self.committed.len()
+    }
+
+    /// Take back what the calls under a frame that failed committed since its
+    /// [`RawStorage::frame_start`]: rskj rolls back the frame's track, with
+    /// what they committed into it. Only the current transaction's writes
+    /// can go, whatever `start` says.
+    pub fn revert_frame(&mut self, start: usize) {
+        let start = start.clamp(self.tx_start, self.committed.len());
+        self.reverted.extend(self.committed.drain(start..));
+    }
+
     /// Mark the start of a transaction.
     pub fn begin_tx(&mut self) {
         debug_assert!(self.pending.is_empty());
         self.tx_start = self.committed.len();
         self.kept.clear();
         self.kept_committed = 0;
+        self.reverted.clear();
     }
 
     /// Revert every write of the current transaction (tx failed), but its
@@ -155,18 +173,21 @@ impl RawStorage {
         self.pending.clear();
         self.committed.extend_from_slice(&self.kept);
         self.kept_committed = self.kept.len();
+        self.reverted.clear();
     }
 
-    /// The writes the current transaction has committed so far.
+    /// The writes the current transaction's calls have committed so far, with
+    /// those a failed frame took back.
     ///
     /// Valid between [`RawStorage::begin_tx`] and the next one, which is
     /// where RSKIP-144 collision tracking reads it: these are unitrie cells
     /// like any other, and two parallel sublists that both drive the Bridge
-    /// into writing one have collided. Already net of
-    /// [`RawStorage::discard_tx`], so a failed transaction reports only its
-    /// kept writes, which are made all the same.
-    pub fn tx_writes(&self) -> &[RawWrite] {
-        &self.committed[self.tx_start..]
+    /// into writing one have collided. rskj's tracker counts a key as it's
+    /// written, so a frame's failure doesn't take a write back from it.
+    /// Already net of [`RawStorage::discard_tx`], so a failed transaction
+    /// reports only its kept writes, which are made all the same.
+    pub fn tx_writes(&self) -> impl Iterator<Item = &RawWrite> {
+        self.committed[self.tx_start..].iter().chain(&self.reverted)
     }
 
     /// Take all committed writes for trie projection (block end).
@@ -175,6 +196,7 @@ impl RawStorage {
         self.tx_start = 0;
         self.kept.clear();
         self.kept_committed = 0;
+        self.reverted.clear();
         std::mem::take(&mut self.committed)
     }
 }
@@ -279,7 +301,7 @@ mod tests {
 
         raw.discard_tx();
         let kept = [(ADDR, key(1), Some(vec![1])), (ADDR, key(2), Some(vec![4]))];
-        assert_eq!(raw.tx_writes(), kept);
+        assert_eq!(raw.tx_writes().cloned().collect::<Vec<_>>(), kept);
 
         // The next transaction keeps its own and nothing of this one's: what
         // a discarded call kept, and what its unfinished call kept, once.
@@ -300,5 +322,75 @@ mod tests {
         raw.discard_call();
         raw.discard_call();
         assert_eq!(raw.drain(), [(ADDR, key(5), Some(vec![10]))]);
+    }
+
+    /// A frame that fails takes back what the calls under it committed, a
+    /// frame under it that returned included, and nothing from before it.
+    /// What it took back stays written for RSKIP-144, and leaves the block.
+    #[test]
+    fn a_failed_frame_takes_back_what_the_calls_under_it_committed() {
+        let mut raw = RawStorage::default();
+        raw.begin_tx();
+        raw.put(ADDR, key(1), Some(vec![1]));
+        raw.commit_call();
+
+        let outer = raw.frame_start();
+        raw.put(ADDR, key(1), Some(vec![2]));
+        raw.commit_call();
+        // A frame under it fails: only its own writes go.
+        let inner = raw.frame_start();
+        raw.put(ADDR, key(2), Some(vec![3]));
+        raw.commit_call();
+        raw.revert_frame(inner);
+        assert_eq!(raw.get(ADDR, key(1)), Some(vec![2]));
+        assert_eq!(raw.get(ADDR, key(2)), None);
+        // Another one returns, then the outer frame fails and takes it along.
+        raw.frame_start();
+        raw.put(ADDR, key(3), Some(vec![4]));
+        raw.commit_call();
+        raw.revert_frame(outer);
+        assert_eq!(raw.get(ADDR, key(1)), Some(vec![1]));
+        assert_eq!(raw.get(ADDR, key(3)), None);
+
+        let mut written: Vec<_> = raw.tx_writes().map(|(_, cell, _)| *cell).collect();
+        written.sort();
+        assert_eq!(written, [key(1), key(1), key(2), key(3)]);
+        assert_eq!(raw.drain(), [(ADDR, key(1), Some(vec![1]))]);
+        assert_eq!(
+            raw.tx_writes().count(),
+            0,
+            "a drained overlay starts afresh"
+        );
+    }
+
+    /// What a failed frame took back is its transaction's: the next one
+    /// doesn't report it, nor does its own once it fails. And a frame takes
+    /// back only its own transaction's writes, whatever start it's given.
+    #[test]
+    fn what_a_failed_frame_took_back_ends_with_its_transaction() {
+        let mut raw = RawStorage::default();
+        raw.begin_tx();
+        let frame = raw.frame_start();
+        raw.put(ADDR, key(1), Some(vec![1]));
+        raw.commit_call();
+        raw.revert_frame(frame);
+        assert_eq!(raw.tx_writes().count(), 1);
+        raw.begin_tx();
+        assert_eq!(raw.tx_writes().count(), 0);
+
+        let frame = raw.frame_start();
+        raw.put(ADDR, key(2), Some(vec![2]));
+        raw.commit_call();
+        raw.revert_frame(frame);
+        raw.discard_tx();
+        assert_eq!(raw.tx_writes().count(), 0);
+
+        raw.begin_tx();
+        raw.put(ADDR, key(3), Some(vec![3]));
+        raw.commit_call();
+        raw.begin_tx();
+        raw.revert_frame(0);
+        raw.revert_frame(usize::MAX);
+        assert_eq!(raw.get(ADDR, key(3)), Some(vec![3]));
     }
 }

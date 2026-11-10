@@ -2063,7 +2063,8 @@ impl RskExecutor {
                 self.hardfork_cfg.has_rskip171(header.number),
             )
             .postponing_fees(postpone_fees)
-            .failing_programs(fails_programs);
+            .failing_programs(fails_programs)
+            .with_called_precompiles(called_precompiles.clone());
                 // `inspect_run` for the one transaction being traced, `run`
                 // for every other -- and `run` is the same code path an EVM
                 // built without an inspector takes, because revm carries the
@@ -8434,6 +8435,140 @@ mod tests {
         let before = RskHardforkConfig::all_active(crate::hardfork::RSK_MAINNET_CHAIN_ID);
         assert!(!before.has_rskip136(1_000));
         assert_eq!(head(before, 1_000), Some(stored.serialize_compact_v2()));
+    }
+
+    /// rskj gives a contract's call to a precompile a track of its own,
+    /// commits it into the caller's when the call returns, and rolls it back
+    /// with the caller's when the caller fails: what the Bridge wrote, and the
+    /// storage root `callToPrecompiledAddress` gave it (`setupContract`). So a
+    /// contract that seeds an empty BTC store through a getter leaves nothing
+    /// of it behind if it then reverts, or the contract that called it does,
+    /// or it was a constructor that reverts, and the transaction goes on all
+    /// the same. What came before the frame that failed stays: identity's
+    /// storage root, and a seeding a frame that returned made.
+    #[test]
+    fn a_frame_that_fails_takes_back_what_the_precompiles_under_it_wrote() {
+        use crate::bridge::btc_store::{btc_hash_to_storage_key, compute_work, StoredBlock};
+        use crate::bridge::storage::{bridge_storage_key, compound_key, BTC_BLOCK_HEIGHT_KEY};
+        // Code that CALLs `to` with `data` (32 bytes at most), all its gas
+        // and no value, and drops what the CALL pushed.
+        fn call(to: Address, data: &[u8]) -> Vec<u8> {
+            let mut word = [0u8; 32];
+            word[..data.len()].copy_from_slice(data);
+            let mut code = vec![0x7f]; // PUSH32 the data, left-aligned
+            code.extend_from_slice(&word);
+            code.extend_from_slice(&[0x60, 0x00, 0x52]); // MSTORE it at 0
+            let size = u8::try_from(data.len()).unwrap();
+            // No return area, the data as the arguments, no value.
+            code.extend_from_slice(&[0x60, 0x00, 0x60, 0x00, 0x60, size, 0x60, 0x00, 0x60, 0x00]);
+            code.push(0x73); // PUSH20 to
+            code.extend_from_slice(to.as_slice());
+            code.extend_from_slice(&[0x5a, 0xf1, 0x50]); // GAS, CALL, POP
+            code
+        }
+        fn stop(mut code: Vec<u8>) -> Vec<u8> {
+            code.push(0x00);
+            code
+        }
+        fn revert(mut code: Vec<u8>) -> Vec<u8> {
+            code.extend_from_slice(&[0x60, 0x00, 0x60, 0x00, 0xfd]);
+            code
+        }
+        let bridge = crate::precompiles::BRIDGE_ADDR;
+        let identity = Address::with_last_byte(4);
+        let seed = crate::abi::selector("getBtcBlockchainBestChainHeight()");
+
+        let seeds = Address::repeat_byte(0xC1);
+        let seeds_code = stop(call(bridge, &seed));
+        let seeds_and_reverts = Address::repeat_byte(0xC2);
+        let seeds_and_reverts_code = revert(call(bridge, &seed));
+        let reverts_after_seeds = Address::repeat_byte(0xC3);
+        let reverts_after_seeds_code = revert(call(seeds, &[]));
+        // CODECOPY the constructor from behind this prefix, CREATE with it,
+        // drop the address and stop.
+        let creates = Address::repeat_byte(0xC4);
+        let creates_code = {
+            let init = revert(call(bridge, &seed));
+            let size = u8::try_from(init.len()).unwrap();
+            let mut code = vec![0x60, size, 0x60, 16, 0x60, 0x00, 0x39];
+            code.extend_from_slice(&[0x60, size, 0x60, 0x00, 0x60, 0x00, 0xf0, 0x50, 0x00]);
+            code.extend_from_slice(&init);
+            code
+        };
+
+        let genesis = bitcoin::constants::genesis_block(bitcoin::Network::Regtest).header;
+        let cells = [
+            btc_hash_to_storage_key(&genesis.block_hash()),
+            bridge_storage_key("blockStoreChainHead"),
+            compound_key(BTC_BLOCK_HEIGHT_KEY, "-", "0"),
+        ];
+        // A transaction to a contract that calls identity, then `targets`,
+        // and stops: whether it succeeds, what the block last wrote to the
+        // genesis block's cell, the head's and the index entry's, and whether
+        // identity and the Bridge got their storage roots.
+        let entry = Address::repeat_byte(0xE0);
+        let run = |targets: &[Address]| {
+            let calls = targets.iter().map(|target| call(*target, &[]));
+            let entry_code = stop(
+                std::iter::once(call(identity, b"id"))
+                    .chain(calls)
+                    .collect::<Vec<_>>()
+                    .concat(),
+            );
+            let result = execute_alone(
+                RskHardforkConfig::all_active(33),
+                8_000_000,
+                entry,
+                U256::ZERO,
+                1_000_000,
+                &[],
+                &[
+                    (entry, &entry_code[..]),
+                    (seeds, &seeds_code[..]),
+                    (seeds_and_reverts, &seeds_and_reverts_code[..]),
+                    (reverts_after_seeds, &reverts_after_seeds_code[..]),
+                    (creates, &creates_code[..]),
+                ],
+            );
+            let last = |cell: &U256| {
+                let raw = &result.markers.raw_storage;
+                let write = raw
+                    .iter()
+                    .rev()
+                    .find(|(address, key, _)| *address == bridge && key == cell);
+                write.and_then(|(_, _, value)| value.clone())
+            };
+            (
+                result.tx_results[0].success,
+                cells.iter().map(last).collect::<Vec<_>>(),
+                result.markers.precompiles.contains(&identity),
+                result.markers.precompiles.contains(&bridge),
+            )
+        };
+
+        let stored =
+            StoredBlock::new(genesis, 0, compute_work(genesis.bits)).serialize_compact_v2();
+        let hash = crate::bridge::btc_chain::bitcoin_hash_to_b256(&genesis.block_hash());
+        let indexed = crate::bridge::serialization::rlp_encode_element(hash.as_slice());
+        let seeded = vec![Some(stored.clone()), Some(stored), Some(indexed)];
+        assert_eq!(run(&[seeds]), (true, seeded.clone(), true, true));
+        let nothing = vec![None, None, None];
+        for target in [seeds_and_reverts, reverts_after_seeds, creates] {
+            assert_eq!(
+                run(&[target]),
+                (true, nothing.clone(), true, false),
+                "{target}"
+            );
+        }
+        // Seeded by a frame that returned, then a frame that fails writes
+        // nothing and takes nothing back.
+        for then in [seeds_and_reverts, reverts_after_seeds, creates] {
+            assert_eq!(
+                run(&[seeds, then]),
+                (true, seeded.clone(), true, true),
+                "{then}"
+            );
+        }
     }
 
     /// **No call to a precompile panics the node.**

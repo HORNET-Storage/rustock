@@ -47,7 +47,7 @@ use revm::primitives::{Address, Bytes, U256};
 use revm::inspector::JournalExt;
 use revm::state::EvmState;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// `MainnetHandler` with rskj's eternal-frontier account semantics
 /// (see module docs).
@@ -121,6 +121,18 @@ invisible_exception: Arc<AtomicBool>,
     /// (`env::header_fits_program_invoke`), throws, and catches nothing:
     /// the block is not imported, and a miner leaves the transaction out.
     fail_programs: bool,
+    /// Shared with `RskPrecompileProvider`: the precompiles that returned in
+    /// this transaction, each of which rskj's `callToPrecompiledAddress`
+    /// gives a storage root (`setupContract`) in the call's own track. `None`
+    /// where the run applies none of them.
+    called_precompiles: Option<Arc<Mutex<Vec<Address>>>>,
+    /// For each frame of contract code running, innermost last: where what
+    /// the precompiles called under it write outside revm's journal begins,
+    /// in `RawStorage` (`frame_start`) and in `called_precompiles`. A frame
+    /// that fails takes it back, as rskj rolls back the track of a call or
+    /// create that reverts or fails, with what the calls under it committed
+    /// into it.
+    frames: Vec<(usize, usize)>,
     _phantom: core::marker::PhantomData<(CTX, ERROR, FRAME)>,
 }
 
@@ -154,6 +166,13 @@ impl<CTX, ERROR, FRAME> RskHandler<CTX, ERROR, FRAME> {
         self
     }
 
+    /// The list of the precompiles called, which the run applies: a frame
+    /// that fails takes its calls back off it. See the field.
+    pub fn with_called_precompiles(mut self, called: Arc<Mutex<Vec<Address>>>) -> Self {
+        self.called_precompiles = Some(called);
+        self
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn with_rskip125(
         empty_create_on_unpayable_deposit: bool,
@@ -175,6 +194,8 @@ impl<CTX, ERROR, FRAME> RskHandler<CTX, ERROR, FRAME> {
             // Per-transaction, as before RSKIP-144; `postponing_fees` opts in.
             postpone_fees: false,
             fail_programs: false,
+            called_precompiles: None,
+            frames: Vec::new(),
             _phantom: core::marker::PhantomData,
         }
     }
@@ -192,8 +213,13 @@ where
         // `JournalExt` is what exposes the entry log, and it is the bound
         // revm's own inspectors carry. RSKIP-144 collision tracking needs it
         // for the same reason: a write is only visible while it still stands,
-        // and a revert pops the entry that recorded it.
-        Context: ContextTr<Journal: JournalTr<State = EvmState> + JournalExt>,
+        // and a revert pops the entry that recorded it. `RskChainExt` holds
+        // what the precompiles write outside the journal, which a frame that
+        // fails takes back too (see `frames`).
+        Context: ContextTr<
+            Chain = crate::raw_storage::RskChainExt,
+            Journal: JournalTr<State = EvmState> + JournalExt,
+        >,
         Frame = EthFrame<EthInterpreter>,
         Instructions: InstructionProvider<
             Context = <EVM as EvmTr>::Context,
@@ -348,6 +374,9 @@ where
     ///   empty-deploy quirk to internal creates.
     /// - before RSKIP197, a contract whose call to a precompile threw is
     ///   halted as it takes the call's result (see `aborts_caller`).
+    /// - what the precompiles called under a frame of contract code write
+    ///   outside revm's journal goes back with the frame if it fails (see
+    ///   `frames`).
     fn run_exec_loop(
         &mut self,
         evm: &mut Self::Evm,
@@ -376,6 +405,7 @@ where
         // Top-level CREATE transaction: rskj's TransactionExecutor.create never
         // bumps the nonce (even post-RSKIP125), so it stays 0.
         set_created_contract_nonce(evm, 0);
+        self.open_frame(evm);
 
         loop {
             let call_or_result = rsk_frame_run(evm, self.empty_create_on_unpayable_deposit)?;
@@ -445,6 +475,7 @@ where
                             // created contract's nonce to 1; before, it is 0.
                             let nonce = u64::from(self.rskip125_active);
                             set_created_contract_nonce(evm, nonce);
+                            self.open_frame(evm);
                             continue;
                         }
                         // Do not pop the frame since no new frame was created:
@@ -502,7 +533,12 @@ where
                         }
                     }
                 }
-                ItemOrResult::Result(result) => result,
+                // A frame of contract code ended, having committed exactly
+                // when its result is ok (`rsk_frame_run`).
+                ItemOrResult::Result(result) => {
+                    self.close_frame(evm, result.instruction_result().is_ok());
+                    result
+                }
             };
             if *TRACE_FRAMES {
                 tracing::debug!(
@@ -554,6 +590,38 @@ where
                     .interpreter
                     .halt(InstructionResult::PrecompileError);
             }
+        }
+    }
+}
+
+impl<EVM, ERROR> RskHandler<EVM, ERROR, EthFrame<EthInterpreter>>
+where
+    EVM: EvmTr<Context: crate::RskContextTr>,
+{
+    /// A frame of contract code opens (see `frames`).
+    fn open_frame(&mut self, evm: &mut EVM) {
+        let raw = evm.ctx().chain().raw_storage.frame_start();
+        let called = self
+            .called_precompiles
+            .as_ref()
+            .and_then(|list| list.lock().ok().map(|list| list.len()))
+            .unwrap_or_default();
+        self.frames.push((raw, called));
+    }
+
+    /// The innermost frame of contract code ends, having `committed` or not.
+    /// One that didn't takes back what the precompiles called under it wrote
+    /// outside revm's journal (see `frames`).
+    fn close_frame(&mut self, evm: &mut EVM, committed: bool) {
+        let Some((raw, called)) = self.frames.pop() else {
+            return;
+        };
+        if committed {
+            return;
+        }
+        evm.ctx().chain_mut().raw_storage.revert_frame(raw);
+        if let Some(Ok(mut list)) = self.called_precompiles.as_ref().map(|list| list.lock()) {
+            list.truncate(called);
         }
     }
 }
@@ -818,7 +886,10 @@ where
 impl<EVM, ERROR> revm::inspector::InspectorHandler for RskHandler<EVM, ERROR, EthFrame<EthInterpreter>>
 where
     EVM: revm::inspector::InspectorEvmTr<
-        Context: ContextTr<Journal: JournalTr<State = EvmState>>,
+        Context: ContextTr<
+            Chain = crate::raw_storage::RskChainExt,
+            Journal: JournalTr<State = EvmState>,
+        >,
         Frame = EthFrame<EthInterpreter>,
         Instructions: InstructionProvider<
             Context = <EVM as EvmTr>::Context,
