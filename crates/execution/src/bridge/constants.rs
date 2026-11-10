@@ -63,6 +63,16 @@ pub struct BridgeConstants {
     /// Max depth to search blocks below the index activation height.
     pub max_depth_to_search_blocks_below_index_activation: u32,
 
+    // -- Pegout index --
+    /// rskj `btcHeightWhenPegoutTxIndexActivates`: the Bitcoin height the
+    /// pegout index (RSKIP379) was estimated to start at.
+    pub btc_height_when_pegout_tx_index_activates: u32,
+    /// rskj `pegoutTxIndexGracePeriodInBtcBlocks`. From RSKIP379,
+    /// `registerBtcTransaction` classifies a transaction by the index when its
+    /// block is at least this far past `btc_height_when_pegout_tx_index_activates`,
+    /// and by the legacy rules below it (`PegUtils.getTransactionType`).
+    pub pegout_tx_index_grace_period_in_btc_blocks: u32,
+
     /// BTC transaction confirmation max depth.
     pub btc_transaction_confirmation_max_depth: u32,
 
@@ -188,6 +198,9 @@ impl BridgeConstants {
             update_bridge_execution_period: 180_000,
             btc_height_when_block_index_activates: 696_022,
             max_depth_to_search_blocks_below_index_activation: 4320,
+            btc_height_when_pegout_tx_index_activates: 837_589,
+            // THIRTY_DAYS_IN_BTC_BLOCKS
+            pegout_tx_index_grace_period_in_btc_blocks: 4320,
             btc_transaction_confirmation_max_depth: 4320,
             // 5 × MILLICOIN = 5 × 100_000 = 500_000 sat/KB
             genesis_fee_per_kb: 500_000,
@@ -283,6 +296,8 @@ impl BridgeConstants {
             update_bridge_execution_period: 180_000,
             btc_height_when_block_index_activates: 2_039_594,
             max_depth_to_search_blocks_below_index_activation: 4320,
+            btc_height_when_pegout_tx_index_activates: 2_589_553,
+            pegout_tx_index_grace_period_in_btc_blocks: 1440,
             btc_transaction_confirmation_max_depth: 4320,
             // 1 × MILLICOIN = 100_000 sat/KB
             genesis_fee_per_kb: 100_000,
@@ -397,6 +412,9 @@ impl BridgeConstants {
             update_bridge_execution_period: 1,
             btc_height_when_block_index_activates: 0,
             max_depth_to_search_blocks_below_index_activation: 4320,
+            // rskj's regtest's, which `rskj_regtest` keeps too.
+            btc_height_when_pegout_tx_index_activates: 250,
+            pegout_tx_index_grace_period_in_btc_blocks: 100,
             btc_transaction_confirmation_max_depth: 4320,
             genesis_fee_per_kb: 100_000,
             // rustock's own regtest has no federation; `rskj_regtest` has rskj's.
@@ -539,6 +557,19 @@ mod tests {
         );
     }
 
+    /// rskj's pegout index starts at Bitcoin height 841,909 on mainnet
+    /// (837,589 and 30 days) and 2,590,993 on testnet (2,589,553 and 10 days).
+    #[test]
+    fn rskj_pegout_tx_index_heights() {
+        for (c, activates, grace) in [
+            (BridgeConstants::mainnet(), 837_589, 4320),
+            (BridgeConstants::testnet(), 2_589_553, 1440),
+        ] {
+            assert_eq!(c.btc_height_when_pegout_tx_index_activates, activates);
+            assert_eq!(c.pegout_tx_index_grace_period_in_btc_blocks, grace);
+        }
+    }
+
     /// A chain from an rskj genesis file runs on rskj's `BridgeRegTestConstants`
     /// and `FederationRegTestConstants`, not on rustock's own regtest's.
     #[test]
@@ -555,6 +586,8 @@ mod tests {
         assert_eq!(rskj.genesis_federation_format, 4000);
         assert_eq!(rskj.block_with_too_much_chain_work_height, i32::MAX as u32);
         assert_eq!(rskj.erp_fed_activation_delay, 500);
+        assert_eq!(rskj.btc_height_when_pegout_tx_index_activates, 250);
+        assert_eq!(rskj.pegout_tx_index_grace_period_in_btc_blocks, 100);
 
         // rustock's own regtest keeps its own settings and has no federation.
         let own = BridgeConstants::regtest();

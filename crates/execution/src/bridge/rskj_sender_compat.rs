@@ -1,4 +1,5 @@
-//! rskj-compatible peg-in sender detection for P2SH-multisig inputs.
+//! rskj-compatible peg-in sender detection for P2SH-multisig inputs, and the
+//! redeem-script parsing it shares with signature stripping.
 //!
 //! # Why this file exists, and why it is separate
 //!
@@ -20,11 +21,18 @@
 //!
 //! * [`is_sent_to_multisig`] -- the port. Nothing else in the tree parses
 //!   redeem scripts this way.
-//! * [`set_enabled`] -- turns the whole path off. When the RSKIP activates,
-//!   the node sets it false at the activation height and this file can then be
-//!   deleted outright, along with its two callers in `peg.rs`.
+//! * [`set_enabled`] -- turns the sender path off. When the RSKIP activates,
+//!   the node sets it false at the activation height, and the path's two
+//!   callers in `peg.rs` can then be deleted.
 //! * [`set_observer`] -- fires whenever the path is actually exercised, so an
 //!   operator learns that a peg-in depended on code we intend to remove.
+//!
+//! rskj strips a transaction's signatures with the same parsers
+//! (`BitcoinUtils.removeSignaturesFromMultiSigTransaction`, which the SVP
+//! checks and the pegout index run on every input), so the port,
+//! [`redeem_script_of_input`] and [`signatures_required_to_spend`] serve that
+//! too. That use isn't the sender path: it doesn't follow [`set_enabled`], and
+//! it stays when the sender path goes.
 //!
 //! # Fidelity notes
 //!
@@ -60,6 +68,10 @@ const OP_DROP: u8 = 0x75;
 const OP_CHECKMULTISIG: u8 = 0xae;
 const OP_CHECKMULTISIGVERIFY: u8 = 0xaf;
 const OP_CHECKSEQUENCEVERIFY: u8 = 0xb2;
+const OP_DUP: u8 = 0x76;
+const OP_EQUALVERIFY: u8 = 0x88;
+const OP_HASH160: u8 = 0xa9;
+const OP_CHECKSIG: u8 = 0xac;
 
 /// `RedeemScriptParserFactory.NON_STANDARD_ERP_TESTNET_REDEEM_SCRIPT_SERIALIZED`.
 ///
@@ -469,6 +481,93 @@ fn dispatch(chunks: &[JChunk], depth: usize) -> Verdict {
         Ok(false) => {}
     }
     Verdict::NotMultisig // factory throws "unknown redeem script", caught
+}
+
+// --- signature stripping ----------------------------------------------------
+
+/// `BitcoinUtils.extractRedeemScriptFromInput`: the last push of an input's
+/// witness if it has one, else the last chunk of its scriptSig, in either case
+/// only if bitcoinj can parse it as a script.
+///
+/// `Err` is the `ScriptException` `TransactionInput.getScriptSig()` throws on a
+/// scriptSig it can't parse, which nothing between it and `Bridge.execute`
+/// catches.
+pub fn redeem_script_of_input(
+    script_sig: &[u8],
+    last_witness_push: Option<&[u8]>,
+) -> Result<Option<Vec<u8>>, &'static str> {
+    if let Some(push) = last_witness_push {
+        return Ok(parse_script_program(push).map(|_| push.to_vec()));
+    }
+    let Some(chunks) = parse_script_program(script_sig) else {
+        return Err("ScriptException parsing an input's scriptSig");
+    };
+    // An opcode's data is null, which finds no script. OP_0's is empty, which
+    // finds the empty one.
+    let Some(program) = chunks.last().and_then(|c| c.data.as_ref()) else {
+        return Ok(None);
+    };
+    Ok(parse_script_program(program).map(|_| program.clone()))
+}
+
+/// `Script.getNumberOfSignaturesRequiredToSpend()`: a multisig's M, and one for
+/// a pay-to-address or pay-to-pubkey script. bitcoinj throws for anything else:
+/// an `IllegalStateException`, or `isSentToAddress`'s `NullPointerException`
+/// for a script that opens `OP_DUP OP_HASH160` with an opcode where the hash
+/// belongs. Nothing between it and `Bridge.execute` catches any of them.
+/// Callers pass only scripts bitcoinj has parsed, so the unparseable answer is
+/// never reached.
+pub fn signatures_required_to_spend(script: &[u8]) -> Result<i64, &'static str> {
+    let Some(chunks) = parse_script_program(script) else {
+        return Err("ScriptException parsing the script");
+    };
+    match dispatch(&chunks, 0) {
+        Verdict::Multisig => multisig_m(&chunks),
+        Verdict::RskjThrows(why) => Err(why),
+        Verdict::NotMultisig if is_sent_to_address(&chunks) || is_sent_to_raw_pub_key(&chunks) => {
+            Ok(1)
+        }
+        Verdict::NotMultisig => Err("bitcoinj can't count the signatures this script needs"),
+    }
+}
+
+/// `getRedeemScriptParser().getM()` for a script `dispatch` finds a multisig:
+/// a flyover script's inner script's, a standard multisig's first chunk, and an
+/// ERP script's default multisig's first chunk, which follows its `OP_NOTIF`.
+/// The structure checks have decoded that chunk already, so the error can't be
+/// reached.
+fn multisig_m(chunks: &[JChunk]) -> Result<i64, &'static str> {
+    if has_flyover_structure(chunks) {
+        return multisig_m(&chunks[2..]);
+    }
+    let first = if has_standard_structure(chunks) == Ok(true) {
+        &chunks[0]
+    } else {
+        &chunks[1]
+    };
+    first
+        .decode_positive_n()
+        .map_err(|_| "decoding a multisig's M")
+}
+
+/// `Script.isSentToAddress()`. Where Java's missing null check throws, for an
+/// opcode in the hash's place, this answers false: its one caller fails the
+/// same either way.
+fn is_sent_to_address(chunks: &[JChunk]) -> bool {
+    chunks.len() == 5
+        && chunks[0].equals_op_code(OP_DUP)
+        && chunks[1].equals_op_code(OP_HASH160)
+        && chunks[2].data.as_ref().is_some_and(|hash| hash.len() == 20)
+        && chunks[3].equals_op_code(OP_EQUALVERIFY)
+        && chunks[4].equals_op_code(OP_CHECKSIG)
+}
+
+/// `Script.isSentToRawPubKey()`.
+fn is_sent_to_raw_pub_key(chunks: &[JChunk]) -> bool {
+    chunks.len() == 2
+        && chunks[1].equals_op_code(OP_CHECKSIG)
+        && !chunks[0].is_op_code()
+        && chunks[0].data.as_ref().is_some_and(|d| d.len() > 1)
 }
 
 fn hex_decode(s: &str) -> Vec<u8> {
