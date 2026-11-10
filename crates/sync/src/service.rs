@@ -238,10 +238,23 @@ pub(crate) fn fast_forward_state(
 /// be logged as `Executed block` one line after the store refused it, on
 /// 2026-09-24 at 14:01:15, and why the coherence check then had to reload the
 /// committed root five seconds later.
+///
+/// That refusal is the reorg being handled, not a failure: the block is not
+/// recorded, and is executed again or re-adopted once the chain settles. So
+/// it is a warning; anything else that stops the record is an error. Testnet
+/// logged #8,274,238's as an error on 9 November.
 pub(crate) fn record_execution(store: &BlockStore, hash: B256, state_root: B256) -> bool {
     match Validated::prove(store, hash) {
         Ok(at) => match store.apply(&Transition::Executed { at, state_root }) {
             Ok(_) => true,
+            Err(e) if no_longer_canonical(store, hash) => {
+                warn!(
+                    target: "rustock::sync",
+                    "Executed {:?}, but a reorg moved the chain while it ran; not recording it: {}",
+                    hash, e
+                );
+                false
+            }
             Err(e) => {
                 error!(target: "rustock::sync", "Recording execution of {:?} failed: {:?}", hash, e);
                 false
@@ -256,6 +269,16 @@ pub(crate) fn record_execution(store: &BlockStore, hash: B256, state_root: B256)
             false
         }
     }
+}
+
+/// Whether `hash` has stopped being the canonical block at its height: what a
+/// reorg landing between executing a block and recording it leaves. A store
+/// that cannot say is not taken for one.
+pub(crate) fn no_longer_canonical(store: &BlockStore, hash: B256) -> bool {
+    let Ok(Some(header)) = store.header(hash) else {
+        return false;
+    };
+    matches!(store.canonical_hash(header.number), Ok(canonical) if canonical != Some(hash))
 }
 
 pub(crate) fn backlog_needs_executing(has_processor: bool, downloaded: u64, executed: u64) -> bool {
@@ -444,6 +467,10 @@ pub(crate) struct ExecOutcome {
     /// `false` when a block failed to execute (or a parent/body was missing);
     /// the sync must not advance past it.
     pub(crate) all_ok: bool,
+    /// The batch stopped because a reorg made a block of it non-canonical
+    /// while it executed, so the block was not recorded: the chain moved,
+    /// nothing failed.
+    pub(crate) superseded: bool,
     /// State root after the last successfully executed block in the batch.
     /// Becomes the starting root for the next batch's execution.
     pub(crate) new_state_root: TrieNode,
@@ -4669,7 +4696,7 @@ impl SyncService {
             Ok(o) => o,
             Err(e) => {
                 error!(target: "rustock::sync", "Block execution task panicked: {e}");
-                self.halt_after_exec_failure();
+                self.halt_after_exec_failure(false);
                 return;
             }
         };
@@ -4677,7 +4704,7 @@ impl SyncService {
         self.current_state_root = Some(outcome.new_state_root);
 
         if !outcome.all_ok {
-            self.halt_after_exec_failure();
+            self.halt_after_exec_failure(outcome.superseded);
             return;
         }
 
@@ -4709,7 +4736,11 @@ impl SyncService {
     /// (it must not execute on the wrong parent state — its already-stored
     /// bodies are kept and reused), and go Idle. Mirrors rskj treating such a
     /// block as invalid and stopping there.
-    fn halt_after_exec_failure(&mut self) {
+    ///
+    /// `superseded`: the batch stopped because a reorg made one of its blocks
+    /// non-canonical while it ran. The same retry, but nothing failed, so a
+    /// warning rather than an error.
+    fn halt_after_exec_failure(&mut self, superseded: bool) {
         let exec_number = self
             .manager
             .store
@@ -4726,10 +4757,18 @@ impl SyncService {
         } else {
             self.futile_exec_halts = (exec_number, 1);
         }
-        error!(
-            target: "rustock::sync",
-            "Sync halted: block execution failed; will retry from executed head #{exec_number}"
-        );
+        if superseded {
+            warn!(
+                target: "rustock::sync",
+                "Sync paused: a reorg moved the chain while a block executed; will retry \
+                 from executed head #{exec_number}"
+            );
+        } else {
+            error!(
+                target: "rustock::sync",
+                "Sync halted: block execution failed; will retry from executed head #{exec_number}"
+            );
+        }
         self.state = SyncState::Idle;
     }
 
@@ -5755,6 +5794,7 @@ pub(crate) fn process_downloaded_blocks(
     // Of `processed`, how many were adopted without re-running the EVM.
     let mut fast_forwarded = 0u64;
     let mut all_ok = true;
+    let mut superseded = false;
     let mut last_executed: Option<(B256, B256)> = None;
 
     // Lineage guard: the first block must extend the executed head and
@@ -5903,6 +5943,10 @@ pub(crate) fn process_downloaded_blocks(
                 // the only thing that can make this block canonical or replace
                 // it. Reporting the batch as clean would leave the executed
                 // head behind the blocks just written, with nothing to notice.
+                // `finish` records the last executed block again, one
+                // `after_block` was refused included, so whether a reorg left
+                // it behind is read here.
+                superseded = no_longer_canonical(store, hash);
                 all_ok = false;
             }
         }
@@ -5923,6 +5967,7 @@ pub(crate) fn process_downloaded_blocks(
 
     ExecOutcome {
         all_ok,
+        superseded,
         new_state_root: current_root,
         blocks_since_flush: committer.pending(),
     }

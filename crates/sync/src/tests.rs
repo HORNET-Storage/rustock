@@ -2635,6 +2635,198 @@ fn record_execution_reports_whether_the_marker_moved() {
     assert_eq!(exec, canonical.hash(), "the executed head stays on the canonical block");
 }
 
+/// What this thread logs on `rustock::sync` while the guard lives, as
+/// `(level, message)`.
+fn record_sync_log() -> (
+    tracing::subscriber::DefaultGuard,
+    Arc<std::sync::Mutex<Vec<(tracing::Level, String)>>>,
+) {
+    struct Message(String);
+    impl tracing::field::Visit for Message {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.0 = format!("{value:?}");
+            }
+        }
+    }
+    struct Recorder(Arc<std::sync::Mutex<Vec<(tracing::Level, String)>>>);
+    impl tracing::Subscriber for Recorder {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            metadata.target() == "rustock::sync"
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut message = Message(String::new());
+            event.record(&mut message);
+            self.0
+                .lock()
+                .unwrap()
+                .push((*event.metadata().level(), message.0));
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+    let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let guard = tracing::subscriber::set_default(Recorder(log.clone()));
+    (guard, log)
+}
+
+/// Whether `log` holds a message at `level` containing `text`.
+fn logged(log: &[(tracing::Level, String)], level: tracing::Level, text: &str) -> bool {
+    log.iter().any(|(l, m)| *l == level && m.contains(text))
+}
+
+/// A reorg that lands between executing a block and recording it is handled:
+/// the block is not recorded, and is executed again or re-adopted. It is a
+/// warning, not an error, as testnet logged #8,274,238's on 9 November.
+/// Either shape: a sibling took the block's height, or a shorter, heavier
+/// chain took the head below it, leaving its height without a block.
+#[test]
+fn a_reorg_while_a_block_executes_is_a_warning() {
+    for shorter in [false, true] {
+        let dir = tempdir().unwrap();
+        let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+        let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+        store.update_head(&genesis, U256::from(1)).unwrap();
+        let canonical = dummy_header(1, genesis.hash(), U256::from(2));
+        store.update_head(&canonical, U256::from(3)).unwrap();
+        let executed = if shorter {
+            let above = dummy_header(2, canonical.hash(), U256::from(2));
+            store.update_head(&above, U256::from(5)).unwrap();
+            let heavier = fork_header(1, genesis.hash(), U256::from(9), 0xEE);
+            store.put_header(&heavier).unwrap();
+            let proved = rustock_storage::Validated::prove(&store, heavier.hash()).unwrap();
+            store
+                .apply(&rustock_storage::Transition::Adopt { head: proved })
+                .unwrap();
+            assert_eq!(store.canonical_hash(2).unwrap(), None);
+            above
+        } else {
+            let sibling = fork_header(1, genesis.hash(), U256::from(2), 0xEE);
+            store.put_header(&sibling).unwrap();
+            sibling
+        };
+
+        let (_guard, log) = record_sync_log();
+        let recorded =
+            crate::service::record_execution(&store, executed.hash(), executed.state_root);
+
+        assert!(!recorded);
+        let log = log.lock().unwrap().clone();
+        assert!(
+            logged(&log, tracing::Level::WARN, "a reorg moved the chain"),
+            "shorter {shorter}: {log:?}"
+        );
+        assert!(
+            !logged(&log, tracing::Level::ERROR, ""),
+            "shorter {shorter}: {log:?}"
+        );
+    }
+}
+
+/// A refused record that no reorg explains is still an error: here a block
+/// canonical at its height but above the head, which only a broken index
+/// leaves.
+#[test]
+fn a_refused_record_no_reorg_explains_is_still_an_error() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+    let above = dummy_header(1, genesis.hash(), U256::from(2));
+    store.put_header(&above).unwrap();
+    store.put_canonical_hash(1, above.hash()).unwrap();
+
+    let (_guard, log) = record_sync_log();
+    let recorded = crate::service::record_execution(&store, above.hash(), above.state_root);
+
+    assert!(!recorded);
+    let log = log.lock().unwrap().clone();
+    assert!(
+        logged(&log, tracing::Level::ERROR, "Recording execution"),
+        "{log:?}"
+    );
+    assert!(!logged(&log, tracing::Level::WARN, ""), "{log:?}");
+    // Nor is a block the store does not hold taken for one a reorg left behind.
+    assert!(!crate::service::no_longer_canonical(
+        &store,
+        B256::repeat_byte(0x99)
+    ));
+}
+
+/// The batch path reports a block a reorg left behind as superseded, so the
+/// halt that follows is a warning. The block was executed by this node
+/// before (its receipts and state are held), so the batch adopts it and
+/// only recording it is refused.
+#[test]
+fn a_batch_reports_a_block_a_reorg_left_behind_as_superseded() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let trie = Arc::new(rustock_trie::MemoryTrieStore::new()) as Arc<dyn rustock_trie::TrieStore>;
+    let empty = rustock_trie::TrieNode::empty();
+    let root = empty.compute_hash(trie.as_ref());
+    trie.put(root.as_slice(), &empty.to_message(trie.as_ref()));
+
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+    store.set_exec_head(genesis.hash(), root).unwrap();
+    let canonical = dummy_header(1, genesis.hash(), U256::from(2));
+    store.update_head(&canonical, U256::from(3)).unwrap();
+
+    let hardfork = rustock_execution::RskHardforkConfig::mainnet();
+    let receipts = vec![rustock_core::Receipt {
+        post_tx_state: vec![0x01],
+        cumulative_gas_used: 0,
+        gas_used: 0,
+        logs_bloom: alloy_primitives::Bloom::ZERO,
+        logs: vec![],
+        status: true,
+    }];
+    let remasc = rustock_core::Transaction::remasc(1);
+    let mut left_behind = fork_header(1, genesis.hash(), U256::from(1), 0xEE);
+    left_behind.state_root = root;
+    left_behind.receipts_root =
+        rustock_core::ordered_trie_root(&receipts, hardfork.has_unitrie_state_root(1));
+    store.put_header(&left_behind).unwrap();
+    store
+        .put_body(left_behind.hash(), std::slice::from_ref(&remasc), &[])
+        .unwrap();
+    store.put_receipts(left_behind.hash(), &receipts).unwrap();
+
+    let processor = rustock_execution::BlockProcessor::new(hardfork, store.clone());
+    let block = rustock_core::types::block::Block {
+        header: left_behind.clone(),
+        transactions: vec![remasc],
+        ommers: Vec::new(),
+    };
+    assert_eq!(
+        processor.validate_block(&block).map_err(|e| e.to_string()),
+        Ok(())
+    );
+
+    let outcome = crate::service::process_downloaded_blocks(
+        &processor,
+        trie,
+        empty,
+        &store,
+        None,
+        0,
+        1,
+        &[(left_behind.hash(), left_behind)],
+        &crate::chain_activity::ChainActivity::new(),
+        &crate::gas_price::GasPriceTracker::default(),
+    );
+    assert!(!outcome.all_ok, "the block was not recorded");
+    assert!(
+        outcome.superseded,
+        "and the batch says a reorg left it behind"
+    );
+}
+
 #[tokio::test]
 async fn test_reconcile_leaves_a_genuine_tip_alone() {
     // The same code path must not fire at the tip. Nothing is stored above our
@@ -4435,6 +4627,7 @@ impl ExecController {
             this.cv.notify_all();
             crate::service::ExecOutcome {
                 all_ok,
+                superseded: false,
                 new_state_root: state_root,
                 blocks_since_flush,
             }
@@ -4672,7 +4865,12 @@ async fn test_pipeline_two_batches_advance_exec_head() {
         if let Some((hash, h)) = pending.last() {
             let _ = store_for_exec.set_exec_head(*hash, B256::from_slice(&[h.number as u8; 32]));
         }
-        crate::service::ExecOutcome { all_ok: true, new_state_root: state_root, blocks_since_flush: bsf }
+        crate::service::ExecOutcome {
+            all_ok: true,
+            superseded: false,
+            new_state_root: state_root,
+            blocks_since_flush: bsf,
+        }
     });
 
     let mut service = make_service(store.clone());
@@ -4701,6 +4899,45 @@ async fn test_pipeline_two_batches_advance_exec_head() {
     assert_eq!(exec_head_number(&store), 6, "exec head should reach #6 after batch 2");
 
     assert_eq!(service.last_body_height_for_test(), 6, "download cursor at #6");
+}
+
+/// A batch a reorg stopped halts as a failed one does, but says why at the
+/// level it merits: nothing failed, the chain moved. A batch whose task
+/// panicked failed.
+#[tokio::test]
+async fn a_batch_a_reorg_stopped_halts_with_a_warning_and_a_failed_one_with_an_error() {
+    for (superseded, panics) in [(true, false), (false, false), (false, true)] {
+        let dir = tempdir().unwrap();
+        let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+        let headers = store_chain(&store, 3);
+        let exec_fn: crate::service::ExecFn =
+            Arc::new(move |state_root, bsf, _pending: Vec<(B256, Header)>| {
+                assert!(!panics, "the execution task panicked, as the test asks");
+                crate::service::ExecOutcome {
+                    all_ok: false,
+                    superseded,
+                    new_state_root: state_root,
+                    blocks_since_flush: bsf,
+                }
+            });
+        let mut service = make_service(store.clone());
+        service.set_test_exec(exec_fn);
+
+        let (_guard, log) = record_sync_log();
+        service
+            .finish_batch(&pending_of(&headers[0..3]), 1000)
+            .await;
+        drain_executions(&mut service).await;
+
+        let log = log.lock().unwrap().clone();
+        let paused = logged(&log, tracing::Level::WARN, "a reorg moved the chain");
+        let halted = logged(&log, tracing::Level::ERROR, "Sync halted");
+        assert_eq!(
+            (paused, halted),
+            (superseded, !superseded),
+            "superseded {superseded}: {log:?}"
+        );
+    }
 }
 
 /// Poll on_tick until no background execution remains in flight.
