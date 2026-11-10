@@ -939,7 +939,29 @@ fn is_submission_allowed_when_enabled_and_limit_exceeded_then_should_return_fals
 #[test]
 fn second_build_block_to_mine_turns_notify_flag_off() {
     let fx = fixture(20);
+    // rskj's test fixes its clock. A child is stamped the wall clock or one
+    // second past its parent, whichever is later, so on a parent stamped in
+    // 2100 both builds stamp the same second; on the wall clock, two builds
+    // either side of a second's turn would differ.
+    let mut ahead = header_at(21, fx.parent.hash(), fx.parent.state_root);
+    ahead.timestamp = 4_102_444_800;
+    ahead.umm_root = fx
+        .chain_config
+        .activation_heights
+        .umm_active(21)
+        .then(Bytes::new);
+    let hash = ahead.hash();
+    fx.store.put_header_with_hash(hash, &ahead).unwrap();
+    fx.store.put_canonical_hash(21, hash).unwrap();
+    fx.store.put_total_difficulty(hash, U256::from(22)).unwrap();
+    fx.store.set_head(hash).unwrap();
+    fx.store.set_exec_head(hash, fx.parent.state_root).unwrap();
+
     let work = fx.server.get_work().unwrap();
+    assert_eq!(
+        work.parent_block_hash, hash,
+        "built on the parent stamped in 2100"
+    );
     assert!(work.notify);
     fx.server.build_work().unwrap();
     let again = fx.server.get_work().unwrap();
