@@ -7498,9 +7498,9 @@ mod tests {
     fn the_switch_removes_exactly_the_two_multisig_shapes() {
         use super::super::rskj_sender_compat as compat;
 
-        // Guard: this flips process-wide state, so restore it.
-        let was = compat::enabled();
-        compat::set_enabled(false);
+        // On this test's thread alone: flipped for the whole process, the
+        // switch changed the answers of the tests running beside this one.
+        compat::set_enabled_on_this_thread(Some(false));
 
         assert!(
             matches!(classify_pegin_sender(&p2pkh_tx()).unwrap(), Some(PeginSender::P2pkh { .. })),
@@ -7519,7 +7519,7 @@ mod tests {
             "P2SH-P2WSH is no longer classified"
         );
 
-        compat::set_enabled(was);
+        compat::set_enabled_on_this_thread(None);
         assert!(
             matches!(classify_pegin_sender(&p2sh_multisig_tx()).unwrap(), Some(PeginSender::P2shMultisig { .. })),
             "and switching back restores it"

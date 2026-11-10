@@ -129,7 +129,26 @@ pub fn set_enabled(on: bool) {
 }
 
 pub fn enabled() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_SWITCH.with(std::cell::Cell::get) {
+        return on;
+    }
     ENABLED.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's own setting of the switch, on its own thread alone. A test
+    /// that flipped the process-wide switch changed the answers of the tests
+    /// running beside it.
+    static TEST_SWITCH: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Sets the switch for the calling thread alone, or with `None` clears that
+/// setting.
+#[cfg(test)]
+pub(crate) fn set_enabled_on_this_thread(on: Option<bool>) {
+    TEST_SWITCH.with(|switch| switch.set(on));
 }
 
 // --- observer --------------------------------------------------------------
