@@ -80,6 +80,18 @@ impl ChainRules {
         }
     }
 
+    /// The free senders of `constants`, for a chain whose Bridge constants
+    /// aren't the ones its id names: rskj's regtest, started from a genesis
+    /// file, runs on `BridgeConstants::rskj_regtest`, and the pool must agree
+    /// with the block processor on what costs nothing.
+    pub fn with_bridge_constants(
+        mut self,
+        constants: &rustock_execution::bridge::constants::BridgeConstants,
+    ) -> Self {
+        self.free_bridge_senders = rustock_execution::executor::free_bridge_senders(constants);
+        self
+    }
+
     /// rskj `Transaction.transactionCost == 0`: a federator's call to the
     /// Bridge before `areBridgeTxsPaid`.
     fn is_free_tx(&self, tx: &Transaction, sender: &Address, number: u64) -> bool {
@@ -1208,6 +1220,22 @@ mod tests {
     /// from genesis and a transaction to the Bridge is never free.
     fn regtest_rules() -> ChainRules {
         ChainRules::for_chain(rustock_execution::hardfork::RskHardforkConfig::all_active(33), 6_800_000)
+    }
+
+    /// A node on rskj's regtest (an rskj genesis file) gives the pool rskj's
+    /// regtest Bridge constants, so the pool counts the federators' Bridge
+    /// calls free as the block processor does; rustock's own regtest has none.
+    #[test]
+    fn the_pool_takes_rskj_regtests_free_senders() {
+        let rskj = rustock_execution::bridge::constants::BridgeConstants::rskj_regtest();
+        let expected = rustock_execution::executor::free_bridge_senders(&rskj);
+        let rules = regtest_rules().with_bridge_constants(&rskj);
+        assert_eq!(rules.free_bridge_senders, expected);
+        // rskj's regtest adds its three federators to the five authorizers.
+        assert_eq!(
+            regtest_rules().free_bridge_senders.len() + 3,
+            expected.len()
+        );
     }
 
     fn sign_tx(tx: &mut Transaction, key: &SigningKey, chain_id: u64) {

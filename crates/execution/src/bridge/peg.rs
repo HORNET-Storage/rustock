@@ -4120,9 +4120,12 @@ pub(crate) fn active_federation_keys_and_redeem<CTX: crate::RskContextTr>(
             }
         }
         (Some(n), None) => (n.btc_keys(), super::storage::NEW_FEDERATION_FORMAT_VERSION_KEY),
+        // rskj `FederationSupportImpl.getGenesisFederation`: the genesis
+        // federation is built in the format its constants name.
         (None, _) => return {
             let keys = genesis_federation_keys(config);
-            let redeem = build_federation_redeem_script(&keys, keys.len() / 2 + 1);
+            let redeem =
+                federation_redeem_for_format(&keys, config.genesis_federation_format, config);
             (keys, redeem)
         },
     };
@@ -4152,7 +4155,7 @@ pub(crate) fn active_federation_format<CTX: crate::RskContextTr>(
             }
         }
         (Some(_), None) => super::storage::NEW_FEDERATION_FORMAT_VERSION_KEY,
-        (None, _) => return 1000, // genesis federation: plain multisig
+        (None, _) => return config.genesis_federation_format,
     };
     federation_format_version(ctx, format_key)
 }

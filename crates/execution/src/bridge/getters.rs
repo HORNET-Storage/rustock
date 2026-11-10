@@ -1464,6 +1464,34 @@ mod tests {
         }
     }
 
+    /// With nothing stored, the active federation is the genesis federation,
+    /// built in the format its network's constants name. Mainnet's and testnet's
+    /// are standard multisig, as rskj's public nodes answer
+    /// `getFederationAddress` at block 1. rskj's regtest's is a P2SH-P2WSH ERP
+    /// federation, as an independent port of rskj's `P2shErpRedeemScriptBuilder`
+    /// computes it (scratch `t294/regtest_genesis_fed.py`); before, rustock built
+    /// every genesis federation as standard multisig.
+    #[test]
+    fn the_genesis_federation_is_built_in_its_networks_format() {
+        for (config, forks, address) in [
+            (mainnet(), hardforks(), "39AHNvUmzaYgewA8yCtBtNsfRz7QD7ZJYi"),
+            (
+                BridgeConstants::testnet(),
+                RskHardforkConfig::testnet(),
+                "2N1N5mdHWmRUfv49f7GnUeFfuyLcBQK7hj2",
+            ),
+            (
+                BridgeConstants::rskj_regtest(),
+                RskHardforkConfig::regtest(),
+                "2MvQSG61B4LtKLECeo1dRDeDWXgJfnr3fC7",
+            ),
+        ] {
+            let mut ctx = ctx_at(1);
+            let out = get_federation_address(&mut ctx, 0, &config, &forks).unwrap();
+            assert_eq!(as_string(&out), address);
+        }
+    }
+
     // ---- creation time units ----
 
     /// RSKIP419 changes the unit from milliseconds to seconds. Storage keeps

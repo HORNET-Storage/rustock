@@ -479,7 +479,13 @@ pub(crate) fn commit_proposed_federation<CTX: crate::RskContextTr>(
         ),
     };
     let old_keys: Vec<[u8; 33]> = old_members.iter().map(|m| m.btc).collect();
-    let old_format = federation_format_version(hardfork_cfg, old_block);
+    // A stored federation keeps the format its creation block gave it; the
+    // genesis federation, the one its constants name
+    // (`FederationSupportImpl.getGenesisFederation`).
+    let old_format = match &active {
+        Some(_) => federation_format_version(hardfork_cfg, old_block),
+        None => config.genesis_federation_format,
+    };
 
     // moveUTXOsFromNewToOldFederation.
     let active_utxos = load_federation_utxos(ctx, hardfork_cfg, block_number);
@@ -511,9 +517,15 @@ pub(crate) fn commit_proposed_federation<CTX: crate::RskContextTr>(
     // RSKIP186: saveLastRetiredFederationScript (the retiring = old fed) +
     // setNextFederationCreationBlockHeight(proposed fed's creation block).
     if hardfork_cfg.has_rskip186(block_number) {
-        let old_redeem = super::peg::build_committed_federation_redeem_script(
-            &old_keys, config, hardfork_cfg, old_block,
-        );
+        let old_redeem = match &active {
+            Some(_) => super::peg::build_committed_federation_redeem_script(
+                &old_keys,
+                config,
+                hardfork_cfg,
+                old_block,
+            ),
+            None => super::peg::federation_redeem_for_format_pub(&old_keys, old_format, config),
+        };
         let old_hash160 = super::peg::redeem_script_hash160_pub(&old_redeem);
         // RSKIP377: getDefaultP2SHScript() = getOutputScript(getDefaultRedeemScript())
         // — the *default* (standard multisig) redeem, wrapped P2SH-P2WSH for a
@@ -592,7 +604,12 @@ fn commit_pending_federation<CTX: crate::RskContextTr>(
     // 1000 standard multisig, 2000 non-standard ERP, 3000 P2SH-ERP, 4000
     // P2SH-P2WSH-ERP. The old fed's type is fixed by its creation block; the
     // built fed's by this block.
-    let old_format = federation_format_version(hardfork_cfg, old_block);
+    // The genesis federation's type is the one its constants name
+    // (`FederationSupportImpl.getGenesisFederation`).
+    let old_format = match &active {
+        Some(_) => federation_format_version(hardfork_cfg, old_block),
+        None => config.genesis_federation_format,
+    };
     let new_format = federation_format_version(hardfork_cfg, block_number);
 
     // Redeem scripts / hash160s: needed for the commit_federation event in BOTH
@@ -600,9 +617,15 @@ fn commit_pending_federation<CTX: crate::RskContextTr>(
     // legacy handover. The retiring fed's redeem is rebuilt as the type it was
     // CREATED with (keyed on its creation block); the built fed's by THIS
     // block's activations (rskj PendingFederation.buildFederation).
-    let old_redeem = super::peg::build_committed_federation_redeem_script(
-        &old_keys, config, hardfork_cfg, old_block,
-    );
+    let old_redeem = match &active {
+        Some(_) => super::peg::build_committed_federation_redeem_script(
+            &old_keys,
+            config,
+            hardfork_cfg,
+            old_block,
+        ),
+        None => super::peg::federation_redeem_for_format_pub(&old_keys, old_format, config),
+    };
     let new_redeem = super::peg::build_committed_federation_redeem_script(
         &new_keys, config, hardfork_cfg, block_number,
     );
@@ -1582,6 +1605,70 @@ mod tests {
         assert!(pending(&mut ctx).is_empty(), "one vote waits");
         assert_eq!(create(&mut ctx, authorizers[1]), 1);
         assert!(!pending(&mut ctx).is_empty(), "two decide");
+    }
+
+    /// rskj builds the genesis federation in the format its constants name
+    /// (`FederationSupportImpl.getGenesisFederation`), so the first federation
+    /// change moves rskj's regtest one into the old slot as P2SH-P2WSH ERP
+    /// (4000) and retires it under its own P2SH-P2WSH script, whatever block
+    /// 1's heights say. Under heights where block 1 predates every ERP
+    /// federation, as mainnet's, the format and script taken from the creation
+    /// block's heights, as before, were standard multisig's. Both handovers:
+    /// the legacy one, and RSKIP419's of a proposed federation.
+    #[test]
+    fn the_genesis_federation_leaves_in_its_own_format() {
+        use revm::MainContext;
+        let config = super::super::constants::BridgeConstants::rskj_regtest();
+        let hardforks = crate::hardfork::RskHardforkConfig::mainnet();
+        assert!(!hardforks.has_rskip201(1));
+        let ctx_at = |block: u64| {
+            revm::Context::mainnet()
+                .with_block(revm::context::BlockEnv {
+                    number: alloy_primitives::U256::from(block),
+                    ..Default::default()
+                })
+                .with_chain(crate::raw_storage::RskChainExt::default())
+        };
+        let members: Vec<StoredMember> = super::super::peg::genesis_federation_keys(
+            &super::super::constants::BridgeConstants::testnet(),
+        )
+        .into_iter()
+        .map(StoredMember::from_btc)
+        .collect();
+        let old_format =
+            |ctx: &mut _| bridge_load_bytes_named(ctx, OLD_FEDERATION_FORMAT_VERSION_KEY);
+
+        // hop401: multikey cells (RSKIP123), the legacy handover, and RSKIP186's
+        // retired script, which before RSKIP377 is the federation's own.
+        let block = 5_000_000u64;
+        assert!(hardforks.has_rskip123(block) && hardforks.has_rskip186(block));
+        assert!(!hardforks.has_rskip377(block) && !hardforks.has_rskip419(block));
+        let mut ctx = ctx_at(block);
+        commit_pending_federation(&mut ctx, &members, &config, &hardforks);
+        assert_eq!(old_format(&mut ctx), serialization::rlp_encode_u64(4000));
+        // 2MvQSG61B4LtKLECeo1dRDeDWXgJfnr3fC7's script
+        let regtest_federation: [u8; 20] = hex::decode("22a65d9485781e6cdc0e49fc405ba628365e28c7")
+            .unwrap()
+            .try_into()
+            .unwrap();
+        assert_eq!(
+            bridge_load_bytes_named(&mut ctx, LAST_RETIRED_FEDERATION_P2SH_SCRIPT_KEY),
+            serialization::rlp_encode_list(&[serialization::rlp_encode_element(
+                &super::super::peg::p2sh_output_script_program(&regtest_federation),
+            )])
+        );
+
+        // lovell700: RSKIP419 promotes the proposed federation.
+        let block = 7_400_000u64;
+        assert!(hardforks.has_rskip419(block));
+        let mut ctx = ctx_at(block);
+        bridge_store_bytes_named(
+            &mut ctx,
+            PROPOSED_FEDERATION_KEY,
+            &super::super::federation::serialize_federation_multikey(&members, 1_000, block - 10),
+        );
+        commit_proposed_federation(&mut ctx, &config, &hardforks);
+        assert_eq!(old_format(&mut ctx), serialization::rlp_encode_u64(4000));
     }
 
     /// A Bridge call that reads the whitelist writes it back as the call

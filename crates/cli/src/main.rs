@@ -2485,10 +2485,21 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         trie_store_for_pool.clone(),
     )
     .with_gas_price_tracker(gas_price_tracker.clone())
-    .with_chain_rules(rustock_sync::txpool::ChainRules::for_chain(
-        hardfork_cfg_for_pool,
-        config.min_sequential_set_gas_limit,
-    ));
+    .with_chain_rules({
+        let rules = rustock_sync::txpool::ChainRules::for_chain(
+            hardfork_cfg_for_pool,
+            config.min_sequential_set_gas_limit,
+        );
+        // A chain from an rskj genesis file is rskj's regtest: its federators'
+        // and authorizers' Bridge calls are free, as the block processor counts.
+        if config.genesis_spec.is_some() {
+            rules.with_bridge_constants(
+                &rustock_execution::bridge::constants::BridgeConstants::rskj_regtest(),
+            )
+        } else {
+            rules
+        }
+    });
     if let Some(cache) = &sender_cache {
         pool_builder = pool_builder.with_sender_cache(cache.clone());
     }

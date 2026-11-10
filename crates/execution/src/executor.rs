@@ -2396,14 +2396,17 @@ pub fn bridge_constants_for(chain_id: u64) -> crate::bridge::constants::BridgeCo
 }
 
 /// The senders whose transactions to the Bridge are free before
-/// `areBridgeTxsPaid`: the genesis federation and the authorized free-tx
-/// keys (rskj `BridgeUtils.isFreeBridgeTx`). Shared by the executor and the
-/// transaction pool, which must agree on what costs nothing.
+/// `areBridgeTxsPaid` (rskj `BridgeUtils.isFreeBridgeTx`): the genesis
+/// federation's members and the federation-change, lock-whitelist and
+/// fee-per-KB authorizers (`isFromAuthorizedSender`). Shared by the executor
+/// and the transaction pool, which must agree on what costs nothing.
 pub fn free_bridge_senders(constants: &crate::bridge::constants::BridgeConstants) -> Vec<Address> {
     constants
         .genesis_federation_public_keys
         .iter()
-        .chain(constants.authorized_free_tx_keys.iter())
+        .chain(constants.federation_change_authorizer_keys)
+        .chain(constants.whitelist_authorizer_keys)
+        .chain(constants.fee_per_kb_authorizer_keys)
         .filter_map(|hex| rsk_address_from_pubkey_hex(hex))
         .collect()
 }
@@ -8894,7 +8897,6 @@ mod tests {
         ] {
             for keys in [
                 constants.genesis_federation_public_keys,
-                constants.authorized_free_tx_keys,
                 constants.whitelist_authorizer_keys,
                 constants.fee_per_kb_authorizer_keys,
                 constants.increase_locking_cap_authorizer_keys,
@@ -10055,6 +10057,30 @@ mod tests {
         assert_eq!(senders.len(), 22);
         let unique: std::collections::HashSet<_> = senders.iter().collect();
         assert_eq!(unique.len(), 22);
+    }
+
+    /// rskj's regtest, from a genesis file: its three federators and its five
+    /// authorizers (federation change, lock whitelist, fee per KB) send free
+    /// Bridge transactions while areBridgeTxsPaid is off
+    /// (`BridgeUtils.isFreeBridgeTx`). rustock's own regtest has no federators.
+    #[test]
+    fn rskj_regtests_free_bridge_senders() {
+        use crate::bridge::constants::BridgeConstants;
+        let federator = rsk_address_from_pubkey_hex(
+            "0362634ab57dae9cb373a5d536e66a8c4f67468bbcfb063809bab643072d78a124",
+        )
+        .unwrap();
+        let rskj: std::collections::HashSet<_> =
+            free_bridge_senders(&BridgeConstants::rskj_regtest())
+                .into_iter()
+                .collect();
+        assert_eq!(rskj.len(), 8);
+        assert!(rskj.contains(&federator));
+        let own: std::collections::HashSet<_> = free_bridge_senders(&BridgeConstants::regtest())
+            .into_iter()
+            .collect();
+        assert_eq!(own.len(), 5);
+        assert!(!own.contains(&federator));
     }
 
     /// Runs a gas_limit-0 tx to the Bridge through execute_block at the
