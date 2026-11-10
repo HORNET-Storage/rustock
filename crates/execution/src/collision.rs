@@ -559,11 +559,12 @@ pub fn record_transaction(transaction_id: usize, state: &EvmState) {
 
             // A contract deployed here writes its code cell and the
             // storage-prefix marker (rskj `setupContract`). Both are plain
-            // unitrie cells under the same account. Gated on there being
-            // code, which is what `apply_state_changes` gates the same two
-            // writes on: a CREATE that returns nothing gets neither cell in
-            // rskj either (`TransactionExecutor.create`: "without code nor
-            // storage. It doesn't even call setupContract()").
+            // unitrie cells under the same account. rskj writes the marker
+            // for every creation but a transaction's with no data
+            // (`TransactionExecutor.create`: "It doesn't even call
+            // setupContract()"), whatever code the creation returns. Noting
+            // the two only where it returned code loses no collision: a
+            // creation writes the account's own cell too, noted above.
             if account.is_created_locally()
                 && account.info.code.as_ref().is_some_and(|c| !c.is_empty())
             {

@@ -53,6 +53,16 @@ pub struct RskChainExt {
     /// transaction called the precompile itself
     /// (`crate::tracer::record_precompile_transfer`).
     pub precompile_transfers: Vec<(Address, Address, U256)>,
+    /// rskj's `deletedAccounts`: what the block's earlier transactions
+    /// destroyed (`TransactionExecutor.finalization` deletes each as its
+    /// transaction ends). From RSKIP125 a creation at one of them fails
+    /// (`Program.createContract`). A sequential sublist starts with what the
+    /// parallel ones deleted, as rskj's `BlockExecutor` hands it on.
+    pub deleted_in_block: std::collections::HashSet<Address>,
+    /// The contracts the block's earlier transactions created and left
+    /// standing. Each holds rskj's storage-prefix marker (`setupContract`
+    /// writes it as the creation begins), whatever code it ended with.
+    pub created_in_block: std::collections::HashSet<Address>,
 }
 
 /// Raw-bytes storage overlay for the block being executed.

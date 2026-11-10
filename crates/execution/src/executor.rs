@@ -149,6 +149,12 @@ fn merge_markers(into: &mut crate::state::ContractMarkers, from: crate::state::C
     }
     into.bump_remasc_sender |= from.bump_remasc_sender;
     into.raw_storage.extend(from.raw_storage);
+    into.created.extend(from.created);
+    for addr in from.deleted {
+        if !into.deleted.contains(&addr) {
+            into.deleted.push(addr);
+        }
+    }
     into.null_account = match (into.null_account, from.null_account) {
         (Some(paid), Some(more)) => Some(paid + more),
         (paid, more) => paid.or(more),
@@ -429,6 +435,7 @@ impl RskExecutor {
         crate::rsk_instructions::install(
             &mut evm.instruction,
             self.hardfork_cfg.has_rskip140(header.number),
+            self.hardfork_cfg.has_rskip169(header.number),
             self.hardfork_cfg.has_chainid(header.number),
             self.hardfork_cfg.has_push0(header.number),
             self.hardfork_cfg.has_basefee(header.number),
@@ -568,6 +575,7 @@ impl RskExecutor {
         crate::rsk_instructions::install(
             &mut evm.instruction,
             self.hardfork_cfg.has_rskip140(header.number),
+            self.hardfork_cfg.has_rskip169(header.number),
             self.hardfork_cfg.has_chainid(header.number),
             self.hardfork_cfg.has_push0(header.number),
             self.hardfork_cfg.has_basefee(header.number),
@@ -749,6 +757,7 @@ impl RskExecutor {
         crate::rsk_instructions::install(
             &mut evm.instruction,
             self.hardfork_cfg.has_rskip140(header.number),
+            self.hardfork_cfg.has_rskip169(header.number),
             self.hardfork_cfg.has_chainid(header.number),
             self.hardfork_cfg.has_push0(header.number),
             self.hardfork_cfg.has_basefee(header.number),
@@ -916,6 +925,7 @@ impl RskExecutor {
             crate::tracer::RskTracer::new(0),
             TracedTxs::None,
             U256::ZERO,
+            &[],
             true,
             Some(&mut dropped),
         )?;
@@ -1059,6 +1069,7 @@ impl RskExecutor {
                 inspector,
                 traced,
                 U256::ZERO,
+                &[],
                 true,
                 None,
             );
@@ -1118,6 +1129,7 @@ impl RskExecutor {
             inspector.fresh_like(),
             TracedTxs::None,
             U256::ZERO,
+            &[],
             true,
             None,
         )?;
@@ -1186,6 +1198,7 @@ impl RskExecutor {
                             template.fresh_like(),
                             traced,
                             U256::ZERO,
+                            &[],
                             false,
                             None,
                         );
@@ -1256,6 +1269,12 @@ impl RskExecutor {
             .iter()
             .map(|(r, _)| r.paid_fees)
             .fold(U256::ZERO, |a, b| a + b);
+        // What the parallel sublists deleted, where RSKIP-131 refuses a
+        // creation in the sequential one (rskj `executeParallel`).
+        let deleted_before: Vec<Address> = runs
+            .iter()
+            .flat_map(|(r, _)| r.markers.deleted.iter().copied())
+            .collect();
         let at_sequential = std::time::Instant::now();
         let (sequential_result, mut traces) = self.run_sublist(
             header,
@@ -1266,6 +1285,7 @@ impl RskExecutor {
             inspector,
             traced,
             fees_carried,
+            &deleted_before,
             false,
             None,
         )?;
@@ -1344,6 +1364,10 @@ impl RskExecutor {
         // `totalPaidFees` into the sequential executor the same way, so that
         // the settlement at the REMASC transaction covers the whole block.
         fees_carried: U256,
+        // `deleted_before`: what the sublists run before this one deleted.
+        // rskj hands the parallel sublists' `deletedAccounts` to the
+        // sequential one (`BlockExecutor.executeParallel`), for RSKIP-131.
+        deleted_before: &[Address],
         // `run_maintenance`: run the block-level precompile maintenance
         // first. True for the run that starts the block and false for every
         // later sublist -- rskj's `maintainPrecompiledContractStorageRoots`
@@ -1367,6 +1391,7 @@ impl RskExecutor {
         let mut chain_ext = crate::raw_storage::RskChainExt::default();
         chain_ext.raw_storage.set_reader(trie_store, state_root.clone());
         chain_ext.btc_block_cache = self.btc_block_cache.clone();
+        chain_ext.deleted_in_block.extend(deleted_before.iter().copied());
         let ctx = revm::Context::mainnet()
             .with_db(WrapDatabaseRef(db))
             .with_block(block_env)
@@ -1412,6 +1437,7 @@ impl RskExecutor {
         crate::rsk_instructions::install(
             &mut evm.instruction,
             self.hardfork_cfg.has_rskip140(header.number),
+            self.hardfork_cfg.has_rskip169(header.number),
             self.hardfork_cfg.has_chainid(header.number),
             self.hardfork_cfg.has_push0(header.number),
             self.hardfork_cfg.has_basefee(header.number),
@@ -2239,14 +2265,27 @@ impl RskExecutor {
             // the touched flag. A later tx that touches the address re-marks
             // Touched, which apply_state_changes reads as "alive again at
             // block end" (mainnet #3173807).
+            //
+            // Until then it does not exist (rskj `isExist`): loaded as not
+            // existing, like an account the trie never had. And the block
+            // keeps rskj's `deletedAccounts`, for RSKIP-131, and the contracts
+            // its transactions created and left standing, which hold rskj's
+            // marker whatever code they ended with.
             {
-                use revm::context_interface::ContextTr;
-                for account in evm.ctx.journal_mut().inner.state.values_mut() {
+                let skipped = &markers.skip_created;
+                let ctx = &mut evm.ctx;
+                let block = &mut ctx.chain;
+                for (address, account) in ctx.journaled_state.inner.state.iter_mut() {
                     if account.is_selfdestructed_locally() {
                         account.selfdestruct();
                         account.unmark_selfdestructed_locally();
                         account.unmark_created_locally();
                         account.unmark_touch();
+                        account.status |= revm::state::AccountStatus::LoadedAsNotExisting;
+                        block.deleted_in_block.insert(*address);
+                        block.created_in_block.remove(address);
+                    } else if account.is_created_locally() && !skipped.contains(address) {
+                        block.created_in_block.insert(*address);
                     }
                 }
             }
@@ -2279,6 +2318,11 @@ impl RskExecutor {
         {
             use revm::context_interface::ContextTr;
             markers.raw_storage = evm.ctx.chain_mut().raw_storage.drain();
+            let block = &evm.ctx.chain;
+            markers.created = block.created_in_block.iter().copied().collect();
+            markers.created.sort_unstable();
+            markers.deleted = block.deleted_in_block.iter().copied().collect();
+            markers.deleted.sort_unstable();
         }
         let state = evm.finalize();
 
@@ -13779,12 +13823,16 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
         assert_eq!(sender_acct.balance, one_rbtc, "burned balance goes nowhere");
     }
 
-    /// Destroy → CREATE2 re-deploy at the same address → destroy again, all
-    /// in one block (the rskj TransactionExecutor comment: "the remote case
-    /// there is a CREATE2 creating a deleted account"). The final destruction
-    /// must win: nothing of the address survives at block end.
+    /// RSKIP-131: from RSKIP125 rskj's `Program.createContract` refuses a
+    /// creation at an address an earlier transaction of the block deleted:
+    /// the `deletedAccounts` that `TransactionExecutor` hands every program
+    /// "in the remote case there is a CREATE2 creating a deleted account".
+    /// Destroy, then CREATE2 at the same address in a later transaction: the
+    /// factory's nonce still goes up, the gas given to the creation is spent,
+    /// and the address stays deleted, so a transfer to it makes a plain
+    /// account.
     #[test]
-    fn selfdestruct_recreate_via_create2_then_selfdestruct_again() {
+    fn create2_at_an_address_destroyed_earlier_in_the_block_is_refused() {
         let store = Arc::new(MemoryTrieStore::new());
         let sender = Address::repeat_byte(0xAA);
         let factory = Address::repeat_byte(0xFA);
@@ -13796,11 +13844,11 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
         let init: [u8; 11] = [0x61, 0x33, 0xFF, 0x60, 0x00, 0x52, 0x60, 0x02, 0x60, 0x1E, 0xF3];
         // Factory runtime: PUSH11 init; PUSH1 0; MSTORE   (init at mem[21..32])
         //                  PUSH1 0 (salt); PUSH1 11 (size); PUSH1 21 (offset);
-        //                  PUSH1 0 (value); CREATE2; POP; STOP
+        //                  PUSH1 0 (value); CREATE2; STOP
         let mut factory_code = vec![0x6A];
         factory_code.extend_from_slice(&init);
         factory_code.extend_from_slice(&[
-            0x60, 0x00, 0x52, 0x60, 0x00, 0x60, 0x0B, 0x60, 0x15, 0x60, 0x00, 0xF5, 0x50, 0x00,
+            0x60, 0x00, 0x52, 0x60, 0x00, 0x60, 0x0B, 0x60, 0x15, 0x60, 0x00, 0xF5, 0x00,
         ]);
         let victim = factory.create2(B256::ZERO, alloy_primitives::keccak256(init));
 
@@ -13818,43 +13866,333 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
         let txs = vec![
             (plain_tx(0, &factory, U256::ZERO), sender), // deploy victim
             (plain_tx(1, &victim, U256::ZERO), sender),  // destroy it
-            (plain_tx(2, &factory, U256::ZERO), sender), // re-deploy at same addr
-            (plain_tx(3, &victim, U256::from(7)), sender), // destroy again
+            (plain_tx(2, &factory, U256::ZERO), sender), // CREATE2 at the same address
+            (plain_tx(3, &victim, U256::from(7)), sender), // a transfer to it
         ];
         let r = executor
             .execute_block(&dummy_header(3_173_807), &txs, &root, store.clone())
             .expect("block");
         assert!(r.tx_results.iter().all(|t| t.success));
+        // The refused creation was given all the gas there was, and spent it.
+        assert_eq!(r.tx_results[2].gas_used, 1_000_000);
 
         let new_root =
             crate::state::apply_state_changes(&root, store.as_ref(), &r.state_changes, &r.markers);
-        // If the second CREATE2 had failed (collision against the stale
-        // destroyed entry), tx 3 would have been a plain transfer and the
-        // victim would survive with balance 7.
-        assert!(
-            trie_account(&new_root, store.as_ref(), &victim).is_none(),
-            "victim fully deleted after destroy → CREATE2 re-deploy → destroy"
+        let victim_acct = trie_account(&new_root, store.as_ref(), &victim).expect("an account");
+        assert_eq!(
+            victim_acct.balance,
+            U256::from(7),
+            "the plain account the transfer made"
         );
-        assert!(
-            new_root
-                .get(
-                    &TrieKeySlice::from_key(&rustock_trie::code_key(&victim)),
-                    store.as_ref(),
-                )
-                .is_none(),
-            "victim code deleted"
-        );
-        assert!(
-            new_root
-                .get(
-                    &TrieKeySlice::from_key(&rustock_trie::storage_prefix_key(&victim)),
-                    store.as_ref(),
-                )
-                .is_none(),
-            "victim marker deleted"
-        );
-        // The selfdestruct in tx 3 pays the 7 wei back to the caller.
+        assert_subtree_deleted(&new_root, store.as_ref(), &victim);
+        // Both CREATE2s count on the factory's nonce, the refused one too.
+        let factory_acct = trie_account(&new_root, store.as_ref(), &factory).unwrap();
+        assert_eq!(factory_acct.nonce, U256::from(3));
         let sender_acct = trie_account(&new_root, store.as_ref(), &sender).unwrap();
-        assert_eq!(sender_acct.balance, one_rbtc, "value round-trips via suicide");
+        assert_eq!(sender_acct.balance, one_rbtc - U256::from(7));
+    }
+
+    /// RSKIP-131 across sublists: rskj hands what the parallel sublists
+    /// deleted to the sequential one (`BlockExecutor.executeParallel`), so a
+    /// CREATE2 there at an address a parallel sublist destroyed is refused,
+    /// on one thread or two. Two parallel sublists, as one runs as the whole
+    /// block does.
+    #[test]
+    fn create2_in_the_sequential_sublist_where_a_parallel_one_destroyed_is_refused() {
+        let store: Arc<dyn TrieStore> = Arc::new(MemoryTrieStore::new());
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let destroyer = Address::repeat_byte(0x11);
+        let bystander = Address::repeat_byte(0x13);
+        let creator = Address::repeat_byte(0x12);
+        // The factory and its victim of the test above, the victim deployed.
+        let factory = Address::repeat_byte(0xFA);
+        let init: [u8; 11] = [
+            0x61, 0x33, 0xFF, 0x60, 0x00, 0x52, 0x60, 0x02, 0x60, 0x1E, 0xF3,
+        ];
+        let mut factory_code = vec![0x6A];
+        factory_code.extend_from_slice(&init);
+        factory_code.extend_from_slice(&[
+            0x60, 0x00, 0x52, 0x60, 0x00, 0x60, 0x0B, 0x60, 0x15, 0x60, 0x00, 0xF5, 0x00,
+        ]);
+        let victim = factory.create2(B256::ZERO, alloy_primitives::keccak256(init));
+
+        let mut root = put_account(&TrieNode::empty(), store.as_ref(), &destroyer, 0, one_rbtc);
+        root = put_account(&root, store.as_ref(), &bystander, 0, one_rbtc);
+        root = put_account(&root, store.as_ref(), &creator, 0, one_rbtc);
+        root = put_account_with_code(
+            &root,
+            store.as_ref(),
+            &factory,
+            2,
+            U256::ZERO,
+            &factory_code,
+        );
+        root = put_account_with_code(&root, store.as_ref(), &victim, 1, U256::ZERO, &[0x33, 0xFF]);
+        let marker = rustock_trie::storage_prefix_key(&victim);
+        root = root.put(&TrieKeySlice::from_key(&marker), &[1], store.as_ref());
+
+        // Testnet, past reed810 (#7,139,600): {tx0} and {tx1} in parallel
+        // sublists, tx2 sequential.
+        let mut header = dummy_header(8_000_000);
+        header.version_fields = Some(rustock_core::types::header::HeaderVersionFields {
+            version: 1,
+            edges: Some(vec![1, 2]),
+            base_event: None,
+        });
+        header.gas_limit = U256::from(12_000_000);
+        let tx = |to: &Address| rustock_core::Transaction {
+            gas_limit: U256::from(500_000),
+            ..plain_tx(0, to, U256::ZERO)
+        };
+        let transactions = vec![
+            (tx(&victim), destroyer),
+            (tx(&Address::repeat_byte(0xA1)), bystander),
+            (tx(&factory), creator),
+        ];
+
+        for threads in [1, 2] {
+            let executor = RskExecutor::new(RskHardforkConfig::testnet(), block_store.clone())
+                .with_execution_threads(threads);
+            let r = executor
+                .execute_block(&header, &transactions, &root, store.clone())
+                .expect("block");
+            assert!(
+                r.tx_results.iter().all(|t| t.success),
+                "{threads} thread(s)"
+            );
+            assert_eq!(
+                r.tx_results[2].gas_used, 500_000,
+                "{threads} thread(s): refused"
+            );
+            let new_root = r.applied_root.clone().unwrap_or_else(|| {
+                crate::state::apply_state_changes(
+                    &root,
+                    store.as_ref(),
+                    &r.state_changes,
+                    &r.markers,
+                )
+            });
+            let gone = trie_account(&new_root, store.as_ref(), &victim).is_none();
+            assert!(gone, "{threads} thread(s): the victim stays deleted");
+            assert_subtree_deleted(&new_root, store.as_ref(), &victim);
+            let factory_acct = trie_account(&new_root, store.as_ref(), &factory).unwrap();
+            assert_eq!(factory_acct.nonce, U256::from(3), "{threads} thread(s)");
+        }
+    }
+
+    /// FRCR-279: before RSKIP169 (iris300) rskj's EXTCODEHASH answers a
+    /// contract whose code key holds nothing with 0 (`getCodeHashNonStandard`),
+    /// and from it with `keccak256("")`, as any account without code. A
+    /// contract is an account with the marker `setupContract` writes: here
+    /// one made with no code in the same transaction, one made earlier in the
+    /// block and one from before it. An account without the marker answers
+    /// `keccak256("")` either way -- one a creation with no data made too,
+    /// as rskj's `TransactionExecutor.create` doesn't call `setupContract` for
+    /// it -- and an address with no account 0.
+    ///
+    /// The contract made with no code keeps its marker, too, though a later
+    /// transaction loads it again, which drops revm's flag for a creation.
+    #[test]
+    fn extcodehash_of_a_contract_without_code_is_0_before_rskip169() {
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let sender = Address::repeat_byte(0xAC);
+        // Probe: SSTORE(addr, EXTCODEHASH(addr) + 1), the address its calldata.
+        let probe = Address::repeat_byte(0xB0);
+        let probe_code = [
+            0x60, 0x00, 0x35, 0x80, 0x3f, 0x60, 0x01, 0x01, 0x90, 0x55, 0x00,
+        ];
+        // Maker: CREATE with no init code; SSTORE(0, EXTCODEHASH(new) + 1).
+        let maker = Address::repeat_byte(0xB1);
+        let maker_code = [
+            0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0xf0, 0x3f, 0x60, 0x01, 0x01, 0x60, 0x00, 0x55,
+            0x00,
+        ];
+        let made = maker.create(1);
+        let codeless = Address::repeat_byte(0xB2);
+        let eoa = Address::repeat_byte(0xB3);
+        let absent = Address::repeat_byte(0xB4);
+        let no_data = sender.create(5);
+
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = put_account(&TrieNode::empty(), store.as_ref(), &sender, 0, one_rbtc);
+        let root = put_account_with_code(&root, store.as_ref(), &probe, 1, U256::ZERO, &probe_code);
+        let root = put_account_with_code(&root, store.as_ref(), &maker, 1, U256::ZERO, &maker_code);
+        // A contract with no code from before the block: its marker, no code.
+        let root = put_account(&root, store.as_ref(), &codeless, 1, U256::ZERO);
+        let marker = rustock_trie::storage_prefix_key(&codeless);
+        let root = root.put(&TrieKeySlice::from_key(&marker), &[1], store.as_ref());
+        let root = put_account(&root, store.as_ref(), &eoa, 0, one_rbtc);
+
+        let probe_tx = |nonce: u64, target: &Address| rustock_core::Transaction {
+            input: Bytes::copy_from_slice(target.into_word().as_slice()),
+            ..plain_tx(nonce, &probe, U256::ZERO)
+        };
+        let txs = vec![
+            (plain_tx(0, &maker, U256::ZERO), sender),
+            (probe_tx(1, &made), sender),
+            (probe_tx(2, &codeless), sender),
+            (probe_tx(3, &eoa), sender),
+            (probe_tx(4, &absent), sender),
+            (
+                rustock_core::Transaction {
+                    to: Bytes::new(),
+                    ..plain_tx(5, &probe, U256::ZERO)
+                },
+                sender,
+            ),
+            (probe_tx(6, &no_data), sender),
+        ];
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+        let plus_one = |hash: B256| U256::from_be_bytes(hash.0) + U256::from(1);
+        let empty = plus_one(crate::rsk_instructions::KECCAK_EMPTY);
+        // Between papyrus200 (#2,392,700, EXTCODEHASH) and iris300 (#3,614,800),
+        // then past it.
+        for (number, contract) in [(3_000_000u64, plus_one(B256::ZERO)), (3_700_000, empty)] {
+            let r = executor
+                .execute_block(&dummy_header(number), &txs, &root, store.clone())
+                .expect("block");
+            assert!(r.tx_results.iter().all(|t| t.success), "#{number}");
+            let slot = |owner: &Address, key: U256| {
+                r.state_changes
+                    .get(owner)
+                    .and_then(|a| a.storage.get(&key))
+                    .map_or(U256::ZERO, |s| s.present_value)
+            };
+            let probed = |target: &Address| slot(&probe, U256::from_be_slice(target.as_slice()));
+            assert_eq!(
+                slot(&maker, U256::ZERO),
+                contract,
+                "#{number}: made in this transaction"
+            );
+            assert_eq!(
+                probed(&made),
+                contract,
+                "#{number}: made earlier in the block"
+            );
+            assert_eq!(
+                probed(&codeless),
+                contract,
+                "#{number}: made before the block"
+            );
+            assert_eq!(probed(&eoa), empty, "#{number}: not a contract");
+            assert_eq!(
+                probed(&absent),
+                plus_one(B256::ZERO),
+                "#{number}: no account"
+            );
+            assert_eq!(
+                probed(&no_data),
+                empty,
+                "#{number}: made with no data, no contract"
+            );
+
+            let new_root = crate::state::apply_state_changes(
+                &root,
+                store.as_ref(),
+                &r.state_changes,
+                &r.markers,
+            );
+            let made_marker = rustock_trie::storage_prefix_key(&made);
+            assert!(
+                new_root
+                    .get(&TrieKeySlice::from_key(&made_marker), store.as_ref())
+                    .is_some(),
+                "#{number}: the contract made with no code keeps its marker"
+            );
+        }
+    }
+
+    /// An account an earlier transaction of the block destroyed doesn't
+    /// exist for the rest of the block (rskj deletes it as that transaction
+    /// ends) until something touches it: EXTCODEHASH answers 0, and a CALL
+    /// to it pays NEW_ACCT_CALL, as for any address with no account. The
+    /// CALL makes it again, a plain account, not a contract: before RSKIP169
+    /// too, though the parent state still holds its marker.
+    #[test]
+    fn an_account_destroyed_earlier_in_the_block_does_not_exist_until_touched() {
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let sender = Address::repeat_byte(0xAC);
+        // Victim: CALLER; SELFDESTRUCT. And an account that stays.
+        let victim = Address::repeat_byte(0xD1);
+        let eoa = Address::repeat_byte(0xE0);
+        // Probes: SSTORE(addr, EXTCODEHASH(addr) + 1), the address their calldata.
+        let probe_code = [
+            0x60, 0x00, 0x35, 0x80, 0x3f, 0x60, 0x01, 0x01, 0x90, 0x55, 0x00,
+        ];
+        let first_probe = Address::repeat_byte(0xB5);
+        let second_probe = Address::repeat_byte(0xB6);
+        // Caller: CALL(1M gas, the address its calldata, 0 wei, no data); POP; STOP.
+        let caller = Address::repeat_byte(0xB7);
+        let caller_code = [
+            0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x35, 0x62,
+            0x0f, 0x42, 0x40, 0xf1, 0x50, 0x00,
+        ];
+
+        let store = Arc::new(MemoryTrieStore::new());
+        let mut root = put_account(&TrieNode::empty(), store.as_ref(), &sender, 0, one_rbtc);
+        root = put_account_with_code(&root, store.as_ref(), &victim, 1, U256::ZERO, &[0x33, 0xFF]);
+        let marker = rustock_trie::storage_prefix_key(&victim);
+        root = root.put(&TrieKeySlice::from_key(&marker), &[1], store.as_ref());
+        root = put_account(&root, store.as_ref(), &eoa, 0, U256::ZERO);
+        for probe in [first_probe, second_probe] {
+            root = put_account_with_code(&root, store.as_ref(), &probe, 1, U256::ZERO, &probe_code);
+        }
+        root = put_account_with_code(&root, store.as_ref(), &caller, 1, U256::ZERO, &caller_code);
+
+        let with_input = |nonce: u64, to: &Address, target: &Address| rustock_core::Transaction {
+            input: Bytes::copy_from_slice(target.into_word().as_slice()),
+            ..plain_tx(nonce, to, U256::ZERO)
+        };
+        let txs = vec![
+            (plain_tx(0, &victim, U256::ZERO), sender), // destroys it
+            (with_input(1, &first_probe, &victim), sender), // EXTCODEHASH: no account
+            (with_input(2, &caller, &victim), sender),  // CALL: a new account
+            (with_input(3, &caller, &eoa), sender),     // CALL: an account
+            (with_input(4, &second_probe, &victim), sender), // EXTCODEHASH: an account
+        ];
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+        let empty = U256::from_be_bytes(crate::rsk_instructions::KECCAK_EMPTY.0);
+        // Before iris300 (#3,614,800) and after it.
+        for number in [3_000_000u64, 3_700_000] {
+            let r = executor
+                .execute_block(&dummy_header(number), &txs, &root, store.clone())
+                .expect("block");
+            assert!(r.tx_results.iter().all(|t| t.success), "#{number}");
+            let probed = |probe: &Address| {
+                let key = U256::from_be_slice(victim.as_slice());
+                r.state_changes
+                    .get(probe)
+                    .and_then(|a| a.storage.get(&key))
+                    .map_or(U256::ZERO, |s| s.present_value)
+            };
+            assert_eq!(
+                probed(&first_probe),
+                U256::from(1),
+                "#{number}: no account: 0"
+            );
+            assert_eq!(
+                probed(&second_probe),
+                empty + U256::from(1),
+                "#{number}: an account"
+            );
+            assert_eq!(
+                r.tx_results[2].gas_used - r.tx_results[3].gas_used,
+                25_000,
+                "#{number}: a CALL to an address with no account pays NEW_ACCT_CALL"
+            );
+
+            let new_root = crate::state::apply_state_changes(
+                &root,
+                store.as_ref(),
+                &r.state_changes,
+                &r.markers,
+            );
+            let again = trie_account(&new_root, store.as_ref(), &victim).is_some();
+            assert!(again, "#{number}: made again");
+            assert_subtree_deleted(&new_root, store.as_ref(), &victim);
+        }
     }
 }

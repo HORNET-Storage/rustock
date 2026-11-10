@@ -10,7 +10,7 @@ use revm::bytecode::Bytecode;
 use revm::state::AccountInfo;
 use rustock_trie::{
     TrieNode, TrieStore, TrieKeySlice,
-    account_key, code_key, storage_key,
+    account_key, code_key, storage_key, storage_prefix_key,
     AccountState,
 };
 use rustock_storage::BlockStore;
@@ -59,6 +59,13 @@ impl RskDatabase {
         block_store: Arc<BlockStore>,
     ) -> Self {
         Self { root, store, block_store, code_cache: RefCell::new(HashMap::new()) }
+    }
+
+    /// rskj `MutableRepository.isContract`: whether `address` holds the
+    /// storage-prefix marker `setupContract` writes, in the state this
+    /// database reads.
+    pub fn has_contract_marker(&self, address: &Address) -> Result<bool, RskDbError> {
+        Ok(self.trie_get(&storage_prefix_key(address))?.is_some())
     }
 
     /// Reads one key, distinguishing "not in the trie" from "the trie is

@@ -40,6 +40,15 @@ pub struct ContractMarkers {
     /// credited here, as `bump_remasc_sender` is, and created if it is new,
     /// even for nothing, as rskj's `addBalance` creates it.
     pub null_account: Option<U256>,
+    /// The contracts the block created and left standing, each with rskj's
+    /// marker whatever code it ended with (`setupContract` writes it as the
+    /// creation begins). revm forgets a creation's local flag once a later
+    /// transaction loads the account, so one created with no code and
+    /// touched again would otherwise lose its marker.
+    pub created: Vec<Address>,
+    /// What the block's transactions destroyed (rskj's `deletedAccounts`),
+    /// which a sequential sublist inherits from the parallel ones.
+    pub deleted: Vec<Address>,
 }
 
 /// Apply all state changes from EVM execution to the trie, returning the new root.
@@ -92,10 +101,14 @@ pub fn apply_state_changes(
             // unitrie (mainnet: ~20 EOAs that took value, by #1,591,000).
             // A real CREATE goes through `create_account_checkpoint`
             // (`mark_created_locally` → `CreatedLocal`) and deploys code, so
-            // gate the marker on having code or being locally created.
+            // gate the marker on having code or being locally created -- in
+            // this transaction (`CreatedLocal`) or an earlier one of the
+            // block's, whose flag revm drops when a later one loads the
+            // account (`markers.created`).
             let code_bytes = account.info.code.as_ref().map(|c| c.original_bytes());
             let has_code = code_bytes.as_ref().is_some_and(|c| !c.is_empty());
-            if !markers.skip_created.contains(addr) && (has_code || account.is_created_locally()) {
+            let created_here = account.is_created_locally() || markers.created.contains(addr);
+            if !markers.skip_created.contains(addr) && (has_code || created_here) {
                 batch.push((storage_prefix_key(addr), vec![1]));
             }
             if let Some(code_bytes) = code_bytes {

@@ -729,6 +729,13 @@ impl RskHardforkConfig {
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Iris300
     }
 
+    /// RSKIP169: EXTCODEHASH of a contract whose code key holds nothing
+    /// answers `keccak256("")` (rskj `getCodeHashStandard`), where before it
+    /// answered 0 (`getCodeHashNonStandard`) (Iris300).
+    pub fn has_rskip169(&self, block_number: u64) -> bool {
+        self.active_upgrade(block_number) >= RskNetworkUpgrade::Iris300
+    }
+
     /// RSKIP174: a top-level contract creation carries over the balance an
     /// address already held, instead of destroying it (Iris300).
     ///
@@ -1586,6 +1593,7 @@ mod rskj_schedule_tests {
         ("rskip146", RskHardforkConfig::has_rskip146, Some(2_392_700), Some(863_000)),
         ("rskip150", RskHardforkConfig::has_rskip150, Some(2_018_000), Some(504_000)),
         ("rskip152", RskHardforkConfig::has_chainid, Some(2_392_700), Some(863_000)),
+        ("rskip169", RskHardforkConfig::has_rskip169, Some(3_614_800), Some(2_060_500)),
         ("rskip170", RskHardforkConfig::has_rskip170, Some(3_614_800), Some(2_060_500)),
         ("rskip171", RskHardforkConfig::has_rskip171, Some(3_614_800), Some(2_060_500)),
         ("rskip174", RskHardforkConfig::has_rskip174, Some(3_614_800), Some(2_060_500)),

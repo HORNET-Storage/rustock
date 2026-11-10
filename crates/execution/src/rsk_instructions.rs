@@ -66,6 +66,10 @@ thread_local! {
     /// (rskj `VM.doEXTCODEHASH` precompile branch). Set by `install`.
     static EXTCODEHASH_PRECOMPILES: core::cell::RefCell<Vec<Address>> =
         const { core::cell::RefCell::new(Vec::new()) };
+    /// RSKIP169: whether EXTCODEHASH answers a contract whose code key holds
+    /// nothing with `keccak256("")` (`getCodeHashStandard`), or with 0 as
+    /// before it (`getCodeHashNonStandard`). Set by `install`.
+    static EXTCODEHASH_STANDARD: core::cell::Cell<bool> = const { core::cell::Cell::new(true) };
     /// The block's real miner address (`header.getCoinbase()`), pushed by the
     /// COINBASE opcode. rustock sets `block.beneficiary = REMASC_ADDR` so revm
     /// routes gas fees to REMASC; that would make COINBASE return REMASC, but
@@ -160,6 +164,9 @@ pub fn set_transaction_index(index: u64) {
 /// EXTCODEHASH only activates at papyrus — so before that it must throw an
 /// invalid-opcode exception (consuming all gas), matching rskj's VM.
 ///
+/// `extcodehash_standard` is RSKIP169 (iris300): from it EXTCODEHASH answers a
+/// contract whose code key holds nothing as any account without code.
+///
 /// `dupn_swapn_txindex_enabled` is RSKIP191's absence: before iris300 rskj
 /// runs RSK's own DUPN, SWAPN and TXINDEX.
 ///
@@ -167,6 +174,7 @@ pub fn set_transaction_index(index: u64) {
 pub fn install<WIRE, HOST>(
     instructions: &mut EthInstructions<WIRE, HOST>,
     extcodehash_enabled: bool,
+    extcodehash_standard: bool,
     istanbul_opcodes_enabled: bool,
     push0_enabled: bool,
     basefee_enabled: bool,
@@ -179,7 +187,7 @@ pub fn install<WIRE, HOST>(
     block: BlockWords,
 ) where
     WIRE: InterpreterTypes,
-    HOST: Host,
+    HOST: Host + ContractMarker,
 {
     // RSKIP446 (lovell700): transient storage TLOAD/TSTORE (0x5c/0x5d,
     // EIP-1153, rskj `GasCost.TLOAD`/`TSTORE` = 100 each). RSKIP445 (lovell700):
@@ -240,6 +248,7 @@ pub fn install<WIRE, HOST>(
         // active precompiles to `keccak256("")` — see `rsk_extcodehash`.
         EXTCODEHASH_PRECOMPILES
             .with(|p| *p.borrow_mut() = extcodehash_precompiles.to_vec());
+        EXTCODEHASH_STANDARD.set(extcodehash_standard);
         instructions.insert_instruction(
             opcode::EXTCODEHASH,
             Instruction::new(rsk_extcodehash::<WIRE, HOST>, 400),
@@ -480,7 +489,9 @@ pub(crate) const KECCAK_EMPTY: B256 = B256::new([
 ///   - active precompile  -> `keccak256("")` (rskj special-cases precompiles);
 ///   - account absent from the trie -> `0`;
 ///   - account present but not a contract (no code) -> `keccak256("")`;
-///   - contract -> its code hash.
+///   - contract -> its code hash. One whose code key holds nothing answers
+///     `keccak256("")` from RSKIP169 (`getCodeHashStandard`) and `0` before
+///     it (`getCodeHashNonStandard`), which needs [`ContractMarker`].
 ///
 /// revm's stock EXTCODEHASH instead returns `0` whenever `AccountInfo::is_empty()`
 /// (EIP-161: balance==0 && nonce==0 && no code), so an existing-but-empty
@@ -490,7 +501,7 @@ pub(crate) const KECCAK_EMPTY: B256 = B256::new([
 /// host's flag (`true` only when `Database::basic` returned `None`, i.e. the
 /// trie has no node — see the HOMESTEAD journal pin in `RskHandler`), which is
 /// exactly rskj's `isExist`.
-fn rsk_extcodehash<WIRE: InterpreterTypes, H: Host + ?Sized>(
+fn rsk_extcodehash<WIRE: InterpreterTypes, H: Host + ContractMarker + ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
 ) {
     let Some(([], top)) = context.interpreter.stack.popn_top::<0>() else {
@@ -509,16 +520,82 @@ fn rsk_extcodehash<WIRE: InterpreterTypes, H: Host + ?Sized>(
         context.interpreter.halt_fatal();
         return;
     };
-    // `is_empty` is the host's trie-existence flag (rskj `isExist`): absent ->
-    // 0; present-but-codeless -> keccak256(""); contract -> its code hash.
-    let result = if load.is_empty {
+    // `is_empty` is the host's trie-existence flag (rskj `isExist`).
+    let exists = !load.is_empty;
+    let code_hash = load.account.code_hash;
+    let codeless = load.account.is_empty_code_hash() || code_hash.is_zero();
+    let result = if !exists {
         B256::ZERO
-    } else if load.account.is_empty_code_hash() || load.account.code_hash.is_zero() {
+    } else if !codeless {
+        code_hash
+    } else if EXTCODEHASH_STANDARD.get() {
         KECCAK_EMPTY
     } else {
-        load.account.code_hash
+        match context.host.holds_contract_marker(addr) {
+            Some(true) => B256::ZERO,
+            Some(false) => KECCAK_EMPTY,
+            None => {
+                context.interpreter.halt_fatal();
+                return;
+            }
+        }
     };
     *top = result.into();
+}
+
+/// What EXTCODEHASH asks before RSKIP169 that revm's `Host` can't answer:
+/// whether an account is a contract as rskj's `isContract` reads it, by the
+/// storage-prefix marker `setupContract` writes.
+pub trait ContractMarker {
+    /// Whether `address` holds the marker. `None` where the state couldn't be
+    /// read, the error left in the context as revm's own loads leave it.
+    fn holds_contract_marker(&mut self, address: Address) -> Option<bool>;
+}
+
+type RskDb = revm::database::WrapDatabaseRef<crate::database::RskDatabase>;
+
+/// The executor's context. The marker is a creation's of this transaction
+/// (the journal), of the block's earlier ones (the chain slot, which also
+/// knows what they destroyed, marker and all), or else the parent state's.
+impl<BLOCK, TX, CFG, LOCAL> ContractMarker
+    for revm::Context<
+        BLOCK,
+        TX,
+        CFG,
+        RskDb,
+        revm::context::Journal<RskDb>,
+        crate::raw_storage::RskChainExt,
+        LOCAL,
+    >
+where
+    LOCAL: revm::context_interface::LocalContextTr,
+{
+    fn holds_contract_marker(&mut self, address: Address) -> Option<bool> {
+        let created_now = self
+            .journaled_state
+            .inner
+            .state
+            .get(&address)
+            .is_some_and(|account| account.is_created_locally());
+        if created_now || self.chain.created_in_block.contains(&address) {
+            return Some(true);
+        }
+        if self.chain.deleted_in_block.contains(&address) {
+            return Some(false);
+        }
+        match self
+            .journaled_state
+            .database
+            .0
+            .has_contract_marker(&address)
+        {
+            Ok(holds) => Some(holds),
+            Err(e) => {
+                self.error = Err(revm::context_interface::ContextError::Db(e));
+                None
+            }
+        }
+    }
 }
 
 /// CHAINID without revm's ISTANBUL spec check (RSKIP152 activates it at
@@ -802,7 +879,7 @@ thread_local! {
 
 /// All-ops tracer: log pc/opcode/gas (post-static-charge), then dispatch to
 /// the real implementation (custom rsk op or default PETERSBURG table).
-fn traced_all<WIRE: InterpreterTypes, HOST: Host>(
+fn traced_all<WIRE: InterpreterTypes, HOST: Host + ContractMarker>(
     context: InstructionContext<'_, HOST, WIRE>,
 ) {
     use revm::interpreter::interpreter_types::{InputsTr, Jumps, LegacyBytecode};
@@ -1377,6 +1454,7 @@ mod thread_affinity_tests {
                 &mut table,
                 true,
                 true,
+                true,
                 false,
                 false,
                 true,
@@ -1414,11 +1492,14 @@ mod thread_affinity_tests {
     }
 
     /// `DummyHost` only needs to exist for the table to be generic over
-    /// something; no instruction runs here.
+    /// something the instructions take, which is the executor's context: it
+    /// answers EXTCODEHASH's `ContractMarker`. No instruction runs here.
     type DummyHost = revm::context::Context<
         revm::context::BlockEnv,
         revm::context::TxEnv,
         revm::context::CfgEnv,
-        revm::database::EmptyDB,
+        RskDb,
+        revm::context::Journal<RskDb>,
+        crate::raw_storage::RskChainExt,
     >;
 }

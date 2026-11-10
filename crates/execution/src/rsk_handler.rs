@@ -610,43 +610,51 @@ where
                     // (rskj Program.getMaxDepth); revm hard-codes 1024, so
                     // the cap is enforced here. rskj's deep checks push 0,
                     // refund the child gas, and return BEFORE any
-                    // returnDataBuffer reset.
+                    // returnDataBuffer reset. RSKIP-131's refusal of a
+                    // creation at an address the block deleted returns
+                    // before it too, the creation's gas spent.
                     let rskip150_active = self.pre_rskip150_precompiles.is_none();
-                    if rskip150_active && init.depth > 400 {
-                        if let Some(synth) = call_too_deep_result(&init.frame_input) {
-                            use revm::interpreter::interpreter_types::ReturnData;
-                            preserved_return_buffer = Some(
-                                evm.frame_stack()
-                                    .get()
-                                    .interpreter
-                                    .return_data
-                                    .buffer()
-                                    .clone(),
+                    let refused = if rskip150_active && init.depth > 400 {
+                        call_too_deep_result(&init.frame_input)
+                    } else if self.rskip125_active {
+                        deleted_address_collision(evm, &init)
+                    } else {
+                        None
+                    };
+                    if let Some(synth) = refused {
+                        use revm::interpreter::interpreter_types::ReturnData;
+                        preserved_return_buffer = Some(
+                            evm.frame_stack()
+                                .get()
+                                .interpreter
+                                .return_data
+                                .buffer()
+                                .clone(),
+                        );
+                        if *TRACE_FRAMES {
+                            tracing::debug!(
+                                "FRAME REJECTED {:?} depth={}",
+                                synth.instruction_result(),
+                                init.depth
                             );
-                            if *TRACE_FRAMES {
-                                tracing::debug!(
-                                    "FRAME REJECTED CallTooDeep depth={} (RSKIP150 limit 400)",
-                                    init.depth
-                                );
-                            }
-                            // An inspector hears of the refusal as revm tells it
-                            // of a frame refused at its own limit of 1024.
-                            let synth = D::refuse(evm, init, synth);
-                            note_attempted_writes(evm);
-                            let returned = evm.frame_return_result(synth)?;
-                            forget_reverted_entries(evm);
-                            if let Some(result) = returned {
-                                return Ok(result);
-                            }
-                            if let Some(buffer) = preserved_return_buffer {
-                                evm.frame_stack()
-                                    .get()
-                                    .interpreter
-                                    .return_data
-                                    .set_buffer(buffer);
-                            }
-                            continue;
                         }
+                        // An inspector hears of the refusal as revm tells it
+                        // of a frame refused at its own limit of 1024.
+                        let synth = D::refuse(evm, init, synth);
+                        note_attempted_writes(evm);
+                        let returned = evm.frame_return_result(synth)?;
+                        forget_reverted_entries(evm);
+                        if let Some(result) = returned {
+                            return Ok(result);
+                        }
+                        if let Some(buffer) = preserved_return_buffer {
+                            evm.frame_stack()
+                                .get()
+                                .interpreter
+                                .return_data
+                                .set_buffer(buffer);
+                        }
+                        continue;
                     }
                     match D::init(evm, init)? {
                         ItemOrResult::Item(()) => {
@@ -1135,6 +1143,53 @@ fn call_too_deep_result(
         ))),
         FrameInput::Empty => None,
     }
+}
+
+/// RSKIP-131, with RSKIP125: rskj's `Program.createContract` refuses a
+/// creation at an address an earlier transaction of the block deleted
+/// (`deletedAccountsInBlock`) as it refuses one at an address in use: the
+/// creator's nonce is bumped, the gas forwarded to the creation is spent,
+/// and 0 is pushed. `None` lets revm open the frame, or refuse it first for
+/// depth or endowment, as rskj refuses those first.
+fn deleted_address_collision<EVM>(evm: &mut EVM, init: &FrameInit) -> Option<FrameResult>
+where
+    EVM: EvmTr<
+        Context: ContextTr<
+            Chain = crate::raw_storage::RskChainExt,
+            Journal: JournalTr<State = EvmState>,
+        >,
+    >,
+{
+    use revm::interpreter::interpreter_action::FrameInput;
+    use revm::interpreter::InterpreterResult;
+    use revm::primitives::constants::CALL_STACK_LIMIT;
+    let FrameInput::Create(inputs) = &init.frame_input else {
+        return None;
+    };
+    let ctx = evm.ctx();
+    if init.depth > CALL_STACK_LIMIT as usize || ctx.chain().deleted_in_block.is_empty() {
+        return None;
+    }
+    let (balance, nonce) = {
+        let caller = ctx.journal_mut().load_account_mut(inputs.caller()).ok()?;
+        (*caller.balance(), caller.nonce())
+    };
+    let address = inputs.created_address(nonce);
+    if balance < inputs.value() || !ctx.chain().deleted_in_block.contains(&address) {
+        return None;
+    }
+    let mut caller = ctx.journal_mut().load_account_mut(inputs.caller()).ok()?;
+    if !caller.bump_nonce() {
+        return None;
+    }
+    Some(FrameResult::Create(CreateOutcome::new(
+        InterpreterResult {
+            result: InstructionResult::CreateCollision,
+            gas: Gas::new(inputs.gas_limit()),
+            output: Bytes::new(),
+        },
+        None,
+    )))
 }
 
 /// If the top (just-initialized) frame is a CREATE frame, reset the created
