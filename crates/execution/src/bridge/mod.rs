@@ -14,6 +14,7 @@ pub mod btc_block_cache;
 #[cfg(test)]
 mod btc_block_cache_readpath_tests;
 pub mod btc_chain;
+pub mod btc_rules;
 pub mod btc_store;
 pub mod constants;
 pub mod events;

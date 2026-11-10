@@ -21,11 +21,12 @@ use bitcoin::BlockHash;
 use revm::context_interface::{Block as BlockTr, ContextTr};
 use revm::precompile::{PrecompileError, PrecompileOutput};
 
+use super::btc_rules::{check_difficulty_transitions, verify_header};
 use super::btc_store::{
-    check_proof_of_work, compute_work, get_stored_block, load_chain_head, put_stored_block,
-    store_chain_head, StoredBlock,
+    compute_work, get_stored_block, load_chain_head, put_stored_block, store_chain_head,
+    StoredBlock,
 };
-use super::constants::BridgeConstants;
+use super::constants::{BridgeConstants, BtcNetwork};
 use crate::hardfork::RskHardforkConfig;
 
 // receiveHeader result codes — must match rskj BridgeSupport exactly
@@ -135,22 +136,18 @@ pub fn receive_header<CTX: crate::RskContextTr>(
         return Ok(encode_int_result(gas_cost, ERR_UNEXPECTED_EXCEPTION));
     }
 
-    // 6. btcBlockChain.add(header) — bitcoinj throws on bad PoW or any other
-    // error, which rskj catches and maps to UNEXPECTED_EXCEPTION.
-    if !check_proof_of_work(&btc_header) {
+    // 6. btcBlockChain.add(header): where bitcoinj throws, rskj answers
+    // UNEXPECTED_EXCEPTION.
+    if !add(
+        ctx,
+        &btc_header,
+        &parent,
+        config.btc_network,
+        use_v2,
+        rskip199,
+    ) {
         return Ok(encode_int_result(gas_cost, ERR_UNEXPECTED_EXCEPTION));
     }
-
-    // Compute chain work
-    let work = compute_work(btc_header.bits);
-    let new_chain_work = parent.chain_work.wrapping_add(work);
-
-    let stored = StoredBlock::new(btc_header, new_height, new_chain_work);
-
-    // Store the block and, when it extends the best chain or wins a reorg,
-    // update the chain head and the height->hash main-chain index
-    // (bitcoinj `BtcAbstractBlockChain.connectBlock`).
-    connect_block(ctx, &stored, &parent, use_v2, rskip199);
 
     // Update timestamp (rskj serializeLong -> RLP)
     super::storage::bridge_store_timestamp(
@@ -162,79 +159,94 @@ pub fn receive_header<CTX: crate::RskContextTr>(
     Ok(encode_int_result(gas_cost, SUCCESS))
 }
 
-/// Connect a freshly built `StoredBlock` to the BTC header chain, mirroring
+/// bitcoinj `BtcAbstractBlockChain.add`, for a header that isn't stored, on
+/// its stored `parent`: the header's target must be in range and its hash
+/// under it (`verifyHeader`), and its target the one its parent's chain calls
+/// for (`checkDifficultyTransitions`); then it's connected (`connectBlock`).
+/// `false` where bitcoinj throws.
+fn add<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    header: &BtcHeader,
+    parent: &StoredBlock,
+    network: BtcNetwork,
+    use_v2: bool,
+    rskip199: bool,
+) -> bool {
+    verify_header(header, network)
+        && check_difficulty_transitions(ctx, parent, header, network)
+        && connect_block(ctx, header, parent, use_v2, rskip199)
+}
+
 /// bitcoinj `BtcAbstractBlockChain.connectBlock` in header-only mode
-/// (`shouldVerifyTransactions() == false`, which is how the Bridge runs it).
+/// (`shouldVerifyTransactions() == false`, which is how the Bridge runs it),
+/// for a header that isn't stored, on its stored `parent` (bitcoinj's
+/// `storedPrev`). `false` where bitcoinj throws.
 ///
-/// `stored` is the new block (height/work already computed from `parent`); the
-/// caller has already verified PoW, rejected already-known blocks, and resolved
-/// `parent` (= bitcoinj `storedPrev`). `connectBlock` itself always persists the
-/// block via `addToBlockStore`, then:
+/// - A header on the head (`storedPrev.equals(chainHead)`) is stored and
+///   becomes the head.
+/// - Any other is a fork. `findSplit` walks it and the head back to the block
+///   they share, and throws where a walk runs out of stored blocks, as it
+///   does for a fork from the genesis block on mainnet and testnet, whose
+///   stored chain begins at the checkpoint: then nothing is stored.
+///   Otherwise the fork is stored, and if it has **strictly more work** than
+///   the head (`StoredBlock.moreWorkThan`, so a tie doesn't reorganize),
+///   `handleNewBestChain` makes it the head.
 ///
-/// - if the block extends the current best chain (`parent == chainHead`), it
-///   becomes the new head directly; or
-/// - if it forks the chain but has **strictly more work** than the head
-///   (`StoredBlock.moreWorkThan`, i.e. `chainWork >` — ties do NOT reorg), it
-///   triggers `handleNewBestChain`, which rewrites the height->hash main-chain
-///   index for **every** block on the new branch above the split point, then
-///   sets the head.
-///
-/// rustock previously only ever set the head's single index entry, so a BTC
-/// reorg deeper than one block left stale entries at the intermediate heights —
-/// the divergence localized to the `btcBlockHeight-<height>` cell.
+/// bitcoinj's checkpoint lock-in decides nothing here: mainnet's checkpoints
+/// are at heights only a fork from the genesis block reaches, and testnet3
+/// and regtest have none.
 fn connect_block<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
-    stored: &StoredBlock,
+    header: &BtcHeader,
     parent: &StoredBlock,
     use_v2: bool,
     rskip199: bool,
-) {
-    // `addToBlockStore`: persist the block unconditionally.
-    put_stored_block(ctx, stored, use_v2);
-
+) -> bool {
+    // `StoredBlock.build`.
+    let stored = StoredBlock::new(
+        *header,
+        parent.height + 1,
+        parent.chain_work.wrapping_add(compute_work(header.bits)),
+    );
     let head = match load_chain_head(ctx) {
-        Some(h) => h,
-        // No head yet (chain not seeded): treat as a direct extension.
-        None => {
-            set_chain_head(ctx, stored, use_v2, rskip199);
-            return;
+        Some(head) if head.header.block_hash() != parent.header.block_hash() => head,
+        // On the head, or with no head yet (the chain not seeded).
+        _ => {
+            put_stored_block(ctx, &stored, use_v2);
+            set_chain_head(ctx, &stored, use_v2, rskip199);
+            return true;
         }
     };
-
-    // Direct extension of the best chain (`storedPrev.equals(chainHead)`).
-    if parent.header.block_hash() == head.header.block_hash() {
-        set_chain_head(ctx, stored, use_v2, rskip199);
-        return;
-    }
-
-    // Fork. Only reorganize if the new block has strictly more work than the
-    // current head (bitcoinj `StoredBlock.moreWorkThan` uses `>` — a tie keeps
-    // the existing head). A fork with <= work is stored but does not move the
-    // head or touch the main-chain index.
+    let Some(split) = find_split(&stored, &head, |hash| get_stored_block(ctx, hash)) else {
+        return false;
+    };
     if stored.chain_work > head.chain_work {
-        handle_new_best_chain(ctx, stored, &head, use_v2, rskip199);
+        handle_new_best_chain(ctx, &stored, &split, use_v2, rskip199)
+    } else {
+        put_stored_block(ctx, &stored, use_v2);
+        true
     }
 }
 
-/// bitcoinj `handleNewBestChain`: reindex the new branch and set the head.
-/// Rewrites `setMainChainBlock(height, hash)` for every block on the new branch
-/// from the split point (exclusive) up to the new head, then sets the head
-/// (which itself reindexes the head height).
+/// bitcoinj `handleNewBestChain`, given the `split` `findSplit` found: every
+/// block on the new branch above the split (`getPartialChain`) takes its
+/// height in the height->hash main-chain index (`setMainChainBlock`, from
+/// RSKIP199), then the new block is stored and becomes the head, which
+/// indexes its height again. rustock once indexed the head's height alone,
+/// so a reorg deeper than one block left stale entries at the heights below
+/// it, in the `btcBlockHeight-<height>` cells. `false` where bitcoinj throws.
 fn handle_new_best_chain<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     new_head: &StoredBlock,
-    old_head: &StoredBlock,
+    split: &StoredBlock,
     use_v2: bool,
     rskip199: bool,
-) {
+) -> bool {
+    let Some(new_branch) = get_partial_chain(new_head, split, |hash| get_stored_block(ctx, hash))
+    else {
+        return false;
+    };
     if rskip199 {
-        // Resolve a block's parent (bitcoinj `StoredBlock.getPrev`) from
-        // Bridge storage. Collected eagerly because the reindex below also
-        // mutates `ctx`, so we cannot hold a borrowing closure across it.
-        let split = find_split(new_head, old_head, |h| get_stored_block(ctx, h));
-        // bitcoinj getPartialChain(newChainHead, splitPoint): the new branch
-        // blocks above the split, walked from the head down via getPrev.
-        let new_branch = get_partial_chain(new_head, &split, |h| get_stored_block(ctx, h));
         for block in new_branch {
             super::storage::bridge_store_btc_block_hash_by_height(
                 ctx,
@@ -243,52 +255,52 @@ fn handle_new_best_chain<CTX: crate::RskContextTr>(
             );
         }
     }
+    put_stored_block(ctx, new_head, use_v2);
     set_chain_head(ctx, new_head, use_v2, rskip199);
+    true
 }
 
 /// bitcoinj `findSplit(newChainHead, oldChainHead, store)`: walk both branches
-/// back (by `getPrev`) until they meet at the common ancestor. `get_prev`
-/// resolves a block's parent stored block. Returns the split-point stored block.
+/// back (by `getPrev`), the higher first, until they meet at the block they
+/// share. `get_prev` resolves a block's parent. `None` where a walk runs out
+/// of stored blocks, where bitcoinj throws ("Attempt to follow an orphan
+/// chain").
 fn find_split(
     new_head: &StoredBlock,
     old_head: &StoredBlock,
     mut get_prev: impl FnMut(&BlockHash) -> Option<StoredBlock>,
-) -> StoredBlock {
+) -> Option<StoredBlock> {
     let mut current_chain_cursor = old_head.clone();
     let mut new_chain_cursor = new_head.clone();
     while current_chain_cursor.header.block_hash() != new_chain_cursor.header.block_hash() {
         if current_chain_cursor.height > new_chain_cursor.height {
-            current_chain_cursor = get_prev(&current_chain_cursor.header.prev_blockhash)
-                .expect("findSplit: attempt to follow an orphan chain");
+            current_chain_cursor = get_prev(&current_chain_cursor.header.prev_blockhash)?;
         } else {
-            new_chain_cursor = get_prev(&new_chain_cursor.header.prev_blockhash)
-                .expect("findSplit: attempt to follow an orphan chain");
+            new_chain_cursor = get_prev(&new_chain_cursor.header.prev_blockhash)?;
         }
     }
-    current_chain_cursor
+    Some(current_chain_cursor)
 }
 
 /// bitcoinj `getPartialChain(higher, lower, store)`: blocks from `higher` down
 /// to (but excluding) `lower`, in head→split order. Walks from the in-memory
-/// `higher` and resolves ancestors via `get_prev` (the head's own parent is
-/// already persisted by the time we get here).
+/// `higher` and resolves its ancestors through `get_prev`. `None` where the
+/// walk runs out of stored blocks ("Ran off the end of the chain").
 fn get_partial_chain(
     higher: &StoredBlock,
     lower: &StoredBlock,
     mut get_prev: impl FnMut(&BlockHash) -> Option<StoredBlock>,
-) -> Vec<StoredBlock> {
+) -> Option<Vec<StoredBlock>> {
     debug_assert!(higher.height > lower.height, "higher and lower are reversed");
     let mut results = Vec::new();
     let mut cursor = higher.clone();
     loop {
         results.push(cursor.clone());
-        cursor = get_prev(&cursor.header.prev_blockhash)
-            .expect("getPartialChain: ran off the end of the chain");
+        cursor = get_prev(&cursor.header.prev_blockhash)?;
         if cursor.header.block_hash() == lower.header.block_hash() {
-            break;
+            return Some(results);
         }
     }
-    results
 }
 
 /// Update the chain head (rskj `RepositoryBtcBlockStoreWithCache.setChainHead` +
@@ -473,6 +485,25 @@ pub fn ensure_btc_block_store<CTX: crate::RskContextTr>(
     ensure_btc_chain_seeded(ctx, config, use_v2, hardfork_cfg.has_rskip199(block_number));
 }
 
+/// Whether bitcoinj's `BtcBlock.parseTransactions` reads `rest`, the at most
+/// five bytes that may follow a header's 80 before RSKIP124, as no
+/// transactions: nothing at all, or a transaction count of 0 in any of
+/// `VarInt`'s widths, after which it reads no further. Any other count asks
+/// for transactions that five bytes can't hold (or, above
+/// `Integer.MAX_VALUE`, for a list of negative size), and bitcoinj throws.
+fn no_transactions_follow(rest: &[u8]) -> bool {
+    let zero = |bytes: Option<&[u8]>| bytes.is_some_and(|bytes| bytes.iter().all(|&b| b == 0));
+    match rest.first() {
+        None => true,
+        Some(0xfd) => zero(rest.get(1..3)),
+        Some(0xfe) => zero(rest.get(1..5)),
+        Some(0xff) => zero(rest.get(1..9)),
+        Some(&count) => count == 0,
+    }
+}
+
+/// rskj `Bridge.receiveHeaders` and `BridgeSupport.receiveHeaders`: every
+/// header, in order, through bitcoinj's `add`, each it can't add skipped.
 pub fn receive_headers<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     args: &[u8],
@@ -502,6 +533,16 @@ pub fn receive_headers<CTX: crate::RskContextTr>(
             "receiveHeaders: a header is not a header's size",
         ));
     }
+    // Then it parses every header (`makeBlock`), and refuses the whole call
+    // for one it can't parse.
+    if headers
+        .iter()
+        .any(|header| !no_transactions_follow(&header[80..]))
+    {
+        return Err(PrecompileError::other(
+            "receiveHeaders: a header could not be parsed",
+        ));
+    }
 
     let rskip434 = hardfork_cfg.has_rskip434(block_number);
     let rskip199 = hardfork_cfg.has_rskip199(block_number);
@@ -509,49 +550,37 @@ pub fn receive_headers<CTX: crate::RskContextTr>(
     ensure_btc_chain_seeded(ctx, config, use_v2, rskip199);
     let is_mainnet = matches!(config.btc_network, super::constants::BtcNetwork::Mainnet);
 
-    let max_headers = config.max_btc_headers_per_rsk_block as usize;
-    let count = headers.len().min(max_headers);
-
-    for header_bytes in headers.iter().take(count) {
-        let btc_header: BtcHeader = match deserialize(&header_bytes[..80]) {
-            Ok(h) => h,
-            Err(_) => continue,
-        };
-
-        let block_hash = btc_header.block_hash();
-
-        // Skip if already known
-        if get_stored_block(ctx, &block_hash).is_some() {
+    // However many there are.
+    for header_bytes in &headers {
+        let Ok(btc_header) = deserialize::<BtcHeader>(&header_bytes[..80]) else {
             continue;
-        }
-
-        // Check PoW
-        if !check_proof_of_work(&btc_header) {
-            continue;
-        }
-
-        // Find parent
-        let parent = match get_stored_block(ctx, &btc_header.prev_blockhash) {
-            Some(p) => p,
-            None => continue,
         };
-
+        // The parent first: with none stored, `cannotProcessNextBlock` throws
+        // on it, and rskj skips the header.
+        let Some(parent) = get_stored_block(ctx, &btc_header.prev_blockhash) else {
+            continue;
+        };
         // rskj cannotProcessNextBlock: bitcoinj's 12-byte chainwork
         // overflows at BTC mainnet #849,138; headers from there cannot be
-        // processed until RSKIP434.
+        // processed until RSKIP434. It stops the loop before `add` looks at
+        // the header, so even at a header already stored.
         if parent.height + 1 >= config.block_with_too_much_chain_work_height
             && is_mainnet
             && !rskip434
         {
             break;
         }
-
-        let work = compute_work(btc_header.bits);
-        let new_chain_work = parent.chain_work.wrapping_add(work);
-        let new_height = parent.height + 1;
-
-        let stored = StoredBlock::new(btc_header, new_height, new_chain_work);
-        connect_block(ctx, &stored, &parent, use_v2, rskip199);
+        // `btcBlockChain.add`, which takes a header already stored as it is.
+        if get_stored_block(ctx, &btc_header.block_hash()).is_none() {
+            add(
+                ctx,
+                &btc_header,
+                &parent,
+                config.btc_network,
+                use_v2,
+                rskip199,
+            );
+        }
     }
 
     // rskj `receiveHeaders` is a VOID method (BridgeMethods.RECEIVE_HEADERS
@@ -981,12 +1010,12 @@ mod tests {
         let get_prev = |h: &BlockHash| store.get(h).cloned();
 
         // Split point is the fork ancestor `a`.
-        let split = find_split(&n4, &o3, get_prev);
+        let split = find_split(&n4, &o3, get_prev).unwrap();
         assert_eq!(split.header.block_hash(), a.header.block_hash());
         assert_eq!(split.height, 101);
 
         // New branch above the split, head-first: [n4, n3, n2].
-        let partial = get_partial_chain(&n4, &split, get_prev);
+        let partial = get_partial_chain(&n4, &split, get_prev).unwrap();
         let hashes: Vec<_> = partial.iter().map(|b| b.header.block_hash()).collect();
         assert_eq!(
             hashes,
@@ -1010,12 +1039,26 @@ mod tests {
         let store = store_of(&[a.clone(), b.clone()]);
         let get_prev = |h: &BlockHash| store.get(h).cloned();
 
-        let split = find_split(&b, &a, get_prev);
+        let split = find_split(&b, &a, get_prev).unwrap();
         assert_eq!(split.header.block_hash(), a.header.block_hash());
 
-        let partial = get_partial_chain(&b, &a, get_prev);
+        let partial = get_partial_chain(&b, &a, get_prev).unwrap();
         assert_eq!(partial.len(), 1);
         assert_eq!(partial[0].header.block_hash(), b.header.block_hash());
+    }
+
+    /// bitcoinj's `findSplit` throws where either walk runs out of stored
+    /// blocks; rustock's panicked.
+    #[test]
+    fn find_split_fails_where_a_walk_runs_out() {
+        let a = link(BlockHash::all_zeros(), 1, 101, 110);
+        let b = link(a.header.block_hash(), 2, 102, 120);
+        // Its parent isn't stored.
+        let stray = link(BlockHash::all_zeros(), 3, 5, 10);
+        let store = store_of(&[a.clone(), b.clone(), stray.clone()]);
+        let get_prev = |h: &BlockHash| store.get(h).cloned();
+        assert!(find_split(&stray, &b, get_prev).is_none());
+        assert!(find_split(&b, &stray, get_prev).is_none());
     }
 
     /// The inlined mainnet checkpoint must decode to the bitcoinj checkpoint
@@ -1372,5 +1415,277 @@ mod tests {
         );
         assert_eq!(seeded(2, false), (None, None), "a contract's call");
         assert_eq!(seeded(2, true), (Some(genesis), indexed));
+    }
+
+    /// A writable context at `block_number`, in a block whose time is well
+    /// past any `receiveHeader` interval.
+    fn ctx_at(block_number: u64) -> impl crate::RskContextTr {
+        use revm::MainContext;
+        let block = revm::context::BlockEnv {
+            number: U256::from(block_number),
+            timestamp: U256::from(1_700_000_000_u64),
+            ..revm::context::BlockEnv::default()
+        };
+        revm::Context::mainnet()
+            .with_block(block)
+            .with_chain(crate::raw_storage::RskChainExt::default())
+    }
+
+    fn regtest_genesis() -> BlockHash {
+        bitcoin::constants::genesis_block(bitcoin::Network::Regtest)
+            .header
+            .block_hash()
+    }
+
+    /// A regtest header on `prev`, mined: at regtest's target about every
+    /// other nonce does.
+    fn mine_regtest(prev: BlockHash, seed: u8) -> BtcHeader {
+        (0..)
+            .map(|nonce| BtcHeader {
+                version: Version::from_consensus(1),
+                prev_blockhash: prev,
+                merkle_root: TxMerkleNode::from_byte_array([seed; 32]),
+                time: 1_700_000_000,
+                bits: CompactTarget::from_consensus(0x207f_ffff),
+                nonce,
+            })
+            .find(|header| verify_header(header, BtcNetwork::Regtest))
+            .unwrap()
+    }
+
+    /// `length` regtest headers from the genesis block, each on the one
+    /// before.
+    fn regtest_chain(length: usize) -> Vec<BtcHeader> {
+        let mut prev = regtest_genesis();
+        (0..length)
+            .map(|_| {
+                let header = mine_regtest(prev, 0x11);
+                prev = header.block_hash();
+                header
+            })
+            .collect()
+    }
+
+    fn send_headers<CTX: crate::RskContextTr>(
+        ctx: &mut CTX,
+        headers: &[BtcHeader],
+        config: &BridgeConstants,
+        cfg: &RskHardforkConfig,
+    ) {
+        use crate::abi::encode::{self, Arg};
+        let encoded: Vec<Vec<u8>> = headers.iter().map(serialize).collect();
+        let slices: Vec<&[u8]> = encoded.iter().map(Vec::as_slice).collect();
+        let args = encode::args(&[Arg::BytesArray(&slices)]);
+        receive_headers(ctx, &args, 0, config, true, cfg).unwrap();
+    }
+
+    /// `receiveHeader`'s answer to `header`.
+    fn send_header<CTX: crate::RskContextTr>(
+        ctx: &mut CTX,
+        header: &BtcHeader,
+        config: &BridgeConstants,
+        cfg: &RskHardforkConfig,
+    ) -> Vec<u8> {
+        use crate::abi::encode::{self, Arg};
+        let args = encode::args(&[Arg::Bytes(&serialize(header))]);
+        receive_header(ctx, &args, 0, config, true, cfg)
+            .unwrap()
+            .bytes
+            .to_vec()
+    }
+
+    fn answer(code: i64) -> Vec<u8> {
+        encode_int_result(0, code).bytes.to_vec()
+    }
+
+    /// rskj's `receiveHeaders` takes every header it's given: rustock stopped
+    /// at 500.
+    #[test]
+    fn receive_headers_takes_every_header_it_is_given() {
+        let (config, cfg) = (BridgeConstants::regtest(), RskHardforkConfig::regtest());
+        let mut ctx = ctx_at(0);
+        send_headers(&mut ctx, &regtest_chain(501), &config, &cfg);
+        assert_eq!(load_chain_head(&mut ctx).map(|head| head.height), Some(501));
+    }
+
+    /// rskj's `receiveHeader` takes a header 25 below the head
+    /// (`maxDepthBlockchainAccepted`) and refuses one 26 below: rustock took
+    /// them down to 4,320.
+    #[test]
+    fn receive_header_takes_a_header_25_below_the_head_but_not_26() {
+        let (config, cfg) = (BridgeConstants::regtest(), RskHardforkConfig::regtest());
+        let chain = regtest_chain(27);
+        // The head is at 27. A header on block 1 is at 2, 25 below it; one on
+        // the genesis block is 26 below.
+        for (prev, code) in [
+            (chain[0].block_hash(), SUCCESS),
+            (regtest_genesis(), ERR_BLOCK_TOO_OLD),
+        ] {
+            let mut ctx = ctx_at(0);
+            send_headers(&mut ctx, &chain, &config, &cfg);
+            let fork = mine_regtest(prev, 0xf0);
+            assert_eq!(send_header(&mut ctx, &fork, &config, &cfg), answer(code));
+        }
+    }
+
+    /// rskj's `receiveHeader` answers UNEXPECTED_EXCEPTION for a header
+    /// bitcoinj's `add` throws on: one whose hash is above its target
+    /// (`verifyHeader`), or one whose hash is under its target but whose target
+    /// isn't the one its parent's chain calls for
+    /// (`checkDifficultyTransitions`). rustock checked the hash alone, so
+    /// anyone could add a header at a target of their choice through the
+    /// public `receiveHeader`, where rskj refuses it.
+    #[test]
+    fn receive_header_refuses_a_header_bitcoinj_cant_add() {
+        let (config, cfg) = (BridgeConstants::regtest(), RskHardforkConfig::regtest());
+        let on_target = mine_regtest(regtest_genesis(), 0x11);
+        let above_target = (0..)
+            .map(|nonce| BtcHeader { nonce, ..on_target })
+            .find(|header| !verify_header(header, BtcNetwork::Regtest))
+            .unwrap();
+        let easier = (0..)
+            .map(|nonce| BtcHeader {
+                bits: CompactTarget::from_consensus(0x2100_ffff),
+                nonce,
+                ..on_target
+            })
+            .find(|header| verify_header(header, BtcNetwork::Regtest))
+            .unwrap();
+        for refused in [above_target, easier] {
+            let mut ctx = ctx_at(0);
+            assert_eq!(
+                send_header(&mut ctx, &refused, &config, &cfg),
+                answer(ERR_UNEXPECTED_EXCEPTION)
+            );
+            assert!(get_stored_block(&mut ctx, &refused.block_hash()).is_none());
+        }
+        let mut ctx = ctx_at(0);
+        assert_eq!(
+            send_header(&mut ctx, &on_target, &config, &cfg),
+            answer(SUCCESS)
+        );
+    }
+
+    /// rskj's `receiveHeaders` looks a header's parent up first, and stops at
+    /// the first header whose height would be past `cannotProcessNextBlock`'s
+    /// limit, even one already stored, taking none after it; from RSKIP434 it
+    /// goes on. Real mainnet headers 849,134 and 849,135, after a header
+    /// stored on 849,137.
+    #[test]
+    fn receive_headers_stops_at_a_header_past_the_chain_work_limit_even_one_stored() {
+        let config = BridgeConstants::mainnet();
+        let limit = config.block_with_too_much_chain_work_height;
+        let real = |hex: &str| {
+            deserialize::<BtcHeader>(&alloy_primitives::hex::decode(hex).unwrap()).unwrap()
+        };
+        let h849134 = real("0080b92c24f123130ae29e899f0cab72653722e54cdf3b30445202000000000000000000c72ead65a3b78ab637d1876c00414a77e47bcc5b52667ac1e573633563bea5a695aa7766255d031728d182a8");
+        let h849135 = real("00004020bf67910b5d3996ee594848b482ee84d0e28c97a9a2d601000000000000000000865e218552bb92df36c962f5163e84a6c2542584fb36be2fa8b2a4246c73a701f1ae7766255d031791836b22");
+        let h849137 = real("00e00820925b77c9ff4d0036aa29f3238cde12e9af9d55c34ed30200000000000000000032a9fa3e12ef87a2327b55db6a16a1227bb381db8b269d90aa3a6e38cf39665f91b47766255d0317c1b1575f");
+        let past_the_limit = BtcHeader {
+            prev_blockhash: h849137.block_hash(),
+            ..h849135
+        };
+        let takes_849135 = |block_number: u64| {
+            let mut ctx = ctx_at(block_number);
+            let head = StoredBlock::new(h849134, 849_134, U256::from(1));
+            put_stored_block(&mut ctx, &head, true);
+            store_chain_head(&mut ctx, &head, true);
+            for (header, height) in [(h849137, limit - 1), (past_the_limit, limit)] {
+                put_stored_block(
+                    &mut ctx,
+                    &StoredBlock::new(header, height, U256::from(1)),
+                    true,
+                );
+            }
+            let cfg = RskHardforkConfig::mainnet();
+            send_headers(&mut ctx, &[past_the_limit, h849135], &config, &cfg);
+            get_stored_block(&mut ctx, &h849135.block_hash()).is_some()
+        };
+        assert!(!takes_849135(0), "before RSKIP434");
+        assert!(takes_849135(7_000_000), "from RSKIP434");
+    }
+
+    /// bitcoinj's `connectBlock` walks a fork back to the head's chain
+    /// (`findSplit`) before it stores it, and throws where the walk runs out of
+    /// stored blocks. Mainnet's store holds the genesis block and the chain from
+    /// the checkpoint, so Bitcoin's block 1, on the genesis block, is refused,
+    /// where rustock stored it. On regtest, whose chain is whole from the
+    /// genesis block, a fork is stored, and becomes the head only with more
+    /// work than the head, when every height on its branch is indexed to it.
+    #[test]
+    fn a_fork_that_cant_be_walked_back_to_the_heads_chain_is_refused() {
+        let block_1: BtcHeader = deserialize(
+            &alloy_primitives::hex::decode(
+                "010000006fe28c0ab6f1b372c1a6a246ae63f74f931e8365e15a089c68d6190000000000\
+                 982051fd1e4ba744bbbe680e1fee14677ba1a3c3540bf7b1cdb606e857233e0e\
+                 61bc6649ffff001d01e36299",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            block_1.block_hash().to_string(),
+            "00000000839a8e6886ab5951d76f411475428afc90947ee320161bbf18eb6048"
+        );
+        let (config, cfg) = (BridgeConstants::mainnet(), RskHardforkConfig::mainnet());
+        let mut ctx = ctx_at(0);
+        send_headers(&mut ctx, &[block_1], &config, &cfg);
+        assert!(get_stored_block(&mut ctx, &block_1.block_hash()).is_none());
+
+        let (config, cfg) = (BridgeConstants::regtest(), RskHardforkConfig::regtest());
+        let chain = regtest_chain(1);
+        let fork = mine_regtest(regtest_genesis(), 0xf1);
+        let past = mine_regtest(fork.block_hash(), 0xf2);
+        let mut ctx = ctx_at(0);
+        let head = |ctx: &mut _| load_chain_head(ctx).map(|head| head.header);
+        send_headers(&mut ctx, &[chain[0], fork], &config, &cfg);
+        assert!(get_stored_block(&mut ctx, &fork.block_hash()).is_some());
+        assert_eq!(head(&mut ctx), Some(chain[0]), "a tie keeps the head");
+        send_headers(&mut ctx, &[past], &config, &cfg);
+        assert_eq!(head(&mut ctx), Some(past));
+        for (height, block) in [(1, fork), (2, past)] {
+            assert_eq!(
+                crate::bridge::storage::bridge_load_btc_block_hash_by_height(&mut ctx, height),
+                Some(bitcoin_hash_to_b256(&block.block_hash()))
+            );
+        }
+    }
+
+    /// Before RSKIP124 up to five bytes may follow a header, which rskj's
+    /// `makeBlock` parses as the block's transactions: a count of 0 parses, in
+    /// any of `VarInt`'s widths, and anything else refuses the whole call.
+    #[test]
+    fn before_rskip124_what_follows_a_header_must_count_no_transactions() {
+        let cases: [(&[u8], bool); 11] = [
+            (&[], true),
+            (&[0], true),
+            (&[0, 0xab], true),
+            (&[0xfd, 0, 0], true),
+            (&[0xfe, 0, 0, 0, 0], true),
+            (&[1], false),
+            (&[0xfc], false),
+            (&[0xfd, 0], false),
+            (&[0xfd, 1, 0], false),
+            (&[0xfe, 0, 0, 0, 0x80], false),
+            (&[0xff, 0, 0, 0, 0], false),
+        ];
+        for (rest, parses) in cases {
+            assert_eq!(no_transactions_follow(rest), parses, "{rest:02x?}");
+        }
+
+        use crate::abi::encode::{self, Arg};
+        // Mainnet's ladder has RSKIP124 from wasabi100.
+        let (config, cfg) = (BridgeConstants::regtest(), RskHardforkConfig::mainnet());
+        let header = mine_regtest(regtest_genesis(), 0x11);
+        let takes = |rest: &[u8]| {
+            let mut bytes = serialize(&header);
+            bytes.extend_from_slice(rest);
+            let args = encode::args(&[Arg::BytesArray(&[&bytes])]);
+            let mut ctx = ctx_at(0);
+            receive_headers(&mut ctx, &args, 0, &config, false, &cfg).is_ok()
+                && get_stored_block(&mut ctx, &header.block_hash()).is_some()
+        };
+        assert!(takes(&[0]));
+        assert!(!takes(&[1]));
     }
 }

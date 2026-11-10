@@ -5710,7 +5710,12 @@ mod tests {
         let mine = |prev: BlockHash, merkle_seed: u8| -> bitcoin::block::Header {
             (0u32..10_000)
                 .map(|nonce| hdr(prev, merkle_seed, nonce))
-                .find(crate::bridge::btc_store::check_proof_of_work)
+                .find(|header| {
+                    crate::bridge::btc_rules::verify_header(
+                        header,
+                        crate::bridge::constants::BtcNetwork::Regtest,
+                    )
+                })
                 .expect("regtest PoW is trivial")
         };
 
@@ -5942,7 +5947,12 @@ mod tests {
                 bits: CompactTarget::from_consensus(0x207f_ffff),
                 nonce,
             })
-            .find(crate::bridge::btc_store::check_proof_of_work)
+            .find(|header| {
+                crate::bridge::btc_rules::verify_header(
+                    header,
+                    crate::bridge::constants::BtcNetwork::Regtest,
+                )
+            })
             .expect("regtest PoW is trivial");
         let block_hash = crate::bridge::btc_chain::bitcoin_hash_to_b256(&header.block_hash()).0;
 

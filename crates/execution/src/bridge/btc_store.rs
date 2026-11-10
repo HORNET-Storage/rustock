@@ -326,20 +326,7 @@ pub fn compact_target_to_u256(bits: CompactTarget) -> U256 {
     }
 }
 
-/// Check if a block hash meets the proof-of-work target.
-/// The hash (interpreted as a LE U256) must be ≤ target.
-pub fn check_proof_of_work(header: &BtcHeader) -> bool {
-    let target = compact_target_to_u256(header.bits);
-    let hash = header.block_hash();
-    let raw = hash.to_raw_hash();
-    let hash_bytes: &[u8; 32] = raw.as_byte_array();
-    // bitcoin crate stores hashes in "internal byte order" (raw SHA256 output).
-    // For PoW, these bytes are interpreted as a little-endian 256-bit number
-    // (matching Bitcoin Core's UintToArith256). Valid blocks have trailing
-    // zero bytes in internal order (leading zeros in display order).
-    let hash_u256 = U256::from_le_bytes(*hash_bytes);
-    hash_u256 <= target
-}
+
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -351,6 +338,9 @@ mod tests {
     use bitcoin::block::Version;
     use bitcoin::hashes::Hash;
     use bitcoin::{CompactTarget, TxMerkleNode};
+
+    use crate::bridge::btc_rules::verify_header;
+    use crate::bridge::constants::BtcNetwork;
 
     fn test_header(version: i32, nonce: u32) -> BtcHeader {
         BtcHeader {
@@ -539,7 +529,10 @@ mod tests {
     #[test]
     fn rskj_mainnet_849137_passes_pow() {
         let header = parse_mainnet_header();
-        assert!(check_proof_of_work(&header), "mainnet block 849137 should pass PoW");
+        assert!(
+            verify_header(&header, BtcNetwork::Mainnet),
+            "mainnet block 849137 should pass PoW"
+        );
     }
 
     /// Verify compute_work produces a non-zero result for mainnet difficulty.
@@ -573,7 +566,10 @@ mod tests {
             let bytes = hex_to_bytes(hdr_hex);
             assert_eq!(bytes.len(), 80, "header {i} wrong size");
             let hdr: BtcHeader = deserialize(&bytes).expect("header {i} deserialize");
-            assert!(check_proof_of_work(&hdr), "mainnet block at index {i} should pass PoW");
+            assert!(
+                verify_header(&hdr, BtcNetwork::Mainnet),
+                "mainnet block at index {i} should pass PoW"
+            );
         }
     }
 

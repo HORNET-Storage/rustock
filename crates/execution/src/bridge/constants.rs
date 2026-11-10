@@ -18,11 +18,10 @@ pub struct BridgeConstants {
 
     // -- Header relay --
 
-    /// Maximum BTC headers accepted in a single `receiveHeaders` call.
-    pub max_btc_headers_per_rsk_block: u32,
     /// Minimum seconds between `receiveHeader` calls (rate limiting).
     pub min_seconds_between_calls_receive_header: u64,
-    /// Maximum depth for BTC blockchain queries.
+    /// rskj `maxDepthBlockchainAccepted`: how far below the BTC chain's head
+    /// `receiveHeader` takes a header, 25 on every network.
     pub max_depth_blockchain_accepted: u32,
 
     // -- Peg-in / peg-out limits --
@@ -165,9 +164,8 @@ impl BridgeConstants {
             btc_network: BtcNetwork::Mainnet,
             btc2rsk_minimum_acceptable_confirmations: 100,
             rsk2btc_minimum_acceptable_confirmations: 4000,
-            max_btc_headers_per_rsk_block: 500,
             min_seconds_between_calls_receive_header: 300,
-            max_depth_blockchain_accepted: 4320,
+            max_depth_blockchain_accepted: 25,
             legacy_minimum_pegin_tx_value: 1_000_000, // 0.01 BTC
             minimum_pegin_tx_value: 500_000,           // 0.005 BTC
             legacy_minimum_pegout_tx_value: 800_000,   // 0.008 BTC
@@ -271,9 +269,8 @@ impl BridgeConstants {
             btc_network: BtcNetwork::Testnet,
             btc2rsk_minimum_acceptable_confirmations: 10,
             rsk2btc_minimum_acceptable_confirmations: 10,
-            max_btc_headers_per_rsk_block: 500,
             min_seconds_between_calls_receive_header: 300,
-            max_depth_blockchain_accepted: 4320,
+            max_depth_blockchain_accepted: 25,
             legacy_minimum_pegin_tx_value: 1_000_000,
             minimum_pegin_tx_value: 500_000,
             legacy_minimum_pegout_tx_value: 500_000,
@@ -381,9 +378,8 @@ impl BridgeConstants {
             btc_network: BtcNetwork::Regtest,
             btc2rsk_minimum_acceptable_confirmations: 1,
             rsk2btc_minimum_acceptable_confirmations: 10,
-            max_btc_headers_per_rsk_block: 500,
             min_seconds_between_calls_receive_header: 0,
-            max_depth_blockchain_accepted: 4320,
+            max_depth_blockchain_accepted: 25,
             legacy_minimum_pegin_tx_value: 1_000_000,
             minimum_pegin_tx_value: 500_000,
             legacy_minimum_pegout_tx_value: 500_000,
@@ -507,5 +503,17 @@ mod tests {
         assert_eq!(BridgeConstants::mainnet().legacy_minimum_pegout_tx_value, 800_000);
         assert_eq!(BridgeConstants::testnet().legacy_minimum_pegout_tx_value, 500_000);
         assert_eq!(BridgeConstants::regtest().legacy_minimum_pegout_tx_value, 500_000);
+    }
+
+    /// rskj's `maxDepthBlockchainAccepted` is 25 on every network.
+    #[test]
+    fn rskj_max_depth_blockchain_accepted() {
+        for c in [
+            BridgeConstants::mainnet(),
+            BridgeConstants::testnet(),
+            BridgeConstants::regtest(),
+        ] {
+            assert_eq!(c.max_depth_blockchain_accepted, 25);
+        }
     }
 }
