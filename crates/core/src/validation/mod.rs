@@ -123,7 +123,9 @@ pub enum ValidationError {
     #[error("Fork detection data could not be read from the coinbase")]
     ForkDetectionDataUnreadable,
 
-    #[error("The uncle counts of the 32 blocks below sum to {sum} as a Java int, which rskj refuses")]
+    #[error(
+        "The uncle counts of the 32 blocks below sum to {sum} as a Java int, which rskj refuses"
+    )]
     UncleCountsSumBelowZero { sum: i32 },
 
     #[error("Invalid transaction execution sublist edges: {reason}")]

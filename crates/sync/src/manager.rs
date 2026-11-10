@@ -180,7 +180,8 @@ impl SyncManager {
         let Some(uncles) = crate::total_difficulty::held_uncles(&self.store, hash, header) else {
             return header.difficulty;
         };
-        match crate::total_difficulty::credited_uncles(&self.store, &self.verifier, header, &uncles) {
+        match crate::total_difficulty::credited_uncles(&self.store, &self.verifier, header, &uncles)
+        {
             Ok(credited) => header.difficulty.saturating_add(credited),
             Err(why) => {
                 debug!(
@@ -214,7 +215,12 @@ impl SyncManager {
     /// Settle one block's total difficulty from the uncles its body names.
     /// `false` when it cannot be settled: its parent has no total, or the
     /// store failed.
-    pub(crate) fn settle_total_difficulty(&self, hash: B256, header: &Header, uncles: &[Header]) -> bool {
+    pub(crate) fn settle_total_difficulty(
+        &self,
+        hash: B256,
+        header: &Header,
+        uncles: &[Header],
+    ) -> bool {
         match crate::total_difficulty::settle(&self.store, &self.verifier, hash, header, uncles) {
             Ok(settled) => settled.is_some(),
             Err(e) => {

@@ -188,7 +188,9 @@ fn block_rules_accept_every_sampled_mainnet_block() {
 #[test]
 #[ignore = "requires a synced block store (RUSTOCK_BLOCKS_DB)"]
 fn uncle_rules_accept_real_uncle_bearing_blocks() {
-    use rustock_core::validation::{fork_detection::REQUIRED_BLOCKS, uncles::UNCLE_GENERATION_LIMIT};
+    use rustock_core::validation::{
+        fork_detection::REQUIRED_BLOCKS, uncles::UNCLE_GENERATION_LIMIT,
+    };
 
     let Some(path) = db_path() else {
         eprintln!("RUSTOCK_BLOCKS_DB not set; skipping");

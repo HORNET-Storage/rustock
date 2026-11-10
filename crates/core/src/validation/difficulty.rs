@@ -230,12 +230,13 @@ mod rskip97_tests {
     /// and its difficulty falls.
     #[test]
     fn the_expected_time_wraps_as_a_java_int() {
-        let rule = DifficultyRule { config: Arc::new(ChainConfig::mainnet()) };
+        let rule = DifficultyRule {
+            config: Arc::new(ChainConfig::mainnet()),
+        };
         let parent = header_at(5_000_000, 1_000_000, U256::from(10u128.pow(21)));
         let step = parent.difficulty / U256::from(400);
-        let child = |uncles: u64| {
-            rule.difficulty_for_child(&parent, 5_000_001, 1_000_000 + 10, uncles)
-        };
+        let child =
+            |uncles: u64| rule.difficulty_for_child(&parent, 5_000_001, 1_000_000 + 10, uncles);
 
         // (1 + 1) * 14: 28 seconds expected, and 10 is sooner.
         assert_eq!(child(1), parent.difficulty + step);

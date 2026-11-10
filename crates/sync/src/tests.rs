@@ -4323,15 +4323,23 @@ async fn test_reorg_via_headers_response_higher_td() {
     let a2 = dummy_header(2, a1.hash(), U256::from(10));
     store.put_header(&a1).unwrap();
     store.put_canonical_hash(1, a1.hash()).unwrap();
-    store.put_total_difficulty(a1.hash(), U256::from(20)).unwrap();
+    store
+        .put_total_difficulty(a1.hash(), U256::from(20))
+        .unwrap();
     store.put_header(&a2).unwrap();
     store.put_canonical_hash(2, a2.hash()).unwrap();
-    store.put_total_difficulty(a2.hash(), U256::from(30)).unwrap();
+    store
+        .put_total_difficulty(a2.hash(), U256::from(30))
+        .unwrap();
     store.update_head(&a2, U256::from(30)).unwrap();
 
     let verifier = Arc::new(HeaderVerifier::new());
     let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
-    let manager = Arc::new(SyncManager::new(store.clone(), verifier, peer_store.clone()));
+    let manager = Arc::new(SyncManager::new(
+        store.clone(),
+        verifier,
+        peer_store.clone(),
+    ));
 
     let (_event_tx, event_rx) = mpsc::unbounded_channel();
     let mut service = SyncService::new(manager, peer_store, event_rx);
@@ -4343,7 +4351,9 @@ async fn test_reorg_via_headers_response_higher_td() {
 
     // Receive fork headers (descending order, like real peers send)
     let peer = B512::repeat_byte(0x01);
-    service.on_headers_response(peer, vec![b2.clone(), b1.clone()]).await;
+    service
+        .on_headers_response(peer, vec![b2.clone(), b1.clone()])
+        .await;
 
     // Fork B has TD = 10 + 20 + 20 = 50 vs chain A's TD = 30
     // Head should switch to fork B
@@ -4366,15 +4376,23 @@ async fn test_no_reorg_via_headers_response_lower_td() {
     let a2 = dummy_header(2, a1.hash(), U256::from(20));
     store.put_header(&a1).unwrap();
     store.put_canonical_hash(1, a1.hash()).unwrap();
-    store.put_total_difficulty(a1.hash(), U256::from(30)).unwrap();
+    store
+        .put_total_difficulty(a1.hash(), U256::from(30))
+        .unwrap();
     store.put_header(&a2).unwrap();
     store.put_canonical_hash(2, a2.hash()).unwrap();
-    store.put_total_difficulty(a2.hash(), U256::from(50)).unwrap();
+    store
+        .put_total_difficulty(a2.hash(), U256::from(50))
+        .unwrap();
     store.update_head(&a2, U256::from(50)).unwrap();
 
     let verifier = Arc::new(HeaderVerifier::new());
     let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
-    let manager = Arc::new(SyncManager::new(store.clone(), verifier, peer_store.clone()));
+    let manager = Arc::new(SyncManager::new(
+        store.clone(),
+        verifier,
+        peer_store.clone(),
+    ));
 
     let (_event_tx, event_rx) = mpsc::unbounded_channel();
     let mut service = SyncService::new(manager, peer_store, event_rx);
@@ -4385,7 +4403,9 @@ async fn test_no_reorg_via_headers_response_lower_td() {
     let b2 = fork_header(2, b1.hash(), U256::from(5), 0xBB);
 
     let peer = B512::repeat_byte(0x01);
-    service.on_headers_response(peer, vec![b2.clone(), b1.clone()]).await;
+    service
+        .on_headers_response(peer, vec![b2.clone(), b1.clone()])
+        .await;
 
     // Fork B has TD = 10 + 5 + 5 = 20 vs chain A's TD = 50
     // Head should NOT change
@@ -4402,10 +4422,10 @@ async fn test_no_reorg_via_headers_response_lower_td() {
 
 #[tokio::test]
 async fn test_sync_handler_serves_body_request() {
-    use rustock_networking::protocol::{P2pMessage, RskMessage, RskSubMessage};
-    use rustock_networking::protocol::P2pHandler;
-    use rustock_networking::protocol::rsk::BodyRequest;
     use rustock_core::Transaction;
+    use rustock_networking::protocol::rsk::BodyRequest;
+    use rustock_networking::protocol::P2pHandler;
+    use rustock_networking::protocol::{P2pMessage, RskMessage, RskSubMessage};
 
     let dir = tempdir().unwrap();
     let store = Arc::new(BlockStore::open(dir.path()).unwrap());
@@ -6185,7 +6205,9 @@ async fn test_follow_mode_re_requests_bodies_it_is_missing() {
     }
 
     // Executed up to #1; #2..#5 are canonical, header-only, no body.
-    store.set_exec_head(headers[0].hash(), headers[0].state_root).unwrap();
+    store
+        .set_exec_head(headers[0].hash(), headers[0].state_root)
+        .unwrap();
 
     let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
     let peer = B512::repeat_byte(0x01);
@@ -6193,7 +6215,11 @@ async fn test_follow_mode_re_requests_bodies_it_is_missing() {
     peer_store.add_peer(peer, tx).await;
 
     let verifier = Arc::new(HeaderVerifier::new());
-    let manager = Arc::new(SyncManager::new(store.clone(), verifier, peer_store.clone()));
+    let manager = Arc::new(SyncManager::new(
+        store.clone(),
+        verifier,
+        peer_store.clone(),
+    ));
     let (_event_tx, event_rx) = mpsc::unbounded_channel();
     let mut service = SyncService::new(manager, peer_store, event_rx);
     service.state = SyncState::Following;
@@ -6564,7 +6590,11 @@ async fn a_retreat_after_a_failed_snapshot_sync_leaves_it_free_to_try_again() {
         store.update_head(&h, U256::from(n)).unwrap();
         parent = h.hash();
     }
-    assert_eq!(store.exec_head().unwrap(), None, "precondition: nothing executed");
+    assert_eq!(
+        store.exec_head().unwrap(),
+        None,
+        "precondition: nothing executed"
+    );
 
     let trie = Arc::new(rustock_trie::MemoryTrieStore::new()) as Arc<dyn rustock_trie::TrieStore>;
     let mut service = service_over(store.clone()).with_trie_store_for_test(trie);
@@ -6572,7 +6602,10 @@ async fn a_retreat_after_a_failed_snapshot_sync_leaves_it_free_to_try_again() {
     // The watchdog's first escalation.
     service.reverify_head_lineage(1);
 
-    let head = store.header(store.head().unwrap().unwrap()).unwrap().unwrap();
+    let head = store
+        .header(store.head().unwrap().unwrap())
+        .unwrap()
+        .unwrap();
     assert_eq!(head.number, 1_009, "precondition: the retreat happened");
     assert_eq!(
         store.exec_head().unwrap(),
@@ -6582,7 +6615,10 @@ async fn a_retreat_after_a_failed_snapshot_sync_leaves_it_free_to_try_again() {
 
     // And the node can still do the one thing that gets it going: try the
     // snapshot again.
-    service.start_snap_sync(crate::snap::SnapConfig::default(), Arc::new(HeaderVerifier::new()));
+    service.start_snap_sync(
+        crate::snap::SnapConfig::default(),
+        Arc::new(HeaderVerifier::new()),
+    );
     assert!(
         service.snap_phase().is_some(),
         "snapshot sync declined to start on a node that has executed nothing"
@@ -6596,7 +6632,12 @@ async fn a_retreat_after_a_failed_snapshot_sync_leaves_it_free_to_try_again() {
 fn chain_with_an_unverified_state(
     len: u64,
     checkpoint: u64,
-) -> (Arc<BlockStore>, tempfile::TempDir, Vec<Header>, Arc<dyn rustock_trie::TrieStore>) {
+) -> (
+    Arc<BlockStore>,
+    tempfile::TempDir,
+    Vec<Header>,
+    Arc<dyn rustock_trie::TrieStore>,
+) {
     let dir = tempdir().unwrap();
     let store = Arc::new(BlockStore::open(dir.path()).unwrap());
     let unverified = B256::repeat_byte(0x77);
@@ -6604,7 +6645,11 @@ fn chain_with_an_unverified_state(
     let mut parent = B256::ZERO;
     for n in 0..=len {
         let mut h = dummy_header(n, parent, U256::from(1));
-        h.state_root = if n == checkpoint { unverified } else { B256::repeat_byte(0x5a) };
+        h.state_root = if n == checkpoint {
+            unverified
+        } else {
+            B256::repeat_byte(0x5a)
+        };
         store.update_head(&h, U256::from(n + 1)).unwrap();
         parent = h.hash();
         headers.push(h);
@@ -6612,7 +6657,11 @@ fn chain_with_an_unverified_state(
     let trie = Arc::new(rustock_trie::MemoryTrieStore::new()) as Arc<dyn rustock_trie::TrieStore>;
     let root = rustock_trie::TrieNode::empty();
     trie.put(unverified.as_slice(), &root.to_message(trie.as_ref()));
-    assert_eq!(store.exec_head().unwrap(), None, "precondition: nothing executed");
+    assert_eq!(
+        store.exec_head().unwrap(),
+        None,
+        "precondition: nothing executed"
+    );
     (store, dir, headers, trie)
 }
 
@@ -6629,7 +6678,11 @@ async fn a_retreat_does_not_take_up_a_state_that_failed_its_check() {
 
     service.reverify_head_lineage(1);
 
-    assert_eq!(store.head().unwrap(), Some(headers[9].hash()), "precondition: the retreat happened");
+    assert_eq!(
+        store.head().unwrap(),
+        Some(headers[9].hash()),
+        "precondition: the retreat happened"
+    );
     assert_eq!(
         store.exec_head().unwrap(),
         None,
@@ -6657,7 +6710,10 @@ async fn with_nothing_executed_a_head_off_the_chain_is_reseated_not_rolled_back(
 
     let mut service = service_over(store.clone()).with_trie_store_for_test(trie);
     service.verify_coherence();
-    age_violation(&mut service, EXECUTION_OFF_CHAIN_GRACE + Duration::from_secs(1));
+    age_violation(
+        &mut service,
+        EXECUTION_OFF_CHAIN_GRACE + Duration::from_secs(1),
+    );
     service.verify_coherence();
 
     assert_eq!(
@@ -6670,7 +6726,10 @@ async fn with_nothing_executed_a_head_off_the_chain_is_reseated_not_rolled_back(
         Some(headers[10].hash()),
         "the head should be back on the canonical chain"
     );
-    assert_eq!(crate::invariant::check(&store, None, crate::Scope::Full), Ok(()));
+    assert_eq!(
+        crate::invariant::check(&store, None, crate::Scope::Full),
+        Ok(())
+    );
 }
 
 // ── snapshot sync owns the peer set while it runs (#185) ─────────────────────
@@ -6757,27 +6816,37 @@ fn snapshot_syncing_node() -> (SyncService, Arc<BlockStore>, tempfile::TempDir) 
     let store = Arc::new(BlockStore::open(dir.path()).unwrap());
     let genesis = dummy_header(0, B256::ZERO, U256::from(1));
     store.update_head(&genesis, U256::from(1)).unwrap();
-    let mut service = make_service(store.clone()).with_trie_store_for_test(Arc::new(
-        rustock_trie::MemoryTrieStore::new(),
-    ));
+    let mut service = make_service(store.clone())
+        .with_trie_store_for_test(Arc::new(rustock_trie::MemoryTrieStore::new()));
     service.start_snap_sync(
-        crate::snap::SnapConfig { client_enabled: true, ..Default::default() },
+        crate::snap::SnapConfig {
+            client_enabled: true,
+            ..Default::default()
+        },
         Arc::new(HeaderVerifier::new()),
     );
-    assert!(service.snap_phase().is_some(), "precondition: a session is running");
+    assert!(
+        service.snap_phase().is_some(),
+        "precondition: a session is running"
+    );
     (service, store, dir)
 }
 
 /// What failed every attempt on mainnet on 6 November 2026.
 fn state_not_whole() -> crate::snap::session::SnapFailure {
-    crate::snap::session::SnapFailure::IncompleteState("trie node 0x751b is not in the store".into())
+    crate::snap::session::SnapFailure::IncompleteState(
+        "trie node 0x751b is not in the store".into(),
+    )
 }
 
 /// Fail sessions until no further one opens, and say how many that took.
 async fn fail_until_spent(service: &mut SyncService) -> u32 {
     let mut failed = 0;
     while service.snap_phase().is_some() {
-        assert!(failed <= crate::service::MAX_SNAP_ATTEMPTS, "sessions kept opening");
+        assert!(
+            failed <= crate::service::MAX_SNAP_ATTEMPTS,
+            "sessions kept opening"
+        );
         service.fail_snap_session_for_test(state_not_whole()).await;
         failed += 1;
     }
@@ -6820,19 +6889,34 @@ async fn a_node_that_executed_nothing_tries_snapshot_sync_again_rather_than_halt
     );
     let (at, next_wait) = service.snap_retry_for_test();
     assert!(at.is_some(), "no further try was set");
-    assert_eq!(next_wait, SNAP_RETRY_FIRST * 2, "the wait after this one doubles");
+    assert_eq!(
+        next_wait,
+        SNAP_RETRY_FIRST * 2,
+        "the wait after this one doubles"
+    );
 
     // A tick before it is due changes nothing. In particular the guard for a
     // node suspended with no session must not take the wait for one.
     service.on_tick().await;
     assert_eq!(service.snap_phase(), None);
-    assert!(service.is_suspended_for_snap_for_test(), "the wait was taken for a lost session");
+    assert!(
+        service.is_suspended_for_snap_for_test(),
+        "the wait was taken for a lost session"
+    );
 
     // Once due, a session opens, and it is a single attempt.
     make_the_next_try_due(&mut service);
     service.on_tick().await;
-    assert_eq!(service.snap_phase(), Some(Phase::AwaitingStatus), "the try that was set did not happen");
-    assert_eq!(fail_until_spent(&mut service).await, 1, "a later round is one attempt");
+    assert_eq!(
+        service.snap_phase(),
+        Some(Phase::AwaitingStatus),
+        "the try that was set did not happen"
+    );
+    assert_eq!(
+        fail_until_spent(&mut service).await,
+        1,
+        "a later round is one attempt"
+    );
     let (at, next_wait) = service.snap_retry_for_test();
     assert!(at.is_some(), "no try was set after the second round");
     assert_eq!(next_wait, SNAP_RETRY_FIRST * 4);
@@ -6866,8 +6950,14 @@ async fn a_new_snapshot_try_asks_every_peer_again() {
     make_the_next_try_due(&mut service);
     service.on_tick().await;
 
-    assert!(service.snap_phase().is_some(), "precondition: the try happened");
-    assert!(service.snap_avoid_for_test().is_empty(), "a peer is still set aside");
+    assert!(
+        service.snap_phase().is_some(),
+        "precondition: the try happened"
+    );
+    assert!(
+        service.snap_avoid_for_test().is_empty(),
+        "a peer is still set aside"
+    );
 }
 
 /// A node that has executed something hands over to ordinary sync as before:
@@ -6880,10 +6970,19 @@ async fn a_node_that_has_executed_still_hands_over_to_ordinary_sync() {
     store.update_head(&one, U256::from(2)).unwrap();
     store.set_exec_head(one.hash(), one.state_root).unwrap();
 
-    assert_eq!(fail_until_spent(&mut service).await, crate::service::MAX_SNAP_ATTEMPTS);
+    assert_eq!(
+        fail_until_spent(&mut service).await,
+        crate::service::MAX_SNAP_ATTEMPTS
+    );
 
-    assert!(!service.is_suspended_for_snap_for_test(), "the peer set was not handed back");
-    assert!(service.snap_retry_for_test().0.is_none(), "a try was set for a node with a way forward");
+    assert!(
+        !service.is_suspended_for_snap_for_test(),
+        "the peer set was not handed back"
+    );
+    assert!(
+        service.snap_retry_for_test().0.is_none(),
+        "a try was set for a node with a way forward"
+    );
 }
 
 /// Execution recorded at genesis is execution of nothing, as `start_snap_sync`
@@ -6896,8 +6995,14 @@ async fn a_node_executed_only_to_genesis_tries_snapshot_sync_again_too() {
 
     fail_until_spent(&mut service).await;
 
-    assert!(service.is_suspended_for_snap_for_test(), "handed over with nothing to execute from");
-    assert!(service.snap_retry_for_test().0.is_some(), "no further try was set");
+    assert!(
+        service.is_suspended_for_snap_for_test(),
+        "handed over with nothing to execute from"
+    );
+    assert!(
+        service.snap_retry_for_test().0.is_some(),
+        "no further try was set"
+    );
 }
 
 // ── serving headers: the canonical fast path (#185) ──────────────────────────
@@ -8019,7 +8124,10 @@ async fn a_committed_uncle_without_proof_of_work_proves_nothing() {
     let verifiers = [
         (HeaderVerifier::new(), 1_020u64),
         (HeaderVerifier::new().with_uncle_rule(NoWorkAt999), 21),
-        (HeaderVerifier::new().with_uncle_parent_rule(OffItsParentAt999), 21),
+        (
+            HeaderVerifier::new().with_uncle_parent_rule(OffItsParentAt999),
+            21,
+        ),
     ];
     for (verifier, total) in verifiers {
         let dir = tempfile::tempdir().unwrap();
@@ -8039,7 +8147,11 @@ async fn a_committed_uncle_without_proof_of_work_proves_nothing() {
             let mut h = h.clone();
             h.uncle_count = us.len() as u64;
             h.ommers_hash = alloy_primitives::keccak256(
-                HeaderWithUncles { header: h.clone(), uncles: us.to_vec() }.encoded_uncles(),
+                HeaderWithUncles {
+                    header: h.clone(),
+                    uncles: us.to_vec(),
+                }
+                .encoded_uncles(),
             );
             h.cached_hash = None;
             h
@@ -8048,17 +8160,30 @@ async fn a_committed_uncle_without_proof_of_work_proves_nothing() {
         let mut uncle = dummy_header(1, genesis_hash, U256::from(999));
         uncle.gas_used = 1;
         uncle.cached_hash = None;
-        let b2 =
-            commit(&dummy_header(2, b1.hash(), U256::from(10)), std::slice::from_ref(&uncle));
+        let b2 = commit(
+            &dummy_header(2, b1.hash(), U256::from(10)),
+            std::slice::from_ref(&uncle),
+        );
         let hash = b2.hash();
-        let entry = HeaderWithUncles { header: b2, uncles: vec![uncle] };
-        assert!(entry.commitment_matches(), "the commitment is honest; the work is not");
+        let entry = HeaderWithUncles {
+            header: b2,
+            uncles: vec![uncle],
+        };
+        assert!(
+            entry.commitment_matches(),
+            "the commitment is honest; the work is not"
+        );
 
         let headers = manager.note_proven_difficulties(vec![
-            HeaderWithUncles { header: b1, uncles: Vec::new() },
+            HeaderWithUncles {
+                header: b1,
+                uncles: Vec::new(),
+            },
             entry,
         ]);
-        manager.handle_headers_response(headers, test_peer()).unwrap();
+        manager
+            .handle_headers_response(headers, test_peer())
+            .unwrap();
 
         assert_eq!(
             store.total_difficulty(hash).unwrap(),
@@ -8091,10 +8216,12 @@ struct NoWorkAt999;
 impl rustock_core::validation::HeaderValidator for NoWorkAt999 {
     fn validate(&self, h: &Header) -> Result<(), rustock_core::validation::ValidationError> {
         if h.difficulty == U256::from(999u64) {
-            return Err(rustock_core::validation::ValidationError::BitcoinPowInvalid {
-                hash: h.hash(),
-                target: U256::ZERO,
-            });
+            return Err(
+                rustock_core::validation::ValidationError::BitcoinPowInvalid {
+                    hash: h.hash(),
+                    target: U256::ZERO,
+                },
+            );
         }
         Ok(())
     }
@@ -8111,10 +8238,12 @@ impl rustock_core::validation::ParentHeaderValidator for OffItsParentAt999 {
         _parent: &Header,
     ) -> Result<(), rustock_core::validation::ValidationError> {
         if h.difficulty == U256::from(999u64) {
-            return Err(rustock_core::validation::ValidationError::DifficultyMismatch {
-                expected: U256::from(10u64),
-                got: h.difficulty,
-            });
+            return Err(
+                rustock_core::validation::ValidationError::DifficultyMismatch {
+                    expected: U256::from(10u64),
+                    got: h.difficulty,
+                },
+            );
         }
         Ok(())
     }
@@ -8139,7 +8268,11 @@ fn genesis_and_siblings(store: &BlockStore, first: u64, second: u64) -> (Header,
 async fn answer_body_requests(service: &mut SyncService, uncles_of: impl Fn(B256) -> Vec<Header>) {
     for _ in 0..16 {
         let asked: Vec<(u64, B256, B512)> = match &service.state {
-            SyncState::DownloadingBodies { pending_headers, id_index, .. } => id_index
+            SyncState::DownloadingBodies {
+                pending_headers,
+                id_index,
+                ..
+            } => id_index
                 .iter()
                 .map(|(id, (i, peer))| (*id, pending_headers[*i].0, *peer))
                 .collect(),
@@ -8167,7 +8300,11 @@ async fn caught_up(
     let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
     let (tx, _rx) = mpsc::channel(rustock_networking::peers::PEER_CHANNEL_CAPACITY);
     peer_store.add_peer(B512::repeat_byte(0x01), tx).await;
-    let manager = Arc::new(SyncManager::new(store.clone(), Arc::new(verifier), peer_store.clone()));
+    let manager = Arc::new(SyncManager::new(
+        store.clone(),
+        Arc::new(verifier),
+        peer_store.clone(),
+    ));
     manager
         .handle_headers_response(vec![b3.clone(), b2.clone(), b1.clone()], test_peer())
         .unwrap();
@@ -8182,10 +8319,18 @@ async fn caught_up(
     service.start_body_downloads(3).await;
     let named = b2.hash();
     answer_body_requests(&mut service, |hash| {
-        if hash == named { uncles.to_vec() } else { Vec::new() }
+        if hash == named {
+            uncles.to_vec()
+        } else {
+            Vec::new()
+        }
     })
     .await;
-    assert!(matches!(service.state, SyncState::Following), "{:?}", service.state);
+    assert!(
+        matches!(service.state, SyncState::Following),
+        "{:?}",
+        service.state
+    );
     [b1, b2, b3]
 }
 
@@ -8200,9 +8345,18 @@ async fn a_caught_up_batch_counts_the_uncles_its_bodies_bring() {
     let [b1, b2, b3] = caught_up(&store, HeaderVerifier::new(), b1, &uncles).await;
 
     // 1 + 10; then + 10 + 7 + 5; then + 10.
-    assert_eq!(store.total_difficulty(b1.hash()).unwrap(), Some(U256::from(11)));
-    assert_eq!(store.total_difficulty(b2.hash()).unwrap(), Some(U256::from(33)));
-    assert_eq!(store.total_difficulty(b3.hash()).unwrap(), Some(U256::from(43)));
+    assert_eq!(
+        store.total_difficulty(b1.hash()).unwrap(),
+        Some(U256::from(11))
+    );
+    assert_eq!(
+        store.total_difficulty(b2.hash()).unwrap(),
+        Some(U256::from(33))
+    );
+    assert_eq!(
+        store.total_difficulty(b3.hash()).unwrap(),
+        Some(U256::from(43))
+    );
 }
 
 /// A body's uncles count only once they pass the whole uncle rule: the rules
@@ -8223,8 +8377,14 @@ async fn a_caught_up_body_whose_uncle_did_no_work_adds_no_uncle() {
         let [_, b2, b3] = caught_up(&store, verifier, b1, &uncles).await;
 
         // Neither uncle: rskj refuses the whole block over one.
-        assert_eq!(store.total_difficulty(b2.hash()).unwrap(), Some(U256::from(21)));
-        assert_eq!(store.total_difficulty(b3.hash()).unwrap(), Some(U256::from(31)));
+        assert_eq!(
+            store.total_difficulty(b2.hash()).unwrap(),
+            Some(U256::from(21))
+        );
+        assert_eq!(
+            store.total_difficulty(b3.hash()).unwrap(),
+            Some(U256::from(31))
+        );
     }
 }
 
@@ -8240,11 +8400,19 @@ async fn a_followed_block_counts_its_uncles_when_its_body_comes() {
 
     let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
     let verifier = Arc::new(HeaderVerifier::new());
-    let manager = Arc::new(SyncManager::new(store.clone(), verifier, peer_store.clone()));
-    manager.handle_headers_response(vec![b1.clone()], test_peer()).unwrap();
+    let manager = Arc::new(SyncManager::new(
+        store.clone(),
+        verifier,
+        peer_store.clone(),
+    ));
+    manager
+        .handle_headers_response(vec![b1.clone()], test_peer())
+        .unwrap();
     store.put_body(b1.hash(), &[], &[]).unwrap();
     store.set_exec_head(b1.hash(), B256::ZERO).unwrap();
-    manager.handle_headers_response(vec![b2.clone()], test_peer()).unwrap();
+    manager
+        .handle_headers_response(vec![b2.clone()], test_peer())
+        .unwrap();
     assert_eq!(
         store.total_difficulty(b2.hash()).unwrap(),
         Some(U256::from(21)),
@@ -8262,7 +8430,10 @@ async fn a_followed_block_counts_its_uncles_when_its_body_comes() {
         .on_body_response(peer, 7, vec![], uncles, None)
         .await;
 
-    assert_eq!(store.total_difficulty(b2.hash()).unwrap(), Some(U256::from(33)));
+    assert_eq!(
+        store.total_difficulty(b2.hash()).unwrap(),
+        Some(U256::from(33))
+    );
 }
 
 /// A header ingested again with its body held, as a fork announcement does to
@@ -8278,11 +8449,15 @@ async fn a_header_ingested_again_credits_only_uncles_that_did_their_work() {
         let verifier = Arc::new(HeaderVerifier::new().with_uncle_rule(NoWorkAt999));
         let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
         let manager = SyncManager::new(store.clone(), verifier, peer_store);
-        manager.handle_headers_response(vec![b2.clone(), b1.clone()], test_peer()).unwrap();
+        manager
+            .handle_headers_response(vec![b2.clone(), b1.clone()], test_peer())
+            .unwrap();
         store.put_body(b1.hash(), &[], &[]).unwrap();
         store.put_body(b2.hash(), &[], &uncles).unwrap();
 
-        manager.handle_headers_response(vec![b2.clone(), b1.clone()], test_peer()).unwrap();
+        manager
+            .handle_headers_response(vec![b2.clone(), b1.clone()], test_peer())
+            .unwrap();
         assert_eq!(
             store.total_difficulty(b2.hash()).unwrap(),
             Some(U256::from(total)),
@@ -8303,20 +8478,33 @@ async fn a_held_header_without_its_parent_keeps_its_total() {
     let b2 = naming_uncles(dummy_header(2, b1.hash(), U256::from(10)), &uncles);
     // #2 held with the total that counts its uncles; #1 not held at all.
     store.put_header(&b2).unwrap();
-    store.put_total_difficulty(b2.hash(), U256::from(33)).unwrap();
+    store
+        .put_total_difficulty(b2.hash(), U256::from(33))
+        .unwrap();
 
     let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
     let manager = SyncManager::new(store.clone(), Arc::new(HeaderVerifier::new()), peer_store);
     // A peer at `rsk/63` proves what #2 adds, its uncles with it.
     let entries = vec![
-        HeaderWithUncles { header: b1, uncles: Vec::new() },
-        HeaderWithUncles { header: b2.clone(), uncles },
+        HeaderWithUncles {
+            header: b1,
+            uncles: Vec::new(),
+        },
+        HeaderWithUncles {
+            header: b2.clone(),
+            uncles,
+        },
     ];
     assert!(entries.iter().all(HeaderWithUncles::commitment_matches));
     manager.note_proven_difficulties(entries);
 
-    manager.handle_headers_response(vec![b2.clone()], test_peer()).unwrap();
-    assert_eq!(store.total_difficulty(b2.hash()).unwrap(), Some(U256::from(33)));
+    manager
+        .handle_headers_response(vec![b2.clone()], test_peer())
+        .unwrap();
+    assert_eq!(
+        store.total_difficulty(b2.hash()).unwrap(),
+        Some(U256::from(33))
+    );
 }
 
 /// An uncle is judged against the uncles its block's ancestors named, so it is
@@ -8334,7 +8522,9 @@ async fn an_uncle_is_not_credited_while_an_ancestors_uncles_are_not_held() {
     let b3 = naming_uncles(dummy_header(3, b2.hash(), U256::from(10)), reused);
     for (header, total) in [(&b1, 11u64), (&b2, 28)] {
         store.put_header(header).unwrap();
-        store.put_total_difficulty(header.hash(), U256::from(total)).unwrap();
+        store
+            .put_total_difficulty(header.hash(), U256::from(total))
+            .unwrap();
     }
     store.put_body(b1.hash(), &[], &[]).unwrap();
     store.put_header(&b3).unwrap();
@@ -8351,14 +8541,20 @@ async fn an_uncle_is_not_credited_while_an_ancestors_uncles_are_not_held() {
     // With #2's uncles held, the rule sees the reuse and refuses it.
     store.put_body(b2.hash(), &[], reused).unwrap();
     assert!(manager.settle_total_difficulty(b3.hash(), &b3, reused));
-    assert_eq!(store.total_difficulty(b3.hash()).unwrap(), Some(U256::from(38)));
+    assert_eq!(
+        store.total_difficulty(b3.hash()).unwrap(),
+        Some(U256::from(38))
+    );
 
     // And an uncle that no ancestor named is credited: 28 + 10 + 5.
     let fresh = &uncles[1..];
     let b3 = naming_uncles(dummy_header(3, b2.hash(), U256::from(10)), fresh);
     store.put_header(&b3).unwrap();
     assert!(manager.settle_total_difficulty(b3.hash(), &b3, fresh));
-    assert_eq!(store.total_difficulty(b3.hash()).unwrap(), Some(U256::from(43)));
+    assert_eq!(
+        store.total_difficulty(b3.hash()).unwrap(),
+        Some(U256::from(43))
+    );
 }
 
 /// The oldest ancestor the rule walks, seven generations back or genesis, must
@@ -8371,7 +8567,9 @@ async fn the_oldest_ancestor_the_uncle_rule_walks_must_be_held_too() {
     store.update_head(&genesis, U256::from(1)).unwrap();
     let b1 = dummy_header(1, genesis.hash(), U256::from(10));
     store.put_header(&b1).unwrap();
-    store.put_total_difficulty(b1.hash(), U256::from(11)).unwrap();
+    store
+        .put_total_difficulty(b1.hash(), U256::from(11))
+        .unwrap();
     store.put_body(b1.hash(), &[], &[]).unwrap();
     let uncles = vec![dummy_header(1, genesis.hash(), U256::from(7))];
     let b2 = naming_uncles(dummy_header(2, b1.hash(), U256::from(10)), &uncles);
@@ -8388,7 +8586,10 @@ async fn the_oldest_ancestor_the_uncle_rule_walks_must_be_held_too() {
 
     store.put_body(genesis.hash(), &[], &[]).unwrap();
     assert!(manager.settle_total_difficulty(b2.hash(), &b2, &uncles));
-    assert_eq!(store.total_difficulty(b2.hash()).unwrap(), Some(U256::from(28)));
+    assert_eq!(
+        store.total_difficulty(b2.hash()).unwrap(),
+        Some(U256::from(28))
+    );
 }
 
 /// A batch stopped by a block that fails consensus validation is not clean,
@@ -8420,7 +8621,10 @@ fn a_batch_stopped_by_a_block_that_fails_validation_is_not_clean() {
         transactions: Vec::new(),
         ommers: Vec::new(),
     };
-    assert!(processor.validate_block(&block).is_err(), "the block must fail validation");
+    assert!(
+        processor.validate_block(&block).is_err(),
+        "the block must fail validation"
+    );
 
     let outcome = crate::service::process_downloaded_blocks(
         &processor,
@@ -8434,7 +8638,10 @@ fn a_batch_stopped_by_a_block_that_fails_validation_is_not_clean() {
         &crate::chain_activity::ChainActivity::new(),
         &crate::gas_price::GasPriceTracker::default(),
     );
-    assert!(!outcome.all_ok, "a batch stopped by an invalid block reported itself clean");
+    assert!(
+        !outcome.all_ok,
+        "a batch stopped by an invalid block reported itself clean"
+    );
     assert_eq!(
         store.exec_head().unwrap().map(|(hash, _)| hash),
         Some(genesis.hash()),

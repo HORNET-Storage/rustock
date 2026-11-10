@@ -126,7 +126,9 @@ fn walk(node: &TrieNode, start: u64, store: &dyn TrieStore, h: &mut Holes) {
 fn main() -> anyhow::Result<()> {
     let a: Vec<String> = std::env::args().collect();
     if a.len() < 3 {
-        eprintln!("usage: snap_holes <data-dir> <block | 0xSTATE_ROOT> [limit-bytes] [grid] [served]");
+        eprintln!(
+            "usage: snap_holes <data-dir> <block | 0xSTATE_ROOT> [limit-bytes] [grid] [served]"
+        );
         std::process::exit(2);
     }
     let dir = &a[1];
@@ -148,7 +150,8 @@ fn main() -> anyhow::Result<()> {
         header.state_root
     };
 
-    let trie_dir = std::env::var("RUSTOCK_TRIE_DIR").unwrap_or_else(|_| format!("{dir}/trie-epochs"));
+    let trie_dir =
+        std::env::var("RUSTOCK_TRIE_DIR").unwrap_or_else(|_| format!("{dir}/trie-epochs"));
     let store = EpochTrieStore::open_read_only(&trie_dir, EpochConfig::default())?;
     let message = store
         .get(root_hash.as_slice())
@@ -178,7 +181,11 @@ fn main() -> anyhow::Result<()> {
             .expect("walk")
     });
 
-    println!("state root {root_hash:?}, {total} bytes; walked offsets 0..{} in {:?}", h.limit, started.elapsed());
+    println!(
+        "state root {root_hash:?}, {total} bytes; walked offsets 0..{} in {:?}",
+        h.limit,
+        started.elapsed()
+    );
     println!(
         "present: {} nodes, {} bytes of entries; missing: {} subtree(s), {} bytes ({:.1}% of the span walked)",
         h.present_nodes,
@@ -210,9 +217,17 @@ fn main() -> anyhow::Result<()> {
         (grid.saturating_sub(served)) as f64 * 100.0 / grid as f64
     );
     println!();
-    println!("{:>14} {:>14} {:>9} {:>8} {:>8}  exact", "start", "end", "bytes", "start%g", "end%g");
+    println!(
+        "{:>14} {:>14} {:>9} {:>8} {:>8}  exact",
+        "start", "end", "bytes", "start%g", "end%g"
+    );
     for &(s, e, exact) in h.found.iter().take(40) {
-        println!("{s:>14} {e:>14} {:>9} {:>8} {:>8}  {exact}", e - s, s % grid, e % grid);
+        println!(
+            "{s:>14} {e:>14} {:>9} {:>8} {:>8}  {exact}",
+            e - s,
+            s % grid,
+            e % grid
+        );
     }
     Ok(())
 }

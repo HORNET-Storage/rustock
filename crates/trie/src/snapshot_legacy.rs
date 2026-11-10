@@ -629,7 +629,11 @@ pub fn rebuild(chunk: &LegacyChunk, expected_root: B256) -> Result<Rebuilt, Rebu
         let hash = keccak256(&message);
         hashes[index] = Some(hash);
 
-        let outside = if stubs[index].has_long_value { stubs[index].value.len() as u64 } else { 0 };
+        let outside = if stubs[index].has_long_value {
+            stubs[index].value.len() as u64
+        } else {
+            0
+        };
         own[index] = message.len() as u64 + outside;
         long_values.append(&mut stubs[index].embedded_values);
         if stubs[index].has_long_value {
@@ -713,7 +717,12 @@ fn placements(
     root: usize,
 ) -> Result<Vec<Option<u64>>, RebuildError> {
     let unplaced = || RebuildError::Unplaced;
-    let total = |i: usize| stubs[i].children_size.checked_add(own[i]).ok_or_else(unplaced);
+    let total = |i: usize| {
+        stubs[i]
+            .children_size
+            .checked_add(own[i])
+            .ok_or_else(unplaced)
+    };
 
     let mut starts: Vec<Option<u64>> = vec![None; stubs.len()];
     // Each node, with the offset its subtree begins at.
@@ -886,7 +895,11 @@ fn parse_stub(
             let message = consensus_message(&stub, None, None).ok_or_else(bad)?;
             // `total_size` of the child: its message, the value it keeps
             // outside it, and whatever hangs below it.
-            let outside = if stub.has_long_value { stub.value.len() as u64 } else { 0 };
+            let outside = if stub.has_long_value {
+                stub.value.len() as u64
+            } else {
+                0
+            };
             embedded_total = (message.len() as u64)
                 .checked_add(outside)
                 .and_then(|size| size.checked_add(stub.children_size))

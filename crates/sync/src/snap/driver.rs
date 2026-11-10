@@ -96,7 +96,11 @@ pub struct Peers<'a> {
 impl<'a> Peers<'a> {
     /// One set of peers for every kind of request.
     pub fn all(peers: &'a [B512]) -> Self {
-        Self { snap: peers, uncles: peers, any: peers }
+        Self {
+            snap: peers,
+            uncles: peers,
+            any: peers,
+        }
     }
 
     fn is_empty(&self) -> bool {
@@ -329,7 +333,10 @@ impl SnapDriver {
         }
         let (strikes, until) = self.benched.entry(peer).or_insert((0, now));
         *strikes = strikes.saturating_add(1);
-        *until = now + BENCH.saturating_mul(1 << (*strikes - 1).min(4)).min(BENCH_MAX);
+        *until = now
+            + BENCH
+                .saturating_mul(1 << (*strikes - 1).min(4))
+                .min(BENCH_MAX);
     }
 
     /// Of `peers`, those not sitting out -- or all of them, if every one is.
@@ -433,7 +440,11 @@ impl SnapDriver {
         // plain headers, which every peer serves.
         let now = Instant::now();
         let header_peers = self.available(
-            if self.session.phase() == Phase::AscendingHeaders { peers.uncles } else { peers.any },
+            if self.session.phase() == Phase::AscendingHeaders {
+                peers.uncles
+            } else {
+                peers.any
+            },
             now,
         );
         let snap_peers = self.available(&self.worth_asking(peers.snap), now);

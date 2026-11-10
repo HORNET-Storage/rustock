@@ -1287,14 +1287,21 @@ mod tests {
 
     /// Each node is a child of the one after it, and the last is `root`.
     fn assert_chained(nodes: &[TrieNode], root: &TrieNode, store: &MemoryTrieStore) {
-        assert_eq!(nodes.last().expect("a path").compute_hash(store), root.compute_hash(store));
+        assert_eq!(
+            nodes.last().expect("a path").compute_hash(store),
+            root.compute_hash(store)
+        );
         for pair in nodes.windows(2) {
             let (child, parent) = (&pair[0], &pair[1]);
             let message = child.to_message(store);
-            let linked = [&parent.left, &parent.right]
-                .iter()
-                .any(|r| r.resolve(store).is_some_and(|c| c.to_message(store) == message));
-            assert!(linked, "a node on the path is not a child of the one above it");
+            let linked = [&parent.left, &parent.right].iter().any(|r| {
+                r.resolve(store)
+                    .is_some_and(|c| c.to_message(store) == message)
+            });
+            assert!(
+                linked,
+                "a node on the path is not a child of the one above it"
+            );
         }
     }
 
@@ -1305,9 +1312,16 @@ mod tests {
         let root = branching(&store);
         let key = TrieKeySlice::from_key(&[21, 7]);
 
-        let toward = root.try_nodes_toward(&key, &store).expect("a complete store");
+        let toward = root
+            .try_nodes_toward(&key, &store)
+            .expect("a complete store");
         let on_path = root.nodes_on_path(&key, &store).expect("present");
-        let messages = |nodes: &[TrieNode]| nodes.iter().map(|n| n.to_message(&store)).collect::<Vec<_>>();
+        let messages = |nodes: &[TrieNode]| {
+            nodes
+                .iter()
+                .map(|n| n.to_message(&store))
+                .collect::<Vec<_>>()
+        };
         assert_eq!(messages(&toward), messages(&on_path));
     }
 
@@ -1325,8 +1339,14 @@ mod tests {
         ];
         for key in absent {
             let slice = TrieKeySlice::from_key(key);
-            assert_eq!(root.try_get(&slice, &store), Ok(None), "{key:?} is in the trie");
-            let nodes = root.try_nodes_toward(&slice, &store).expect("a complete store");
+            assert_eq!(
+                root.try_get(&slice, &store),
+                Ok(None),
+                "{key:?} is in the trie"
+            );
+            let nodes = root
+                .try_nodes_toward(&slice, &store)
+                .expect("a complete store");
             assert_chained(&nodes, &root, &store);
         }
 
@@ -1350,7 +1370,9 @@ mod tests {
         // descendants.
         let empty = MemoryTrieStore::new();
         let detached = TrieNode::from_message(&root.to_message(&store), &empty);
-        assert!(detached.try_nodes_toward(&TrieKeySlice::from_key(&[21, 8]), &empty).is_err());
+        assert!(detached
+            .try_nodes_toward(&TrieKeySlice::from_key(&[21, 8]), &empty)
+            .is_err());
     }
 
     #[test]

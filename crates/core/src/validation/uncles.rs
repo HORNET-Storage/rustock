@@ -8,8 +8,8 @@
 use super::fork_detection::MainchainView;
 use super::{
     BitcoinTimestampRule, BlockNumberRule, BlockParentGasLimitRule, DifficultyRule, GasUsedRule,
-    HeaderValidator, MergedMiningRule, ParentHeaderValidator,
-    PrevMinGasPriceRule, TimestampRule, ValidationError,
+    HeaderValidator, MergedMiningRule, ParentHeaderValidator, PrevMinGasPriceRule, TimestampRule,
+    ValidationError,
 };
 use crate::config::ChainConfig;
 use crate::types::block::Block;
@@ -35,7 +35,9 @@ pub const UNCLE_GENERATION_LIMIT: u64 = 7;
 /// one.
 pub fn rsk_header_rules(config: Arc<ChainConfig>) -> Vec<Box<dyn HeaderValidator>> {
     vec![
-        Box::new(MergedMiningRule { config: config.clone() }),
+        Box::new(MergedMiningRule {
+            config: config.clone(),
+        }),
         Box::new(TimestampRule::new(config.max_future_block_time)),
         Box::new(BitcoinTimestampRule { config }),
         Box::new(GasUsedRule),
@@ -49,7 +51,9 @@ pub fn rsk_parent_rules(config: Arc<ChainConfig>) -> Vec<Box<dyn ParentHeaderVal
         Box::new(PrevMinGasPriceRule),
         Box::new(BlockNumberRule),
         Box::new(TimestampRule::new(config.max_future_block_time)),
-        Box::new(DifficultyRule { config: config.clone() }),
+        Box::new(DifficultyRule {
+            config: config.clone(),
+        }),
         Box::new(BlockParentGasLimitRule { config }),
     ]
 }

@@ -353,7 +353,11 @@ fn merkle_proofs_fold_back_to_the_root() {
         assert_eq!(proof.len() % 32, 0);
 
         let root = merkle::root_from_proof(&txids[0], &proof);
-        assert_eq!(root, Some(reference_merkle_root(&txids)), "{count} transactions");
+        assert_eq!(
+            root,
+            Some(reference_merkle_root(&txids)),
+            "{count} transactions"
+        );
     }
 }
 

@@ -153,11 +153,7 @@ fn method_enabled(name: &str) -> BridgeMethodEnabled {
         | "releaseUnionBridgeRbtc"
         | "setUnionBridgeTransferPermissions" => Rule(RskHardforkConfig::has_rskip502),
         // RSKIP529 (reed810): the union bridge's super and base events.
-        "getSuperEvent"
-        | "setSuperEvent"
-        | "clearSuperEvent"
-        | "getBaseEvent"
-        | "setBaseEvent"
+        "getSuperEvent" | "setSuperEvent" | "clearSuperEvent" | "getBaseEvent" | "setBaseEvent"
         | "clearBaseEvent" => Rule(RskHardforkConfig::has_rskip529),
         // !RSKIP87 / !RSKIP89
         "addLockWhitelistAddress" | "getBtcBlockchainBlockLocator" => Until(Orchid),

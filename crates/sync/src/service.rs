@@ -1350,7 +1350,11 @@ impl SyncService {
 
         let outbound = step(
             driver,
-            crate::snap::driver::Peers { snap: &snap, uncles: &uncles, any: &any },
+            crate::snap::driver::Peers {
+                snap: &snap,
+                uncles: &uncles,
+                any: &any,
+            },
         );
 
         // Charge whatever the step turned up before anything else: a peer that
@@ -1461,7 +1465,8 @@ impl SyncService {
     /// `start_snap_sync` starts a session for, and one ordinary sync can do
     /// nothing for once a session has written its window of headers.
     fn executed_nothing(&self) -> bool {
-        self.recorded_execution().is_none_or(|executed| executed.number == 0)
+        self.recorded_execution()
+            .is_none_or(|executed| executed.number == 0)
     }
 
     /// Try snapshot sync again, after the wait `finish_snap_sync` set.
@@ -3639,13 +3644,22 @@ impl SyncService {
         // blocks deep into the middle of a mainnet walk, which the walk then
         // took for ground this node already held, and stopped there.
         if self.suspended_for_snap {
-            let ours = |driver: Option<&crate::snap::driver::SnapDriver>, id: u64, headers: bool| {
-                driver.is_some_and(|d| if headers { d.awaits_headers(id) } else { d.awaits_skeleton(id) })
-            };
+            let ours =
+                |driver: Option<&crate::snap::driver::SnapDriver>, id: u64, headers: bool| {
+                    driver.is_some_and(|d| {
+                        if headers {
+                            d.awaits_headers(id)
+                        } else {
+                            d.awaits_skeleton(id)
+                        }
+                    })
+                };
             let claimed = match &event {
                 SyncEvent::SkeletonResponse { id, .. } => ours(self.snap.as_ref(), *id, false),
                 SyncEvent::HeadersResponse { id, .. }
-                | SyncEvent::HeadersWithUnclesResponse { id, .. } => ours(self.snap.as_ref(), *id, true),
+                | SyncEvent::HeadersWithUnclesResponse { id, .. } => {
+                    ours(self.snap.as_ref(), *id, true)
+                }
                 SyncEvent::SnapStatusResponse { .. }
                 | SyncEvent::SnapChunkResponse { .. }
                 | SyncEvent::SnapBlocksResponse { .. } => true,

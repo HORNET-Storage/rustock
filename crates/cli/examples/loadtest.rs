@@ -786,7 +786,11 @@ fn seal_merged_mining(header: &mut Header) -> Result<()> {
     // From block 449 the hash's last twelve bytes are fork-detection data,
     // and any twelve do here: this measures proof of work, not fork
     // detection. Below 449 rskj wants the whole hash.
-    let fork_data: &[u8] = if header.number >= REQUIRED_BLOCKS { &[0u8; 12] } else { &[] };
+    let fork_data: &[u8] = if header.number >= REQUIRED_BLOCKS {
+        &[0u8; 12]
+    } else {
+        &[]
+    };
     let payload = fork_detection::apply_to_hash(header.hash_for_merged_mining(), fork_data);
 
     let cb = coinbase::build_coinbase(&payload, 0);

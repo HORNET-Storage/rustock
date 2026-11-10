@@ -122,11 +122,16 @@ fn chain_with_uncles(
         let uncle = header(number - 1, B256::repeat_byte(0x0c), B256::ZERO, difficulty);
         let mut h = header(number, parent, state_root, difficulty);
         h.uncle_count = 1;
-        h.ommers_hash = rustock_execution::processor::compute_ommers_hash(std::slice::from_ref(&uncle));
+        h.ommers_hash =
+            rustock_execution::processor::compute_ommers_hash(std::slice::from_ref(&uncle));
         parent = h.hash();
         td += 2 * difficulty;
         tds.push(U256::from(td));
-        blocks.push(Block { header: h, transactions: Vec::new(), ommers: vec![uncle] });
+        blocks.push(Block {
+            header: h,
+            transactions: Vec::new(),
+            ommers: vec![uncle],
+        });
     }
     (blocks, tds)
 }
@@ -1006,14 +1011,26 @@ fn an_honest_rskj_chunk_is_kept_and_not_charged() {
     let (mut driver, id, from, server) = driver_awaiting_a_chunk(&f, &blocks, &tds, &peers);
     driver.take_blame();
 
-    driver.on_chunk(id, server, &rskj_chunk(&f, from, 4_000), Refusal::None, &peers);
+    driver.on_chunk(
+        id,
+        server,
+        &rskj_chunk(&f, from, 4_000),
+        Refusal::None,
+        &peers,
+    );
 
-    assert!(driver.take_blame().is_empty(), "an honest rskj peer was charged");
+    assert!(
+        driver.take_blame().is_empty(),
+        "an honest rskj peer was charged"
+    );
     let (covered, total) = driver.state_progress();
     assert!(covered > 0, "the chunk moved nothing");
     assert_eq!(
         total,
-        Some(rustock_trie::snapshot::total_size(&f.trie_root, f.trie.as_ref())),
+        Some(rustock_trie::snapshot::total_size(
+            &f.trie_root,
+            f.trie.as_ref()
+        )),
         "the size of the trie comes from the rebuilt root, not the peer's hint"
     );
 }
@@ -1039,7 +1056,11 @@ fn an_rskj_chunk_for_another_offset_is_charged() {
     assert_eq!(blame.len(), 1, "got {blame:?}");
     assert_eq!(blame[0].peer, server);
     assert_eq!(blame[0].event, EventType::InvalidMessage);
-    assert_eq!(driver.state_progress().0, 0, "a chunk for another offset moved the download");
+    assert_eq!(
+        driver.state_progress().0,
+        0,
+        "a chunk for another offset moved the download"
+    );
 }
 
 /// An rskj chunk with nothing of its own -- what rskj answers when the node at
@@ -1057,14 +1078,28 @@ fn an_rskj_chunk_with_nothing_of_its_own_is_not_charged() {
 
     // A one-byte cell: no node fits, so the chunk carries only the path to it.
     let nothing = rskj_chunk(&f, from, 1);
-    let ChunkPayload::Legacy(blob) = &nothing else { unreachable!() };
+    let ChunkPayload::Legacy(blob) = &nothing else {
+        unreachable!()
+    };
     let chunk = rustock_trie::snapshot_legacy::decode_blob(blob).expect("decodes");
-    assert!(chunk.nodes.is_empty() && !chunk.post_root.is_empty(), "not the chunk this test is about");
+    assert!(
+        chunk.nodes.is_empty() && !chunk.post_root.is_empty(),
+        "not the chunk this test is about"
+    );
 
     driver.on_chunk(id, server, &nothing, Refusal::None, &peers);
-    assert!(driver.take_blame().is_empty(), "charged a peer for the offset it was asked");
-    assert!(!driver.unhelpful().contains(&server), "stopped asking a peer that can serve");
-    assert!(driver.state_progress().0 > 0, "the node at the offset, sent whole, was not kept");
+    assert!(
+        driver.take_blame().is_empty(),
+        "charged a peer for the offset it was asked"
+    );
+    assert!(
+        !driver.unhelpful().contains(&server),
+        "stopped asking a peer that can serve"
+    );
+    assert!(
+        driver.state_progress().0 > 0,
+        "the node at the offset, sent whole, was not kept"
+    );
 }
 
 /// **Answers that move nothing end the session**, however well they rebuild.
@@ -1115,8 +1150,12 @@ fn answers_that_move_nothing_end_the_session() {
 fn chunk_requests(out: &[super::driver::Outbound]) -> Vec<(u64, u64, B512)> {
     out.iter()
         .filter_map(|o| {
-            let P2pMessage::RskMessage(m) = &o.message else { return None };
-            let RskSubMessage::SnapChunkRequest(req) = &m.sub_message else { return None };
+            let P2pMessage::RskMessage(m) = &o.message else {
+                return None;
+            };
+            let RskSubMessage::SnapChunkRequest(req) = &m.sub_message else {
+                return None;
+            };
             Some((req.id, req.from, o.peer))
         })
         .collect()
@@ -1133,7 +1172,13 @@ fn an_offset_refused_as_off_the_grid_is_asked_on_the_grid_next() {
     let peers = vec![B512::repeat_byte(1), B512::repeat_byte(2)];
 
     let (mut driver, id, from, server) = driver_awaiting_a_chunk(&f, &blocks, &tds, &peers);
-    driver.on_chunk(id, server, &rskj_chunk(&f, from, 2_000), Refusal::None, &peers);
+    driver.on_chunk(
+        id,
+        server,
+        &rskj_chunk(&f, from, 2_000),
+        Refusal::None,
+        &peers,
+    );
     let (cursor, _) = driver.state_progress();
     assert!(cursor > 0, "the chunk moved nothing");
     // Let whatever else the setup left outstanding time out, so the budget
@@ -1148,14 +1193,25 @@ fn an_offset_refused_as_off_the_grid_is_asked_on_the_grid_next() {
         .iter()
         .find(|(_, asked, _)| *asked == cursor + 1)
         .unwrap_or_else(|| panic!("nothing asked just past the cursor {cursor}: {exact:?}"));
-    assert_ne!(asked % 100_000, 0, "the exact offset happens to be on the grid; the test proves nothing");
+    assert_ne!(
+        asked % 100_000,
+        0,
+        "the exact offset happens to be on the grid; the test proves nothing"
+    );
 
-    let refused = ChunkPayload::Proved { entries: Vec::new(), witness: Vec::new() };
+    let refused = ChunkPayload::Proved {
+        entries: Vec::new(),
+        witness: Vec::new(),
+    };
     let out = driver.on_chunk(id, peer, &refused, Refusal::OffsetNotOnGrid, &peers);
-    assert!(driver.take_blame().is_empty(), "a refusal about the offset was charged");
+    assert!(
+        driver.take_blame().is_empty(),
+        "a refusal about the offset was charged"
+    );
     let next = chunk_requests(&out);
     assert!(
-        next.iter().any(|(_, asked, _)| *asked == cursor / 100_000 * 100_000),
+        next.iter()
+            .any(|(_, asked, _)| *asked == cursor / 100_000 * 100_000),
         "the refused offset was not replaced by its cell: {next:?}"
     );
     assert!(
@@ -1247,18 +1303,35 @@ fn the_header_walk_asks_peers_without_snap() {
     let plain = B512::repeat_byte(2);
     let mut driver = SnapDriver::new(f.session(HeaderVerifier::new()));
 
-    let out = driver.poll(Peers { snap: &[server], uncles: &[], any: &[server, plain] });
+    let out = driver.poll(Peers {
+        snap: &[server],
+        uncles: &[],
+        any: &[server, plain],
+    });
     let (status_id, kind) = asked(&out[0]);
     assert_eq!(kind, "status");
-    assert_eq!(out[0].peer, server, "a status request goes only to a snap peer");
+    assert_eq!(
+        out[0].peer, server,
+        "a status request goes only to a snap peer"
+    );
 
     // Only an ordinary peer is left to ask, as when the server stops answering.
-    let only_plain = Peers { snap: &[], uncles: &[], any: &[plain] };
+    let only_plain = Peers {
+        snap: &[],
+        uncles: &[],
+        any: &[plain],
+    };
     let out = driver.on_status(status_id, server, &blocks, &tds, 5_000, 0, only_plain);
-    assert!(!out.is_empty(), "the walk stalled with an ordinary peer to ask");
+    assert!(
+        !out.is_empty(),
+        "the walk stalled with an ordinary peer to ask"
+    );
     for request in &out {
         let (_, kind) = asked(request);
-        assert!(matches!(kind, "headers" | "skeleton"), "asked an ordinary peer for a {kind}");
+        assert!(
+            matches!(kind, "headers" | "skeleton"),
+            "asked an ordinary peer for a {kind}"
+        );
         assert_eq!(request.peer, plain);
     }
 }
@@ -1273,11 +1346,22 @@ fn snapshot_requests_go_only_to_snap_peers() {
     let plain = B512::repeat_byte(2);
     let mut driver = SnapDriver::new(f.session(HeaderVerifier::new()));
 
-    let out = driver.poll(Peers { snap: &[], uncles: &[plain], any: &[plain] });
-    assert!(out.is_empty(), "asked a peer without snap for a snapshot message");
+    let out = driver.poll(Peers {
+        snap: &[],
+        uncles: &[plain],
+        any: &[plain],
+    });
+    assert!(
+        out.is_empty(),
+        "asked a peer without snap for a snapshot message"
+    );
     assert!(driver.outstanding_ids().is_empty());
 
-    let out = driver.poll(Peers { snap: &[server], uncles: &[], any: &[server, plain] });
+    let out = driver.poll(Peers {
+        snap: &[server],
+        uncles: &[],
+        any: &[server, plain],
+    });
     let (_, kind) = asked(&out[0]);
     assert_eq!(kind, "status");
     assert_eq!(out[0].peer, server);
@@ -1295,8 +1379,20 @@ fn a_request_nobody_can_take_is_asked_once_somebody_can() {
 
     let out = driver.poll(&[server]);
     let (status_id, _) = asked(&out[0]);
-    let nobody_for_headers = Peers { snap: &[server], uncles: &[], any: &[] };
-    let out = driver.on_status(status_id, server, &blocks, &tds, 5_000, 0, nobody_for_headers);
+    let nobody_for_headers = Peers {
+        snap: &[server],
+        uncles: &[],
+        any: &[],
+    };
+    let out = driver.on_status(
+        status_id,
+        server,
+        &blocks,
+        &tds,
+        5_000,
+        0,
+        nobody_for_headers,
+    );
     assert!(out.is_empty());
     assert!(
         driver.outstanding_ids().is_empty(),
@@ -1304,7 +1400,11 @@ fn a_request_nobody_can_take_is_asked_once_somebody_can() {
     );
 
     let plain = B512::repeat_byte(2);
-    let out = driver.poll(Peers { snap: &[], uncles: &[], any: &[plain] });
+    let out = driver.poll(Peers {
+        snap: &[],
+        uncles: &[],
+        any: &[plain],
+    });
     assert!(!out.is_empty(), "the walk's requests were lost");
     assert!(out.iter().all(|request| request.peer == plain));
 }
@@ -1327,10 +1427,15 @@ fn an_empty_header_answer_is_asked_again() {
         .find(|a| matches!(a, Action::RequestHeaders { .. }))
         .cloned()
         .expect("the walk asks for headers");
-    let Action::RequestHeaders { point, .. } = asked else { unreachable!() };
+    let Action::RequestHeaders { point, .. } = asked else {
+        unreachable!()
+    };
 
     let again = session.on_headers(point, &[]);
-    assert!(again.contains(&asked), "the range was not asked for again: {again:?}");
+    assert!(
+        again.contains(&asked),
+        "the range was not asked for again: {again:?}"
+    );
 }
 
 /// A peer that left a request unanswered sits out while somebody else can be
@@ -1348,13 +1453,21 @@ fn a_peer_that_left_a_request_unanswered_sits_out() {
     let out = driver.poll(&[server]);
     let (status_id, _) = asked(&out[0]);
     // At first only `silent` can be asked for headers, and it answers nothing.
-    let only_silent = Peers { snap: &[server], uncles: &[], any: &[silent] };
+    let only_silent = Peers {
+        snap: &[server],
+        uncles: &[],
+        any: &[silent],
+    };
     let out = driver.on_status(status_id, server, &blocks, &tds, 5_000, 0, only_silent);
     assert!(!out.is_empty() && out.iter().all(|request| request.peer == silent));
     let later = std::time::Instant::now() + std::time::Duration::from_secs(31);
     assert_eq!(driver.expire(later), out.len());
 
-    let out = driver.poll(Peers { snap: &[server], uncles: &[], any: &[server, silent] });
+    let out = driver.poll(Peers {
+        snap: &[server],
+        uncles: &[],
+        any: &[server, silent],
+    });
     assert!(!out.is_empty(), "the walk's requests were not asked again");
     assert!(
         out.iter().all(|request| request.peer == server),
@@ -1614,14 +1727,21 @@ fn the_header_walk_asks_more_of_more_peers() {
     for _ in 0..10 {
         let mut next = Vec::new();
         for request in &out {
-            let P2pMessage::RskMessage(m) = &request.message else { continue };
-            let RskSubMessage::SkeletonRequest(r) = &m.sub_message else { continue };
+            let P2pMessage::RskMessage(m) = &request.message else {
+                continue;
+            };
+            let RskSubMessage::SkeletonRequest(r) = &m.sub_message else {
+                continue;
+            };
             let ids: Vec<rustock_networking::protocol::BlockIdentifier> = blocks
                 .iter()
                 .map(|b| &b.header)
                 .filter(|h| h.number % 192 == 0)
                 .filter(|h| h.number >= r.start_number && h.number <= r.start_number + 3_840)
-                .map(|h| rustock_networking::protocol::BlockIdentifier { number: h.number, hash: h.hash() })
+                .map(|h| rustock_networking::protocol::BlockIdentifier {
+                    number: h.number,
+                    hash: h.hash(),
+                })
                 .collect();
             next.extend(driver.on_skeleton(r.id, request.peer, &ids, &peers));
         }
@@ -1632,8 +1752,14 @@ fn the_header_walk_asks_more_of_more_peers() {
     }
 
     let outstanding = driver.outstanding_ids().len();
-    assert!(outstanding > 2, "held to a state download's budget: {outstanding} outstanding");
-    assert!(outstanding <= 2 * peers.len(), "{outstanding} outstanding, more than two per peer");
+    assert!(
+        outstanding > 2,
+        "held to a state download's budget: {outstanding} outstanding"
+    );
+    assert!(
+        outstanding <= 2 * peers.len(),
+        "{outstanding} outstanding, more than two per peer"
+    );
 }
 
 /// **A refused claim leaves nothing behind.** Making the checkpoint this
@@ -1655,14 +1781,18 @@ fn a_refused_claim_leaves_nothing_behind() {
     let mut session = f.session(HeaderVerifier::new());
     let actions = session.on_status(&blocks, &tds, 8_000, 0);
     assert_eq!(session.phase(), Phase::VerifyingHeaders);
-    let Some(Action::RequestHeaders { point, count, .. }) =
-        actions.into_iter().find(|a| matches!(a, Action::RequestHeaders { .. }))
+    let Some(Action::RequestHeaders { point, count, .. }) = actions
+        .into_iter()
+        .find(|a| matches!(a, Action::RequestHeaders { .. }))
     else {
         panic!("the walk asks for headers");
     };
     session.on_headers(point, &headers_for(&blocks, point, count));
     assert!(
-        matches!(session.failure(), Some(SnapFailure::OverstatedDifficulty { .. })),
+        matches!(
+            session.failure(),
+            Some(SnapFailure::OverstatedDifficulty { .. })
+        ),
         "{:?}",
         session.failure()
     );
@@ -1672,7 +1802,11 @@ fn a_refused_claim_leaves_nothing_behind() {
         None,
         "the refused checkpoint was indexed as canonical"
     );
-    assert_ne!(f.store.head().unwrap(), Some(checkpoint.hash()), "it became the head");
+    assert_ne!(
+        f.store.head().unwrap(),
+        Some(checkpoint.hash()),
+        "it became the head"
+    );
     assert_eq!(
         f.store.total_difficulty(checkpoint.hash()).unwrap(),
         None,
@@ -1695,7 +1829,9 @@ async fn the_ordinary_sync_takes_no_headers_during_a_snapshot_session() {
 
     let f = fixture(20);
     let genesis = f.with_genesis();
-    f.store.put_total_difficulty(genesis, U256::from(100u64)).expect("td");
+    f.store
+        .put_total_difficulty(genesis, U256::from(100u64))
+        .expect("td");
     f.store.set_head(genesis).expect("head");
     let (blocks, _) = chain(1, 3, genesis, 100, f.state_root);
 
@@ -1706,7 +1842,10 @@ async fn the_ordinary_sync_takes_no_headers_during_a_snapshot_session() {
         .add_peer_with(
             peer,
             tx,
-            rustock_networking::handshake::PeerCapabilities { rsk_version: 62, snap: true },
+            rustock_networking::handshake::PeerCapabilities {
+                rsk_version: 62,
+                snap: true,
+            },
         )
         .await;
     let manager = Arc::new(SyncManager::new(
@@ -1729,7 +1868,11 @@ async fn the_ordinary_sync_takes_no_headers_during_a_snapshot_session() {
         })
         .await;
 
-    assert_eq!(f.store.head().unwrap(), Some(genesis), "the ordinary sync moved the head");
+    assert_eq!(
+        f.store.head().unwrap(),
+        Some(genesis),
+        "the ordinary sync moved the head"
+    );
     assert_eq!(
         f.store.canonical_hash(1).unwrap(),
         None,
@@ -2081,7 +2224,10 @@ fn a_claim_beyond_what_the_unseen_uncles_could_add_is_refused() {
     let actions = session.on_status(&blocks, &tds, 8_000, 0);
     answer_header_walk(&mut session, &blocks, actions);
     assert!(
-        matches!(session.failure(), Some(SnapFailure::OverstatedDifficulty { .. })),
+        matches!(
+            session.failure(),
+            Some(SnapFailure::OverstatedDifficulty { .. })
+        ),
         "{:?}",
         session.failure()
     );

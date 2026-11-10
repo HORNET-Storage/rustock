@@ -1610,9 +1610,16 @@ fn rebuilt(peer: &Peer, response: &SnapChunkResponse) -> super::client::RebuiltC
 /// Downloads a state from rskj servers alone, as mainnet's are, with this
 /// node's own grid. Returns the client, its store, and how many requests it
 /// took.
-fn download_from_rskj(peer: &Peer, grid: u64, cell: u64) -> (StateDownload, Arc<MemoryTrieStore>, usize) {
+fn download_from_rskj(
+    peer: &Peer,
+    grid: u64,
+    cell: u64,
+) -> (StateDownload, Arc<MemoryTrieStore>, usize) {
     let local = Arc::new(MemoryTrieStore::new());
-    let config = SnapConfig { chunk_grid: grid, ..config(4, grid) };
+    let config = SnapConfig {
+        chunk_grid: grid,
+        ..config(4, grid)
+    };
     let mut client = StateDownload::new(peer.root_hash, peer.total(), &config, local.clone());
     // Several times what a download that moves needs, so that one that has
     // stopped moving fails at once rather than after a hundred thousand
@@ -1621,10 +1628,15 @@ fn download_from_rskj(peer: &Peer, grid: u64, cell: u64) -> (StateDownload, Arc<
     let mut asked = 0;
     while !client.is_complete() {
         asked += 1;
-        assert!(asked < enough, "{asked} requests and not done: the download has stopped moving");
+        assert!(
+            asked < enough,
+            "{asked} requests and not done: the download has stopped moving"
+        );
         let request = client.next_request().expect("work left and none in flight");
         let chunk = rebuilt(peer, &rskj_serves(peer, request.from, cell));
-        client.accept_rebuilt(request.from, &chunk).expect("an honest rskj chunk");
+        client
+            .accept_rebuilt(request.from, &chunk)
+            .expect("an honest rskj chunk");
     }
     (client, local, asked)
 }
@@ -1639,7 +1651,10 @@ fn holds_everything(peer: &Peer, local: &MemoryTrieStore) {
             node.offset
         );
         for value in &node.long_values {
-            assert!(local.get(keccak256(value).as_slice()).is_some(), "a long value was never fetched");
+            assert!(
+                local.get(keccak256(value).as_slice()).is_some(),
+                "a long value was never fetched"
+            );
         }
     }
 }
@@ -1658,17 +1673,25 @@ fn an_rskj_server_fills_every_cell_of_a_wider_grid() {
 
     let peer = Peer::new(12_000);
     let total = peer.total();
-    assert!(total > 6 * 100_000, "the trie must span several cells, not {total} bytes");
+    assert!(
+        total > 6 * 100_000,
+        "the trie must span several cells, not {total} bytes"
+    );
 
     let (client, local, asked) = download_from_rskj(&peer, 100_000, RSKJ_CHUNK_GRID);
-    client.verify_stored().expect("the downloaded state is whole");
+    client
+        .verify_stored()
+        .expect("the downloaded state is whole");
     holds_everything(&peer, &local);
 
     // And at one request per rskj cell, give or take one per slice: an
     // answer that stops mid-cell is followed by a request for exactly where
     // it stopped, not by the same cell again.
     let cells = total.div_ceil(RSKJ_CHUNK_GRID) as usize;
-    assert!(asked <= cells + cells / 10 + 2 * 4, "{asked} requests for {cells} rskj cells");
+    assert!(
+        asked <= cells + cells / 10 + 2 * 4,
+        "{asked} requests for {cells} rskj cells"
+    );
 }
 
 /// **A node longer than rskj's cell is fetched.**
@@ -1785,7 +1808,9 @@ fn a_node_longer_than_an_rskj_cell_is_fetched() {
 fn a_short_rskj_chunk_is_not_taken_for_the_cell() {
     let peer = Peer::new(3_000);
     let (client, local, _) = download_from_rskj(&peer, 100_000, 7_000);
-    client.verify_stored().expect("the downloaded state is whole");
+    client
+        .verify_stored()
+        .expect("the downloaded state is whole");
     holds_everything(&peer, &local);
 }
 
@@ -1798,12 +1823,23 @@ fn an_rskj_chunk_that_begins_after_the_offset_asked_is_refused() {
     use crate::snap::RSKJ_CHUNK_GRID;
 
     let peer = Peer::new(3_000);
-    assert!(peer.total() > 4 * RSKJ_CHUNK_GRID, "the trie must span several rskj cells");
+    assert!(
+        peer.total() > 4 * RSKJ_CHUNK_GRID,
+        "the trie must span several rskj cells"
+    );
     let local = Arc::new(MemoryTrieStore::new());
-    let mut client = StateDownload::new(peer.root_hash, peer.total(), &config(1, 100_000), local.clone());
+    let mut client = StateDownload::new(
+        peer.root_hash,
+        peer.total(),
+        &config(1, 100_000),
+        local.clone(),
+    );
 
     let request = client.next_request().expect("a request");
-    let elsewhere = rebuilt(&peer, &rskj_serves(&peer, request.from + 2 * RSKJ_CHUNK_GRID, RSKJ_CHUNK_GRID));
+    let elsewhere = rebuilt(
+        &peer,
+        &rskj_serves(&peer, request.from + 2 * RSKJ_CHUNK_GRID, RSKJ_CHUNK_GRID),
+    );
     match client.accept_rebuilt(request.from, &elsewhere) {
         Err(ChunkError::Misplaced { asked, starts }) => {
             assert_eq!(asked, request.from);
@@ -1813,7 +1849,11 @@ fn an_rskj_chunk_that_begins_after_the_offset_asked_is_refused() {
     }
     assert_eq!(local.len(), 0, "a refused chunk wrote to the store");
     assert_eq!(client.progress().0, 0, "a refused chunk moved the cursor");
-    assert_eq!(client.next_request().map(|r| r.from), Some(request.from), "the range was not asked again");
+    assert_eq!(
+        client.next_request().map(|r| r.from),
+        Some(request.from),
+        "the range was not asked again"
+    );
 }
 
 /// **After an rskj chunk the next request names the offset just past the
@@ -1831,9 +1871,14 @@ fn a_refused_exact_offset_is_asked_on_the_grid_next() {
     let first = client.next_request().expect("a request");
     assert_eq!(first.from, 0);
     let chunk = rebuilt(&peer, &rskj_serves(&peer, first.from, RSKJ_CHUNK_GRID));
-    client.accept_rebuilt(first.from, &chunk).expect("an honest chunk");
+    client
+        .accept_rebuilt(first.from, &chunk)
+        .expect("an honest chunk");
     let (cursor, _) = client.progress();
-    assert!(cursor > 0 && cursor < 100_000, "an rskj chunk stops mid-cell, at {cursor}");
+    assert!(
+        cursor > 0 && cursor < 100_000,
+        "an rskj chunk stops mid-cell, at {cursor}"
+    );
 
     let exact = client.next_request().expect("more to fetch");
     assert_eq!(
@@ -1844,7 +1889,10 @@ fn a_refused_exact_offset_is_asked_on_the_grid_next() {
 
     client.realign(exact.from);
     let aligned = client.next_request().expect("more to fetch");
-    assert_eq!(aligned.from, 0, "a refused offset was asked again instead of the cell");
+    assert_eq!(
+        aligned.from, 0,
+        "a refused offset was asked again instead of the cell"
+    );
 }
 
 /// **An rskj chunk counts the node its walk stopped at**, which rskj sends

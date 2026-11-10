@@ -474,17 +474,26 @@ fn rskj_chunks_place_themselves_where_the_trie_has_them() {
             let stream = chunk_from(&root, 0, u64::MAX, &store);
             let k = locate(&chunk, &stream, &store, from);
             let last = &stream[k + chunk.nodes.len() - 1];
-            assert_eq!(start, stream[k].offset, "{keys} keys {from}..{to}: where it begins");
+            assert_eq!(
+                start, stream[k].offset,
+                "{keys} keys {from}..{to}: where it begins"
+            );
             assert_eq!(end, last.end(), "{keys} keys {from}..{to}: where it ends");
 
-            assert!(start <= from, "{keys} keys {from}..{to}: begins at {start}, after {from}");
+            assert!(
+                start <= from,
+                "{keys} keys {from}..{to}: begins at {start}, after {from}"
+            );
             assert!(
                 end < to || end == total,
                 "{keys} keys {from}..{to}: runs to {end}, past the range"
             );
             if let Some((was, until, reached)) = previous {
                 if was == keys && until == from {
-                    assert_eq!(start, reached, "{keys} keys: {from}.. does not pick up at {reached}");
+                    assert_eq!(
+                        start, reached,
+                        "{keys} keys: {from}.. does not pick up at {reached}"
+                    );
                 }
             }
             previous = Some((keys, to, end));
@@ -532,10 +541,17 @@ fn asked_where_they_stopped_rskj_chunks_tile_the_trie() {
             let (start, end) = rebuilt
                 .span
                 .unwrap_or_else(|| panic!("cell {cell} at {asked}: nothing of its own"));
-            assert!(start <= asked, "cell {cell} at {asked}: begins at {start}, after the offset");
+            assert!(
+                start <= asked,
+                "cell {cell} at {asked}: begins at {start}, after the offset"
+            );
             let k = locate(&chunk, &stream, &store, asked);
             assert_eq!(start, stream[k].offset, "cell {cell} at {asked}");
-            assert_eq!(end, stream[k + chunk.nodes.len() - 1].end(), "cell {cell} at {asked}");
+            assert_eq!(
+                end,
+                stream[k + chunk.nodes.len() - 1].end(),
+                "cell {cell} at {asked}"
+            );
             assert!(end > reached, "cell {cell} at {asked}: no progress");
             reached = end;
             asked = reached + 1;
@@ -595,7 +611,9 @@ fn a_chunk_that_leaves_out_a_stretch_is_refused() {
             let k = locate(&chunk, &stream, &store, asked);
             let last = &stream[k + n - 1];
             let node = rustock_trie::TrieNode::from_message(&last.message, &store);
-            let NodeRef::Hash(left) = node.left.clone() else { continue };
+            let NodeRef::Hash(left) = node.left.clone() else {
+                continue;
+            };
             let left_size = total_size(&NodeRef::Hash(left).resolve(&store).expect("held"), &store);
             // The last node's left subtree, wholly inside the chunk and not
             // the whole of what precedes the last node.
@@ -683,12 +701,21 @@ fn a_node_hung_where_its_parent_has_none_is_refused() {
             match rebuild(&tampered, root_hash) {
                 Err(RebuildError::Dangling { .. }) => dangling += 1,
                 Err(_) => {}
-                Ok(r) => panic!("a node hung where there is no child was taken, spanning {:?}", r.span),
+                Ok(r) => panic!(
+                    "a node hung where there is no child was taken, spanning {:?}",
+                    r.span
+                ),
             }
         }
     }
-    assert!(tampered_with > 0, "no chunk ended in a node without a separate right child");
-    assert!(dangling > 0, "the root caught every tampering, so the link check was never reached");
+    assert!(
+        tampered_with > 0,
+        "no chunk ended in a node without a separate right child"
+    );
+    assert!(
+        dangling > 0,
+        "the root caught every tampering, so the link check was never reached"
+    );
 }
 
 /// A trie in the shape Rootstock's state has: accounts, and under a contract's
@@ -711,15 +738,25 @@ fn unitrie(accounts: usize) -> (TrieNode, MemoryTrieStore) {
     for i in 0..accounts {
         let address = Address::from_word(B256::from(alloy_primitives::U256::from(i as u64 + 1)));
         // An account state: nonce and balance, well under 32 bytes.
-        root = put(root, account_key(&address), vec![0xc4, (i as u8).wrapping_add(1), 0x82, 0x03, 0xe8]);
+        root = put(
+            root,
+            account_key(&address),
+            vec![0xc4, (i as u8).wrapping_add(1), 0x82, 0x03, 0xe8],
+        );
         if i % 3 == 0 {
             continue;
         }
-        let code: Vec<u8> = (0..(40 + i % 90) as u8).map(|b| b.wrapping_mul(i as u8 | 1)).collect();
+        let code: Vec<u8> = (0..(40 + i % 90) as u8)
+            .map(|b| b.wrapping_mul(i as u8 | 1))
+            .collect();
         root = put(root, code_key(&address), code);
         for slot in 0..(i % 6) as u64 {
             let value = vec![(slot as u8).wrapping_add(i as u8) | 1; 1 + (slot as usize * 7) % 32];
-            root = put(root, storage_key(&address, &B256::from(alloy_primitives::U256::from(slot))), value);
+            root = put(
+                root,
+                storage_key(&address, &B256::from(alloy_primitives::U256::from(slot))),
+                value,
+            );
         }
     }
     root.save(&store, true);
@@ -754,38 +791,69 @@ fn every_node_can_begin_a_chunk_where_it_sits() {
         let asked = entry.end();
         let chunk = legacy_chunk(&root_bytes, asked, asked + 2_000, &store).expect("builds");
         let rebuilt = rebuild(&chunk, root_hash).unwrap_or_else(|e| panic!("node {i}: {e}"));
-        let (start, end) = rebuilt.span.unwrap_or_else(|| panic!("node {i}: nothing of its own"));
+        let (start, end) = rebuilt
+            .span
+            .unwrap_or_else(|| panic!("node {i}: nothing of its own"));
         let k = locate(&chunk, &stream, &store, asked);
-        assert_eq!(k, i, "the chunk asked at the end of node {i} begins elsewhere");
-        assert_eq!(start, entry.offset, "node {i} is placed at {start}, not {}", entry.offset);
-        assert_eq!(end, stream[k + chunk.nodes.len() - 1].end(), "node {i}: where the chunk ends");
+        assert_eq!(
+            k, i,
+            "the chunk asked at the end of node {i} begins elsewhere"
+        );
+        assert_eq!(
+            start, entry.offset,
+            "node {i} is placed at {start}, not {}",
+            entry.offset
+        );
+        assert_eq!(
+            end,
+            stream[k + chunk.nodes.len() - 1].end(),
+            "node {i}: where the chunk ends"
+        );
         let node = TrieNode::from_message(&entry.message, &store);
         shapes.insert((kind(&node.left), kind(&node.right)));
     }
-    for shape in [("separate", "separate"), ("separate", "embedded"), ("embedded", "embedded")] {
-        assert!(shapes.contains(&shape), "no first node shaped {shape:?} among {shapes:?}");
+    for shape in [
+        ("separate", "separate"),
+        ("separate", "embedded"),
+        ("embedded", "embedded"),
+    ] {
+        assert!(
+            shapes.contains(&shape),
+            "no first node shaped {shape:?} among {shapes:?}"
+        );
     }
 }
 
 /// The long values a rebuilt chunk's nodes name -- their own, and their
 /// embedded children's -- and how many of those were embedded, if each is
 /// among the values the rebuild kept. Panics on one that is not.
-fn long_values_named(rebuilt: &rustock_trie::snapshot_legacy::Rebuilt, what: &str) -> (usize, usize) {
+fn long_values_named(
+    rebuilt: &rustock_trie::snapshot_legacy::Rebuilt,
+    what: &str,
+) -> (usize, usize) {
     use rustock_trie::{MemoryTrieStore, NodeRef, TrieNode};
-    let kept: std::collections::HashSet<[u8; 32]> =
-        rebuilt.long_values.iter().map(|v| alloy_primitives::keccak256(v).0).collect();
+    let kept: std::collections::HashSet<[u8; 32]> = rebuilt
+        .long_values
+        .iter()
+        .map(|v| alloy_primitives::keccak256(v).0)
+        .collect();
     let nothing = MemoryTrieStore::new();
     let (mut named, mut embedded) = (0, 0);
     for (_, message) in &rebuilt.nodes {
         let node = TrieNode::try_from_message(message, &nothing).expect("a rebuilt node parses");
-        let children = [&node.left, &node.right].into_iter().filter_map(|c| match c {
-            NodeRef::Node(n) => Some(n.as_ref()),
-            _ => None,
-        });
+        let children = [&node.left, &node.right]
+            .into_iter()
+            .filter_map(|c| match c {
+                NodeRef::Node(n) => Some(n.as_ref()),
+                _ => None,
+            });
         for (n, inside) in std::iter::once((&node, false)).chain(children.map(|n| (n, true))) {
             if n.has_long_value() {
                 let hash = n.value_hash.expect("a long value is named by its hash");
-                assert!(kept.contains(&hash.0), "{what}: a long value named and not kept");
+                assert!(
+                    kept.contains(&hash.0),
+                    "{what}: a long value named and not kept"
+                );
                 named += 1;
                 embedded += usize::from(inside);
             }
@@ -837,7 +905,10 @@ fn every_long_value_a_chunk_names_comes_with_it() {
             from += cell;
         }
     }
-    assert!(embedded > 0, "no embedded long value was exercised ({named} named in all)");
+    assert!(
+        embedded > 0,
+        "no embedded long value was exercised ({named} named in all)"
+    );
 }
 
 /// The Rootstock-shaped trie of [`unitrie`], with long code under some

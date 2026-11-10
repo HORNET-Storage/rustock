@@ -4743,13 +4743,24 @@ async fn a_block_with_full_transactions_names_the_real_sender() {
 
     for (method, arg) in [
         ("eth_getBlockByNumber", json!(["0x2a", true])),
-        ("eth_getBlockByHash", json!([format!("{:#x}", state.store.canonical_hash(42).unwrap().unwrap()), true])),
+        (
+            "eth_getBlockByHash",
+            json!([
+                format!("{:#x}", state.store.canonical_hash(42).unwrap().unwrap()),
+                true
+            ]),
+        ),
     ] {
         let resp = dispatch_for_test(&state, make_request(method, arg)).await;
         let block = resp.result.expect("the block must be returned");
-        let txs = block["transactions"].as_array().expect("full transaction objects");
+        let txs = block["transactions"]
+            .as_array()
+            .expect("full transaction objects");
         assert_eq!(txs.len(), 1, "{method}");
-        assert_eq!(txs[0]["from"], expected, "{method} reported the wrong sender");
+        assert_eq!(
+            txs[0]["from"], expected,
+            "{method} reported the wrong sender"
+        );
         assert_ne!(
             txs[0]["from"],
             json!("0x0000000000000000000000000000000000000000"),
@@ -7137,14 +7148,22 @@ fn assert_hangs_from(nodes: &Value, state_root: B256, trie_store: &dyn rustock_t
         .map(|bytes| TrieNode::from_message(&bytes, trie_store))
         .collect();
     assert!(parsed.len() > 1, "the path should span more than one level");
-    assert_eq!(parsed.last().unwrap().compute_hash(trie_store), state_root, "not the block's state root");
+    assert_eq!(
+        parsed.last().unwrap().compute_hash(trie_store),
+        state_root,
+        "not the block's state root"
+    );
     for pair in parsed.windows(2) {
         let (child, parent) = (&pair[0], &pair[1]);
         let message = child.to_message(trie_store);
-        let linked = [&parent.left, &parent.right]
-            .iter()
-            .any(|r| r.resolve(trie_store).is_some_and(|c| c.to_message(trie_store) == message));
-        assert!(linked, "a node on the path is not a child of the one above it");
+        let linked = [&parent.left, &parent.right].iter().any(|r| {
+            r.resolve(trie_store)
+                .is_some_and(|c| c.to_message(trie_store) == message)
+        });
+        assert!(
+            linked,
+            "a node on the path is not a child of the one above it"
+        );
     }
 }
 
@@ -7207,8 +7226,16 @@ async fn a_light_client_reads_a_contracts_storage_from_the_answer_alone() {
         .put(&TrieKeySlice::from_key(&key(3)), &[7], &*trie_store);
     root.save(&*trie_store, true);
     let root_43 = root.compute_hash(&*trie_store);
-    TrieStore::put(&*trie_store, root_43.as_slice(), &root.to_message(&*trie_store));
-    let header = Header { parent_hash: hash_42, state_root: root_43, ..test_header(43) };
+    TrieStore::put(
+        &*trie_store,
+        root_43.as_slice(),
+        &root.to_message(&*trie_store),
+    );
+    let header = Header {
+        parent_hash: hash_42,
+        state_root: root_43,
+        ..test_header(43)
+    };
     let hash_43 = header.hash();
     state.store.put_header(&header).unwrap();
     state.store.put_canonical_hash(43, hash_43).unwrap();
@@ -7219,13 +7246,20 @@ async fn a_light_client_reads_a_contracts_storage_from_the_answer_alone() {
         ("0x2a", hash_42, [Some(42u8), Some(99), None]),
         ("0x2b", hash_43, [Some(43), None, Some(7)]),
     ] {
-        let raw = dispatch_for_test(&state, make_request("rsk_getRawBlockHeaderByNumber", json!([block])))
-            .await
-            .result
-            .unwrap();
+        let raw = dispatch_for_test(
+            &state,
+            make_request("rsk_getRawBlockHeaderByNumber", json!([block])),
+        )
+        .await
+        .result
+        .unwrap();
         let raw = hex::decode(raw.as_str().unwrap().trim_start_matches("0x")).unwrap();
         let header = Header::decode_with_hash(&mut raw.as_slice()).unwrap();
-        assert_eq!(header.hash(), trusted, "block {block}: the header is the trusted block's");
+        assert_eq!(
+            header.hash(),
+            trusted,
+            "block {block}: the header is the trusted block's"
+        );
 
         let req = make_request(
             "rsk_getStorageNodes",
@@ -7235,7 +7269,11 @@ async fn a_light_client_reads_a_contracts_storage_from_the_answer_alone() {
         for (i, want) in want.iter().enumerate() {
             let slot = i as u8 + 1;
             assert_eq!(
-                read_slot_as_a_light_client(&r["storage"][i]["nodes"], header.state_root, &key(slot)),
+                read_slot_as_a_light_client(
+                    &r["storage"][i]["nodes"],
+                    header.state_root,
+                    &key(slot)
+                ),
                 Ok(want.map(|v| vec![v])),
                 "block {block}, slot {slot}"
             );
@@ -7268,10 +7306,17 @@ async fn a_light_client_reads_a_contracts_storage_from_the_answer_alone() {
 async fn storage_nodes_prove_a_slot_that_is_there() {
     let (state, _tmp, addr, state_root) = setup_proof_state();
     let trie_store = state.trie_store.clone().unwrap();
-    let req = make_request("rsk_getStorageNodes", json!([format!("{addr:#x}"), ["0x1"], "latest"]));
+    let req = make_request(
+        "rsk_getStorageNodes",
+        json!([format!("{addr:#x}"), ["0x1"], "latest"]),
+    );
     let r = dispatch_for_test(&state, req).await.result.unwrap();
 
-    assert_eq!(r["blockNumber"], json!("0x2a"), "the block the nodes hang from is named");
+    assert_eq!(
+        r["blockNumber"],
+        json!("0x2a"),
+        "the block the nodes hang from is named"
+    );
     assert_eq!(r["stateRoot"], json!(format!("{state_root:#x}")));
     let slot = &r["storage"][0];
     assert_eq!(slot["present"], json!(true));
@@ -7286,7 +7331,10 @@ async fn storage_nodes_prove_a_slot_that_is_there() {
 async fn storage_nodes_prove_a_slot_that_is_not() {
     let (state, _tmp, addr, state_root) = setup_proof_state();
     let trie_store = state.trie_store.clone().unwrap();
-    let req = make_request("rsk_getStorageNodes", json!([format!("{addr:#x}"), ["0x3"], "latest"]));
+    let req = make_request(
+        "rsk_getStorageNodes",
+        json!([format!("{addr:#x}"), ["0x3"], "latest"]),
+    );
     let r = dispatch_for_test(&state, req).await.result.unwrap();
 
     let slot = &r["storage"][0];
@@ -7294,7 +7342,10 @@ async fn storage_nodes_prove_a_slot_that_is_not() {
     assert_eq!(slot["value"], json!("0x0"));
     assert_hangs_from(&slot["nodes"], state_root, &*trie_store);
 
-    let req = make_request("eth_getProof", json!([format!("{addr:#x}"), ["0x3"], "latest"]));
+    let req = make_request(
+        "eth_getProof",
+        json!([format!("{addr:#x}"), ["0x3"], "latest"]),
+    );
     let r = dispatch_for_test(&state, req).await.result.unwrap();
     assert_eq!(
         r["storageProof"][0]["proof"].as_array().unwrap().len(),

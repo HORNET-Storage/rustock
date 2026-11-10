@@ -396,7 +396,11 @@ impl HeaderWalk {
         if !self.headers_sent.contains(&need) && !self.runs.contains_key(&need) {
             let floor = ((need - 1) / HEADER_CHUNK) * HEADER_CHUNK;
             self.headers_sent.insert(need);
-            out.push(Want::Headers { from: self.need_hash, count: (need - floor) as u32, point: need });
+            out.push(Want::Headers {
+                from: self.need_hash,
+                count: (need - floor) as u32,
+                point: need,
+            });
             if out.len() >= budget {
                 return out;
             }
@@ -537,10 +541,15 @@ impl HeaderWalk {
                             .unwrap_or(U256::ZERO);
                         let below = (i + UNCLE_GENERATIONS + 1).saturating_sub(headers.len());
                         if below == 0 {
-                            uncle_weight = uncle_weight
-                                .saturating_add(U256::from(header.uncle_count).saturating_mul(highest));
+                            uncle_weight = uncle_weight.saturating_add(
+                                U256::from(header.uncle_count).saturating_mul(highest),
+                            );
                         } else {
-                            reaching.push(Reaching { count: header.uncle_count, highest, below });
+                            reaching.push(Reaching {
+                                count: header.uncle_count,
+                                highest,
+                                below,
+                            });
                         }
                     }
                 }
@@ -728,7 +737,8 @@ impl HeaderWalk {
             if uncles.below > 0 {
                 return true;
             }
-            settled = settled.saturating_add(U256::from(uncles.count).saturating_mul(uncles.highest));
+            settled =
+                settled.saturating_add(U256::from(uncles.count).saturating_mul(uncles.highest));
             false
         });
         self.uncle_weight = self.uncle_weight.saturating_add(settled);
@@ -737,7 +747,12 @@ impl HeaderWalk {
     /// Settle the uncles whose possible parents reach below the walk, on this
     /// node's own chain under the anchor, which the store holds.
     fn settle_on_own_chain(&mut self) {
-        let wanted = self.reaching.iter().map(|uncles| uncles.below).max().unwrap_or(0);
+        let wanted = self
+            .reaching
+            .iter()
+            .map(|uncles| uncles.below)
+            .max()
+            .unwrap_or(0);
         let mut difficulties = Vec::with_capacity(wanted);
         let mut hash = self.need_hash;
         let mut whole = true;

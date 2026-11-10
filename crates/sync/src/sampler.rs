@@ -795,7 +795,9 @@ impl SamplingGate {
         // starting with any skeleton nobody answered: until it is in, the
         // window is not covered, and nothing else will ask for it again.
         while self.skeletons_outstanding < 4 {
-            let Some(start) = self.retry_skeletons.pop() else { break };
+            let Some(start) = self.retry_skeletons.pop() else {
+                break;
+            };
             out.push(GateAction::RequestSkeleton { start });
             self.skeletons_outstanding += 1;
         }
@@ -1017,7 +1019,18 @@ mod gate_tests {
         let blocks = 20_000u64;
         let head = cp.number + blocks;
         let honest = cp.cumulative_difficulty + cp.difficulty * U256::from(blocks);
-        let mut gate = SamplingGate::new(cp, honest, head, DIV, MIN, SPAN, CheckpointDefence { verify_hash: false, bound_work: true });
+        let mut gate = SamplingGate::new(
+            cp,
+            honest,
+            head,
+            DIV,
+            MIN,
+            SPAN,
+            CheckpointDefence {
+                verify_hash: false,
+                bound_work: true,
+            },
+        );
         let verifier = HeaderVerifier::new();
 
         // The first skeleton goes unanswered and is handed back; the rest of
@@ -1031,7 +1044,11 @@ mod gate_tests {
         }
         let lost = lost.expect("a skeleton is asked for");
         gate.release_skeleton(lost);
-        assert_eq!(gate.outcome(), GateOutcome::Pending, "judged without the lost skeleton");
+        assert_eq!(
+            gate.outcome(),
+            GateOutcome::Pending,
+            "judged without the lost skeleton"
+        );
 
         let mut asked_again = false;
         for _ in 0..64 {
@@ -1045,7 +1062,11 @@ mod gate_tests {
             }
         }
         assert!(asked_again, "the lost skeleton was never asked again");
-        assert!(matches!(gate.outcome(), GateOutcome::Passed { .. }), "{:?}", gate.outcome());
+        assert!(
+            matches!(gate.outcome(), GateOutcome::Passed { .. }),
+            "{:?}",
+            gate.outcome()
+        );
     }
 
     /// The gate does not reach a verdict before the window is covered —

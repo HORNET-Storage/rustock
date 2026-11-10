@@ -470,7 +470,10 @@ impl StateDownload {
         // would leave a gap behind the cursor.
         if starts > from {
             self.release(from);
-            return Err(ChunkError::Misplaced { asked: from, starts });
+            return Err(ChunkError::Misplaced {
+                asked: from,
+                starts,
+            });
         }
 
         for (hash, message) in &chunk.nodes {
@@ -500,7 +503,11 @@ impl StateDownload {
             chunk.nodes.len()
         );
 
-        Ok(Progress { nodes: chunk.nodes.len(), advanced, complete: self.is_complete() })
+        Ok(Progress {
+            nodes: chunk.nodes.len(),
+            advanced,
+            complete: self.is_complete(),
+        })
     }
 
     /// Replace the hinted size with the one the root proves, and reshape the

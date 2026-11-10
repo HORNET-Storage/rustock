@@ -1400,7 +1400,7 @@ impl Header {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::{Address, B256, U256, Bytes, keccak256, b256, address, hex};
+    use alloy_primitives::{address, b256, hex, keccak256, Address, Bytes, B256, U256};
     use alloy_rlp::{Decodable, Encodable};
 
     /// A mainnet header from below RSKIPUMM, as the heights `Header::decode`
@@ -1444,11 +1444,12 @@ mod tests {
         header.encode(&mut buffer);
 
         // Decode
-        let decoded_header = Header::decode(&mut buffer.as_slice()).expect("Failed to decode header");
+        let decoded_header =
+            Header::decode(&mut buffer.as_slice()).expect("Failed to decode header");
 
         // Assert
         assert_eq!(header, decoded_header);
-        
+
         // Hash check (just to ensure it doesn't panic)
         let hash = header.hash();
         assert_ne!(hash, B256::ZERO);
@@ -2904,7 +2905,10 @@ mod versioned_wire_header_tests {
         // Testnet headers, so testnet's RSKIP-144 height.
         let testnet = crate::config::ActivationHeights::testnet();
         let h = Header::decode_with_activations(&mut slice, &testnet).unwrap();
-        assert_eq!((h.cached_hash, h.cached_hash_for_merged_mining), (None, None));
+        assert_eq!(
+            (h.cached_hash, h.cached_hash_for_merged_mining),
+            (None, None)
+        );
         h
     }
 

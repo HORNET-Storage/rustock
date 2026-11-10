@@ -568,10 +568,24 @@ mod snap_capability_tests {
         let rsk63 = B512::repeat_byte(1);
         let rsk62_snap = B512::repeat_byte(2);
         store
-            .add_peer_with(rsk63, tx.clone(), PeerCapabilities { rsk_version: 63, snap: false })
+            .add_peer_with(
+                rsk63,
+                tx.clone(),
+                PeerCapabilities {
+                    rsk_version: 63,
+                    snap: false,
+                },
+            )
             .await;
         store
-            .add_peer_with(rsk62_snap, tx, PeerCapabilities { rsk_version: 62, snap: true })
+            .add_peer_with(
+                rsk62_snap,
+                tx,
+                PeerCapabilities {
+                    rsk_version: 62,
+                    snap: true,
+                },
+            )
             .await;
 
         assert_eq!(store.peers_sending_header_uncles().await, vec![rsk63]);

@@ -121,7 +121,6 @@ pub fn difficulty_to_target(difficulty: alloy_primitives::U256) -> alloy_primiti
         below + U256::from(1)
     } else {
         below
-
     }
 }
 
@@ -305,7 +304,9 @@ impl HeaderValidator for MergedMiningRule {
         // to look for.
         if let Some(umm_root) = &header.umm_root {
             if !umm_root.is_empty() && umm_root.len() != UMM_ROOT_LENGTH {
-                return Err(ValidationError::UmmRootInvalid { len: umm_root.len() });
+                return Err(ValidationError::UmmRootInvalid {
+                    len: umm_root.len(),
+                });
             }
         }
         let rsk_hash = header.hash_for_merged_mining();

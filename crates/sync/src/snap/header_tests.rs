@@ -159,9 +159,9 @@ impl Fixture {
                 log.push((frontier, want));
                 match want {
                     Want::Skeleton { start } => walk.on_skeleton(&self.skeleton(start)),
-                    Want::Headers { point, count, .. } => {
-                        walk.on_headers(point, &self.headers(point, count), &Default::default()).expect("honest")
-                    }
+                    Want::Headers { point, count, .. } => walk
+                        .on_headers(point, &self.headers(point, count), &Default::default())
+                        .expect("honest"),
                 }
             }
             walk.advance().expect("honest answers link");
@@ -202,7 +202,11 @@ fn heaviest_uncles(chain: &[Header], blocks: std::ops::RangeInclusive<usize>) ->
     let mut total = U256::ZERO;
     for n in blocks {
         let parents = n.saturating_sub(7)..=n.saturating_sub(2);
-        let heaviest = chain[parents].iter().map(|h| h.difficulty).max().expect("a parent");
+        let heaviest = chain[parents]
+            .iter()
+            .map(|h| h.difficulty)
+            .max()
+            .expect("a parent");
         total += U256::from(chain[n].uncle_count) * (heaviest + heaviest / U256::from(50u64));
     }
     total
@@ -468,8 +472,15 @@ fn the_walk_asks_from_the_top_down() {
             Want::Headers { .. } => None,
         })
         .collect();
-    assert_eq!(starts.first(), Some(&19_200), "the first skeleton is the one under the checkpoint");
-    assert!(starts.windows(2).all(|w| w[0] > w[1]), "not asked from the top down: {starts:?}");
+    assert_eq!(
+        starts.first(),
+        Some(&19_200),
+        "the first skeleton is the one under the checkpoint"
+    );
+    assert!(
+        starts.windows(2).all(|w| w[0] > w[1]),
+        "not asked from the top down: {starts:?}"
+    );
 
     let (frontier, _) = log
         .iter()
@@ -509,21 +520,45 @@ fn a_frontier_answered_from_another_chain_is_asked_for_again() {
     let f = fixture(1000);
     let forked = another_chain(1000);
     let mut walk = f.walk(1000, HeaderVerifier::new());
-    walk.on_headers(1000, &f.headers(1000, (1000 - 960) as u32), &Default::default()).expect("honest");
+    walk.on_headers(
+        1000,
+        &f.headers(1000, (1000 - 960) as u32),
+        &Default::default(),
+    )
+    .expect("honest");
     walk.advance().expect("links");
     assert_eq!(walk.frontier(), 960);
 
-    let frontier = Want::Headers { from: f.chain[960].hash(), count: HEADER_CHUNK as u32, point: 960 };
-    assert!(walk.wants(8).contains(&frontier), "the walk asks for its frontier from the hash it holds");
+    let frontier = Want::Headers {
+        from: f.chain[960].hash(),
+        count: HEADER_CHUNK as u32,
+        point: 960,
+    };
+    assert!(
+        walk.wants(8).contains(&frontier),
+        "the walk asks for its frontier from the hash it holds"
+    );
 
     // Right height, wrong chain.
-    let run: Vec<Header> = (769..=960).rev().map(|i| forked[i as usize].clone()).collect();
-    walk.on_headers(960, &run, &Default::default()).expect("internally valid");
+    let run: Vec<Header> = (769..=960)
+        .rev()
+        .map(|i| forked[i as usize].clone())
+        .collect();
+    walk.on_headers(960, &run, &Default::default())
+        .expect("internally valid");
     walk.advance().expect("no error, just no progress");
     assert_eq!(walk.frontier(), 960, "a foreign run moved the walk");
 
-    assert!(walk.wants(8).contains(&frontier), "the frontier was not asked for again");
-    walk.on_headers(960, &f.headers(960, HEADER_CHUNK as u32), &Default::default()).expect("honest");
+    assert!(
+        walk.wants(8).contains(&frontier),
+        "the frontier was not asked for again"
+    );
+    walk.on_headers(
+        960,
+        &f.headers(960, HEADER_CHUNK as u32),
+        &Default::default(),
+    )
+    .expect("honest");
     walk.advance().expect("links");
     assert_eq!(walk.frontier(), 768);
 }
@@ -538,11 +573,16 @@ fn work_counts_once_and_only_for_the_chain() {
     let f = fixture(1000);
     let forked = another_chain(1000);
     let mut walk = f.walk(1000, HeaderVerifier::new());
-    walk.on_headers(1000, &f.headers(1000, 40), &Default::default()).expect("honest");
+    walk.on_headers(1000, &f.headers(1000, 40), &Default::default())
+        .expect("honest");
     walk.advance().expect("links");
-    let foreign: Vec<Header> = (769..=960).rev().map(|i| forked[i as usize].clone()).collect();
+    let foreign: Vec<Header> = (769..=960)
+        .rev()
+        .map(|i| forked[i as usize].clone())
+        .collect();
     for _ in 0..2 {
-        walk.on_headers(960, &foreign, &Default::default()).expect("internally valid");
+        walk.on_headers(960, &foreign, &Default::default())
+            .expect("internally valid");
         walk.advance().expect("no progress, and no error");
     }
     f.run(&mut walk, 8);
@@ -551,7 +591,11 @@ fn work_counts_once_and_only_for_the_chain() {
     // Genesis's own 100, and #1 to #1000 at 100 each, the checkpoint among them.
     let work = U256::from(100_100u64);
     assert_eq!(walk.established_difficulty(), Some(work));
-    assert_eq!(walk.work_ceiling(U256::ZERO), Some(work), "without uncles the work is exact");
+    assert_eq!(
+        walk.work_ceiling(U256::ZERO),
+        Some(work),
+        "without uncles the work is exact"
+    );
 }
 
 /// **The ceiling covers the heaviest uncles the rules allow.** rskj peers send
@@ -566,7 +610,11 @@ fn work_counts_once_and_only_for_the_chain() {
 #[test]
 fn the_ceiling_covers_the_heaviest_uncles_the_rules_allow() {
     let chain = shaped_chain(1000, |n| {
-        let difficulty = if (762..=767).contains(&n) { 10_000_000 } else { 1_000_000 + (n % 10) * 50_000 };
+        let difficulty = if (762..=767).contains(&n) {
+            10_000_000
+        } else {
+            1_000_000 + (n % 10) * 50_000
+        };
         (difficulty, if n >= 8 { n % 3 } else { 0 })
     });
     let f = fixture_of(chain);
@@ -576,9 +624,16 @@ fn the_ceiling_covers_the_heaviest_uncles_the_rules_allow() {
 
     let seen = sum(&f.chain);
     let carried = seen + heaviest_uncles(&f.chain, 1..=1000);
-    assert_eq!(walk.established_difficulty(), Some(seen), "the walk counts the trunk it sees");
+    assert_eq!(
+        walk.established_difficulty(),
+        Some(seen),
+        "the walk counts the trunk it sees"
+    );
     let ceiling = walk.work_ceiling(U256::ZERO).expect("anchored");
-    assert!(ceiling >= carried, "the ceiling {ceiling} is under the {carried} the chain can carry");
+    assert!(
+        ceiling >= carried,
+        "the ceiling {ceiling} is under the {carried} the chain can carry"
+    );
     assert!(
         ceiling * U256::from(100u64) <= carried * U256::from(101u64),
         "the ceiling {ceiling} is loose against {carried}"
@@ -591,7 +646,11 @@ fn the_ceiling_covers_the_heaviest_uncles_the_rules_allow() {
 #[test]
 fn the_ceiling_reaches_under_the_anchor() {
     let chain = shaped_chain(1000, |n| {
-        let difficulty = if (762..=767).contains(&n) { 10_000_000 } else { 1_000_000 };
+        let difficulty = if (762..=767).contains(&n) {
+            10_000_000
+        } else {
+            1_000_000
+        };
         (difficulty, u64::from(n >= 8))
     });
     let f = fixture_of(chain);
@@ -600,8 +659,12 @@ fn the_ceiling_reaches_under_the_anchor() {
     let mut td = f.chain[0].difficulty;
     for header in &f.chain[1..=anchor] {
         td += header.difficulty * U256::from(1 + header.uncle_count);
-        f.store.put_header_with_hash(header.hash(), header).expect("header");
-        f.store.put_canonical_hash(header.number, header.hash()).expect("index");
+        f.store
+            .put_header_with_hash(header.hash(), header)
+            .expect("header");
+        f.store
+            .put_canonical_hash(header.number, header.hash())
+            .expect("index");
         f.store.put_total_difficulty(header.hash(), td).expect("td");
     }
     let mut walk = f.walk(1000, HeaderVerifier::new());
@@ -609,9 +672,15 @@ fn the_ceiling_reaches_under_the_anchor() {
     assert!(walk.is_done());
 
     let carried = td + sum(&f.chain[anchor + 1..]) + heaviest_uncles(&f.chain, anchor + 1..=1000);
-    assert_eq!(walk.established_difficulty(), Some(td + sum(&f.chain[anchor + 1..])));
+    assert_eq!(
+        walk.established_difficulty(),
+        Some(td + sum(&f.chain[anchor + 1..]))
+    );
     let ceiling = walk.work_ceiling(U256::ZERO).expect("anchored");
-    assert!(ceiling >= carried, "the ceiling {ceiling} is under the {carried} the chain can carry");
+    assert!(
+        ceiling >= carried,
+        "the ceiling {ceiling} is under the {carried} the chain can carry"
+    );
     assert!(
         ceiling * U256::from(100u64) <= carried * U256::from(101u64),
         "the ceiling {ceiling} is loose against {carried}"
@@ -627,9 +696,15 @@ fn a_missing_header_under_the_anchor_leaves_the_uncles_unbounded() {
     let f = fixture_of(chain);
     // This node holds #768 as canonical, but none of the headers under it.
     let anchor = &f.chain[768];
-    f.store.put_header_with_hash(anchor.hash(), anchor).expect("header");
-    f.store.put_canonical_hash(768, anchor.hash()).expect("index");
-    f.store.put_total_difficulty(anchor.hash(), U256::from(1_000_000_000u64)).expect("td");
+    f.store
+        .put_header_with_hash(anchor.hash(), anchor)
+        .expect("header");
+    f.store
+        .put_canonical_hash(768, anchor.hash())
+        .expect("index");
+    f.store
+        .put_total_difficulty(anchor.hash(), U256::from(1_000_000_000u64))
+        .expect("td");
     let mut walk = f.walk(1000, HeaderVerifier::new());
     // One request at a time, so that the walk asks only for its frontier and
     // never fetches, and stores, the run under the anchor itself.
@@ -647,17 +722,31 @@ fn a_missing_header_under_the_anchor_leaves_the_uncles_unbounded() {
 fn a_short_answer_does_not_strand_the_walk() {
     let f = fixture(1000);
     let mut walk = f.walk(1000, HeaderVerifier::new());
-    walk.on_headers(1000, &f.headers(1000, (1000 - 960) as u32), &Default::default()).expect("honest");
+    walk.on_headers(
+        1000,
+        &f.headers(1000, (1000 - 960) as u32),
+        &Default::default(),
+    )
+    .expect("honest");
     walk.advance().expect("links");
 
     // 100 of the 192 asked for.
-    walk.on_headers(960, &f.headers(960, 100), &Default::default()).expect("honest, if short");
+    walk.on_headers(960, &f.headers(960, 100), &Default::default())
+        .expect("honest, if short");
     walk.advance().expect("links");
     assert_eq!(walk.frontier(), 860);
 
-    let rest = Want::Headers { from: f.chain[860].hash(), count: 860 - 768, point: 860 };
-    assert!(walk.wants(8).contains(&rest), "the walk did not ask for the rest of the stretch");
-    walk.on_headers(860, &f.headers(860, 860 - 768), &Default::default()).expect("honest");
+    let rest = Want::Headers {
+        from: f.chain[860].hash(),
+        count: 860 - 768,
+        point: 860,
+    };
+    assert!(
+        walk.wants(8).contains(&rest),
+        "the walk did not ask for the rest of the stretch"
+    );
+    walk.on_headers(860, &f.headers(860, 860 - 768), &Default::default())
+        .expect("honest");
     walk.advance().expect("links");
     assert_eq!(walk.frontier(), 768, "not back on the grid");
 
@@ -675,7 +764,9 @@ fn a_walk_that_anchors_above_genesis_leaves_the_chain_below_alone() {
     let anchor = 15_360u64;
     for h in &f.chain[1..=anchor as usize] {
         f.store.put_header_with_hash(h.hash(), h).expect("header");
-        f.store.put_canonical_hash(h.number, h.hash()).expect("index");
+        f.store
+            .put_canonical_hash(h.number, h.hash())
+            .expect("index");
     }
 
     let mut walk = f.walk(20_000, HeaderVerifier::new());
@@ -701,11 +792,27 @@ fn an_identifier_off_the_grid_is_not_asked_for() {
     let f = fixture(1000);
     let mut walk = f.walk(1000, HeaderVerifier::new());
     walk.on_skeleton(&[
-        BlockIdentifier { number: 768, hash: f.chain[768].hash() },
-        BlockIdentifier { number: 900, hash: f.chain[900].hash() },
+        BlockIdentifier {
+            number: 768,
+            hash: f.chain[768].hash(),
+        },
+        BlockIdentifier {
+            number: 900,
+            hash: f.chain[900].hash(),
+        },
     ]);
 
     let wants = walk.wants(8);
-    assert!(wants.iter().any(|w| matches!(w, Want::Headers { point: 768, .. })), "{wants:?}");
-    assert!(!wants.iter().any(|w| matches!(w, Want::Headers { point: 900, .. })), "{wants:?}");
+    assert!(
+        wants
+            .iter()
+            .any(|w| matches!(w, Want::Headers { point: 768, .. })),
+        "{wants:?}"
+    );
+    assert!(
+        !wants
+            .iter()
+            .any(|w| matches!(w, Want::Headers { point: 900, .. })),
+        "{wants:?}"
+    );
 }

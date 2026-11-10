@@ -753,10 +753,12 @@ impl BlockProcessor {
             parent_rules: &parent_rules,
             // Under the same switch as the block's own fork-detection check
             // below, and for the same cost: 449 headers per uncle.
-            fork_detection: self.validate_fork_detection_data.then_some(UncleForkDetection {
-                view: &ancestry,
-                rskip110_height: self.rskip110_height(),
-            }),
+            fork_detection: self
+                .validate_fork_detection_data
+                .then_some(UncleForkDetection {
+                    view: &ancestry,
+                    rskip110_height: self.rskip110_height(),
+                }),
         }
         .validate(block)?;
 
@@ -3153,7 +3155,10 @@ mod tests {
         );
 
         seal(&mut uncle, &[]);
-        assert_eq!(processor.validate_block_rules(&naming(3, &b2, &uncle, &[]), Some(&b2)), Ok(()));
+        assert_eq!(
+            processor.validate_block_rules(&naming(3, &b2, &uncle, &[]), Some(&b2)),
+            Ok(())
+        );
 
         // Proof of work is not all: against its parent it must come later.
         let mut early = child_of(2, &b1, b1.timestamp);
@@ -3204,7 +3209,11 @@ mod tests {
         let tip = chain.len() - 1;
         let parent = &chain[tip];
         let uncle_parent = &chain[tip - 2];
-        let mut uncle = child_of(uncle_parent.number + 1, uncle_parent, uncle_parent.timestamp + 5);
+        let mut uncle = child_of(
+            uncle_parent.number + 1,
+            uncle_parent,
+            uncle_parent.timestamp + 5,
+        );
         uncle.beneficiary = Address::repeat_byte(0x0b);
         let mut right = uncle.clone();
         seal(&mut right, &data_from(tip - 2));
@@ -3214,12 +3223,18 @@ mod tests {
 
         let number = parent.number + 1;
         let block = |uncle: &Header| naming(number, parent, uncle, &data_from(tip));
-        assert_eq!(processor(true).validate_block_rules(&block(&right), Some(parent)), Ok(()));
+        assert_eq!(
+            processor(true).validate_block_rules(&block(&right), Some(parent)),
+            Ok(())
+        );
         assert!(matches!(
             processor(true).validate_block_rules(&block(&wrong), Some(parent)),
             Err(ValidationError::ForkDetectionDataMismatch { .. })
         ));
-        assert_eq!(processor(false).validate_block_rules(&block(&wrong), Some(parent)), Ok(()));
+        assert_eq!(
+            processor(false).validate_block_rules(&block(&wrong), Some(parent)),
+            Ok(())
+        );
     }
 }
 

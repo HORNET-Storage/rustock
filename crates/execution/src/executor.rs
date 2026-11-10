@@ -3829,7 +3829,10 @@ mod tests {
     ///   21,000 intrinsic + 9 (3 PUSH1) + 3 (PUSH20) + 700 EXTCODECOPY = 21,712.
     #[test]
     fn test_extcodecopy_flat_700_at_lovell700() {
-        assert_eq!(RskHardforkConfig::mainnet().spec_id(7_338_024), SpecId::SHANGHAI);
+        assert_eq!(
+            RskHardforkConfig::mainnet().spec_id(7_338_024),
+            SpecId::SHANGHAI
+        );
 
         let store = Arc::new(MemoryTrieStore::new());
         let root = TrieNode::empty();
@@ -3960,7 +3963,11 @@ mod tests {
         };
         assert_eq!(
             RskExecutor::extract_created_address(&create_tx, sender, &true),
-            Some("0xcd234a471b72ba2f1ccf0a70fcaba648a5eecd8d".parse().unwrap()),
+            Some(
+                "0xcd234a471b72ba2f1ccf0a70fcaba648a5eecd8d"
+                    .parse()
+                    .unwrap()
+            ),
         );
         // A reverted CREATE tx leaves no account.
         assert_eq!(
@@ -3999,8 +4006,7 @@ mod tests {
         let root = put_account(&root, store.as_ref(), &voter1, 0, one_rbtc);
         let root = put_account(&root, store.as_ref(), &voter2, 0, one_rbtc);
 
-        let block_store =
-            Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
         let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
 
         let vote_tx = |nonce: u64| {
@@ -4029,7 +4035,12 @@ mod tests {
             .execute_block(&header1, &[(vote_tx(0), voter1)], &root, store.clone())
             .expect("block 1");
         assert!(r1.tx_results[0].success);
-        let root2 = crate::state::apply_state_changes(&root, store.as_ref(), &r1.state_changes, &r1.markers);
+        let root2 = crate::state::apply_state_changes(
+            &root,
+            store.as_ref(),
+            &r1.state_changes,
+            &r1.markers,
+        );
 
         let header2 = dummy_header(632_051);
         let r2 = executor
@@ -4037,9 +4048,8 @@ mod tests {
             .expect("block 2");
         assert!(r2.tx_results[0].success);
 
-        let fee_key = crate::bridge::storage::bridge_storage_key(
-            crate::bridge::storage::FEE_PER_KB_KEY,
-        );
+        let fee_key =
+            crate::bridge::storage::bridge_storage_key(crate::bridge::storage::FEE_PER_KB_KEY);
         let fee_write = r2
             .markers
             .raw_storage
@@ -4149,8 +4159,7 @@ mod tests {
         let sender = Address::repeat_byte(0xAA);
         let one_rbtc = U256::from(10u64).pow(U256::from(18));
         let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
-        let block_store =
-            Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
         let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
 
         // Init code: COINBASE; SSTORE(0, coinbase); RETURN empty runtime.
@@ -4168,14 +4177,17 @@ mod tests {
             to: Bytes::new(),
             value: U256::ZERO,
             input: Bytes::from(init),
-            v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
         };
         let mut header = dummy_header(892_000);
         // A distinctive miner address, distinct from both REMASC_ADDR and the
         // default repeat_byte(0x01).
-        let miner = Address::from_slice(
-            &alloy_primitives::hex!("31fe561eb2c628cd32ec52573d7c4b7e4c278bfa"),
-        );
+        let miner = Address::from_slice(&alloy_primitives::hex!(
+            "31fe561eb2c628cd32ec52573d7c4b7e4c278bfa"
+        ));
         header.beneficiary = miner;
 
         let r1 = executor
@@ -4210,8 +4222,7 @@ mod tests {
         let sender = Address::repeat_byte(0xAA);
         let one_rbtc = U256::from(10u64).pow(U256::from(18));
         let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
-        let block_store =
-            Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
         let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
 
         // Runtime: CREATE(0,0,0) (empty init → no-code child); SSTORE(0, child).
@@ -4231,7 +4242,10 @@ mod tests {
             to: Bytes::new(),
             value: U256::ZERO,
             input: Bytes::from(init),
-            v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
         };
         let header1 = dummy_header(1_591_500);
         let r1 = executor
@@ -4240,11 +4254,16 @@ mod tests {
         assert!(r1.tx_results[0].success);
         let deployed = sender.create(0);
         assert_eq!(
-            r1.state_changes.get(&deployed).expect("creator").info.nonce, 0,
+            r1.state_changes.get(&deployed).expect("creator").info.nonce,
+            0,
             "a top-level CREATE tx keeps nonce 0 even post-RSKIP125"
         );
-        let root2 =
-            crate::state::apply_state_changes(&root, store.as_ref(), &r1.state_changes, &r1.markers);
+        let root2 = crate::state::apply_state_changes(
+            &root,
+            store.as_ref(),
+            &r1.state_changes,
+            &r1.markers,
+        );
 
         // Call the creator → it runs an internal CREATE.
         let call = rustock_core::Transaction {
@@ -4254,7 +4273,10 @@ mod tests {
             to: Bytes::copy_from_slice(deployed.as_slice()),
             value: U256::ZERO,
             input: Bytes::new(),
-            v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
         };
         let header2 = dummy_header(1_591_501);
         let r2 = executor
@@ -4264,7 +4286,12 @@ mod tests {
 
         let child = deployed.create(0);
         assert_eq!(
-            r2.state_changes.get(&child).expect("child contract").info.nonce, 1,
+            r2.state_changes
+                .get(&child)
+                .expect("child contract")
+                .info
+                .nonce,
+            1,
             "internal CREATE post-RSKIP125 bumps the created contract nonce to 1"
         );
     }
@@ -4294,14 +4321,11 @@ mod tests {
         let sender = Address::repeat_byte(0xAA);
         let one_rbtc = U256::from(10u64).pow(U256::from(18));
         let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
-        let block_store =
-            Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
         let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
 
         // Runtime: PUSH1 4; PUSH1 0; SHR (4 >> 0 = 4); PUSH1 0; SSTORE; STOP.
-        let runtime: Vec<u8> = vec![
-            0x60, 0x04, 0x60, 0x00, 0x1c, 0x60, 0x00, 0x55, 0x00,
-        ];
+        let runtime: Vec<u8> = vec![0x60, 0x04, 0x60, 0x00, 0x1c, 0x60, 0x00, 0x55, 0x00];
         let mut init = vec![
             0x60, 0x09, 0x60, 0x0c, 0x60, 0x00, 0x39, 0x60, 0x09, 0x60, 0x00, 0xf3,
         ];
@@ -4314,7 +4338,10 @@ mod tests {
             to: Bytes::new(),
             value: U256::ZERO,
             input: Bytes::from(init),
-            v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
         };
         let header1 = dummy_header(1_591_500);
         let r1 = executor
@@ -4322,8 +4349,12 @@ mod tests {
             .expect("deploy block");
         assert!(r1.tx_results[0].success);
         let deployed = sender.create(0);
-        let root2 =
-            crate::state::apply_state_changes(&root, store.as_ref(), &r1.state_changes, &r1.markers);
+        let root2 = crate::state::apply_state_changes(
+            &root,
+            store.as_ref(),
+            &r1.state_changes,
+            &r1.markers,
+        );
 
         let call = rustock_core::Transaction {
             nonce: 1,
@@ -4332,13 +4363,19 @@ mod tests {
             to: Bytes::copy_from_slice(deployed.as_slice()),
             value: U256::ZERO,
             input: Bytes::new(),
-            v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
         };
         let header2 = dummy_header(1_591_501);
         let r2 = executor
             .execute_block(&header2, &[(call, sender)], &root2, store.clone())
             .expect("call block");
-        assert!(r2.tx_results[0].success, "SHR must be a valid opcode at wasabi");
+        assert!(
+            r2.tx_results[0].success,
+            "SHR must be a valid opcode at wasabi"
+        );
         assert!(
             r2.tx_results[0].gas_used < 1_000_000,
             "SHR call must not consume the whole gas limit (invalid opcode)"
@@ -8688,10 +8725,7 @@ mod tests {
             cached_rlp: None,
         };
 
-        let executor = RskExecutor::new(
-            RskHardforkConfig::all_active(33),
-            block_store,
-        );
+        let executor = RskExecutor::new(RskHardforkConfig::all_active(33), block_store);
 
         let result = executor
             .execute_tx(&header, &tx, sender, &root, store)
@@ -8716,9 +8750,7 @@ mod tests {
         let one_rbtc = U256::from(10u64).pow(U256::from(18));
         let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
 
-        let block_store = Arc::new(
-            BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap(),
-        );
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
 
         let header = dummy_header(8_000_000);
 
@@ -8743,29 +8775,34 @@ mod tests {
         // PUSH1 0x40          ; 60 40    offset
         // RETURN              ; F3
         let runtime: Vec<u8> = vec![
-            0x63, 0xe8, 0xce, 0x22, 0x74,  // PUSH4 0xe8ce2274
-            0x60, 0x00,                      // PUSH1 0
-            0x52,                            // MSTORE
-            0x60, 0x20,                      // PUSH1 32 (retSize)
-            0x60, 0x40,                      // PUSH1 64 (retOffset)
-            0x60, 0x04,                      // PUSH1 4 (argsSize)
-            0x60, 0x1c,                      // PUSH1 28 (argsOffset)
-            0x63, 0x01, 0x00, 0x00, 0x11,   // PUSH4 0x01000011 (Environment addr)
-            0x5A,                            // GAS
-            0xFA,                            // STATICCALL
-            0x60, 0x20,                      // PUSH1 32 (return size)
-            0x60, 0x40,                      // PUSH1 64 (return offset)
-            0xF3,                            // RETURN
+            0x63, 0xe8, 0xce, 0x22, 0x74, // PUSH4 0xe8ce2274
+            0x60, 0x00, // PUSH1 0
+            0x52, // MSTORE
+            0x60, 0x20, // PUSH1 32 (retSize)
+            0x60, 0x40, // PUSH1 64 (retOffset)
+            0x60, 0x04, // PUSH1 4 (argsSize)
+            0x60, 0x1c, // PUSH1 28 (argsOffset)
+            0x63, 0x01, 0x00, 0x00, 0x11, // PUSH4 0x01000011 (Environment addr)
+            0x5A, // GAS
+            0xFA, // STATICCALL
+            0x60, 0x20, // PUSH1 32 (return size)
+            0x60, 0x40, // PUSH1 64 (return offset)
+            0xF3, // RETURN
         ];
 
         let runtime_len = runtime.len() as u8;
         let mut initcode: Vec<u8> = vec![
-            0x60, runtime_len,
-            0x60, 0x0c,
-            0x60, 0x00,
+            0x60,
+            runtime_len,
+            0x60,
+            0x0c,
+            0x60,
+            0x00,
             0x39,
-            0x60, runtime_len,
-            0x60, 0x00,
+            0x60,
+            runtime_len,
+            0x60,
+            0x00,
             0xF3,
         ];
         initcode.extend_from_slice(&runtime);
@@ -8783,19 +8820,21 @@ mod tests {
             cached_rlp: None,
         };
 
-        let executor = RskExecutor::new(
-            RskHardforkConfig::all_active(33),
-            block_store.clone(),
-        );
+        let executor = RskExecutor::new(RskHardforkConfig::all_active(33), block_store.clone());
 
         // Deploy
         let deploy_result = executor
             .execute_block(&header, &[(tx, sender)], &root, store.clone())
             .unwrap();
 
-        assert!(deploy_result.tx_results[0].success, "deployment should succeed");
+        assert!(
+            deploy_result.tx_results[0].success,
+            "deployment should succeed"
+        );
 
-        let contract_addr = deploy_result.state_changes.iter()
+        let contract_addr = deploy_result
+            .state_changes
+            .iter()
             .find(|(addr, acct)| {
                 **addr != sender
                     && **addr != header.beneficiary
@@ -8808,16 +8847,28 @@ mod tests {
         let root2 = TrieNode::empty();
         let root2 = put_account(&root2, store.as_ref(), &sender, 1, one_rbtc);
 
-        let code_bytes = deploy_result.state_changes.get(&contract_addr)
-            .unwrap().info.code.as_ref().unwrap().bytes_slice().to_vec();
+        let code_bytes = deploy_result
+            .state_changes
+            .get(&contract_addr)
+            .unwrap()
+            .info
+            .code
+            .as_ref()
+            .unwrap()
+            .bytes_slice()
+            .to_vec();
 
-        use rustock_trie::{TrieKeySlice, code_key, AccountState};
+        use rustock_trie::{code_key, AccountState, TrieKeySlice};
         let ckey = code_key(&contract_addr);
         let root2 = root2.put(&TrieKeySlice::from_key(&ckey), &code_bytes, store.as_ref());
 
         let caccount = AccountState::new(U256::ZERO, U256::ZERO);
         let akey = account_key(&contract_addr);
-        let root2 = root2.put(&TrieKeySlice::from_key(&akey), &caccount.encode(), store.as_ref());
+        let root2 = root2.put(
+            &TrieKeySlice::from_key(&akey),
+            &caccount.encode(),
+            store.as_ref(),
+        );
 
         let call_tx = rustock_core::Transaction {
             nonce: 1,
@@ -8837,7 +8888,11 @@ mod tests {
             .unwrap();
 
         assert!(call_result.success, "contract call should succeed");
-        assert_eq!(call_result.output.len(), 32, "should return 32-byte ABI-encoded uint32");
+        assert_eq!(
+            call_result.output.len(),
+            32,
+            "should return 32-byte ABI-encoded uint32"
+        );
 
         let depth = u32::from_be_bytes([
             call_result.output[28],

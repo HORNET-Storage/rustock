@@ -835,7 +835,11 @@ mod tests {
             parent = h.hash();
             hs.push(h);
         }
-        assert_eq!(store.exec_head().unwrap(), None, "precondition: nothing executed");
+        assert_eq!(
+            store.exec_head().unwrap(),
+            None,
+            "precondition: nothing executed"
+        );
         (store, dir, hs)
     }
 
@@ -849,7 +853,10 @@ mod tests {
         let v = Validated::prove(&store, hs[9].hash()).unwrap();
         let cursor = store.apply(&Transition::Retreat { to: v }).unwrap();
 
-        assert_eq!(cursor.validated_head.number, 9, "the retreat itself happens");
+        assert_eq!(
+            cursor.validated_head.number, 9,
+            "the retreat itself happens"
+        );
         assert_eq!(
             store.exec_head().unwrap(),
             None,
@@ -870,7 +877,11 @@ mod tests {
             stash(&store, h);
         }
         let v = Validated::prove(&store, c.hash()).unwrap();
-        assert_eq!(v.lineage()[0].0, 5, "precondition: the fork rewrites from #5");
+        assert_eq!(
+            v.lineage()[0].0,
+            5,
+            "precondition: the fork rewrites from #5"
+        );
 
         let cursor = store.apply(&Transition::Adopt { head: v }).unwrap();
 

@@ -1368,7 +1368,9 @@ fn no_gas_limit_is_too_large() {
 /// parent's limit, the lower bound is one below `parent - parent / 1024`.
 #[test]
 fn the_parent_gas_limit_bounds_are_rskjs_when_the_divisor_leaves_a_remainder() {
-    let rule = BlockParentGasLimitRule { config: Arc::new(crate::config::ChainConfig::mainnet()) };
+    let rule = BlockParentGasLimitRule {
+        config: Arc::new(crate::config::ChainConfig::mainnet()),
+    };
     let mut parent = create_dummy_header(10, 1000, B256::ZERO);
     parent.gas_limit = U256::from(6_800_000);
     let with = |limit: u64| {
@@ -1384,7 +1386,9 @@ fn the_parent_gas_limit_bounds_are_rskjs_when_the_divisor_leaves_a_remainder() {
         Err(ValidationError::GasLimitInvalid { .. })
     ));
     assert_eq!(rule.validate_with_parent(&with(6_806_640), &parent), Ok(()));
-    assert!(rule.validate_with_parent(&with(6_806_641), &parent).is_err());
+    assert!(rule
+        .validate_with_parent(&with(6_806_641), &parent)
+        .is_err());
 }
 
 /// Past 256 bits, where the typed field holds `U256::MAX`, rskj still reads
@@ -1448,7 +1452,9 @@ fn the_parent_gas_limit_bounds_hold_past_256_bits() {
 /// merkle proof, which is why it needs a check of its own.
 #[test]
 fn merged_mining_wants_exactly_a_bitcoin_header() {
-    let rule = MergedMiningRule { config: Arc::new(crate::config::ChainConfig::regtest()) };
+    let rule = MergedMiningRule {
+        config: Arc::new(crate::config::ChainConfig::regtest()),
+    };
     let mut header = create_dummy_header(10, 1000, B256::ZERO);
     header.difficulty = U256::from(1);
     let (btc_h, btc_cb, btc_m) = build_mm_proof(&header, 0x207fffff, None);
@@ -1458,7 +1464,10 @@ fn merged_mining_wants_exactly_a_bitcoin_header() {
     let mut longer = btc_h.to_vec();
     longer.push(0);
     header.bitcoin_merged_mining_header = Some(Bytes::from(longer));
-    assert_eq!(rule.validate(&header), Err(ValidationError::BitcoinHeaderDecodeError));
+    assert_eq!(
+        rule.validate(&header),
+        Err(ValidationError::BitcoinHeaderDecodeError)
+    );
 
     header.bitcoin_merged_mining_header = Some(btc_h);
     assert_eq!(rule.validate(&header), Ok(()));
@@ -1516,7 +1525,10 @@ impl fork_detection::MainchainView for NoChain {
 fn fork_detection_starts_above_block_449() {
     for number in [100, 449] {
         let header = create_dummy_header(number, 1000, B256::ZERO);
-        assert_eq!(fork_detection::validate(&header, Some([7; 12]), &NoChain, 0), Ok(()));
+        assert_eq!(
+            fork_detection::validate(&header, Some([7; 12]), &NoChain, 0),
+            Ok(())
+        );
     }
     let header = create_dummy_header(450, 1000, B256::ZERO);
     assert_eq!(
@@ -1643,8 +1655,10 @@ fn uncle_chain(base: u64) -> (Ancestry, Header, Header) {
 fn uncle_of(parent: &Header, timestamp: u64) -> Header {
     let mut uncle = create_dummy_header(parent.number + 1, timestamp, parent.hash());
     uncle.beneficiary = Address::repeat_byte(0x0b);
-    uncle.difficulty = DifficultyRule { config: uncle_config() }
-        .difficulty_for_child(parent, uncle.number, timestamp, 0);
+    uncle.difficulty = DifficultyRule {
+        config: uncle_config(),
+    }
+    .difficulty_for_child(parent, uncle.number, timestamp, 0);
     uncle
 }
 
@@ -1775,7 +1789,10 @@ fn the_uncle_rule_runs_fork_detection_when_asked() {
     let mut uncle = uncle_of(&parent, 1010);
     seal(&mut uncle, 1010);
 
-    let asked = uncles::UncleForkDetection { view: &NoChain, rskip110_height: 0 };
+    let asked = uncles::UncleForkDetection {
+        view: &NoChain,
+        rskip110_height: 0,
+    };
     assert_eq!(
         judge(&ancestry, &block, uncle.clone(), Some(asked)),
         Err(ValidationError::ForkDetectionDataUnreadable)
@@ -1814,11 +1831,21 @@ fn default_rsk_holds_uncles_to_rskjs_uncle_rules() {
 
     let mut adrift = uncle_of(&parent, 1010);
     seal(&mut adrift, 1010 + 300);
-    for verdict in [verifier.verify_uncle(&adrift), verifier.verify(&adrift, None)] {
-        assert!(matches!(verdict, Err(ValidationError::BitcoinTimestampTooFar { .. })));
+    for verdict in [
+        verifier.verify_uncle(&adrift),
+        verifier.verify(&adrift, None),
+    ] {
+        assert!(matches!(
+            verdict,
+            Err(ValidationError::BitcoinTimestampTooFar { .. })
+        ));
     }
 
-    assert_eq!(verifier.uncle_parent_rules().len(), 5, "rskj's five, in its order");
+    assert_eq!(
+        verifier.uncle_parent_rules().len(),
+        5,
+        "rskj's five, in its order"
+    );
 }
 
 /// rskj's trunk takes the timestamp rule on the header alone. A block no
@@ -1907,7 +1934,9 @@ fn wire(display: [u8; 32]) -> [u8; 32] {
 }
 
 fn regtest_merged_mining() -> MergedMiningRule {
-    MergedMiningRule { config: Arc::new(crate::config::ChainConfig::regtest()) }
+    MergedMiningRule {
+        config: Arc::new(crate::config::ChainConfig::regtest()),
+    }
 }
 
 /// rskj compares the root its proof folds to in bitcoinj's display order,
@@ -1940,23 +1969,40 @@ fn the_coinbase_must_run_past_64_bytes() {
     let header = header_at(10);
     let hash = header.hash_for_merged_mining();
     let judge = |absorbed: u64, after: usize| {
-        let coinbase = compressed_coinbase(absorbed, &tail_committing_to(hash.as_slice(), 0, after));
+        let coinbase =
+            compressed_coinbase(absorbed, &tail_committing_to(hash.as_slice(), 0, after));
         let root = merged_mining::compute_coinbase_hash(&coinbase);
-        regtest_merged_mining().validate(&mined_through(header.clone(), coinbase, Vec::new(), wire(root)))
+        regtest_merged_mining().validate(&mined_through(
+            header.clone(),
+            coinbase,
+            Vec::new(),
+            wire(root),
+        ))
     };
 
     // The tag and the hash are 41 bytes of tail.
-    assert_eq!(judge(0, 23), Err(ValidationError::CoinbaseTooShort { length: 64 }));
+    assert_eq!(
+        judge(0, 23),
+        Err(ValidationError::CoinbaseTooShort { length: 64 })
+    );
     assert_eq!(judge(0, 24), Ok(()));
-    assert_eq!(judge(23, 0), Err(ValidationError::CoinbaseTooShort { length: 64 }));
+    assert_eq!(
+        judge(23, 0),
+        Err(ValidationError::CoinbaseTooShort { length: 64 })
+    );
     assert_eq!(judge(24, 0), Ok(()));
     // `u64::MAX` is -1 to a Java `long`, and takes a byte off.
-    assert_eq!(judge(u64::MAX, 24), Err(ValidationError::CoinbaseTooShort { length: 64 }));
+    assert_eq!(
+        judge(u64::MAX, 24),
+        Err(ValidationError::CoinbaseTooShort { length: 64 })
+    );
     assert_eq!(judge(u64::MAX, 25), Ok(()));
     // A count that carries the sum past `i64::MAX` wraps it negative.
     assert_eq!(
         judge(i64::MAX as u64, 25),
-        Err(ValidationError::CoinbaseTooShort { length: i64::MAX.wrapping_add(66) })
+        Err(ValidationError::CoinbaseTooShort {
+            length: i64::MAX.wrapping_add(66)
+        })
     );
 }
 
@@ -2023,7 +2069,12 @@ fn a_coinbase_hashes_from_its_midstate_as_bouncycastle_does() {
     let header = header_at(10);
     let tail = tail_committing_to(header.hash_for_merged_mining().as_slice(), 0, 24);
     let root = bouncycastle_coinbase_hash(1, &tail);
-    let mined = mined_through(header, compressed_coinbase(1, &tail), Vec::new(), wire(root));
+    let mined = mined_through(
+        header,
+        compressed_coinbase(1, &tail),
+        Vec::new(),
+        wire(root),
+    );
     assert_eq!(regtest_merged_mining().validate(&mined), Ok(()));
 }
 
@@ -2051,7 +2102,11 @@ fn rskj_refuses_merkle_nodes_that_parse_as_a_transaction() {
 
     for input in 0..=4 {
         let (left, right) = transaction_shaped(input, 4 - input);
-        assert!(parses(&left, &right), "{input} + {} bytes of script", 4 - input);
+        assert!(
+            parses(&left, &right),
+            "{input} + {} bytes of script",
+            4 - input
+        );
     }
     for (input, output) in [(1, 2), (2, 3)] {
         let (left, right) = transaction_shaped(input, output);
@@ -2090,7 +2145,11 @@ fn rskj_refuses_merkle_nodes_that_parse_as_a_transaction() {
         (2_100_000_000_000_000, true),
         (2_100_000_000_000_001, false),
     ] {
-        assert_eq!(edited(49, &value.to_le_bytes()), parses_as_one, "{value} satoshis");
+        assert_eq!(
+            edited(49, &value.to_le_bytes()),
+            parses_as_one,
+            "{value} satoshis"
+        );
     }
 }
 
@@ -2115,10 +2174,21 @@ fn a_merkle_proof_through_a_transaction_shaped_pair_is_refused() {
         .expect("a coinbase hash with 1 as its fifth byte");
     let (_, sibling) = transaction_shaped(2, 2);
 
-    assert!(merged_mining::parses_as_a_64_byte_transaction(&coinbase_hash, &sibling));
-    assert_eq!(merged_mining::rskip92_merkle_root(&coinbase_hash, &sibling), None);
+    assert!(merged_mining::parses_as_a_64_byte_transaction(
+        &coinbase_hash,
+        &sibling
+    ));
+    assert_eq!(
+        merged_mining::rskip92_merkle_root(&coinbase_hash, &sibling),
+        None
+    );
     let root = merged_mining::combine_left_right(&coinbase_hash, &sibling);
-    let mined = mined_through(header.clone(), coinbase.clone(), sibling.to_vec(), wire(root));
+    let mined = mined_through(
+        header.clone(),
+        coinbase.clone(),
+        sibling.to_vec(),
+        wire(root),
+    );
     assert_eq!(
         regtest_merged_mining().validate(&mined),
         Err(ValidationError::MerkleNodesFormTransaction)
@@ -2128,7 +2198,10 @@ fn a_merkle_proof_through_a_transaction_shaped_pair_is_refused() {
     // block, with the root that sibling folds to, is merge-mined.
     let mut other = sibling;
     other[57 - 32] = 3;
-    assert!(!merged_mining::parses_as_a_64_byte_transaction(&coinbase_hash, &other));
+    assert!(!merged_mining::parses_as_a_64_byte_transaction(
+        &coinbase_hash,
+        &other
+    ));
     let root = merged_mining::combine_left_right(&coinbase_hash, &other);
     let mined = mined_through(header, coinbase, other.to_vec(), wire(root));
     assert_eq!(regtest_merged_mining().validate(&mined), Ok(()));
@@ -2146,7 +2219,11 @@ fn a_umm_root_is_twenty_bytes_or_none() {
         if valid {
             assert_eq!(verdict, Ok(()), "{len} bytes");
         } else {
-            assert_eq!(verdict, Err(ValidationError::UmmRootInvalid { len }), "{len} bytes");
+            assert_eq!(
+                verdict,
+                Err(ValidationError::UmmRootInvalid { len }),
+                "{len} bytes"
+            );
         }
     }
 }
@@ -2162,7 +2239,10 @@ fn fork_detection_data_joins_the_hash_from_wasabi100_and_block_449() {
     // Regtest has RSKIP110 from genesis, so there the height alone decides;
     // with wasabi100 at 1,000, it is wasabi100 that does.
     let late = ChainConfig {
-        activation_heights: ActivationHeights { wasabi100: 1_000, ..ActivationHeights::regtest() },
+        activation_heights: ActivationHeights {
+            wasabi100: 1_000,
+            ..ActivationHeights::regtest()
+        },
         ..ChainConfig::regtest()
     };
     for (config, number, altered_valid) in [
@@ -2171,7 +2251,9 @@ fn fork_detection_data_joins_the_hash_from_wasabi100_and_block_449() {
         (late.clone(), 999, false),
         (late, 1_000, true),
     ] {
-        let rule = MergedMiningRule { config: Arc::new(config) };
+        let rule = MergedMiningRule {
+            config: Arc::new(config),
+        };
         let header = header_at(number);
         let hash = header.hash_for_merged_mining();
         let mut altered = hash;
@@ -2187,7 +2269,11 @@ fn fork_detection_data_joins_the_hash_from_wasabi100_and_block_449() {
 
         assert_eq!(judge(hash), Ok(()), "block {number}, the whole hash");
         if altered_valid {
-            assert_eq!(judge(altered), Ok(()), "block {number}, fork-detection data");
+            assert_eq!(
+                judge(altered),
+                Ok(()),
+                "block {number}, fork-detection data"
+            );
         } else {
             assert_eq!(
                 judge(altered),

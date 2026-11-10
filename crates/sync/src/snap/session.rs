@@ -349,7 +349,9 @@ impl SnapSession {
     /// What may be outstanding at once in the current phase.
     fn budget(&self) -> usize {
         let per_peer = |peers: usize| {
-            peers.saturating_mul(HEADER_REQUESTS_PER_PEER).min(MAX_HEADER_REQUESTS)
+            peers
+                .saturating_mul(HEADER_REQUESTS_PER_PEER)
+                .min(MAX_HEADER_REQUESTS)
         };
         let cap = match self.phase {
             Phase::VerifyingHeaders => per_peer(self.header_peers),
