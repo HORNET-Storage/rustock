@@ -27,7 +27,7 @@
 //! Serialization matches rskj `BridgeSerializationUtils.serializeOneOffLockWhitelist`:
 //!   RLP_list [ hash160_0, bigint(maxVal_0), ..., bigint(disableBlockHeight) ]
 
-use alloy_primitives::{Bytes, U256};
+use alloy_primitives::U256;
 use revm::context_interface::ContextTr;
 use revm::precompile::{PrecompileError, PrecompileOutput};
 
@@ -1248,13 +1248,24 @@ pub fn set_lock_whitelist_disable_block_delay<CTX: crate::RskContextTr>(
 // Read-only governance methods
 // ---------------------------------------------------------------------------
 
-/// `getActivePowpegRedeemScript()` → bytes
+/// `getActivePowpegRedeemScript()` → bytes: rskj
+/// `FederationSupportImpl.getActiveFederationRedeemScript`, the active
+/// federation's redeem script in the format it was stored with, or the genesis
+/// federation's with none stored. rskj answers no bytes before RSKIP293, and
+/// the method opens with RSKIP293, so there is always a script to answer.
 pub fn get_active_powpeg_redeem_script<CTX: crate::RskContextTr>(
-    _ctx: &mut CTX,
+    ctx: &mut CTX,
     gas_cost: u64,
+    config: &super::constants::BridgeConstants,
+    hardfork_cfg: &crate::hardfork::RskHardforkConfig,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    // Return empty bytes (no federation configured yet)
-    Ok(PrecompileOutput::new(gas_cost, Bytes::new()))
+    let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
+    let (_keys, redeem) =
+        super::peg::active_federation_keys_and_redeem(ctx, config, hardfork_cfg, block_number);
+    Ok(PrecompileOutput::new(
+        gas_cost,
+        super::getters::abi_encode_bytes(&redeem).into(),
+    ))
 }
 
 /// `getActiveFederationCreationBlockHeight()` → uint256
@@ -1669,6 +1680,102 @@ mod tests {
         );
         commit_proposed_federation(&mut ctx, &config, &hardforks);
         assert_eq!(old_format(&mut ctx), serialization::rlp_encode_u64(4000));
+    }
+
+    /// rskj answers `getActivePowpegRedeemScript` with the active federation's
+    /// redeem script (`FederationSupportImpl.getActiveFederationRedeemScript`),
+    /// where rustock answered no bytes at all. The vectors are RSKj's public
+    /// nodes' answers, one for each federation format each network has had
+    /// since the method opened: each federation is stored with the members its
+    /// script names and the format its creation block gives it, and asked at
+    /// the block RSKj was asked at. With nothing stored, the genesis federation
+    /// answers: on RSKj's regtest, the P2SH-P2WSH ERP script an independent
+    /// port of RSKj's `P2shErpRedeemScriptBuilder` computes.
+    #[test]
+    fn the_active_powpeg_redeem_script_is_rskjs() {
+        use super::super::constants::BridgeConstants;
+        use crate::hardfork::RskHardforkConfig;
+        use revm::MainContext;
+        let ctx_at = |block: u64| {
+            revm::Context::mainnet()
+                .with_block(revm::context::BlockEnv {
+                    number: alloy_primitives::U256::from(block),
+                    ..Default::default()
+                })
+                .with_chain(crate::raw_storage::RskChainExt::default())
+        };
+        let answer = |script: &[u8]| super::super::getters::abi_encode_bytes(script);
+
+        let mut formats = std::collections::BTreeSet::new();
+        let vectors = include_str!("testdata/active_powpeg_redeem_scripts.txt");
+        for line in vectors
+            .lines()
+            .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
+        {
+            let [network, block, creation, script] =
+                line.split_whitespace().collect::<Vec<_>>()[..]
+            else {
+                panic!("{line}");
+            };
+            let (config, forks) = match network {
+                "mainnet" => (BridgeConstants::mainnet(), RskHardforkConfig::mainnet()),
+                _ => (BridgeConstants::testnet(), RskHardforkConfig::testnet()),
+            };
+            let (block, creation): (u64, u64) = (block.parse().unwrap(), creation.parse().unwrap());
+            let script = hex::decode(script).unwrap();
+            // The members, as the script names them: past OP_NOTIF and the threshold.
+            let mut at = usize::from(script[0] == 0x64) + 1;
+            let mut members = Vec::new();
+            while script[at] == 0x21 {
+                members.push(StoredMember::from_btc(
+                    script[at + 1..at + 34].try_into().unwrap(),
+                ));
+                at += 34;
+            }
+            let format = federation_format_version(&forks, creation);
+            formats.insert((network, format));
+            let mut ctx = ctx_at(block);
+            bridge_store_bytes_named(
+                &mut ctx,
+                NEW_FEDERATION_KEY,
+                &super::super::federation::serialize_federation_multikey(&members, 0, creation),
+            );
+            bridge_store_bytes_named(
+                &mut ctx,
+                NEW_FEDERATION_FORMAT_VERSION_KEY,
+                &serialization::rlp_encode_u64(format),
+            );
+            let out = get_active_powpeg_redeem_script(&mut ctx, 0, &config, &forks).unwrap();
+            assert_eq!(out.bytes.to_vec(), answer(&script), "{network} #{block}");
+        }
+        let expected_formats = [
+            ("mainnet", 1000),
+            ("mainnet", 2000),
+            ("mainnet", 3000),
+            ("mainnet", 4000),
+            ("testnet", 2000),
+            ("testnet", 3000),
+            ("testnet", 4000),
+        ];
+        assert_eq!(formats.into_iter().collect::<Vec<_>>(), expected_formats);
+
+        let regtest_genesis = hex::decode(concat!(
+            "64522102cd53fc53a07f211641a677d250f6de99caf620e8e77071e811a28b3bcddf0be1210362634ab57dae9cb373a5",
+            "d536e66a8c4f67468bbcfb063809bab643072d78a1242103c5946b3fbae03a654237da863c9ed534e0878657175b132b",
+            "8ca630f245df04db53ae6702f401b2755321029cecea902067992d52c38b28bf0bb2345bda9b21eca76b16a17c477a64",
+            "e433012103284178e5fbcc63c54c3b38e3ef88adf2da6c526313650041b0ef955763634ebd2103ab0e2cd7ed158687fc",
+            "13b88019990860cdb72b1f5777b58513312550ea1584bc2103b9fc46657cf72a1afa007ecf431de1cd27ff5cc8829fa6",
+            "25b66ca47b967e6b2454ae68",
+        ))
+        .unwrap();
+        let out = get_active_powpeg_redeem_script(
+            &mut ctx_at(1),
+            0,
+            &BridgeConstants::rskj_regtest(),
+            &RskHardforkConfig::regtest(),
+        )
+        .unwrap();
+        assert_eq!(out.bytes.to_vec(), answer(&regtest_genesis));
     }
 
     /// A Bridge call that reads the whitelist writes it back as the call
