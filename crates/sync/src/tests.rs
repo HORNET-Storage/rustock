@@ -7628,9 +7628,11 @@ fn an_extension(bit: usize) -> rustock_core::types::header_extension::BlockHeade
     }
 }
 
-/// `header` as rskj sends it to its peers, holding only the commitment to
-/// `extension` in its bloom's slot, with the UMM root rskj reads at
-/// regtest's heights and the merged-mining fields every versioned header has.
+/// `header` as rskj's regtest sends it to its peers, holding only the
+/// commitment to `extension` in its bloom's slot, with the UMM root rskj
+/// reads at regtest's heights and the merged-mining fields every versioned
+/// header has, and hashed as regtest's heights say: without the
+/// merged-mining proof and coinbase (RSKIP-92).
 fn compressed(
     header: Header,
     extension: &rustock_core::types::header_extension::BlockHeaderExtension,
@@ -7650,6 +7652,7 @@ fn compressed(
         kept: None,
         ..header
     }
+    .with_activations(&rustock_core::config::ActivationHeights::regtest())
 }
 
 /// A store that reads headers as a node of a chain with RSKIP-351 from block

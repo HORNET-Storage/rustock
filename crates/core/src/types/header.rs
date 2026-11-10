@@ -114,13 +114,15 @@ pub enum HeaderForm {
 }
 
 /// What rskj's `BlockFactory` reads from a header that [`Header`]'s typed
-/// fields can't hold.
+/// fields can't hold, and how it reads it.
 ///
-/// rskj keeps these as it reads them and writes them back the same way, so
-/// they are in the header's hash, and no rule refuses them where they can
-/// appear: a miner picks them. Each is kept only where it differs from
-/// what the typed field writes, so a header rskj's miner wrote has none,
-/// until its gas limit or minimum gas price passes 256 bits.
+/// rskj keeps the fields as it reads them and writes them back the same
+/// way, so they are in the header's hash, and no rule refuses them where
+/// they can appear: a miner picks them. Each is kept only where it differs
+/// from what the typed field writes, so a header rskj's miner wrote has
+/// none, until its gas limit or minimum gas price passes 256 bits. How
+/// rskj hashes the header is kept only where this process's heights would
+/// hash it otherwise ([`KeptFields::rskip92`]).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KeptFields {
     /// The gas limit's bytes, where they aren't how rskj's miner writes its
@@ -160,6 +162,25 @@ pub struct KeptFields {
     /// `minimum_gas_price` holds `U256::MAX`, which no transaction's price
     /// reaches either; see [`Header::minimum_gas_price_value`].
     pub minimum_gas_price: Option<Bytes>,
+    /// Whether RSKIP-92 is active for this header, where the heights it was
+    /// read or built under ([`Header::with_activations`]) say otherwise than
+    /// this process's at its height. rskj's `BlockFactory` and
+    /// `BlockHeaderBuilder` set a header's `useRskip92Encoding` by the
+    /// heights they're given, and its hash leaves the merged-mining proof and
+    /// coinbase out where it's set. Only a header of another chain than this
+    /// process's has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rskip92: Option<bool>,
+}
+
+impl KeptFields {
+    /// Keeps whether RSKIP-92 is active at `number` as `activations` say,
+    /// where this process's heights say otherwise: see [`KeptFields::rskip92`].
+    fn set_rskip92(&mut self, number: u64, activations: &crate::config::ActivationHeights) {
+        let active = number >= activations.orchid;
+        let here = number >= crate::config::ActivationHeights::current().orchid;
+        self.rskip92 = (active != here).then_some(active);
+    }
 }
 
 /// rskj refuses the header: `BlockFactory.decodeHeader` can't read it, or
@@ -1063,6 +1084,9 @@ impl Header {
             }
         };
 
+        // How rskj will hash it, by the heights it's read under.
+        kept.set_rskip92(number, activations);
+
         Ok(Self {
             parent_hash,
             ommers_hash,
@@ -1096,9 +1120,13 @@ impl Header {
 impl Header {
     /// RSKIP92 (orchid): the block hash is computed over the header encoding
     /// WITHOUT the merged-mining merkle proof and coinbase transaction
-    /// (rskj BlockHeader.getHash → getEncodedForHash, useRskip92Encoding).
+    /// (rskj BlockHeader.getHash → getEncodedForHash, useRskip92Encoding),
+    /// as the heights the header was read or built under say
+    /// ([`KeptFields::rskip92`]), or else this process's.
     fn rskip92_active(&self) -> bool {
-        self.number >= crate::config::ActivationHeights::current().orchid
+        self.kept()
+            .and_then(|kept| kept.rskip92)
+            .unwrap_or_else(|| self.number >= crate::config::ActivationHeights::current().orchid)
     }
 
     /// What rskj kept of this header that the typed fields can't hold.
@@ -1185,6 +1213,18 @@ impl Header {
         let (price, written) = minimum_gas_price_of(&value.to_bytes_be());
         self.minimum_gas_price = price;
         self.set_kept(|kept| kept.minimum_gas_price = written);
+    }
+
+    /// This header as one read or built under `activations` rather than this
+    /// process's heights: it hashes as they say RSKIP-92 is at its height
+    /// ([`KeptFields::rskip92`]). A header decoded under explicit heights is
+    /// one already. One built in code hashes under this process's heights,
+    /// which in a node are its chain's, so this is for a header of another
+    /// chain.
+    pub fn with_activations(mut self, activations: &crate::config::ActivationHeights) -> Self {
+        let number = self.number;
+        self.set_kept(|kept| kept.set_rskip92(number, activations));
+        self
     }
 
     /// Changes what is kept, keeping nothing where nothing differs, and drops
@@ -1412,6 +1452,62 @@ mod tests {
         // Hash check (just to ensure it doesn't panic)
         let hash = header.hash();
         assert_ne!(hash, B256::ZERO);
+    }
+
+    /// rskj's `BlockFactory` sets a header's `useRskip92Encoding` by the
+    /// heights it reads with, and the header keeps it. So a header read under
+    /// heights that answer RSKIP-92 otherwise than this process's hashes as
+    /// they say, without its merged-mining proof and coinbase where RSKIP-92
+    /// is active and with them where it isn't, and is sent with that hash.
+    /// Read under this process's heights, it keeps nothing. Built under
+    /// either (`with_activations`), it is the header read under them.
+    #[test]
+    fn a_header_hashes_as_the_heights_it_was_read_under_say() {
+        let here = crate::config::ActivationHeights::current();
+        // Each side of this process's RSKIP-92 boundary, read under heights
+        // whose boundary is on the other side of the header.
+        for number in [here.orchid.saturating_sub(1), here.orchid] {
+            let header = Header {
+                number,
+                bitcoin_merged_mining_header: Some(Bytes::from(vec![0; 80])),
+                ..standard_test_header()
+            };
+            let mut bytes = Vec::new();
+            header.encode(&mut bytes);
+            let active_here = here.orchid <= number;
+            let there = crate::config::ActivationHeights {
+                orchid: if active_here { number + 1 } else { number },
+                ..here.clone()
+            };
+            let read =
+                |heights| Header::decode_with_activations(&mut bytes.as_slice(), heights).unwrap();
+            let (read_here, read_there) = (read(here), read(&there));
+            assert_eq!(read_here.kept(), None, "#{number}");
+            assert_eq!(
+                read_there.kept().and_then(|kept| kept.rskip92),
+                Some(!active_here),
+                "#{number}"
+            );
+
+            let hash =
+                |active: bool| keccak256(header.encoded(HeaderForm::Compressed, true, !active));
+            assert_ne!(
+                hash(true),
+                hash(false),
+                "only one has the proof and coinbase"
+            );
+            assert_eq!(read_here.hash(), hash(active_here), "#{number}");
+            assert_eq!(read_there.hash(), hash(!active_here), "#{number}");
+            let sent =
+                Header::decode_with_hash_and_activations(&mut bytes.as_slice(), &there).unwrap();
+            assert_eq!(sent.cached_hash, Some(hash(!active_here)), "#{number}");
+
+            assert_eq!(header.clone().with_activations(&there), read_there);
+            assert_eq!(header.clone().with_activations(here), read_here);
+            assert_eq!(read_there.with_activations(here), read_here);
+            // The hash it was sent with goes with the heights it was read under.
+            assert_eq!(sent.with_activations(here).hash(), hash(active_here));
+        }
     }
 
     /// The items of an RLP list, each with its own header, as written.
@@ -3177,7 +3273,8 @@ mod versioned_wire_header_tests {
                             umm_root: umm_root.clone(),
                             version_fields: version_fields.clone(),
                             ..real.clone()
-                        };
+                        }
+                        .with_activations(&heights);
                         if !mining {
                             header.bitcoin_merged_mining_header = None;
                             header.bitcoin_merged_mining_merkle_proof = None;

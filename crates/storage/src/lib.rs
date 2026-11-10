@@ -2126,14 +2126,16 @@ mod tests {
         commitment.extend_from_slice(&[0x55; 32]);
         let mut slot = Vec::new();
         commitment.as_slice().encode(&mut slot);
-        // rskj's regtest has RSKIPUMM and RSKIP-351 from block 1.
+        // rskj's regtest has RSKIPUMM and RSKIP-351 from block 1, and its
+        // headers hash as its heights say.
+        let regtest = ActivationHeights::regtest();
         let compressed = Header {
             extension_data: Some(Bytes::from(slot)),
             umm_root: Some(Bytes::new()),
             ..dummy_header(1)
-        };
+        }
+        .with_activations(&regtest);
         let hash = compressed.hash();
-        let regtest = ActivationHeights::regtest();
 
         let dir = tempdir().unwrap();
         {
@@ -2180,14 +2182,17 @@ mod tests {
         use rustock_core::config::ActivationHeights;
         use rustock_core::types::header::HeaderVersionFields;
         let regtest = ActivationHeights::regtest();
-        let v0 = |number| Header {
-            umm_root: Some(Bytes::new()),
-            version_fields: Some(HeaderVersionFields {
-                version: 0,
-                edges: Some(vec![1]),
-                base_event: Some(Bytes::new()),
-            }),
-            ..dummy_header(number)
+        let v0 = |number| {
+            Header {
+                umm_root: Some(Bytes::new()),
+                version_fields: Some(HeaderVersionFields {
+                    version: 0,
+                    edges: Some(vec![1]),
+                    base_event: Some(Bytes::new()),
+                }),
+                ..dummy_header(number)
+            }
+            .with_activations(&regtest)
         };
         let mut commitment = vec![0xe2, 0x02, 0xa0];
         commitment.extend_from_slice(&[0x55; 32]);
@@ -2197,7 +2202,8 @@ mod tests {
             umm_root: Some(Bytes::new()),
             extension_data: Some(Bytes::from(slot)),
             ..dummy_header(6)
-        };
+        }
+        .with_activations(&regtest);
         let (batched, single) = (v0(5), v0(7));
         let uncles = vec![batched.clone(), held.clone()];
 
