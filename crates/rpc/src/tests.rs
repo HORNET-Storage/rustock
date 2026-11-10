@@ -4114,6 +4114,151 @@ async fn block_tags_are_read_as_rskj_reads_them() {
     );
 }
 
+/// A state for a call's defaults: `reader` returns the GASPRICE and the GAS
+/// it sees, as two words; `burner` loops `count` times at 26 gas a turn, so
+/// running it costs 21,003 + 26 * `count`. The head holds 6,800,000 gas and
+/// asks 59,240,000 a unit of it, neither of them a call's default.
+fn setup_defaults_state(count: u32) -> (RpcState, tempfile::TempDir, Address, Address) {
+    use rustock_trie::{account_key, code_key, MemoryTrieStore, TrieKeySlice, TrieNode};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(tmp.path()).unwrap());
+    let trie_store = Arc::new(MemoryTrieStore::new());
+    let mut root = TrieNode::empty();
+    let reader = Address::repeat_byte(0xaa);
+    let burner = Address::repeat_byte(0xbb);
+    // GASPRICE PUSH1 0 MSTORE GAS PUSH1 32 MSTORE PUSH1 64 PUSH1 0 RETURN
+    let read = [
+        0x3a, 0x60, 0x00, 0x52, 0x5a, 0x60, 0x20, 0x52, 0x60, 0x40, 0x60, 0x00, 0xf3,
+    ];
+    // PUSH3 count; JUMPDEST PUSH1 1 SWAP1 SUB DUP1 PUSH1 4 JUMPI; STOP
+    let mut burn = vec![0x62];
+    burn.extend_from_slice(&count.to_be_bytes()[1..]);
+    burn.extend_from_slice(&[0x5b, 0x60, 0x01, 0x90, 0x03, 0x80, 0x60, 0x04, 0x57, 0x00]);
+    for (addr, code) in [(reader, &read[..]), (burner, &burn[..])] {
+        let acct = rustock_trie::AccountState::new(U256::ZERO, U256::ZERO);
+        root = root.put(
+            &TrieKeySlice::from_key(&account_key(&addr)),
+            &acct.encode(),
+            &*trie_store,
+        );
+        root = root.put(
+            &TrieKeySlice::from_key(&code_key(&addr)),
+            code,
+            &*trie_store,
+        );
+    }
+    root.save(&*trie_store, true);
+    let state_root = root.compute_hash(&*trie_store);
+    rustock_trie::TrieStore::put(
+        &*trie_store,
+        state_root.as_slice(),
+        &root.to_message(&*trie_store),
+    );
+
+    let header = Header {
+        state_root,
+        gas_limit: U256::from(6_800_000u64),
+        ..test_header(42)
+    };
+    let hash = header.hash();
+    store.put_header(&header).unwrap();
+    store.put_canonical_hash(42, hash).unwrap();
+    store.set_head(hash).unwrap();
+    store
+        .put_total_difficulty(hash, U256::from(42_000))
+        .unwrap();
+
+    let (mut state, _discard) = setup_state();
+    state.store = store;
+    state.trie_store = Some(trie_store);
+    state.hardfork_cfg = Some(rustock_execution::RskHardforkConfig::mainnet());
+    std::mem::forget(_discard);
+    (state, tmp, reader, burner)
+}
+
+/// A call's defaults are rskj's (task 282, `CallArgumentsToByteArray`): a gas
+/// price of 0, not the block's minimum, and `rpc.callGasCap`'s 10,000,000 gas,
+/// not the block's limit -- the cap on the gas a call names, too. An
+/// estimate runs at `rpc.gasEstimationCap`'s 6,800,000, whatever the call
+/// names (`EthModule.estimateGas`).
+#[tokio::test]
+async fn a_calls_defaults_are_rskjs() {
+    let (state, _tmp, reader, burner) = setup_defaults_state(1 << 18);
+    let ask = |method: &str, call: Value| {
+        let request = make_request(method, json!([call, "latest"]));
+        let state = &state;
+        async move { dispatch_for_test(state, request).await }
+    };
+    let words = |resp: JsonRpcResponse| {
+        let out = resp.result.unwrap_or_else(|| panic!("{:?}", resp.error));
+        let out = hex::decode(out.as_str().unwrap().trim_start_matches("0x")).unwrap();
+        (
+            U256::from_be_slice(&out[..32]),
+            U256::from_be_slice(&out[32..]),
+        )
+    };
+    let to = format!("{reader:#x}");
+
+    // GAS reads the call's gas less the 21,000 and the 13 spent before it.
+    let resp = ask("eth_call", json!({"to": to})).await;
+    assert_eq!(words(resp), (U256::ZERO, U256::from(10_000_000 - 21_013)));
+    let resp = ask("eth_call", json!({"to": to, "gas": "0xffffffffffffffff"})).await;
+    assert_eq!(words(resp), (U256::ZERO, U256::from(10_000_000 - 21_013)));
+    let resp = ask(
+        "eth_call",
+        json!({"to": to, "gas": "0x30d40", "gasPrice": "0x2"}),
+    )
+    .await;
+    assert_eq!(words(resp), (U256::from(2), U256::from(200_000 - 21_013)));
+
+    // Not run with the 21,000 the call names.
+    let resp = ask("eth_estimateGas", json!({"to": to, "gas": "0x5208"})).await;
+    assert!(resp.result.is_some(), "{:?}", resp.error);
+    // The burner needs 21,003 + 26 * 2^18 = 6,836,747, over the estimate's cap
+    // whatever the call names.
+    let burn = format!("{burner:#x}");
+    let resp = ask("eth_estimateGas", json!({"to": burn, "gas": "0x7a1200"})).await;
+    assert!(resp.error.is_some(), "{:?}", resp.result);
+    let resp = ask("eth_call", json!({"to": burn})).await;
+    assert_eq!(resp.result, Some(json!("0x")), "{:?}", resp.error);
+}
+
+/// A sent transaction's defaults are rskj's (task 282,
+/// `TransactionArgumentsUtil.processArguments`): a gas price of 0, not the
+/// node's price, and the gas named as `gas`, else as `gasLimit`, else 90,000,
+/// not the head's whole gas limit.
+#[tokio::test]
+async fn a_sent_transactions_defaults_are_rskjs() {
+    let (mut state, _tmp) = setup_state_with_wallet();
+    state.gas_price = Some(Arc::new(FixedGasPrice(123_456_789, true)));
+    let from = format!("{:#x}", test_wallet().accounts()[0]);
+    for (fields, gas) in [
+        (json!({}), 90_000u64),
+        (json!({"gasLimit": "0x7530"}), 30_000),
+        (json!({"gas": "0x5208", "gasLimit": "0x7530"}), 21_000),
+    ] {
+        let mut request = json!({"from": from, "to": "0x00000000000000000000000000000000000000aa", "nonce": "0x0"});
+        request
+            .as_object_mut()
+            .unwrap()
+            .extend(fields.as_object().unwrap().clone());
+        let resp = dispatch_for_test(
+            &state,
+            make_request("eth_signTransaction", json!([request])),
+        )
+        .await;
+        let raw = resp
+            .result
+            .unwrap_or_else(|| panic!("{fields}: {:?}", resp.error));
+        let raw = hex::decode(raw.as_str().unwrap().trim_start_matches("0x")).unwrap();
+        use alloy_rlp::Decodable;
+        let tx = rustock_core::Transaction::decode(&mut raw.as_slice()).unwrap();
+        assert_eq!(tx.gas_price, U256::ZERO, "{fields}");
+        assert_eq!(tx.gas_limit, U256::from(gas), "{fields}");
+    }
+}
+
 /// `eth_getBlockBy*` with full transactions must name the real sender.
 ///
 /// It used to hardcode `from` to the zero address, so every transaction in

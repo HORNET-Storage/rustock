@@ -128,9 +128,10 @@ impl SignError {
 
 /// Fill in what the caller left out, then sign.
 ///
-/// Every default is the one a caller would otherwise have had to fetch
-/// with a separate call, and is taken from the same place that call would
-/// have taken it.
+/// The defaults are rskj's (`TransactionArgumentsUtil.processArguments`): no
+/// value, a gas price of 0, the gas named as `gas` or else as `gasLimit`, or
+/// else 90,000 (`GasCost.TRANSACTION_DEFAULT`), and the sender's pending nonce
+/// (`EthModuleTransactionBase.sendTransaction`).
 fn build_and_sign(params: &Value, state: &RpcState) -> Result<(Address, Vec<u8>), SignError> {
     let wallet = state.wallet.as_ref().expect("checked by the caller");
 
@@ -182,18 +183,11 @@ fn build_and_sign(params: &Value, state: &RpcState) -> Result<(Address, Vec<u8>)
             .unwrap_or_else(|| account_nonce(&from, state)),
     };
 
-    let gas_price = match quantity(obj.get("gasPrice"))? {
-        Some(p) => p,
-        None => state.gas_price.as_ref().map(|g| g.gas_price()).unwrap_or(U256::ZERO),
-    };
+    let gas_price = quantity(obj.get("gasPrice"))?.unwrap_or(U256::ZERO);
 
-    // Absent, take the block's whole gas limit. A transaction that asks
-    // for more than it needs pays only for what it uses, so the generous
-    // default costs the caller nothing; the stingy one would make a
-    // contract deployment fail for a reason the caller cannot see.
     let gas_limit = match quantity(obj.get("gas"))? {
         Some(g) => g,
-        None => head_gas_limit(state),
+        None => quantity(obj.get("gasLimit"))?.unwrap_or(U256::from(TRANSACTION_DEFAULT_GAS)),
     };
 
     let chain_id = state.hardfork_cfg.as_ref().map(|c| c.chain_id).ok_or(SignError::NoChainId)?;
@@ -253,15 +247,6 @@ fn account_nonce(address: &Address, state: &RpcState) -> u64 {
         .unwrap_or(0)
 }
 
-fn head_gas_limit(state: &RpcState) -> U256 {
-    state
-        .store
-        .head()
-        .ok()
-        .flatten()
-        .and_then(|h| state.store.header(h).ok().flatten())
-        .map(|h| h.gas_limit)
-        // The sequential-sublist floor, which is the smallest limit any
-        // RSK network configures. Only reached if the store has no head.
-        .unwrap_or(U256::from(6_800_000u64))
-}
+/// The gas a sent transaction names when the caller names none: rskj's
+/// `GasCost.TRANSACTION_DEFAULT`.
+const TRANSACTION_DEFAULT_GAS: u64 = 90_000;
