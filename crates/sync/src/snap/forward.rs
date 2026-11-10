@@ -328,19 +328,25 @@ impl ForwardSync {
             }
         }
 
-        // The stretch above the last grid point, which no skeleton identifier
-        // covers. Asked for from the target's own hash, the one hash that is
-        // known without a skeleton. Without this the ascent can never satisfy
-        // `have_number >= target` for a target off the grid, and stalls at
-        // 99.9% having done all the work.
-        let grid_top = (self.target / HEADER_CHUNK) * HEADER_CHUNK;
-        if self.target > grid_top
-            && self.have_number < self.target
+        // The chunk under the target, asked for from the target's own hash: the
+        // one hash above the prefix that is known without a skeleton.
+        //
+        // Off the grid, no skeleton identifier names the target, and without
+        // this the ascent could never satisfy `have_number >= target`: it
+        // stalled at 99.9% having done all the work. On the grid, a skeleton
+        // names it only if the peer answering reaches that far. A peer still
+        // behind the target ends its skeleton at its own best block instead,
+        // and the ascent was then left with no point above the prefix, no run
+        // to bridge down from, and nothing to ask for. Asked for whatever its
+        // alignment, the run under the target is always there to bridge down
+        // from.
+        if self.have_number < self.target
             && out.len() < budget
             && !self.headers_sent.contains(&self.target)
             && !self.satisfied.contains(&self.target)
         {
-            let count = (self.target - grid_top).min(self.target - self.have_number);
+            let below = ((self.target - 1) / HEADER_CHUNK) * HEADER_CHUNK;
+            let count = (self.target - below).min(self.target - self.have_number);
             self.headers_sent.insert(self.target);
             out.push(Want::Headers {
                 from: self.target_hash,
@@ -455,10 +461,14 @@ impl ForwardSync {
                     self.skeleton_todo.push(*start);
                 }
             }
-            Want::Headers { point, .. } => {
-                self.headers_sent.remove(point);
-            }
+            Want::Headers { point, .. } => self.release_headers(*point),
         }
+    }
+
+    /// Hand back the header request for `point`, so it is asked again: for one
+    /// nobody answered, and for an answer this walk cannot use.
+    pub fn release_headers(&mut self, point: u64) {
+        self.headers_sent.remove(&point);
     }
 
     /// Skeleton identifiers: where to ask, and nothing more.

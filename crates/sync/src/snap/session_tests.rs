@@ -2048,6 +2048,41 @@ mod ascent_tests {
             "a peer that could serve the ascent does not by itself select it"
         );
     }
+
+    /// A bare header answer during the ascent hands its range back.
+    ///
+    /// The ascent asks for headers with their uncles, and the driver strikes a
+    /// request off as soon as any header answer to it arrives. Bare headers
+    /// are no use to the ascent, and they were dropped with the range still
+    /// marked as asked: nothing timed it out and nothing asked again, so one
+    /// stray answer stopped the ascent at that height.
+    #[test]
+    fn a_bare_header_answer_during_the_ascent_is_asked_again() {
+        let (mut session, f) = session_with(true, true);
+        let offered = block(header(5_000, B256::ZERO, f.state_root, 100));
+        let asks_for_the_top = |actions: &[Action]| {
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::RequestHeaders { point: 5_000, .. }))
+        };
+        let first = session.on_status(
+            std::slice::from_ref(&offered),
+            &[U256::from(1_000u64)],
+            1024,
+            0,
+        );
+        assert_eq!(session.phase(), Phase::AscendingHeaders);
+        assert!(
+            asks_for_the_top(&first),
+            "the chunk under the target: {first:?}"
+        );
+
+        let again = session.on_headers(5_000, &[]);
+        assert!(
+            asks_for_the_top(&again),
+            "asked for again after a bare answer: {again:?}"
+        );
+    }
 }
 
 /// The gate and the ascent coexist: passing the gate must land in the phase the

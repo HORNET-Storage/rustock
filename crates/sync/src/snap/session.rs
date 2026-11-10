@@ -950,6 +950,17 @@ impl SnapSession {
     }
 
     pub fn on_headers(&mut self, point: u64, headers: &[Header]) -> Vec<Action> {
+        if self.phase == Phase::AscendingHeaders {
+            // The ascent asked for these with their uncles, and totals the work
+            // exactly, so bare headers are no answer to it. Hand the range back
+            // to be asked again. The driver has already struck the request off,
+            // so nothing would time it out, and left marked as asked it was
+            // never asked again: one bare answer stopped the ascent there.
+            if let Some(ascent) = self.ascent.as_mut() {
+                ascent.release_headers(point);
+            }
+            return self.poll();
+        }
         self.ingest_headers(point, headers, &std::collections::HashMap::new())
     }
 
