@@ -3491,6 +3491,63 @@ async fn headers_with_uncles_are_served_from_the_freezer_once_the_body_is_gone()
     );
 }
 
+/// The uncles held for a block are the ones its header commits to. The
+/// freezer keeps uncles by height alone, so what it holds for a height, or a
+/// body held for a block, is checked against the uncles hash of the block
+/// asked about: a list that doesn't hash to it is not that block's, and the
+/// block counts as one whose uncles aren't held.
+#[test]
+fn the_uncles_held_for_a_block_are_the_ones_its_header_commits_to() {
+    use crate::total_difficulty::held_uncles;
+
+    let dir = tempdir().unwrap();
+    let store = BlockStore::open(dir.path()).unwrap();
+    let freezer =
+        Arc::new(rustock_storage::freezer::Freezer::open(dir.path().join("freezer")).unwrap());
+    store.set_freezer(freezer.clone());
+
+    let uncle = dummy_header(1, B256::repeat_byte(0x0c), U256::from(1));
+    let other = dummy_header(1, B256::repeat_byte(0x0d), U256::from(1));
+    let naming_the_uncle = |number: u64| {
+        let mut header = dummy_header(number, B256::repeat_byte(number as u8), U256::from(1));
+        header.uncle_count = 1;
+        header.ommers_hash =
+            rustock_execution::processor::compute_ommers_hash(std::slice::from_ref(&uncle));
+        header
+    };
+    // #2 to #5 all name `uncle`. The freezer holds it for #2 and another
+    // block's uncle for #3; #4's body holds it, and #5's the other.
+    let blocks: Vec<Header> = (2..=5).map(naming_the_uncle).collect();
+    for header in &blocks {
+        store.put_header(header).unwrap();
+        store
+            .put_canonical_hash(header.number, header.hash())
+            .unwrap();
+    }
+    freezer.put_uncles(2, std::slice::from_ref(&uncle)).unwrap();
+    freezer.put_uncles(3, std::slice::from_ref(&other)).unwrap();
+    freezer.sync().unwrap();
+    store
+        .put_body(blocks[2].hash(), &[], std::slice::from_ref(&uncle))
+        .unwrap();
+    store
+        .put_body(blocks[3].hash(), &[], std::slice::from_ref(&other))
+        .unwrap();
+
+    let held = |header: &Header| {
+        held_uncles(&store, header.hash(), header)
+            .map(|uncles| uncles.iter().map(Header::hash).collect::<Vec<_>>())
+    };
+    assert_eq!(
+        held(&blocks[0]),
+        Some(vec![uncle.hash()]),
+        "the freezer's, its own"
+    );
+    assert_eq!(held(&blocks[1]), None, "the freezer's, another block's");
+    assert_eq!(held(&blocks[2]), Some(vec![uncle.hash()]), "its body's");
+    assert_eq!(held(&blocks[3]), None, "a body with another block's uncles");
+}
+
 #[tokio::test]
 async fn test_serve_skeleton_request_unknown_start() {
     use rustock_networking::protocol::{P2pMessage, RskMessage, RskSubMessage};

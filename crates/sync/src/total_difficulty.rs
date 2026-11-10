@@ -76,15 +76,29 @@ impl AncestorSource for Held<'_> {
 
 /// The uncles a held block named: from its body, or once the body is pruned,
 /// from the freezer, which keeps them by height for the canonical chain.
-/// `None` when neither holds them.
+/// `None` when neither holds them, or when what is held is not the list the
+/// block's header commits to (its uncles hash): the freezer's are found by
+/// height alone, and a list that doesn't hash to the header's is another
+/// block's.
 pub(crate) fn held_uncles(store: &BlockStore, hash: B256, header: &Header) -> Option<Vec<Header>> {
-    if let Ok(Some(uncles)) = store.uncles(hash) {
-        return Some(uncles);
-    }
-    if store.canonical_hash(header.number).ok().flatten() != Some(hash) {
+    let uncles = match store.uncles(hash) {
+        Ok(Some(uncles)) => uncles,
+        _ if store.canonical_hash(header.number).ok().flatten() == Some(hash) => {
+            store.freezer()?.uncles(header.number).ok().flatten()?
+        }
+        _ => return None,
+    };
+    let hashed = rustock_execution::processor::compute_ommers_hash(&uncles);
+    if !header.has_ommers_hash(hashed) {
+        warn!(
+            target: "rustock::sync",
+            "Block #{} ({:?}): the uncles held for it are not the ones its header names",
+            header.number,
+            hash
+        );
         return None;
     }
-    store.freezer()?.uncles(header.number).ok().flatten()
+    Some(uncles)
 }
 
 /// The difficulty of `uncles`, the uncles a block names, if they pass rskj's
