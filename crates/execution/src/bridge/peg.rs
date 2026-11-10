@@ -4338,13 +4338,18 @@ pub(crate) fn active_federation_keys_and_redeem<CTX: crate::RskContextTr>(
         // federation is built in the format its constants name.
         (None, _) => return {
             let keys = genesis_federation_keys(config);
-            let redeem =
-                federation_redeem_for_format(&keys, config.genesis_federation_format, config);
+            let redeem = federation_redeem_for_format(
+                &keys,
+                config.genesis_federation_format,
+                config,
+                hardfork_cfg,
+                block_number,
+            );
             (keys, redeem)
         },
     };
     let version = federation_format_version(ctx, format_key);
-    let redeem = federation_redeem_for_format(&keys, version, config);
+    let redeem = federation_redeem_for_format(&keys, version, config, hardfork_cfg, block_number);
     (keys, redeem)
 }
 
@@ -4393,7 +4398,7 @@ pub(crate) fn retiring_federation_keys_and_redeem<CTX: crate::RskContextTr>(
 ) -> Option<(Vec<[u8; 33]>, Vec<u8>)> {
     let keys = retiring_federation_keys(ctx, config, hardfork_cfg, block_number)?;
     let version = federation_format_version(ctx, super::storage::OLD_FEDERATION_FORMAT_VERSION_KEY);
-    let redeem = federation_redeem_for_format(&keys, version, config);
+    let redeem = federation_redeem_for_format(&keys, version, config, hardfork_cfg, block_number);
     Some((keys, redeem))
 }
 
@@ -4437,8 +4442,10 @@ pub(crate) fn federation_redeem_for_format_pub(
     keys: &[[u8; 33]],
     format_version: u64,
     config: &BridgeConstants,
+    hardfork_cfg: &RskHardforkConfig,
+    block_number: u64,
 ) -> Vec<u8> {
-    federation_redeem_for_format(keys, format_version, config)
+    federation_redeem_for_format(keys, format_version, config, hardfork_cfg, block_number)
 }
 
 /// rskj `BridgeUtils.isFromFederateMember(rskTx, federation)`: true when the
@@ -5253,29 +5260,99 @@ fn signed_long_to_byte_array_le(value: i64) -> Vec<u8> {
     be
 }
 
-/// rskj `NonStandardErpRedeemScriptBuilder` (post-RSKIP284/293) and
+/// Which of rskj's ERP redeem script builders a federation's script comes
+/// from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ErpScript {
+    /// `NonStandardErpRedeemScriptBuilderHardcoded`: testnet's one script,
+    /// whatever the keys, before RSKIP284.
+    NonStandardHardcoded,
+    /// `NonStandardErpRedeemScriptBuilderWithCsvUnsignedBE`: before RSKIP293,
+    /// the CSV delay as two unsigned big-endian bytes.
+    NonStandardCsvUnsignedBe,
+    /// `NonStandardErpRedeemScriptBuilder`.
+    NonStandard,
+    /// `P2shErpRedeemScriptBuilder`.
+    P2sh,
+}
+
+/// rskj `NonStandardErpRedeemScriptBuilderHardcoded`'s
+/// `LEGACY_ERP_TESTNET_REDEEM_SCRIPT_BYTES`.
+const LEGACY_ERP_TESTNET_REDEEM_SCRIPT: &str = concat!(
+    "6453",
+    "210208f40073a9e43b3e9103acec79767a6de9b0409749884e989960fee578012fce",
+    "210225e892391625854128c5c4ea4340de0c2a70570f33db53426fc9c746597a03f4",
+    "2102afc230c2d355b1a577682b07bc2646041b5d0177af0f98395a46018da699b6da",
+    "210344a3c38cd59afcba3edcebe143e025574594b001700dec41e59409bdbd0f2a09",
+    "21039a060badbeb24bee49eb2063f616c0f0f0765d4ca646b20a88ce828f259fcdb9",
+    "55670300cd50b27552",
+    "210216c23b2ea8e4f11c3f9e22711addb1d16a93964796913830856b568cc3ea21d3",
+    "210275562901dd8faae20de0a4166362a4f82188db77dbed4ca887422ea1ec185f14",
+    "21034db69f2112f4fb1bb6141bf6e2bd6631f0484d0bd95b16767902c9fe219d4a6f",
+    "5368ae",
+);
+
+/// rskj `NonStandardErpRedeemScriptBuilderFactory`: the builder of a
+/// non-standard ERP federation's redeem script, by network and by the block
+/// being run. rskj rebuilds a stored federation with that block's
+/// activations, so the same federation's script changes at RSKIP284 and at
+/// RSKIP293.
+fn non_standard_erp_script(
+    config: &BridgeConstants,
+    hardfork_cfg: &RskHardforkConfig,
+    block_number: u64,
+) -> ErpScript {
+    if matches!(config.btc_network, super::constants::BtcNetwork::Testnet)
+        && !hardfork_cfg.has_rskip284(block_number)
+    {
+        ErpScript::NonStandardHardcoded
+    } else if !hardfork_cfg.has_rskip293(block_number) {
+        ErpScript::NonStandardCsvUnsignedBe
+    } else {
+        ErpScript::NonStandard
+    }
+}
+
+/// bitcoinj `Utils.unsignedLongToByteArrayBE`: `number` in exactly
+/// `num_bytes` big-endian bytes. bitcoinj refuses a number that doesn't fit,
+/// which a network's CSV delay never is.
+fn unsigned_long_to_byte_array_be(number: i64, num_bytes: usize) -> Vec<u8> {
+    (number as u64).to_be_bytes()[8 - num_bytes..].to_vec()
+}
+
+/// rskj's non-standard ERP redeem script builders (see [`ErpScript`]) and
 /// `P2shErpRedeemScriptBuilder` (post-RSKIP353) emergency-multisig template.
 ///
-/// Both wrap a default N-of-M multisig and an emergency K-of-J multisig in a
-/// CSV-gated `OP_NOTIF ... OP_ELSE <csv> OP_CHECKSEQUENCEVERIFY OP_DROP ...
-/// OP_ENDIF`. The non-standard form strips the trailing `OP_CHECKMULTISIG`
-/// from each inner script and appends a single `OP_CHECKMULTISIG` after
-/// `OP_ENDIF`; the P2SH-ERP form keeps each inner script intact (incl. its
-/// `OP_CHECKMULTISIG`) and emits nothing after `OP_ENDIF`. Inner scripts are
-/// standard multisig with keys sorted lexicographically (see
-/// [`build_federation_redeem_script`]). The CSV delay is pushed via
-/// [`signed_long_to_byte_array_le`].
+/// All but the hard-coded one wrap a default N-of-M multisig and an emergency
+/// K-of-J multisig in a CSV-gated `OP_NOTIF ... OP_ELSE <csv>
+/// OP_CHECKSEQUENCEVERIFY OP_DROP ... OP_ENDIF`. The non-standard form strips
+/// the trailing `OP_CHECKMULTISIG` from each inner script and appends a single
+/// `OP_CHECKMULTISIG` after `OP_ENDIF`; the P2SH-ERP form keeps each inner
+/// script intact (incl. its `OP_CHECKMULTISIG`) and emits nothing after
+/// `OP_ENDIF`. Inner scripts are standard multisig with keys sorted
+/// lexicographically (see [`build_federation_redeem_script`]). The CSV delay
+/// is pushed via [`signed_long_to_byte_array_le`], or before RSKIP293 as two
+/// unsigned big-endian bytes.
 fn build_erp_redeem_script(
     default_keys: &[[u8; 33]],
     default_threshold: usize,
     erp_keys: &[[u8; 33]],
     erp_threshold: usize,
     csv_delay: i64,
-    p2sh: bool,
+    script: ErpScript,
 ) -> Vec<u8> {
+    if script == ErpScript::NonStandardHardcoded {
+        return alloy_primitives::hex::decode(LEGACY_ERP_TESTNET_REDEEM_SCRIPT)
+            .expect("the hard-coded script is hex");
+    }
+    let p2sh = script == ErpScript::P2sh;
     let default_redeem = build_federation_redeem_script(default_keys, default_threshold);
     let erp_redeem = build_federation_redeem_script(erp_keys, erp_threshold);
-    let csv = signed_long_to_byte_array_le(csv_delay);
+    let csv = if script == ErpScript::NonStandardCsvUnsignedBe {
+        unsigned_long_to_byte_array_be(csv_delay, 2)
+    } else {
+        signed_long_to_byte_array_le(csv_delay)
+    };
 
     // `removeOpCheckMultisig`: drop the trailing OP_CHECKMULTISIG (last byte).
     let default_inner: &[u8] = if p2sh { &default_redeem } else { &default_redeem[..default_redeem.len() - 1] };
@@ -5325,8 +5402,12 @@ pub fn build_committed_federation_redeem_script(
         .collect();
     let erp_threshold = erp_keys.len() / 2 + 1;
     let csv = config.erp_fed_activation_delay;
-    let p2sh = hardfork_cfg.has_rskip353(block_number);
-    build_erp_redeem_script(keys, threshold, &erp_keys, erp_threshold, csv, p2sh)
+    let script = if hardfork_cfg.has_rskip353(block_number) {
+        ErpScript::P2sh
+    } else {
+        non_standard_erp_script(config, hardfork_cfg, block_number)
+    };
+    build_erp_redeem_script(keys, threshold, &erp_keys, erp_threshold, csv, script)
 }
 
 /// Build a live federation's redeem script from its **stored format version**,
@@ -5339,11 +5420,16 @@ pub fn build_committed_federation_redeem_script(
 ///   2000 NON_STANDARD_ERP       → non-standard ERP (no trailing OP_CHECKMULTISIG per inner)
 ///   3000 P2SH_ERP / 4000 P2SH_P2WSH_ERP → P2SH-ERP template
 /// (The P2SH-P2WSH-ERP federation reuses the P2SH-ERP redeem template — see
-/// `FederationFactory.buildP2shP2wshErpFederation`.)
+/// `FederationFactory.buildP2shP2wshErpFederation`.) Within format 2000 the
+/// builder follows the block being run (`block_number`), as rskj rebuilds a
+/// stored federation with that block's activations: see
+/// [`non_standard_erp_script`].
 fn federation_redeem_for_format(
     keys: &[[u8; 33]],
     format_version: u64,
     config: &BridgeConstants,
+    hardfork_cfg: &RskHardforkConfig,
+    block_number: u64,
 ) -> Vec<u8> {
     let threshold = keys.len() / 2 + 1;
     if format_version <= 1000 {
@@ -5359,9 +5445,13 @@ fn federation_redeem_for_format(
         .collect();
     let erp_threshold = erp_keys.len() / 2 + 1;
     let csv = config.erp_fed_activation_delay;
-    // 2000 = non-standard ERP (p2sh=false); 3000/4000 = P2SH-ERP template (p2sh=true).
-    let p2sh = format_version >= 3000;
-    build_erp_redeem_script(keys, threshold, &erp_keys, erp_threshold, csv, p2sh)
+    // 2000 = non-standard ERP; 3000/4000 = the P2SH-ERP template.
+    let script = if format_version >= 3000 {
+        ErpScript::P2sh
+    } else {
+        non_standard_erp_script(config, hardfork_cfg, block_number)
+    };
+    build_erp_redeem_script(keys, threshold, &erp_keys, erp_threshold, csv, script)
 }
 
 /// Read a federation's stored format version (rskj
@@ -6915,6 +7005,103 @@ mod tests {
         assert_eq!(signed_long_to_byte_array_le(1), vec![0x01]);
     }
 
+    /// bitcoinj `Utils.unsignedLongToByteArrayBE(csv, 2)`, which the
+    /// non-standard ERP builder pushes before RSKIP293: 52,560 -> `cd 50`.
+    #[test]
+    fn erp_csv_delay_unsigned_be_groundtruth() {
+        assert_eq!(unsigned_long_to_byte_array_be(52_560, 2), vec![0xcd, 0x50]);
+        assert_eq!(unsigned_long_to_byte_array_be(500, 2), vec![0x01, 0xf4]);
+        assert_eq!(unsigned_long_to_byte_array_be(20, 2), vec![0x00, 0x14]);
+    }
+
+    /// rskj `NonStandardErpFederationsTest`'s real values (its
+    /// `createdRedeemScriptProgramFrom...WithRealValues...` tests): five
+    /// federators, three emergency keys, CSV 52,560. The hard-coded builder
+    /// answers its one script whatever the keys; the builder with the unsigned
+    /// big-endian CSV, and today's builder, answer these programs.
+    #[test]
+    fn nonstandard_erp_redeem_scripts_match_rskjs_real_values() {
+        let emergency = [
+            "0216c23b2ea8e4f11c3f9e22711addb1d16a93964796913830856b568cc3ea21d3",
+            "0275562901dd8faae20de0a4166362a4f82188db77dbed4ca887422ea1ec185f14",
+            "034db69f2112f4fb1bb6141bf6e2bd6631f0484d0bd95b16767902c9fe219d4a6f",
+        ]
+        .map(key);
+        let script = |last: &str, kind: ErpScript| {
+            let federators = [
+                "0208f40073a9e43b3e9103acec79767a6de9b0409749884e989960fee578012fce",
+                "0225e892391625854128c5c4ea4340de0c2a70570f33db53426fc9c746597a03f4",
+                "025a2f522aea776fab5241ad72f7f05918e8606676461cb6ce38265a52d4ca9ed6",
+                "02afc230c2d355b1a577682b07bc2646041b5d0177af0f98395a46018da699b6da",
+                last,
+            ]
+            .map(key);
+            alloy_primitives::hex::encode(build_erp_redeem_script(
+                &federators,
+                3,
+                &emergency,
+                2,
+                52_560,
+                kind,
+            ))
+        };
+        assert_eq!(
+            script(
+                "039a060badbeb24bee49eb2063f616c0f0f0765d4ca646b20a88ce828f259fcdb9",
+                ErpScript::NonStandardHardcoded
+            ),
+            "6453210208f40073a9e43b3e9103acec79767a6de9b0409749884e989960fee578012fce210225e892391625854128c5c4ea4340de0c2a70570f33db53426fc9c746597a03f42102afc230c2d355b1a577682b07bc2646041b5d0177af0f98395a46018da699b6da210344a3c38cd59afcba3edcebe143e025574594b001700dec41e59409bdbd0f2a0921039a060badbeb24bee49eb2063f616c0f0f0765d4ca646b20a88ce828f259fcdb955670300cd50b27552210216c23b2ea8e4f11c3f9e22711addb1d16a93964796913830856b568cc3ea21d3210275562901dd8faae20de0a4166362a4f82188db77dbed4ca887422ea1ec185f1421034db69f2112f4fb1bb6141bf6e2bd6631f0484d0bd95b16767902c9fe219d4a6f5368ae"
+        );
+        assert_eq!(
+            script(
+                "0344a3c38cd59afcba3edcebe143e025574594b001700dec41e59409bdbd0f2a09",
+                ErpScript::NonStandardCsvUnsignedBe
+            ),
+            "6453210208f40073a9e43b3e9103acec79767a6de9b0409749884e989960fee578012fce210225e892391625854128c5c4ea4340de0c2a70570f33db53426fc9c746597a03f421025a2f522aea776fab5241ad72f7f05918e8606676461cb6ce38265a52d4ca9ed62102afc230c2d355b1a577682b07bc2646041b5d0177af0f98395a46018da699b6da210344a3c38cd59afcba3edcebe143e025574594b001700dec41e59409bdbd0f2a09556702cd50b27552210216c23b2ea8e4f11c3f9e22711addb1d16a93964796913830856b568cc3ea21d3210275562901dd8faae20de0a4166362a4f82188db77dbed4ca887422ea1ec185f1421034db69f2112f4fb1bb6141bf6e2bd6631f0484d0bd95b16767902c9fe219d4a6f5368ae"
+        );
+        assert_eq!(
+            script(
+                "03fb8e1d5d0392d35ca8c3656acb6193dbf392b3e89b9b7b86693f5c80f7ce8581",
+                ErpScript::NonStandard
+            ),
+            "6453210208f40073a9e43b3e9103acec79767a6de9b0409749884e989960fee578012fce210225e892391625854128c5c4ea4340de0c2a70570f33db53426fc9c746597a03f421025a2f522aea776fab5241ad72f7f05918e8606676461cb6ce38265a52d4ca9ed62102afc230c2d355b1a577682b07bc2646041b5d0177af0f98395a46018da699b6da2103fb8e1d5d0392d35ca8c3656acb6193dbf392b3e89b9b7b86693f5c80f7ce858155670350cd00b27552210216c23b2ea8e4f11c3f9e22711addb1d16a93964796913830856b568cc3ea21d3210275562901dd8faae20de0a4166362a4f82188db77dbed4ca887422ea1ec185f1421034db69f2112f4fb1bb6141bf6e2bd6631f0484d0bd95b16767902c9fe219d4a6f5368ae"
+        );
+    }
+
+    /// rskj `NonStandardErpRedeemScriptBuilderFactory`, by network and block:
+    /// on testnet the hard-coded script before RSKIP284, the unsigned
+    /// big-endian CSV before RSKIP293, today's builder after; elsewhere the
+    /// unsigned CSV before RSKIP293. A stored federation of format 2000 is
+    /// rebuilt by the block being run, not its creation block.
+    #[test]
+    fn the_nonstandard_erp_builder_is_picked_as_rskjs_factory_picks_it() {
+        let (testnet, testnet_cfg) = (BridgeConstants::testnet(), RskHardforkConfig::testnet());
+        let (mainnet, mainnet_cfg) = (BridgeConstants::mainnet(), RskHardforkConfig::mainnet());
+        let on_testnet = |n| non_standard_erp_script(&testnet, &testnet_cfg, n);
+        let on_mainnet = |n| non_standard_erp_script(&mainnet, &mainnet_cfg, n);
+        assert_eq!(on_testnet(2_581_799), ErpScript::NonStandardHardcoded);
+        assert_eq!(on_testnet(2_581_800), ErpScript::NonStandardCsvUnsignedBe);
+        assert_eq!(on_testnet(3_102_999), ErpScript::NonStandardCsvUnsignedBe);
+        assert_eq!(on_testnet(3_103_000), ErpScript::NonStandard);
+        assert_eq!(on_mainnet(0), ErpScript::NonStandardCsvUnsignedBe);
+        assert_eq!(on_mainnet(4_598_499), ErpScript::NonStandardCsvUnsignedBe);
+        assert_eq!(on_mainnet(4_598_500), ErpScript::NonStandard);
+
+        let keys = test_keys(0x10);
+        let at = |n| federation_redeem_for_format(&keys, 2000, &testnet, &testnet_cfg, n);
+        assert_eq!(
+            at(2_581_799),
+            build_erp_redeem_script(&[], 0, &[], 0, 0, ErpScript::NonStandardHardcoded)
+        );
+        let (unsigned_csv, today) = (at(2_581_800), at(3_103_000));
+        assert_eq!(
+            unsigned_csv.len() + 1,
+            today.len(),
+            "two CSV bytes, not three"
+        );
+        assert_ne!(unsigned_csv, today);
+    }
+
     /// Ground truth: the first real RSK mainnet federation change committed at
     /// block #4,652,781 produced a NON-STANDARD ERP federation (RSKIP201 active,
     /// RSKIP353 not). Its base58 P2SH address appears in the block's
@@ -6941,7 +7128,8 @@ mod tests {
             .map(|h| key(h))
             .collect::<Vec<_>>();
         // NonStandard ERP (p2sh = false): default 5-of-9, emergency 3-of-4.
-        let redeem = build_erp_redeem_script(&new_keys, 5, &erp_keys, 3, 52560, false);
+        let redeem =
+            build_erp_redeem_script(&new_keys, 5, &erp_keys, 3, 52560, ErpScript::NonStandard);
         assert_eq!(p2sh_base58_mainnet(&redeem), "3DsneJha6CY6X9gU2M9uEc4nSdbYECB4Gh");
     }
 
@@ -6969,7 +7157,8 @@ mod tests {
             .iter()
             .map(|h| key(h))
             .collect::<Vec<_>>();
-        let redeem = build_erp_redeem_script(&default_keys, 5, &erp_keys, 3, 52560, true);
+        let redeem =
+            build_erp_redeem_script(&default_keys, 5, &erp_keys, 3, 52560, ErpScript::P2sh);
         assert_eq!(
             alloy_primitives::hex::encode(p2sh_output_script(&redeem_script_hash160(&redeem)).as_bytes()),
             "a9142c1bab6ea51fdaf85c8366bd2b1502eaa69b6ae687"
@@ -7001,9 +7190,13 @@ mod tests {
         ]
         .map(key);
         let config = BridgeConstants::mainnet();
+        // Where that federation was committed, past RSKIP293.
+        let (cfg, block) = (RskHardforkConfig::mainnet(), 4_652_781);
+        let for_format =
+            |format| federation_redeem_for_format(&active_keys, format, &config, &cfg, block);
 
         // format 2000 (NON_STANDARD_ERP) → the active fed's real mainnet P2SH.
-        let r2000 = federation_redeem_for_format(&active_keys, 2000, &config);
+        let r2000 = for_format(2000);
         assert_eq!(
             p2sh_base58_mainnet(&r2000),
             "3DsneJha6CY6X9gU2M9uEc4nSdbYECB4Gh",
@@ -7011,7 +7204,7 @@ mod tests {
         );
 
         // format 1000 (STANDARD_MULTISIG) → plain N-of-M, a DIFFERENT address.
-        let r1000 = federation_redeem_for_format(&active_keys, 1000, &config);
+        let r1000 = for_format(1000);
         assert_eq!(
             r1000,
             build_federation_redeem_script(&active_keys, active_keys.len() / 2 + 1),
@@ -7025,7 +7218,7 @@ mod tests {
 
         // format 3000 (P2SH_ERP) → the P2SH-ERP template (p2sh=true), distinct
         // from the non-standard ERP form.
-        let r3000 = federation_redeem_for_format(&active_keys, 3000, &config);
+        let r3000 = for_format(3000);
         assert_ne!(r3000, r2000, "P2SH-ERP and non-standard ERP differ");
     }
 
@@ -8322,7 +8515,13 @@ mod tests {
         .map(key);
         let config = BridgeConstants::mainnet();
         let plain = build_federation_redeem_script(&keys, keys.len() / 2 + 1);
-        let erp = federation_redeem_for_format(&keys, 2000, &config);
+        let erp = federation_redeem_for_format(
+            &keys,
+            2000,
+            &config,
+            &RskHardforkConfig::mainnet(),
+            4_652_781,
+        );
         assert_ne!(
             plain, erp,
             "an ERP retiring federation must not migrate with the plain multisig redeem"
@@ -8644,7 +8843,7 @@ mod tests {
         use super::super::release_tx::{is_erp_redeem, placeholder_scriptsig, segwit_base_input};
         let keys = test_keys(0x10);
         let standard = build_federation_redeem_script(&keys, 2);
-        let erp = build_erp_redeem_script(&keys, 2, &test_keys(0x40), 2, 52_560, true);
+        let erp = build_erp_redeem_script(&keys, 2, &test_keys(0x40), 2, 52_560, ErpScript::P2sh);
         let outputs = [(40_000, p2sh_output_script(&[0x77; 20]))];
         for redeem in [&standard, &erp] {
             let unsigned = spend(vec![legacy(placeholder_scriptsig(redeem, 2)); 2], &outputs);
@@ -9134,7 +9333,7 @@ mod tests {
     fn below_the_index_a_spend_of_the_last_retired_federation_is_no_peg_in() {
         let keys = test_keys(0x10);
         let standard = build_federation_redeem_script(&keys, 2);
-        let erp = build_erp_redeem_script(&keys, 2, &test_keys(0x40), 2, 52_560, true);
+        let erp = build_erp_redeem_script(&keys, 2, &test_keys(0x40), 2, 52_560, ErpScript::P2sh);
         let with_retired = |retired: &[u8; 20], tx: &BtcTransaction| {
             let mut ctx = regtest_bridge_with(tx);
             let script = p2sh_output_script(retired).into_bytes();

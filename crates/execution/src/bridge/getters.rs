@@ -673,13 +673,16 @@ pub fn get_proposed_federation_address<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     gas_cost: u64,
     config: &BridgeConstants,
+    hardfork_cfg: &crate::hardfork::RskHardforkConfig,
 ) -> Result<PrecompileOutput, PrecompileError> {
     let Some(fed) = super::federation::load_stored_federation(ctx, PROPOSED_FEDERATION_KEY) else {
         return Ok(PrecompileOutput::new(gas_cost, abi_encode_string("").into()));
     };
     let keys: Vec<[u8; 33]> = fed.members.iter().map(|m| m.btc).collect();
     let format = super::peg::federation_format_version_pub(ctx, PROPOSED_FEDERATION_FORMAT_VERSION_KEY);
-    let redeem = super::peg::federation_redeem_for_format_pub(&keys, format, config);
+    let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
+    let redeem =
+        super::peg::federation_redeem_for_format_pub(&keys, format, config, hardfork_cfg, block_number);
     let hash160 = super::peg::federation_output_hash160(&redeem, format);
     let address = super::governance::p2sh_base58_address(&hash160, config);
     Ok(PrecompileOutput::new(gas_cost, abi_encode_string(&address).into()))

@@ -517,15 +517,16 @@ pub(crate) fn commit_proposed_federation<CTX: crate::RskContextTr>(
     // RSKIP186: saveLastRetiredFederationScript (the retiring = old fed) +
     // setNextFederationCreationBlockHeight(proposed fed's creation block).
     if hardfork_cfg.has_rskip186(block_number) {
-        let old_redeem = match &active {
-            Some(_) => super::peg::build_committed_federation_redeem_script(
-                &old_keys,
-                config,
-                hardfork_cfg,
-                old_block,
-            ),
-            None => super::peg::federation_redeem_for_format_pub(&old_keys, old_format, config),
-        };
+        // Its format is the one its creation gave it, but rskj rebuilds a
+        // stored federation with this block's activations, which pick the
+        // non-standard ERP builder.
+        let old_redeem = super::peg::federation_redeem_for_format_pub(
+            &old_keys,
+            old_format,
+            config,
+            hardfork_cfg,
+            block_number,
+        );
         let old_hash160 = super::peg::redeem_script_hash160_pub(&old_redeem);
         // RSKIP377: getDefaultP2SHScript() = getOutputScript(getDefaultRedeemScript())
         // — the *default* (standard multisig) redeem, wrapped P2SH-P2WSH for a
@@ -615,17 +616,17 @@ fn commit_pending_federation<CTX: crate::RskContextTr>(
     // Redeem scripts / hash160s: needed for the commit_federation event in BOTH
     // paths, and for the retiring fed's lastRetiredFederationP2SHScript in the
     // legacy handover. The retiring fed's redeem is rebuilt as the type it was
-    // CREATED with (keyed on its creation block); the built fed's by THIS
-    // block's activations (rskj PendingFederation.buildFederation).
-    let old_redeem = match &active {
-        Some(_) => super::peg::build_committed_federation_redeem_script(
-            &old_keys,
-            config,
-            hardfork_cfg,
-            old_block,
-        ),
-        None => super::peg::federation_redeem_for_format_pub(&old_keys, old_format, config),
-    };
+    // CREATED with (its format, keyed on its creation block), but with THIS
+    // block's activations, as rskj reads a stored federation: they pick the
+    // non-standard ERP builder. The built fed's is by THIS block's
+    // activations too (rskj PendingFederation.buildFederation).
+    let old_redeem = super::peg::federation_redeem_for_format_pub(
+        &old_keys,
+        old_format,
+        config,
+        hardfork_cfg,
+        block_number,
+    );
     let new_redeem = super::peg::build_committed_federation_redeem_script(
         &new_keys, config, hardfork_cfg, block_number,
     );

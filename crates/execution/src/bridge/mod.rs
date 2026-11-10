@@ -996,7 +996,9 @@ fn execute_method<CTX: crate::RskContextTr>(
         "getPendingFederationHash" => getters::get_pending_federation_hash(ctx, gas_cost),
         "getPendingFederatorPublicKey" => getters::get_pending_federator_public_key(ctx, args, gas_cost),
         "getPendingFederatorPublicKeyOfType" => getters::get_pending_federator_public_key_of_type(ctx, args, gas_cost),
-        "getProposedFederationAddress" => getters::get_proposed_federation_address(ctx, gas_cost, config),
+        "getProposedFederationAddress" => {
+            getters::get_proposed_federation_address(ctx, gas_cost, config, hardfork_cfg)
+        }
         "getProposedFederationSize" => getters::get_proposed_federation_size(ctx, gas_cost),
         "getProposedFederationCreationTime" => getters::get_proposed_federation_creation_time(ctx, gas_cost),
         "getProposedFederationCreationBlockNumber" => getters::get_proposed_federation_creation_block_number(ctx, gas_cost),
