@@ -1512,6 +1512,36 @@ mod tests {
         );
     }
 
+    /// rskj `FederationRegTestConstants`: regtest's federation changes are
+    /// voted on by three authorizers ('auth-a' to 'auth-c'), so two decide.
+    #[test]
+    fn two_of_regtests_three_authorizers_decide_a_federation_change() {
+        use revm::MainContext;
+        fn create<CTX: crate::RskContextTr>(
+            ctx: &mut CTX,
+            sender: alloy_primitives::Address,
+        ) -> i64 {
+            let config = super::super::constants::BridgeConstants::regtest();
+            let hardforks = crate::hardfork::RskHardforkConfig::regtest();
+            let tx_ctx = crate::precompiles::BridgeTxContext {
+                rsk_sender: sender,
+                ..Default::default()
+            };
+            let out = create_federation(ctx, 0, &config, &hardforks, &tx_ctx).unwrap();
+            i64::from_be_bytes(out.bytes[24..32].try_into().unwrap())
+        }
+        let regtest = super::super::constants::BridgeConstants::regtest();
+        let authorizers = federation_change_authorizers(&regtest);
+        assert_eq!(authorizers.len(), 3);
+        let mut ctx =
+            revm::Context::mainnet().with_chain(crate::raw_storage::RskChainExt::default());
+        assert_eq!(create(&mut ctx, authorizers[0]), 1);
+        let pending = |ctx: &mut _| bridge_load_bytes_named(ctx, PENDING_FEDERATION_KEY);
+        assert!(pending(&mut ctx).is_empty(), "one vote waits");
+        assert_eq!(create(&mut ctx, authorizers[1]), 1);
+        assert!(!pending(&mut ctx).is_empty(), "two decide");
+    }
+
     /// A Bridge call that reads the whitelist writes it back as the call
     /// returns, whatever it answers (upstream #291): `save()` writes whatever
     /// the call loaded. The changes read it after the sender check, the adds
