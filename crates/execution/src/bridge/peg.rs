@@ -102,10 +102,13 @@ fn pegin_below_minimum(live_output_values: &[u64], min: u64, rskip293: bool) -> 
 enum Invalid {
     /// `return false`.
     Swallowed(&'static str),
-    /// A throw: `BridgeIllegalArgumentException`, `VerificationException`,
-    /// `BlockStoreException`, or the `NullPointerException` of a block the
-    /// store does not have.
+    /// A throw: `VerificationException`, `BlockStoreException`, or the
+    /// `NullPointerException` of a block the store does not have.
     Thrown(&'static str),
+    /// A throw of `BridgeIllegalArgumentException`: as `Thrown` from RSKIP88,
+    /// but before it `Bridge.execute` answers it with null, a success with no
+    /// output.
+    IllegalArgument(&'static str),
 }
 
 /// rskj `BridgeSupport.validationsForRegisterBtcTransaction`. Its order is
@@ -137,9 +140,9 @@ fn validations_for_register_btc_transaction<CTX: crate::RskContextTr>(
         return Err(Invalid::Swallowed("insufficient confirmations"));
     }
 
-    // A tree of the wrong size throws.
+    // A tree of the wrong size throws `BridgeIllegalArgumentException`.
     if !PartialMerkleTree::has_expected_size(pmt_data) {
-        return Err(Invalid::Thrown(
+        return Err(Invalid::IllegalArgument(
             "PartialMerkleTree doesn't have expected size",
         ));
     }
@@ -296,10 +299,19 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
             );
             return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
         }
-        Err(Invalid::Thrown(m)) => {
+        // Before RSKIP88 `Bridge.execute` answers a
+        // `BridgeIllegalArgumentException` with null: the call succeeds with no
+        // output and saves nothing.
+        Err(Invalid::IllegalArgument(m)) if !hardfork_cfg.has_rskip88(block_number) => {
+            tracing::debug!(
+                "registerBtcTransaction: {m}; before RSKIP88, a success with no output"
+            );
+            return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
+        }
+        Err(Invalid::Thrown(m) | Invalid::IllegalArgument(m)) => {
             tracing::debug!(
                 "registerBtcTransaction: {m}; throwing \
-                 (rskj BridgeIllegalArgumentException escapes the catch)"
+                 (the throw escapes rskj's catch)"
             );
             return Err(PrecompileError::other(m));
         }
@@ -1827,7 +1839,9 @@ pub fn register_fast_bridge_btc_transaction<CTX: crate::RskContextTr>(
                 flyover_codes::UNPROCESSABLE_VALIDATIONS,
             ))
         }
-        Err(Invalid::Thrown(_)) => return ok(flyover_code_output(flyover_codes::GENERIC_ERROR)),
+        Err(Invalid::Thrown(_) | Invalid::IllegalArgument(_)) => {
+            return ok(flyover_code_output(flyover_codes::GENERIC_ERROR))
+        }
     }
 
     // Parse the BTC tx and compute the witness-stripped txid (getHash(false)).
@@ -8382,6 +8396,7 @@ mod tests {
                 Ok(()) => ("valid", ""),
                 Err(Invalid::Swallowed(why)) => ("false", why),
                 Err(Invalid::Thrown(why)) => ("throws", why),
+                Err(Invalid::IllegalArgument(why)) => ("illegal argument", why),
             }
         };
         let garbage = [0xFF; 3];
@@ -8391,9 +8406,9 @@ mod tests {
             ("false", "insufficient confirmations")
         );
         assert_eq!(run(-1, &garbage, &ONE_INPUT), ("false", "negative height"));
-        // Then the tree: the wrong size throws, and a tree without the
-        // transaction is false.
-        assert_eq!(run(0, &garbage, &ONE_INPUT).0, "throws");
+        // Then the tree: the wrong size throws BridgeIllegalArgumentException,
+        // and a tree without the transaction is false.
+        assert_eq!(run(0, &garbage, &ONE_INPUT).0, "illegal argument");
         assert_eq!(
             run(0, &one_leaf_tree(&NO_INPUTS), &ONE_INPUT),
             ("false", "tx not in PMT")
@@ -8917,6 +8932,47 @@ mod tests {
             );
         }
         outcome(&mut ctx, tx, height, &RskHardforkConfig::rskj_regtest())
+    }
+
+    /// rskj's `validationsForRegisterBtcTransaction` throws
+    /// `BridgeIllegalArgumentException` for a partial merkle tree of the wrong
+    /// size, which `Bridge.execute` answers with null before RSKIP88: the call
+    /// succeeds with no output, charged its gas, and registers nothing. From
+    /// RSKIP88 it throws.
+    #[test]
+    fn before_rskip88_a_tree_of_the_wrong_size_is_a_success_with_no_output() {
+        use revm::MainContext;
+        let (config, cfg) = (BridgeConstants::mainnet(), RskHardforkConfig::mainnet());
+        assert!(!cfg.has_rskip88(728_999) && cfg.has_rskip88(729_000));
+        let (_, checkpoint, _) = config.btc_checkpoint.unwrap();
+        let tx = tx_with(vec![], vec![]);
+        let raw = btc_serialize(&tx);
+        // Confirmed well past the minimum, so the tree's size is the check
+        // that answers.
+        let args = encode::args(&[
+            Arg::Bytes(&raw),
+            Arg::Word(encode::int(i64::from(checkpoint) - 200)),
+            Arg::Bytes(&[0u8; 3]),
+        ]);
+        let at = |number: u64| {
+            let mut ctx =
+                revm::Context::mainnet().with_chain(crate::raw_storage::RskChainExt::default());
+            ctx.block.number = U256::from(number);
+            let out = register_btc_transaction(
+                &mut ctx,
+                &args,
+                7_000,
+                &config,
+                &cfg,
+                &BridgeTxContext::default(),
+            );
+            (out, is_btc_tx_processed(&mut ctx, &legacy_btc_txid(&tx)))
+        };
+        let (out, processed) = at(728_999);
+        let out = out.expect("a success before RSKIP88");
+        assert!(out.bytes.is_empty() && !processed);
+        assert_eq!(out.gas_used, 7_000);
+        assert!(at(729_000).0.is_err(), "a throw from RSKIP88");
     }
 
     /// `registerBtcTransaction` of `tx` at Bitcoin `height` in `ctx`, with RSKj's

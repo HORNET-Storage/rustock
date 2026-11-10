@@ -523,25 +523,32 @@ pub fn receive_headers<CTX: crate::RskContextTr>(
     let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
 
     // rskj `Bridge.receiveHeaders` refuses the whole call when any header is
-    // not a header's size, before it parses one (Bridge.java:537-542).
+    // not a header's size, before it parses one (Bridge.java:537-542), and
+    // then when it can't parse one (`makeBlock`). Both throw
+    // `BridgeIllegalArgumentException`, which `Bridge.execute` answers with
+    // null before RSKIP88: a success with no output, nothing saved.
     let rskip124 = hardfork_cfg.has_rskip124(block_number);
+    let refuse = |why: &'static str| -> Result<PrecompileOutput, PrecompileError> {
+        if hardfork_cfg.has_rskip88(block_number) {
+            Err(PrecompileError::other(why))
+        } else {
+            Ok(PrecompileOutput::new(
+                gas_cost,
+                alloy_primitives::Bytes::new(),
+            ))
+        }
+    };
     if headers
         .iter()
         .any(|header| !is_block_header_size(header.len(), rskip124))
     {
-        return Err(PrecompileError::other(
-            "receiveHeaders: a header is not a header's size",
-        ));
+        return refuse("receiveHeaders: a header is not a header's size");
     }
-    // Then it parses every header (`makeBlock`), and refuses the whole call
-    // for one it can't parse.
     if headers
         .iter()
         .any(|header| !no_transactions_follow(&header[80..]))
     {
-        return Err(PrecompileError::other(
-            "receiveHeaders: a header could not be parsed",
-        ));
+        return refuse("receiveHeaders: a header could not be parsed");
     }
 
     let rskip434 = hardfork_cfg.has_rskip434(block_number);
@@ -1206,13 +1213,34 @@ mod tests {
     }
 
     /// rskj's `receiveHeaders` checks every header's size before it takes any,
-    /// and refuses the whole call for one of the wrong size.
+    /// and refuses the whole call for one of the wrong size, or for one it
+    /// can't parse. Both throw `BridgeIllegalArgumentException`, which
+    /// `Bridge.execute` answers with null before RSKIP88: a success with no
+    /// output, charged its gas. From RSKIP88 they throw.
     #[test]
     fn receive_headers_refuses_them_all_for_one_of_the_wrong_size() {
         use crate::abi::encode::{self, Arg};
-        let args = encode::args(&[Arg::BytesArray(&[&[0u8; 80], &[0u8; 79]])]);
         let (config, cfg) = (BridgeConstants::mainnet(), RskHardforkConfig::mainnet());
-        assert!(receive_headers(&mut empty_ctx(), &args, 0, &config, false, &cfg).is_err());
+        assert!(!cfg.has_rskip88(0) && cfg.has_rskip88(729_000) && !cfg.has_rskip124(729_000));
+        let wrong_size = encode::args(&[Arg::BytesArray(&[&[0u8; 80], &[0u8; 79]])]);
+        // 81 bytes, a size bitcoinj took before RSKIP124, counting one
+        // transaction that isn't there.
+        let mut counted = [0u8; 81];
+        counted[80] = 1;
+        let unparsed = encode::args(&[Arg::BytesArray(&[&counted])]);
+        let at = |number: u64, args: &[u8]| {
+            use revm::MainContext;
+            let mut ctx =
+                revm::Context::mainnet().with_chain(crate::raw_storage::RskChainExt::default());
+            ctx.block.number = alloy_primitives::U256::from(number);
+            receive_headers(&mut ctx, args, 5_000, &config, false, &cfg)
+        };
+        for args in [&wrong_size, &unparsed] {
+            let out = at(0, args).expect("before RSKIP88, a success");
+            assert!(out.bytes.is_empty());
+            assert_eq!(out.gas_used, 5_000);
+            assert!(at(729_000, args).is_err(), "from RSKIP88, a throw");
+        }
     }
 
     /// rskj runs `ensureBtcBlockStore` before every read of the BTC chain, so a
