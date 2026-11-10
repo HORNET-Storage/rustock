@@ -164,6 +164,11 @@ pub struct StoreChainAccess {
     /// A closure rather than a pool handle because this crate does not
     /// know what a pool is, and should not have to in order to say "this
     /// block is now committed".
+    ///
+    /// Called once the block is stored and, if it won, the head and the
+    /// executed head: rskj's `EthereumImpl.addNewMinedBlock` (L60-68) tells
+    /// the rest of the node after `blockchain.tryToConnect` has connected
+    /// it, so whatever the hook tells sees the chain with the block on it.
     pub on_committed: Option<Arc<dyn Fn(&Block) + Send + Sync>>,
     /// Best blocks between trie flushes: rskj's
     /// `blockchain.flushNumberOfBlocks`, whose `BlockChainFlusher` flushes
@@ -341,11 +346,6 @@ impl ChainAccess for StoreChainAccess {
 
         switch_chain += laps.lap();
 
-        if let Some(hook) = &self.on_committed {
-            hook(block);
-        }
-        on_best_block += laps.lap();
-
         let result = if td > current_td {
             self.store.update_canonical_chain(hash).map_err(|e| e.to_string())?;
             self.store.set_exec_head(hash, state_root).map_err(|e| e.to_string())?;
@@ -357,11 +357,20 @@ impl ChainAccess for StoreChainAccess {
             if self.flush_due() {
                 self.trie_store.flush();
             }
-            on_best_block += laps.lap();
             ImportResult::ImportedBest
         } else {
             ImportResult::ImportedNotBest
         };
+
+        // Only now, with the block stored and, if it won, the head: rskj's
+        // `EthereumImpl.addNewMinedBlock` (L60-68) broadcasts a mined block
+        // once `blockchain.tryToConnect` has connected it, and the node's sync
+        // service, told from here, reads the executed head this just set
+        // (#323).
+        if let Some(hook) = &self.on_committed {
+            hook(block);
+        }
+        on_best_block += laps.lap();
 
         info!(
             target: "rustock::mining",

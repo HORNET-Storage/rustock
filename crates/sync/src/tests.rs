@@ -5610,6 +5610,191 @@ async fn a_matching_state_root_is_left_alone() {
     assert_eq!(service.follow_buffer.len(), 1, "cleared the buffer when nothing was wrong");
 }
 
+// -- #323: a block this node mined reaches the in-memory state root ---------
+
+/// A service whose in-memory root is genesis's state, over a store whose
+/// head is `mined`, genesis's child, with a state of its own in the trie.
+struct MinedNode {
+    store: Arc<BlockStore>,
+    trie: Arc<dyn rustock_trie::TrieStore>,
+    service: SyncService,
+    mined: Header,
+    mined_root: B256,
+    _dir: tempfile::TempDir,
+}
+
+fn mined_on_genesis() -> MinedNode {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+    let mined = dummy_header(1, genesis.hash(), U256::from(1));
+    store.update_head(&mined, U256::from(2)).unwrap();
+
+    let trie = Arc::new(rustock_trie::MemoryTrieStore::new()) as Arc<dyn rustock_trie::TrieStore>;
+    let before = rustock_trie::TrieNode::empty();
+    let before_root = before.compute_hash(trie.as_ref());
+    trie.put(before_root.as_slice(), &before.to_message(trie.as_ref()));
+    let mut after = rustock_trie::TrieNode::empty().put(
+        &rustock_trie::TrieKeySlice::from_key(&[1u8, 2, 3]),
+        &[9u8; 8],
+        trie.as_ref(),
+    );
+    after.save(trie.as_ref(), true);
+    let mined_root = after.compute_hash(trie.as_ref());
+    assert_ne!(mined_root, before_root, "fixture did not create two states");
+
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(
+        store.clone(),
+        Arc::new(HeaderVerifier::new()),
+        peer_store.clone(),
+    ));
+    let (_tx, event_rx) = mpsc::unbounded_channel();
+    let processor = rustock_execution::BlockProcessor::new(
+        rustock_execution::RskHardforkConfig::mainnet(),
+        store.clone(),
+    );
+    let service = SyncService::new(manager, peer_store, event_rx).with_block_processor(
+        processor,
+        trie.clone(),
+        before,
+    );
+    MinedNode {
+        store,
+        trie,
+        service,
+        mined,
+        mined_root,
+        _dir: dir,
+    }
+}
+
+/// #323. The miner commits the blocks it mines, not this service, so the
+/// service is told: rskj connects a mined block through the same
+/// `tryToConnect` as a block from a peer. The in-memory root takes the mined
+/// block's committed state, quietly: nothing queued is dropped, and the tick's
+/// reconcile, which reloaded the root with a warning for every block mined,
+/// finds nothing to do.
+#[tokio::test]
+async fn a_mined_block_becomes_the_in_memory_state_root() {
+    let MinedNode {
+        store,
+        trie,
+        mut service,
+        mined,
+        mined_root,
+        _dir,
+    } = mined_on_genesis();
+    store.set_exec_head(mined.hash(), mined_root).unwrap();
+    service.follow_buffer.insert(
+        2,
+        (
+            B256::repeat_byte(2),
+            dummy_header(2, mined.hash(), U256::from(1)),
+            vec![],
+            vec![],
+        ),
+    );
+
+    service
+        .handle_event(crate::SyncEvent::MinedBlock { hash: mined.hash() })
+        .await;
+
+    assert_eq!(
+        service
+            .current_state_root
+            .as_ref()
+            .map(|r| r.compute_hash(trie.as_ref())),
+        Some(mined_root),
+        "the mined block's state is the in-memory root"
+    );
+    service.resync_state_root_with_exec_head();
+    assert_eq!(
+        service.follow_buffer.len(),
+        1,
+        "the reconcile still found the two apart"
+    );
+}
+
+/// Only while the mined block is the executed head: one that lost to a
+/// heavier block leaves the in-memory root to the block that won.
+#[tokio::test]
+async fn a_mined_block_that_is_not_the_executed_head_moves_nothing() {
+    let MinedNode {
+        store,
+        trie,
+        mut service,
+        mined,
+        mined_root,
+        _dir,
+    } = mined_on_genesis();
+    let held = |service: &SyncService| {
+        service
+            .current_state_root
+            .as_ref()
+            .map(|r| r.compute_hash(trie.as_ref()))
+    };
+    let before = held(&service);
+    // A heavier sibling is the executed head, with a state of its own.
+    let heavier = fork_header(1, mined.parent_hash, U256::from(5), 0xbb);
+    store.update_head(&heavier, U256::from(6)).unwrap();
+    store.set_exec_head(heavier.hash(), mined_root).unwrap();
+
+    service
+        .handle_event(crate::SyncEvent::MinedBlock { hash: mined.hash() })
+        .await;
+
+    assert_eq!(
+        held(&service),
+        before,
+        "the root moved for a block that is not the head"
+    );
+}
+
+/// `--follow-up false` drops chain data from peers, and a snapshot session
+/// keeps it from the ordinary sync, but a block this node mined is not that:
+/// its state is still the node's either way.
+#[tokio::test]
+async fn a_serving_or_snapshotting_node_still_takes_the_state_of_a_block_it_mined() {
+    for snapshotting in [false, true] {
+        let MinedNode {
+            store,
+            trie,
+            mut service,
+            mined,
+            mined_root,
+            _dir,
+        } = mined_on_genesis();
+        if snapshotting {
+            service.start_snap_sync(
+                crate::snap::SnapConfig {
+                    client_enabled: true,
+                    ..Default::default()
+                },
+                Arc::new(HeaderVerifier::new()),
+            );
+            assert!(service.is_suspended_for_snap_for_test());
+        } else {
+            service.follow_up = false;
+        }
+        store.set_exec_head(mined.hash(), mined_root).unwrap();
+
+        service
+            .handle_event(crate::SyncEvent::MinedBlock { hash: mined.hash() })
+            .await;
+
+        assert_eq!(
+            service
+                .current_state_root
+                .as_ref()
+                .map(|r| r.compute_hash(trie.as_ref())),
+            Some(mined_root),
+            "snapshotting {snapshotting}"
+        );
+    }
+}
+
 /// The 2026-09-24 15:41 stall: follow mode holding canonical headers above the
 /// executed head with no bodies, and nothing in flight.
 ///

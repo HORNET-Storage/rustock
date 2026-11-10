@@ -2187,6 +2187,8 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
     };
 
     let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+    // The miner's: it tells the sync service of every block it commits (#323).
+    let mined_events = event_tx.clone();
     let sync_handler = Arc::new(
         SyncHandler::new(sync_manager.clone(), event_tx)
             .with_serve_ceiling(args.simulate_height)
@@ -3405,11 +3407,15 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         // What the sync service's import path does for a block that arrived
         // from a peer, done here for one this node mined; then what rskj's
         // `EthereumImpl.addNewMinedBlock` does with a mined block once it is
-        // stored, best or not: send it to the peers.
+        // connected: the sync service takes its state as the node's, and the
+        // peers are sent it, best or not.
         let on_committed: Arc<dyn Fn(&rustock_core::Block) + Send + Sync> = {
             let pool = pool.clone();
-            let broadcast =
-                rustock_sync::on_mined(peer_store.clone(), tokio::runtime::Handle::current());
+            let broadcast = rustock_sync::on_mined(
+                peer_store.clone(),
+                mined_events.clone(),
+                tokio::runtime::Handle::current(),
+            );
             Arc::new(move |block: &rustock_core::Block| {
                 pool.remove_mined(&block.transactions);
                 pool.evict_outdated(block.header.number);

@@ -2251,6 +2251,39 @@ impl SyncService {
         }
     }
 
+    /// A block this node mined, committed by the miner: rskj connects a mined
+    /// block through the same `blockchain.tryToConnect` as a peer's
+    /// (`EthereumImpl.addNewMinedBlock`, L60-68), so once it is best the
+    /// node's state is the block's. The miner executed it and committed its
+    /// state, so the in-memory root takes that state rather than executing
+    /// the block again, as for any block this node has executed
+    /// (`fast_forward_state`).
+    ///
+    /// Without this the root stayed at the block's parent until the tick's
+    /// reconcile reloaded it, with a warning for every block mined, and a
+    /// block from a peer arriving in between met a root behind the executed
+    /// head (#323).
+    pub(crate) fn on_mined_block(&mut self, hash: B256) {
+        let Some(trie_store) = self.trie_store.clone() else {
+            return;
+        };
+        // Only while it is the executed head: a block that lost to a heavier
+        // one, or that a later block has already followed, moves nothing.
+        let Ok(Some((head, committed))) = self.manager.store.exec_head() else {
+            return;
+        };
+        if head != hash {
+            return;
+        }
+        if let Some(data) = trie_store.get(committed.as_slice()) {
+            self.current_state_root = Some(TrieNode::from_message(&data, trie_store.as_ref()));
+            debug!(
+                target: "rustock::sync",
+                "Took mined block {hash:?}'s committed state {committed:?} as the in-memory root"
+            );
+        }
+    }
+
     /// Re-queue canonical blocks this node already holds but has not executed.
     ///
     /// `drain_follow_buffer` is reachable from exactly one place:
@@ -3561,6 +3594,8 @@ impl SyncService {
                     );
                     return;
                 }
+                // Not from a peer: the node's own miner.
+                SyncEvent::MinedBlock { .. } => {}
             }
         }
 
@@ -3587,6 +3622,8 @@ impl SyncService {
                 SyncEvent::SnapStatusResponse { .. }
                 | SyncEvent::SnapChunkResponse { .. }
                 | SyncEvent::SnapBlocksResponse { .. } => true,
+                // Not chain data from a peer: the node's own miner.
+                SyncEvent::MinedBlock { .. } => true,
                 SyncEvent::BodyResponse { .. }
                 | SyncEvent::BlockHashResponse { .. }
                 | SyncEvent::NewBlockHashes { .. }
@@ -3686,6 +3723,9 @@ impl SyncService {
             }
             SyncEvent::NewBlock { peer, block } => {
                 self.on_new_block(peer, *block).await;
+            }
+            SyncEvent::MinedBlock { hash } => {
+                self.on_mined_block(hash);
             }
         }
     }

@@ -57,6 +57,13 @@ pub enum SyncEvent {
         peer: B512,
         block: Box<Block>,
     },
+    /// A block this node mined, now stored and, if it won, the head and the
+    /// executed head: rskj connects a mined block through the same
+    /// `blockchain.tryToConnect` as a peer's (`EthereumImpl.addNewMinedBlock`),
+    /// so the node's state is the block's once it is best.
+    MinedBlock {
+        hash: B256,
+    },
 
     /// A peer's offer of a state it can serve. The blocks are unverified:
     /// their headers still have to be checked back to a block this node

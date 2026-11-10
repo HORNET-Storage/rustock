@@ -63,15 +63,20 @@ pub async fn broadcast_block(peer_store: &PeerStore, block: &Block) -> Vec<B512>
     whole
 }
 
-/// What this node does with a block it mined once the block is stored, best
-/// or not: send it to the peers, as rskj's `EthereumImpl.addNewMinedBlock`
-/// (L60-68) does through [`broadcast_block`]. The miner commits from a
-/// blocking thread, so the sending is handed to `runtime`.
+/// What this node does with a block it mined once the block is stored and,
+/// if it won, the head: what rskj's `EthereumImpl.addNewMinedBlock` (L60-68)
+/// does after `blockchain.tryToConnect`. The node's own sync service is told
+/// ([`crate::SyncEvent::MinedBlock`]), so it takes the state the miner
+/// committed (#323), and the block goes to the peers ([`broadcast_block`]),
+/// best or not. The miner commits from a blocking thread, so the sending is
+/// handed to `runtime`.
 pub fn on_mined(
     peer_store: std::sync::Arc<PeerStore>,
+    events: tokio::sync::mpsc::UnboundedSender<crate::SyncEvent>,
     runtime: tokio::runtime::Handle,
 ) -> impl Fn(&Block) + Send + Sync {
     move |block: &Block| {
+        let _ = events.send(crate::SyncEvent::MinedBlock { hash: block.hash() });
         let peer_store = peer_store.clone();
         let block = block.clone();
         runtime.spawn(async move {
@@ -207,19 +212,29 @@ mod tests {
         }
     }
 
-    /// The miner commits from a blocking thread: the block still reaches every
-    /// peer.
+    /// The miner commits from a blocking thread: the node's own sync service
+    /// hears of the block, and the block still reaches every peer.
     #[tokio::test]
-    async fn a_block_mined_on_a_blocking_thread_reaches_every_peer() {
+    async fn a_mined_block_reaches_the_sync_service_and_every_peer() {
         let (store, mut inboxes) = store_of(4).await;
+        let (events, mut sync_service) = mpsc::unbounded_channel();
         let on_mined = on_mined(
             std::sync::Arc::new(store),
+            events,
             tokio::runtime::Handle::current(),
         );
         let mined = block(7);
+        let hash = mined.hash();
         tokio::task::spawn_blocking(move || on_mined(&mined))
             .await
             .unwrap();
+        assert!(
+            matches!(
+                sync_service.try_recv(),
+                Ok(crate::SyncEvent::MinedBlock { hash: told }) if told == hash
+            ),
+            "the sync service was not told"
+        );
         for (id, inbox) in &mut inboxes {
             let heard =
                 tokio::time::timeout(std::time::Duration::from_secs(10), inbox.recv()).await;

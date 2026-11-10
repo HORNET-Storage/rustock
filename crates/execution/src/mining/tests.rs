@@ -2770,6 +2770,55 @@ fn by_default_every_mined_block_flushes() {
     }
 }
 
+/// rskj's `EthereumImpl.addNewMinedBlock` tells the rest of the node of a
+/// mined block once `blockchain.tryToConnect` has connected it: the hook sees
+/// the block as the head and the executed head, so the sync service it tells
+/// reads the block's state as the node's (#323).
+#[test]
+fn the_commit_hook_runs_once_the_block_is_the_head() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let trie_store: Arc<dyn TrieStore> = Arc::new(MemoryTrieStore::new());
+    let root = TrieNode::empty().compute_hash(trie_store.as_ref());
+    let parent = header_at(0, B256::ZERO, root);
+    let parent_hash = parent.hash();
+    store.put_header_with_hash(parent_hash, &parent).unwrap();
+    store.put_canonical_hash(0, parent_hash).unwrap();
+    store
+        .put_total_difficulty(parent_hash, U256::from(1))
+        .unwrap();
+    store.set_head(parent_hash).unwrap();
+    store.set_exec_head(parent_hash, root).unwrap();
+
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let hook: Arc<dyn Fn(&rustock_core::Block) + Send + Sync> = {
+        let (store, seen) = (store.clone(), seen.clone());
+        Arc::new(move |_block: &rustock_core::Block| {
+            let exec_head = store.exec_head().unwrap();
+            let canonical = store.canonical_hash(1).unwrap();
+            seen.lock().unwrap().push((exec_head, canonical));
+        })
+    };
+    let chain = StoreChainAccess::new(store.clone(), trie_store, Some(hook));
+    let block = rustock_core::Block {
+        header: header_at(1, parent_hash, root),
+        transactions: Vec::new(),
+        ommers: Vec::new(),
+    };
+    let hash = block.hash();
+
+    let outcome = chain
+        .commit_mined_block(&block, root, &mut crate::breakdown::Laps::new(false))
+        .unwrap();
+
+    assert_eq!(outcome.result, ImportResult::ImportedBest);
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![(Some((hash, root)), Some(hash))],
+        "the hook ran once, with the block the executed head and canonical"
+    );
+}
+
 /// The thread mines on its clock: at a 100 ms median (the floor), a second
 /// of running yields several blocks, and stopping ends it.
 #[test]
