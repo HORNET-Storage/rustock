@@ -1433,6 +1433,37 @@ mod tests {
         );
     }
 
+    /// Testnet's history: each of the nine federations committed between
+    /// RSKIP383 (#4,015,800) and RSKIP419 (#6,110,487) became the active one
+    /// 120 blocks after its commitment. rskj's public testnet node answers
+    /// `getFederationCreationBlockNumber` with the previous federation's block
+    /// at the 119th block and with the new one's at the 120th.
+    #[test]
+    fn testnets_federations_before_lovell_became_active_after_120_blocks() {
+        let (config, forks) = (BridgeConstants::testnet(), RskHardforkConfig::testnet());
+        // (the previous federation's creation block, the committed one's)
+        let history = [
+            (3_945_006, 4_019_051),
+            (4_019_051, 4_063_391),
+            (4_063_391, 4_258_297),
+            (4_258_297, 4_487_930),
+            (4_487_930, 5_334_163),
+            (5_334_163, 5_787_959),
+            (5_787_959, 5_854_737),
+            (5_854_737, 6_065_057),
+            (6_065_057, 6_068_377),
+        ];
+        for (previous, committed) in history {
+            for (block, active) in [(committed + 119, previous), (committed + 120, committed)] {
+                let mut ctx = ctx_at(block);
+                store_federation(&mut ctx, NEW_FEDERATION_KEY, &[member(1)], 1_000, committed);
+                store_federation(&mut ctx, OLD_FEDERATION_KEY, &[member(2)], 900, previous);
+                let out = get_federation_creation_block_number(&mut ctx, 0, &config, &forks);
+                assert_eq!(as_int(&out.unwrap()), active as i64, "testnet #{block}");
+            }
+        }
+    }
+
     // ---- creation time units ----
 
     /// RSKIP419 changes the unit from milliseconds to seconds. Storage keeps

@@ -53,7 +53,10 @@ pub struct BridgeConstants {
 
     // -- BTC block index --
 
-    /// BTC height when the block index feature activates.
+    /// rskj `btcHeightWhenBlockIndexActivates`: from RSKIP199, a main-chain
+    /// height below it is found only within
+    /// `max_depth_to_search_blocks_below_index_activation` of the head
+    /// (`getStoredBlockAtMainChainHeight`).
     pub btc_height_when_block_index_activates: u32,
     /// Max depth to search blocks below the index activation height.
     pub max_depth_to_search_blocks_below_index_activation: u32,
@@ -105,6 +108,10 @@ pub struct BridgeConstants {
     pub federation_activation_age_legacy: u64,
     /// Post-RSKIP383 activation age.
     pub federation_activation_age: u64,
+    /// rskj `FederationTestNetConstants.preLovellActivationAge`: testnet's
+    /// activation age from RSKIP383 until RSKIP419. The other networks have
+    /// none, and use `federation_activation_age` from RSKIP383 on.
+    pub federation_activation_age_pre_lovell: Option<u64>,
     /// RSKIP419 SVP validation window, in RSK blocks: a proposed federation
     /// must pass the Sign Validation Protocol within this many blocks of its
     /// creation or the proposal is discarded (rskj FederationConstants
@@ -174,7 +181,7 @@ impl BridgeConstants {
             max_inputs_per_pegout_transaction: 50,
             number_of_blocks_between_pegouts: 360,
             update_bridge_execution_period: 1,
-            btc_height_when_block_index_activates: 696_000,
+            btc_height_when_block_index_activates: 696_022,
             max_depth_to_search_blocks_below_index_activation: 4320,
             btc_transaction_confirmation_max_depth: 4320,
             // 5 × MILLICOIN = 5 × 100_000 = 500_000 sat/KB
@@ -236,6 +243,7 @@ impl BridgeConstants {
             ],
             federation_activation_age_legacy: 18_500,
             federation_activation_age: 40_320,
+            federation_activation_age_pre_lovell: None,
             validation_period_duration_in_blocks: 20_000,
             funds_migration_age_begin: 0,
             funds_migration_age_end: 10_585,
@@ -279,7 +287,7 @@ impl BridgeConstants {
             max_inputs_per_pegout_transaction: 50,
             number_of_blocks_between_pegouts: 360,
             update_bridge_execution_period: 1,
-            btc_height_when_block_index_activates: 2_000_000,
+            btc_height_when_block_index_activates: 2_039_594,
             max_depth_to_search_blocks_below_index_activation: 4320,
             btc_transaction_confirmation_max_depth: 4320,
             // 1 × MILLICOIN = 100_000 sat/KB
@@ -330,6 +338,7 @@ impl BridgeConstants {
             ],
             federation_activation_age_legacy: 60,
             federation_activation_age: 2_400,
+            federation_activation_age_pre_lovell: Some(120),
             validation_period_duration_in_blocks: 2_000,
             funds_migration_age_begin: 60,
             funds_migration_age_end: 900,
@@ -419,6 +428,7 @@ impl BridgeConstants {
             ],
             federation_activation_age_legacy: 10,
             federation_activation_age: 150,
+            federation_activation_age_pre_lovell: None,
             validation_period_duration_in_blocks: 125,
             funds_migration_age_begin: 15,
             funds_migration_age_end: 150,
@@ -515,5 +525,19 @@ mod tests {
         ] {
             assert_eq!(c.max_depth_blockchain_accepted, 25);
         }
+    }
+
+    /// rskj's `btcHeightWhenBlockIndexActivates`: 696,022 on mainnet and
+    /// 2,039,594 on testnet.
+    #[test]
+    fn rskj_btc_height_when_block_index_activates() {
+        assert_eq!(
+            BridgeConstants::mainnet().btc_height_when_block_index_activates,
+            696_022
+        );
+        assert_eq!(
+            BridgeConstants::testnet().btc_height_when_block_index_activates,
+            2_039_594
+        );
     }
 }

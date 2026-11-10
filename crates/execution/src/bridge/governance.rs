@@ -376,15 +376,21 @@ pub(crate) fn federation_format_version(
     }
 }
 
+/// rskj `FederationConstants.getFederationActivationAge`: the legacy age
+/// before RSKIP383 and the age after it, with testnet's own step between
+/// RSKIP383 and RSKIP419 (`FederationTestNetConstants` overrides it to answer
+/// `preLovellActivationAge` there).
 pub(crate) fn federation_activation_age(
     config: &super::constants::BridgeConstants,
     hardfork_cfg: &crate::hardfork::RskHardforkConfig,
     block_number: u64,
 ) -> u64 {
-    if hardfork_cfg.has_rskip383(block_number) {
-        config.federation_activation_age
-    } else {
-        config.federation_activation_age_legacy
+    if !hardfork_cfg.has_rskip383(block_number) {
+        return config.federation_activation_age_legacy;
+    }
+    match config.federation_activation_age_pre_lovell {
+        Some(age) if !hardfork_cfg.has_rskip419(block_number) => age,
+        _ => config.federation_activation_age,
     }
 }
 
@@ -1481,6 +1487,42 @@ mod tests {
 
         // The promoted active-height cell encodes as serializeLong = RLP bigint.
         assert_eq!(serialization::rlp_encode_u64(next_creation), vec![0x83, 0x46, 0xfe, 0xed]);
+    }
+
+    /// rskj's testnet constants activate a federation 60 blocks after its
+    /// commitment before RSKIP383 (fingerroot500, #4,015,800), 120 until
+    /// RSKIP419 (lovell700, #6,110,487), then 2,400. Mainnet has no middle step:
+    /// 18,500 before RSKIP383, 40,320 after.
+    #[test]
+    fn testnets_activation_age_has_a_step_before_lovell() {
+        use super::super::constants::BridgeConstants;
+        use crate::hardfork::RskHardforkConfig;
+        let (testnet, hf) = (BridgeConstants::testnet(), RskHardforkConfig::testnet());
+        for (block, age) in [
+            (4_015_799, 60),
+            (4_015_800, 120),
+            (6_110_486, 120),
+            (6_110_487, 2_400),
+        ] {
+            assert_eq!(
+                federation_activation_age(&testnet, &hf, block),
+                age,
+                "testnet #{block}"
+            );
+        }
+        let (mainnet, hf) = (BridgeConstants::mainnet(), RskHardforkConfig::mainnet());
+        for (block, age) in [
+            (5_467_999, 18_500),
+            (5_468_000, 40_320),
+            (7_338_023, 40_320),
+            (7_338_024, 40_320),
+        ] {
+            assert_eq!(
+                federation_activation_age(&mainnet, &hf, block),
+                age,
+                "mainnet #{block}"
+            );
+        }
     }
 
     /// rskj `addOneOffLockWhitelistAddress` parses the address first, -2 where

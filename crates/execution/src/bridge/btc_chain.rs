@@ -1688,4 +1688,31 @@ mod tests {
         assert!(takes(&[0]));
         assert!(!takes(&[1]));
     }
+
+    /// From RSKIP199 rskj finds a main-chain block below
+    /// `btcHeightWhenBlockIndexActivates` only within
+    /// `maxDepthToSearchBlocksBelowIndexActivation` of the head, and throws
+    /// below that, so a getter's call fails where the lookup would go on. With
+    /// the head more than 4,320 above it, that's below 696,022 on mainnet and
+    /// below 2,039,594 on testnet.
+    #[test]
+    fn below_the_index_activation_rskj_looks_only_so_deep() {
+        let any_header = bitcoin::constants::genesis_block(bitcoin::Network::Bitcoin).header;
+        for (config, limit) in [
+            (BridgeConstants::mainnet(), 696_022),
+            (BridgeConstants::testnet(), 2_039_594),
+        ] {
+            let mut ctx = empty_ctx();
+            let head = StoredBlock::new(any_header, limit + 100_000, U256::ZERO);
+            store_chain_head(&mut ctx, &head, true);
+            let lookup =
+                |ctx: &mut _, height| main_chain_block_at_height(ctx, height, true, Some(&config));
+            assert!(matches!(
+                lookup(&mut ctx, limit - 1),
+                MainChainLookup::StoreError
+            ));
+            // From the limit on the lookup goes on, here to a head not stored.
+            assert!(matches!(lookup(&mut ctx, limit), MainChainLookup::Absent));
+        }
+    }
 }
