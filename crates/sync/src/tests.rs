@@ -7618,7 +7618,9 @@ async fn a_body_from_a_peer_that_was_not_asked_is_ignored() {
 /// are empty, as rskj emits them on every versioned header while RSKIP144 is
 /// active and the block has no sublists: a header given it has the fields
 /// rskj reads at regtest's heights.
-fn an_extension(bit: usize) -> rustock_core::types::header_extension::BlockHeaderExtension {
+pub(crate) fn an_extension(
+    bit: usize,
+) -> rustock_core::types::header_extension::BlockHeaderExtension {
     let mut logs_bloom = vec![0u8; 256];
     logs_bloom[bit / 8] |= 0x80 >> (bit % 8);
     rustock_core::types::header_extension::BlockHeaderExtension::V2 {
@@ -7633,7 +7635,7 @@ fn an_extension(bit: usize) -> rustock_core::types::header_extension::BlockHeade
 /// reads at regtest's heights and the merged-mining fields every versioned
 /// header has, and hashed as regtest's heights say: without the
 /// merged-mining proof and coinbase (RSKIP-92).
-fn compressed(
+pub(crate) fn compressed(
     header: Header,
     extension: &rustock_core::types::header_extension::BlockHeaderExtension,
 ) -> Header {

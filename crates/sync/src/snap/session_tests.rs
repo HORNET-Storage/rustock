@@ -663,6 +663,135 @@ fn a_body_that_does_not_match_its_header_is_refused() {
     );
 }
 
+/// A snapshot's blocks below its checkpoint complete the walk's compressed
+/// headers.
+///
+/// From RSKIP-351 a chain's headers come compressed: a version-1 or version-2
+/// header holds only the commitment to its extension, the block's logs bloom,
+/// execution edges and base event, and the walk stores it so. The blocks
+/// below the checkpoint come whole, and rskj stores each of them whole
+/// (`SnapshotProcessor.processSnapBlocksResponse`, then
+/// `BlockConnectorHelper.startConnecting`'s `saveBlock`). This node kept the
+/// walk's compressed header beside the body: no bloom to answer with, and no
+/// extension to send beside the body it serves.
+#[test]
+fn the_blocks_below_the_checkpoint_complete_the_walks_compressed_headers() {
+    use crate::tests::{an_extension, compressed};
+    use rustock_core::config::ActivationHeights;
+
+    // Stores that read headers as rskj's regtest does: RSKIP-351 from block 1.
+    let regtest_store = |dir: &tempfile::TempDir| {
+        Arc::new(
+            BlockStore::open(dir.path())
+                .expect("open")
+                .with_activations(ActivationHeights::regtest()),
+        )
+    };
+    let mut f = fixture(20);
+    let dir = tempfile::tempdir().expect("tempdir");
+    f.store = regtest_store(&dir);
+    f._dir = dir;
+    let genesis = f.with_genesis();
+
+    // Each block whole, and its header as the walk is sent it.
+    let mut parent = genesis;
+    let (mut whole, mut walked, mut tds) = (Vec::new(), Vec::new(), Vec::new());
+    for number in 1..=3u64 {
+        let extension = an_extension(number as usize);
+        let sent = compressed(header(number, parent, f.state_root, 100), &extension);
+        let full = sent
+            .with_extension(&extension)
+            .expect("the extension it names");
+        assert_eq!(full.hash(), sent.hash(), "both forms hash alike");
+        parent = sent.hash();
+        walked.insert(0, sent);
+        whole.push(block(full));
+        tds.push(U256::from(100 + 100 * number));
+    }
+
+    // The status carries the checkpoint, whole; the walk brings the headers
+    // under it, compressed.
+    let mut session = f.session(HeaderVerifier::new());
+    session.on_status(std::slice::from_ref(&whole[2]), &tds[2..], 5_000, 0);
+    let started = session.on_headers(3, &walked);
+    assert_eq!(
+        session.phase(),
+        Phase::DownloadingState,
+        "{:?}",
+        session.failure()
+    );
+    for b in &whole[..2] {
+        let held = f.store.header(b.header.hash()).unwrap().expect("walked");
+        assert_eq!(
+            held.extension(),
+            None,
+            "the walk holds #{} compressed",
+            b.header.number
+        );
+    }
+
+    let peer_dir = tempfile::tempdir().expect("tempdir");
+    let peer_store = regtest_store(&peer_dir);
+    for (b, td) in whole.iter().zip(tds.iter()) {
+        let hash = b.header.hash();
+        peer_store
+            .put_header_with_hash(hash, &b.header)
+            .expect("header");
+        peer_store
+            .put_canonical_hash(b.header.number, hash)
+            .expect("index");
+        peer_store.put_total_difficulty(hash, *td).expect("td");
+    }
+    let server = SnapServer::new(
+        peer_store,
+        f.trie.clone() as Arc<dyn TrieStore>,
+        SnapConfig {
+            server_enabled: true,
+            ..SnapConfig::default()
+        },
+    );
+    let mut actions = started;
+    let mut guard = 0;
+    while session.phase() == Phase::DownloadingState {
+        guard += 1;
+        assert!(guard < 1000, "state download stalled");
+        if actions.is_empty() {
+            actions = session.poll();
+            assert!(!actions.is_empty(), "no work and not finished");
+        }
+        if let Action::RequestChunk { from, budget, .. } = actions.remove(0) {
+            let response = server
+                .chunk(&SnapChunkRequest {
+                    id: 1,
+                    block_number: 3,
+                    from,
+                    chunk_size: budget,
+                    state_root: Some(f.state_root),
+                })
+                .expect("server answers");
+            actions.extend(session.on_chunk(from, &response.payload, Refusal::None));
+        }
+    }
+    assert_eq!(
+        session.phase(),
+        Phase::DownloadingBlocks,
+        "{:?}",
+        session.failure()
+    );
+
+    session.on_blocks(&whole[..2], &tds[..2]);
+    assert_eq!(session.phase(), Phase::Done, "{:?}", session.failure());
+    for (b, bit) in whole[..2].iter().zip(1..) {
+        let held = f.store.header(b.header.hash()).unwrap().expect("held");
+        assert_eq!(
+            held.extension(),
+            Some(an_extension(bit)),
+            "#{} is held whole, with the extension its hash commits to",
+            b.header.number
+        );
+    }
+}
+
 // ------------------------------------------------------- blaming the peer
 
 use alloy_primitives::B512;

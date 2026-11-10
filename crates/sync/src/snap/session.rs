@@ -1406,6 +1406,15 @@ impl SnapSession {
                 return self.fail(why);
             }
 
+            // The header with it, as the block carries it. From RSKIP-351 on the
+            // walk's copy came compressed and holds only the commitment to the
+            // block's extension: its logs bloom, execution edges and base
+            // event. rskj stores these blocks whole
+            // (`SnapshotProcessor.processSnapBlocksResponse`, then
+            // `BlockConnectorHelper.startConnecting`'s `saveBlock`). The hash
+            // checked above commits to the extension, so nothing unchecked
+            // comes with it.
+            let _ = self.store.put_header_with_hash(hash, &block.header);
             let _ = self.store.put_body(hash, &block.transactions, &block.ommers);
             let _ = self.store.put_total_difficulty(hash, *td);
             oldest = oldest.min(block.header.number);
