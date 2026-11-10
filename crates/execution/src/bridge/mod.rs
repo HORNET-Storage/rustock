@@ -762,7 +762,8 @@ fn receive_headers_cost(args: &[u8], hardfork_cfg: &RskHardforkConfig, block_num
 
 /// rskj `BridgeSupport.getBtcTransactionConfirmationsGetCost`:
 /// 27_000 base + blockDepth * 315 + merkleBranchHashes * 144, falling back to
-/// the base cost when the block is unknown or too deep.
+/// the base cost when the block is unknown or too deep. It finds the block
+/// as the call does (`getBlockKeepingTestnetConsensus`).
 fn btc_tx_confirmations_cost<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     args: &[u8],
@@ -788,7 +789,9 @@ fn btc_tx_confirmations_cost<CTX: crate::RskContextTr>(
     // contract's call that runs out of gas drops it.
     crate::bridge::btc_chain::ensure_btc_block_store(ctx, config, hardfork_cfg);
     let block_hash = crate::bridge::btc_chain::b256_to_bitcoin_hash(&block_hash);
-    let Some(block) = crate::bridge::btc_store::get_stored_block(ctx, &block_hash) else {
+    let Some(block) =
+        crate::bridge::btc_store::get_block_keeping_testnet_consensus(ctx, config, &block_hash)
+    else {
         return BASIC_COST;
     };
     let Some(head) = crate::bridge::btc_store::load_chain_head(ctx) else {
@@ -1430,5 +1433,89 @@ mod tests {
             btc_tx_confirmations_cost(&mut ctx, &args, &config, &cfg),
             27_000 + 2 * 144
         );
+    }
+
+    /// rskj `BuildBlockThatKeepsTestnetConsensusTests`: at testnet's block
+    /// #5,148,285, `getBtcTransactionConfirmations` and its cost find Bitcoin
+    /// block `00000000e8e7...f379`, which the store doesn't hold, as rskj's
+    /// hard-coded block at 2,817,125. Under a head at 2,817,200 the cost
+    /// charges its depth. On a fresh store, whose head is below it, the call
+    /// can't look up the main chain at its height and answers -3. At any other
+    /// block, or on mainnet, the block isn't found.
+    #[test]
+    fn the_confirmations_keep_testnet_consensus_at_5_148_285() {
+        use crate::abi::encode::{self, Arg};
+        use revm::MainContext;
+        let hard_coded: bitcoin::BlockHash =
+            "00000000e8e7b540df01a7067e020fd7e2026bf86289def2283a35120c1af379"
+                .parse()
+                .unwrap();
+        let args = encode::args(&[
+            Arg::Word([0x11; 32]),
+            Arg::Word(btc_chain::bitcoin_hash_to_b256(&hard_coded).0),
+            Arg::Word(encode::int(0)),
+            Arg::Words(&[]),
+        ]);
+        let (testnet, mainnet) = (BridgeConstants::testnet(), BridgeConstants::mainnet());
+        let cfg = RskHardforkConfig::testnet();
+        let ctx_at = |number: u64| {
+            let mut ctx =
+                revm::Context::mainnet().with_chain(crate::raw_storage::RskChainExt::default());
+            ctx.block.number = alloy_primitives::U256::from(number);
+            ctx
+        };
+
+        // rskj's header is the block it names.
+        let block = btc_store::get_block_keeping_testnet_consensus(
+            &mut ctx_at(5_148_285),
+            &testnet,
+            &hard_coded,
+        )
+        .expect("the hard-coded block");
+        assert_eq!((block.block_hash(), block.height), (hard_coded, 2_817_125));
+        for (number, config) in [
+            (5_148_284, &testnet),
+            (5_148_286, &testnet),
+            (5_148_285, &mainnet),
+        ] {
+            let mut ctx = ctx_at(number);
+            assert!(
+                btc_store::get_block_keeping_testnet_consensus(&mut ctx, config, &hard_coded)
+                    .is_none()
+            );
+        }
+
+        // The cost, under rskj's test's head: Bitcoin testnet's block 2,817,200.
+        let head = btc_store::StoredBlock::new(
+            bitcoin::consensus::deserialize(
+                &alloy_primitives::hex::decode("0000642d6b8df2c8ae4a20e20a10ae3b34e485701b8ae7e80ede0828040000000000000063a17c3e5063da2f8f952e496beee729932d35f62c0765baaf12f32931f01c9b49354f66ecd410190f25f402").unwrap(),
+            )
+            .unwrap(),
+            2_817_200,
+            alloy_primitives::U256::from(1),
+        );
+        let cost_at = |number: u64| {
+            let mut ctx = ctx_at(number);
+            btc_store::store_chain_head(&mut ctx, &head, cfg.has_stored_block_v2(number));
+            btc_tx_confirmations_cost(&mut ctx, &args, &testnet, &cfg)
+        };
+        assert_eq!(cost_at(5_148_285), 27_000 + (2_817_200 - 2_817_125) * 315);
+        assert_eq!(cost_at(5_148_286), 27_000);
+
+        // The call, on a fresh store.
+        let answer_at = |number: u64| {
+            let out = tx::get_btc_transaction_confirmations(
+                &mut ctx_at(number),
+                &args,
+                0,
+                &testnet,
+                cfg.has_stored_block_v2(number),
+                &cfg,
+            )
+            .unwrap();
+            i64::from_be_bytes(out.bytes[24..32].try_into().unwrap())
+        };
+        assert_eq!(answer_at(5_148_285), -3);
+        assert_eq!(answer_at(5_148_286), -1);
     }
 }

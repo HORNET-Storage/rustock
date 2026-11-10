@@ -24,7 +24,7 @@ pub fn btc_hash_hex_display(hash: &[u8; 32]) -> String {
     bytes.reverse();
     to_hex(&bytes)
 }
-use super::btc_store::{get_stored_block, load_chain_head};
+use super::btc_store::{get_block_keeping_testnet_consensus, get_stored_block, load_chain_head};
 use super::pmt::{MerkleBranch, PartialMerkleTree};
 use super::serialization::{rlp_decode_list, rlp_encode_element, rlp_encode_list};
 use super::storage::*;
@@ -352,11 +352,11 @@ pub fn get_btc_transaction_confirmations<CTX: crate::RskContextTr>(
     let rskip199 = hardfork_cfg.has_rskip199(block_number);
     super::btc_chain::ensure_btc_chain_seeded(ctx, config, use_v2, rskip199);
 
-    // 1. Block must exist. (rskj `getBlockKeepingTestnetConsensus`; the
-    //    hardcoded testnet block it special-cases is not a mainnet concern.)
+    // 1. Block must exist (rskj `getBlockKeepingTestnetConsensus`, which at
+    //    testnet's block #5,148,285 answers a hard-coded block).
     let block_hash =
         b256_to_bitcoin_hash(&alloy_primitives::B256::from(block_hash_bytes));
-    let block = match get_stored_block(ctx, &block_hash) {
+    let block = match get_block_keeping_testnet_consensus(ctx, config, &block_hash) {
         Some(b) => b,
         None => {
             return Ok(encode_int_output(gas_cost, CONFIRMATION_ERR_INEXISTENT_BLOCK_HASH))

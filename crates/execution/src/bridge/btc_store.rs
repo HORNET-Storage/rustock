@@ -253,6 +253,38 @@ pub fn get_stored_block<CTX: crate::RskContextTr>(ctx: &mut CTX, hash: &BlockHas
     Some(block)
 }
 
+/// rskj `BridgeSupport.getBlockKeepingTestnetConsensus`, the lookup
+/// `getBtcTransactionConfirmations` and its gas cost make: the stored block
+/// `hash` names, except at testnet's block #5,148,285, where Bitcoin block
+/// `00000000e8e7...f379` is the block rskj hard-codes, at height 2,817,125,
+/// whatever the store holds. rskj's cache held that block when its storage
+/// didn't, so nodes answered differently, and rskj fixed the answer.
+pub fn get_block_keeping_testnet_consensus<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    config: &super::constants::BridgeConstants,
+    hash: &BlockHash,
+) -> Option<StoredBlock> {
+    const RSK_BLOCK: u64 = 5_148_285;
+    const BTC_BLOCK: &str = "00000000e8e7b540df01a7067e020fd7e2026bf86289def2283a35120c1af379";
+    const HEADER: &str = "000000203b5d178405c4e6e7dc07d63d6de5db1342044791721654760c00000000000000796cf6743a036300b43fb3abe6703d04a7999751b6d5744f20327d1175320bd37b954e66ffff001d56dc11ce";
+    const CHAIN_WORK: &str = "000000000000000000000000000000000000000000000ddeb5fbcd969312a77c";
+    let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
+    if block_number == RSK_BLOCK
+        && matches!(config.btc_network, super::constants::BtcNetwork::Testnet)
+        && hash.to_string() == BTC_BLOCK
+    {
+        let header = alloy_primitives::hex::decode(HEADER).expect("the header is hex");
+        let header = deserialize::<BtcHeader>(&header).expect("the header is 80 bytes");
+        let work = alloy_primitives::hex::decode(CHAIN_WORK).expect("the chain work is hex");
+        return Some(StoredBlock::new(
+            header,
+            2_817_125,
+            U256::from_be_slice(&work),
+        ));
+    }
+    get_stored_block(ctx, hash)
+}
+
 // ---------------------------------------------------------------------------
 // Raw byte storage: one variable-length value per unitrie key
 // (rskj Repository.addStorageBytes / getStorageBytes).
