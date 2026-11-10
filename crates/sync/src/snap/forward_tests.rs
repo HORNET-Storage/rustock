@@ -435,6 +435,65 @@ fn a_consumed_run_is_committed_so_the_next_start_resumes() {
     );
 }
 
+/// Every block of a committed run gets its own total difficulty: its parent's
+/// plus its own difficulty and its uncles', as rskj's
+/// `BlockChainImpl.internalTryToConnect` gives every block it connects. The
+/// BlockHeader contract's `getCumulativeWork` reads it for any of the last
+/// 4,000 blocks and stops the node at a block without one, and the commit used
+/// to write the newest block's alone.
+#[test]
+fn every_committed_block_gets_its_own_total() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = Arc::new(BlockStore::open(dir.path()).expect("open"));
+    let anchor = header(0, B256::ZERO, 100);
+
+    let mut s = ForwardSync::new(
+        0,
+        anchor.hash(),
+        U256::from(1_000),
+        8,
+        B256::repeat_byte(0xff),
+        true,
+        store.clone(),
+        Arc::new(HeaderVerifier::new()),
+    );
+
+    // An uncle worth 50 on #2 and one worth 30 on #6. The upper run arrives
+    // first and waits, so both are consumed in one pass, each from where the
+    // one below it ended.
+    let lower = run_of(1, 4, anchor.hash(), 100, |n| {
+        if n == 2 {
+            vec![header(1, B256::repeat_byte(9), 50)]
+        } else {
+            Vec::new()
+        }
+    });
+    let upper = run_of(5, 4, lower[0].header.hash(), 100, |n| {
+        if n == 6 {
+            vec![header(5, B256::repeat_byte(7), 30)]
+        } else {
+            Vec::new()
+        }
+    });
+    s.on_headers_with_uncles(8, &upper)
+        .expect("internally valid");
+    assert_eq!(s.frontier(), 0, "the upper run waits for the lower one");
+    s.on_headers_with_uncles(4, &lower).expect("honest run");
+    assert_eq!(s.frontier(), 8);
+
+    let mut blocks: Vec<&Header> = lower.iter().chain(&upper).map(|e| &e.header).collect();
+    blocks.sort_by_key(|h| h.number);
+    let totals = [1_100u64, 1_250, 1_350, 1_450, 1_550, 1_680, 1_780, 1_880];
+    for (block, total) in blocks.into_iter().zip(totals) {
+        assert_eq!(
+            store.total_difficulty(block.hash()).unwrap(),
+            Some(U256::from(total)),
+            "#{} carries its parent's total plus its own work",
+            block.number
+        );
+    }
+}
+
 /// A run that has not linked yet is *not* committed.
 ///
 /// Until it links it is only a peer's word, and publishing it would put an

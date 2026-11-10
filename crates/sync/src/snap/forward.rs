@@ -106,6 +106,13 @@ struct Run {
     /// rather than when it arrives: a run that has not linked yet is still
     /// only a peer's word, and writing it would publish an unproven chain.
     blocks: Vec<(u64, B256)>,
+    /// What each of `blocks` adds to the chain's work, in the same order: its
+    /// own difficulty and its proven uncles', rskj's
+    /// `Block.getCumulativeDifficulty`.
+    ///
+    /// Kept so that the commit can give every block its own total, as rskj
+    /// gives every block it stores one.
+    difficulties: Vec<U256>,
 }
 
 /// Ascends from an anchor toward a target height, proving the work as it goes.
@@ -354,16 +361,29 @@ impl ForwardSync {
         out
     }
 
-    /// Write a consumed run to the canonical index, and move the head and the
-    /// accumulated work with it.
+    /// Write a consumed run to the canonical index with each block's total
+    /// difficulty, and move the head with it.
+    ///
+    /// `below` is the total of the block the run builds on. Each block's total
+    /// is its parent's plus what it adds, as rskj's
+    /// `BlockChainImpl.internalTryToConnect` gives every block it connects one
+    /// (`parentTotalDifficulty.add(block.getCumulativeDifficulty())`). The
+    /// BlockHeader contract's `getCumulativeWork` reads it for any of the last
+    /// 4,000 blocks, and stops the node at a block whose total is missing:
+    /// writing the newest block's alone left every other block without one.
     ///
     /// The head is what `SnapSession::anchor` reads on the next start, so this
-    /// is the whole of resuming. The work is recorded against the new head for
-    /// the same reason: it is the figure the ascent would otherwise have to
-    /// re-derive by walking from genesis again.
-    fn commit(&self, run: &Run) {
-        for (number, hash) in &run.blocks {
-            if let Err(e) = self.store.put_canonical_hash(*number, *hash) {
+    /// is the whole of resuming. The newest block's total is the figure the
+    /// ascent would otherwise have to re-derive by walking from genesis again.
+    fn commit(&self, run: &Run, below: U256) {
+        let mut total = below;
+        for ((number, hash), difficulty) in run.blocks.iter().zip(&run.difficulties) {
+            total = total.saturating_add(*difficulty);
+            if let Err(e) = self
+                .store
+                .put_canonical_hash(*number, *hash)
+                .and_then(|()| self.store.put_total_difficulty(*hash, total))
+            {
                 warn!(
                     target: "rustock::snap",
                     "forward sync: could not index #{number}: {e}"
@@ -400,7 +420,6 @@ impl ForwardSync {
           }
         }
 
-        let _ = self.store.put_total_difficulty(run.newest, self.work);
         if let Err(e) = self.store.set_head(run.newest) {
             warn!(target: "rustock::snap", "forward sync: could not move the head: {e}");
         }
@@ -511,6 +530,11 @@ impl ForwardSync {
         let mut uncle_headers: Vec<(u64, Vec<Header>)> =
             entries.iter().map(|e| (e.header.number, e.uncles.clone())).collect();
         uncle_headers.reverse();
+        let mut difficulties: Vec<U256> = entries
+            .iter()
+            .map(HeaderWithUncles::cumulative_difficulty)
+            .collect();
+        difficulties.reverse();
         self.satisfied.insert(point);
         self.runs.insert(
             oldest.number,
@@ -522,6 +546,7 @@ impl ForwardSync {
                 work,
                 uncles,
                 blocks,
+                difficulties,
                 uncle_headers,
             },
         );
@@ -600,6 +625,7 @@ impl ForwardSync {
                 return;
             }
             let run = self.runs.remove(&(self.have_number + 1)).expect("just read");
+            let below = self.work;
             self.work = self.work.saturating_add(run.work);
             self.counted_uncles.extend(run.uncles.iter().copied());
             self.have_number = run.newest_number;
@@ -622,7 +648,7 @@ impl ForwardSync {
             // every run that links is permanently true, and writing it means a
             // sync that is interrupted resumes from where it stopped instead
             // of starting again at genesis.
-            self.commit(&run);
+            self.commit(&run, below);
             self.points.remove(&run.newest_number);
             self.satisfied.remove(&run.newest_number);
 
