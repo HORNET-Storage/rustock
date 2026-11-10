@@ -5,20 +5,29 @@ use crate::types::*;
 use alloy_primitives::{Address, B256};
 use serde_json::Value;
 
+/// `eth_getTransactionByHash`, as rskj's `Web3Impl` answers it: the
+/// transaction as the main chain holds it (`receiptStore.getInMainChain`),
+/// else as the pool holds it pending, with no block, else null. A block that
+/// lost a reorg is no answer, though its body is still stored (upstream #343).
 pub fn eth_get_transaction_by_hash(id: Value, params: &Value, state: &RpcState) -> JsonRpcResponse {
     let Some(tx_hash) = params.get(0).and_then(|v| v.as_str()).and_then(parse_b256) else {
         return JsonRpcResponse::error(id, INVALID_PARAMS, "Missing or invalid tx hash");
     };
 
-    // Check pool first for pending transactions
-    if let Some(pool) = &state.tx_pool {
-        if let Some((tx, sender, hash)) = pool.get_pending_tx(&tx_hash) {
+    let Some((block_hash, tx_index)) = state
+        .store
+        .tx_location_in_main_chain(tx_hash)
+        .ok()
+        .flatten()
+    else {
+        if let Some((tx, sender, hash)) = state
+            .tx_pool
+            .as_ref()
+            .and_then(|pool| pool.get_pending_tx(&tx_hash))
+        {
             let dto = TransactionDto::from_tx(&tx, hash, None, None, None, sender);
             return JsonRpcResponse::success(id, serde_json::to_value(dto).unwrap());
         }
-    }
-
-    let Some((block_hash, tx_index)) = state.store.tx_location(tx_hash).ok().flatten() else {
         return JsonRpcResponse::success(id, Value::Null);
     };
 
@@ -68,12 +77,20 @@ pub fn eth_get_transaction_by_block_number_and_index(id: Value, params: &Value, 
     tx_by_block_and_index(id, block_hash, index, state)
 }
 
+/// `eth_getTransactionReceipt`: the receipt the main chain holds, rskj's
+/// `receiptStore.getInMainChain`, else null. A block that lost a reorg is no
+/// answer, though its receipts are still stored (upstream #343).
 pub fn eth_get_transaction_receipt(id: Value, params: &Value, state: &RpcState) -> JsonRpcResponse {
     let Some(tx_hash) = params.get(0).and_then(|v| v.as_str()).and_then(parse_b256) else {
         return JsonRpcResponse::error(id, INVALID_PARAMS, "Missing or invalid tx hash");
     };
 
-    let Some((block_hash, tx_index)) = state.store.tx_location(tx_hash).ok().flatten() else {
+    let Some((block_hash, tx_index)) = state
+        .store
+        .tx_location_in_main_chain(tx_hash)
+        .ok()
+        .flatten()
+    else {
         return JsonRpcResponse::success(id, Value::Null);
     };
 

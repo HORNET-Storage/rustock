@@ -1485,32 +1485,81 @@ impl BlockStore {
 }
 
 impl BlockStore {
-    /// Stores a transaction index entry: tx_hash -> (block_hash, tx_index).
+    /// The bytes one block takes in a transaction's index entry: the block's
+    /// hash, then the transaction's position in it, big-endian.
+    const TX_INDEX_ENTRY: usize = 36;
+
+    /// Records that a block holds a transaction, at `tx_index`.
+    ///
+    /// A transaction keeps one entry per block it was committed in, oldest
+    /// first, as rskj's `ReceiptStoreImplV2.add` appends each block's hash to
+    /// the transaction's list. A reorg can put the same transaction in a block
+    /// of each branch, and which of them is canonical can change after both
+    /// were written; overwriting kept only the newest, which after a reorg
+    /// back is the one that lost. A block already listed isn't listed again.
     pub fn put_tx_index(&self, tx_hash: B256, block_hash: B256, tx_index: u32) -> Result<()> {
-        let mut val = [0u8; 36];
-        val[..32].copy_from_slice(block_hash.as_slice());
-        val[32..].copy_from_slice(&tx_index.to_be_bytes());
+        let mut entries = self.tx_index_bytes(tx_hash)?.unwrap_or_default();
+        if entries
+            .chunks_exact(Self::TX_INDEX_ENTRY)
+            .any(|entry| &entry[..32] == block_hash.as_slice())
+        {
+            return Ok(());
+        }
+        entries.extend_from_slice(block_hash.as_slice());
+        entries.extend_from_slice(&tx_index.to_be_bytes());
         self.db
-            .put_cf(self.cf(CF_TX_INDEX)?, tx_hash.as_slice(), val)
+            .put_cf(self.cf(CF_TX_INDEX)?, tx_hash.as_slice(), entries)
             .context("Failed to write tx index")
     }
 
-    /// Looks up which block contains a transaction and at what index.
-    pub fn tx_location(&self, tx_hash: B256) -> Result<Option<(B256, u32)>> {
+    /// A transaction's index entry as stored, refused if it isn't whole.
+    fn tx_index_bytes(&self, tx_hash: B256) -> Result<Option<Vec<u8>>> {
         let bytes = self.db
             .get_cf(self.cf(CF_TX_INDEX)?, tx_hash.as_slice())
             .context("Failed to read tx index")?;
         match bytes {
-            None => Ok(None),
-            Some(b) => {
-                if b.len() < 36 {
-                    return Err(anyhow!("corrupt tx index entry: {} bytes", b.len()));
-                }
-                let block_hash = B256::from_slice(&b[..32]);
-                let tx_index = u32::from_be_bytes([b[32], b[33], b[34], b[35]]);
-                Ok(Some((block_hash, tx_index)))
+            Some(b) if b.is_empty() || b.len() % Self::TX_INDEX_ENTRY != 0 => {
+                Err(anyhow!("corrupt tx index entry: {} bytes", b.len()))
+            }
+            bytes => Ok(bytes),
+        }
+    }
+
+    /// Every block a transaction was committed in, oldest first, with its
+    /// index in each.
+    pub fn tx_locations(&self, tx_hash: B256) -> Result<Vec<(B256, u32)>> {
+        let entries = self.tx_index_bytes(tx_hash)?.unwrap_or_default();
+        Ok(entries
+            .chunks_exact(Self::TX_INDEX_ENTRY)
+            .map(|entry| {
+                let block_hash = B256::from_slice(&entry[..32]);
+                let tx_index = u32::from_be_bytes([entry[32], entry[33], entry[34], entry[35]]);
+                (block_hash, tx_index)
+            })
+            .collect())
+    }
+
+    /// The block a transaction was last committed in, and its index there.
+    /// Not necessarily canonical: see [`Self::tx_location_in_main_chain`].
+    pub fn tx_location(&self, tx_hash: B256) -> Result<Option<(B256, u32)>> {
+        Ok(self.tx_locations(tx_hash)?.pop())
+    }
+
+    /// The canonical block holding a transaction, and its index there: rskj's
+    /// `ReceiptStore.getInMainChain`, which looks through every block the
+    /// transaction was committed in for the one the chain has at that block's
+    /// height. `None` when none of them is, as for a transaction whose only
+    /// block lost a reorg (upstream #343).
+    pub fn tx_location_in_main_chain(&self, tx_hash: B256) -> Result<Option<(B256, u32)>> {
+        for (block_hash, tx_index) in self.tx_locations(tx_hash)? {
+            let Some(header) = self.header(block_hash)? else {
+                continue;
+            };
+            if self.canonical_hash(header.number)? == Some(block_hash) {
+                return Ok(Some((block_hash, tx_index)));
             }
         }
+        Ok(None)
     }
 
     /// Indexes all transactions in a block body for fast lookup by tx hash.
@@ -3363,6 +3412,92 @@ mod tests {
             assert_eq!(found_block, block_hash);
             assert_eq!(found_idx, i as u32);
         }
+    }
+
+    /// A transaction a reorg put in a block of each branch is found in the
+    /// canonical one, whichever was written last, as rskj's
+    /// `ReceiptStoreImplV2.getInMainChain` finds it, and in none while no block
+    /// holding it is canonical (upstream #343). The index keeps both blocks,
+    /// each once.
+    #[test]
+    fn a_transaction_is_found_in_the_canonical_block_that_holds_it() {
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+        let tx = dummy_tx(0);
+        let hash = tx.tx_hash();
+        // Two blocks at #5, one on each branch; the second holds it second.
+        let first = dummy_header(5);
+        let second = Header {
+            timestamp: 1,
+            ..dummy_header(5)
+        };
+        store.put_header(&first).unwrap();
+        store.put_header(&second).unwrap();
+        store
+            .index_block_transactions(first.hash(), std::slice::from_ref(&tx))
+            .unwrap();
+        store
+            .index_block_transactions(second.hash(), &[dummy_tx(1), tx.clone()])
+            .unwrap();
+        store
+            .index_block_transactions(first.hash(), std::slice::from_ref(&tx))
+            .unwrap();
+        assert_eq!(
+            store.tx_locations(hash).unwrap(),
+            [(first.hash(), 0), (second.hash(), 1)]
+        );
+        assert_eq!(store.tx_location(hash).unwrap(), Some((second.hash(), 1)));
+
+        assert_eq!(store.tx_location_in_main_chain(hash).unwrap(), None);
+        store.put_canonical_hash(5, first.hash()).unwrap();
+        assert_eq!(
+            store.tx_location_in_main_chain(hash).unwrap(),
+            Some((first.hash(), 0))
+        );
+        store.put_canonical_hash(5, second.hash()).unwrap();
+        assert_eq!(
+            store.tx_location_in_main_chain(hash).unwrap(),
+            Some((second.hash(), 1))
+        );
+        store
+            .put_canonical_hash(5, B256::repeat_byte(0x99))
+            .unwrap();
+        assert_eq!(store.tx_location_in_main_chain(hash).unwrap(), None);
+
+        // A block the store holds no header of is passed over, as rskj's
+        // `getInMainChain` passes over a block it can't read.
+        let other = dummy_tx(2);
+        store
+            .index_block_transactions(B256::repeat_byte(0x77), std::slice::from_ref(&other))
+            .unwrap();
+        store
+            .index_block_transactions(first.hash(), std::slice::from_ref(&other))
+            .unwrap();
+        store.put_canonical_hash(5, first.hash()).unwrap();
+        assert_eq!(
+            store.tx_location_in_main_chain(other.tx_hash()).unwrap(),
+            Some((first.hash(), 0))
+        );
+
+        // An entry that isn't whole is refused.
+        let cf = store.cf(CF_TX_INDEX).unwrap();
+        store
+            .db
+            .put_cf(cf, B256::repeat_byte(0x55).as_slice(), [0u8; 35])
+            .unwrap();
+        assert!(store.tx_locations(B256::repeat_byte(0x55)).is_err());
+        store
+            .db
+            .put_cf(cf, B256::repeat_byte(0x55).as_slice(), [0u8; 73])
+            .unwrap();
+        assert!(store.tx_location(B256::repeat_byte(0x55)).is_err());
+        store
+            .db
+            .put_cf(cf, B256::repeat_byte(0x55).as_slice(), [0u8; 0])
+            .unwrap();
+        assert!(store
+            .tx_location_in_main_chain(B256::repeat_byte(0x55))
+            .is_err());
     }
 
     #[test]

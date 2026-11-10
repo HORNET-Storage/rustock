@@ -3884,6 +3884,111 @@ fn setup_state_for_tracing() -> (RpcState, tempfile::TempDir, B256, Address, Add
     (state, tmp, tx_hash, sender, caller, callee)
 }
 
+/// A transaction is looked up on the main chain only, as rskj's
+/// `ReceiptStore.getInMainChain` looks it up (upstream #343). A block that
+/// lost a reorg keeps its body and receipts, and may be the block the index
+/// wrote last, but answers for nothing: a transaction both branches hold is
+/// found in the canonical one, and one no canonical block holds is null to
+/// every method, or pending to `eth_getTransactionByHash` if the pool holds
+/// it. The main chain comes before the pool.
+#[tokio::test]
+async fn a_transaction_is_looked_up_on_the_main_chain_only() {
+    let (mut state, _tmp, tx_hash, sender, _, _) = setup_state_for_tracing();
+    let hash = format!("{tx_hash:#x}");
+    let methods = [
+        ("eth_getTransactionByHash", json!([hash])),
+        ("eth_getTransactionReceipt", json!([hash])),
+        ("debug_traceTransaction", json!([hash])),
+        ("trace_transaction", json!([hash])),
+        ("trace_get", json!([hash, ["0x0"]])),
+        ("rsk_getRawTransactionReceiptByHash", json!([hash])),
+    ];
+    let canonical = state.store.canonical_hash(42).unwrap().unwrap();
+    let parent_hash = state.store.canonical_hash(41).unwrap().unwrap();
+    let (transactions, _) = state.store.body(canonical).unwrap().unwrap();
+    let receipts = state.store.receipts(canonical).unwrap().unwrap();
+    // The block `method` names the transaction in.
+    async fn block_of(state: &RpcState, method: &str, hash: &str) -> Value {
+        let resp = dispatch_for_test(state, make_request(method, json!([hash]))).await;
+        resp.result.unwrap()["blockHash"].clone()
+    }
+
+    // A rival block at #42 holds it too, and the index writes it last.
+    let rival = Header {
+        parent_hash,
+        minimum_gas_price: U256::ZERO,
+        extra_data: Bytes::from_static(b"rival"),
+        ..test_header(42)
+    };
+    let rival_hash = rival.hash();
+    state.store.put_header(&rival).unwrap();
+    state
+        .store
+        .put_body(rival_hash, &transactions, &[])
+        .unwrap();
+    state.store.put_receipts(rival_hash, &receipts).unwrap();
+    state
+        .store
+        .index_block_transactions(rival_hash, &transactions)
+        .unwrap();
+
+    for (method, params) in &methods {
+        let resp = dispatch_for_test(&state, make_request(method, params.clone())).await;
+        assert!(
+            resp.result.as_ref().is_some_and(|result| !result.is_null()),
+            "{method} on the chain: {:?}",
+            resp.error
+        );
+    }
+    for method in ["eth_getTransactionByHash", "eth_getTransactionReceipt"] {
+        let block = block_of(&state, method, &hash).await;
+        assert_eq!(block, json!(format!("{canonical:#x}")), "{method}");
+    }
+
+    // The rival takes #42, and is where it's found.
+    state.store.put_canonical_hash(42, rival_hash).unwrap();
+    for method in ["eth_getTransactionByHash", "eth_getTransactionReceipt"] {
+        let block = block_of(&state, method, &hash).await;
+        assert_eq!(block, json!(format!("{rival_hash:#x}")), "{method}");
+    }
+
+    // A third block takes #42, and no block holding it is canonical.
+    state
+        .store
+        .put_canonical_hash(42, B256::repeat_byte(0x42))
+        .unwrap();
+    for (method, params) in &methods {
+        let resp = dispatch_for_test(&state, make_request(method, params.clone())).await;
+        assert_eq!(
+            resp.result,
+            Some(Value::Null),
+            "{method} off the chain: {:?}",
+            resp.error
+        );
+    }
+
+    // Pending in the pool, it is found there, with no block; back on the
+    // chain, it is the mined one that's found.
+    state.tx_pool = Some(Arc::new(OnePendingTx {
+        tx: transactions[0].clone(),
+        hash: tx_hash,
+        sender,
+    }));
+    let resp = dispatch_for_test(
+        &state,
+        make_request("eth_getTransactionByHash", json!([hash])),
+    )
+    .await;
+    let pending = resp.result.unwrap();
+    assert_eq!(pending["hash"], json!(hash));
+    assert_eq!(pending["blockHash"], Value::Null);
+    state.store.put_canonical_hash(42, canonical).unwrap();
+    assert_eq!(
+        block_of(&state, "eth_getTransactionByHash", &hash).await,
+        json!(format!("{canonical:#x}"))
+    );
+}
+
 /// `eth_getBlockBy*` with full transactions must name the real sender.
 ///
 /// It used to hardcode `from` to the zero address, so every transaction in

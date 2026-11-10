@@ -324,22 +324,12 @@ pub fn rsk_get_raw_transaction_receipt_by_hash(
         return JsonRpcResponse::error(id, INVALID_PARAMS, "Missing or invalid transaction hash");
     };
 
-    let Ok(Some((block_hash, index))) = store.tx_location(tx_hash) else {
+    // rskj's `receiptStore.getInMainChain`: the canonical block holding the
+    // transaction, though a block that lost a reorg holds it too and may be
+    // the one the index wrote last.
+    let Ok(Some((block_hash, index))) = store.tx_location_in_main_chain(tx_hash) else {
         return JsonRpcResponse::success(id, Value::Null);
     };
-
-    // `tx_location` indexes the canonical chain, which is rskj's
-    // `getInMainChain`; re-checking the canonical pointer keeps that true if
-    // the index is ever widened to cover forks.
-    let on_main_chain = store
-        .header(block_hash)
-        .ok()
-        .flatten()
-        .and_then(|h| store.canonical_hash(h.number).ok().flatten())
-        .is_some_and(|canonical| canonical == block_hash);
-    if !on_main_chain {
-        return JsonRpcResponse::success(id, Value::Null);
-    }
 
     let Ok(Some(receipts)) = store.receipts(block_hash) else {
         return JsonRpcResponse::success(id, Value::Null);
