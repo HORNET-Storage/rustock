@@ -1207,14 +1207,24 @@ fn a_zero_period_turns_rskip179_off_too() {
     assert!(rule.validate(&header).is_ok(), "a million seconds away");
 }
 
-/// rskj `Constants.getMaxTimestampsDiffInSecs`: testnet widens the window to
-/// two hours from RSKIP297 (hop400); mainnet keeps five minutes.
+/// rskj `Constants.getMaxTimestampsDiffInSecs`: testnet and testnet2 widen the
+/// window to two hours from RSKIP297 (hop400); mainnet and regtest keep five
+/// minutes.
 #[test]
-fn testnet_widens_the_window_from_rskip297() {
+fn testnet_and_testnet2_widen_the_window_from_rskip297() {
     let testnet = rskip179_rule(crate::config::ChainConfig::testnet());
     let hop400 = testnet.config.activation_heights.hop400;
     assert_eq!(testnet.max_timestamps_diff(hop400 - 1), 5 * 60);
     assert_eq!(testnet.max_timestamps_diff(hop400), 120 * 60);
+    // rskj's TESTNET2_CHAIN_ID, under testnet's heights.
+    let mut testnet2 = crate::config::ChainConfig::testnet();
+    testnet2.chain_id = 34;
+    let testnet2 = rskip179_rule(testnet2);
+    assert_eq!(testnet2.max_timestamps_diff(hop400 - 1), 5 * 60);
+    assert_eq!(testnet2.max_timestamps_diff(hop400), 120 * 60);
+    let regtest = rskip179_rule(crate::config::ChainConfig::regtest());
+    let hop400 = regtest.config.activation_heights.hop400;
+    assert_eq!(regtest.max_timestamps_diff(hop400), 5 * 60);
 
     let mainnet = rskip179_rule(crate::config::ChainConfig::mainnet());
     let hop400 = mainnet.config.activation_heights.hop400;

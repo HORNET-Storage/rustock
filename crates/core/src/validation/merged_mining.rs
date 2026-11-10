@@ -47,7 +47,7 @@ pub struct MergedMiningRule {
 /// iris300): the Bitcoin block a header was merged-mined in and the header
 /// itself must be timestamped within `max_timestamps_diff` seconds of each
 /// other, strictly. rskj's `Constants.getMaxTimestampsDiffInSecs`: 5 minutes,
-/// or 2 hours on testnet from RSKIP297 (hop400) on.
+/// or 2 hours on testnet and testnet2 from RSKIP297 (hop400) on.
 ///
 /// From the activation on a header without a decodable merged-mining header
 /// is invalid outright, as it is in rskj. The rule does not depend on
@@ -66,14 +66,11 @@ impl BitcoinTimestampRule {
     pub const DEFAULT_MAX_TIMESTAMPS_DIFF_IN_SECS: u64 = 5 * 60;
     /// rskj `Constants.TESTNET_MAX_TIMESTAMPS_DIFF_IN_SECS`.
     pub const TESTNET_MAX_TIMESTAMPS_DIFF_IN_SECS: u64 = 120 * 60;
-    /// rskj `Constants.TESTNET_CHAIN_ID`.
-    const TESTNET_CHAIN_ID: u8 = 31;
-
     /// rskj `Constants.getMaxTimestampsDiffInSecs` for a block at `number`.
     pub fn max_timestamps_diff(&self, number: u64) -> u64 {
-        if self.config.chain_id == Self::TESTNET_CHAIN_ID
-            && number >= self.config.activation_heights.hop400
-        {
+        // rskj's TESTNET_CHAIN_ID and TESTNET2_CHAIN_ID.
+        let testnet = matches!(self.config.chain_id, 31 | 34);
+        if testnet && number >= self.config.activation_heights.hop400 {
             Self::TESTNET_MAX_TIMESTAMPS_DIFF_IN_SECS
         } else {
             Self::DEFAULT_MAX_TIMESTAMPS_DIFF_IN_SECS
