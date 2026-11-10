@@ -5796,9 +5796,9 @@ fn estimated_fees_from_inputs_and_outputs_count<CTX: crate::RskContextTr>(
     let outputs_count = queued_pegouts + 2;
     let inputs_count = 2;
 
-    // rskj BridgeUtils.simulatePegoutTxSize: RSKIP378 (cardamom1000) is -1 on
-    // both mainnet and testnet, so the pre-cardamom branch is the live one —
-    // and it picks the sizer by federation format, not by activation.
+    // rskj BridgeUtils.calculatePegoutTxSize: from RSKIP271, which every
+    // network activates before anything reaches here, the sizer goes by the
+    // federation's format, segwit for a P2SH-P2WSH ERP federation.
     let size = if format >= 4000 {
         pegout_tx_size_segwit(&redeem_script, &fed_script, threshold, inputs_count, outputs_count)
     } else {

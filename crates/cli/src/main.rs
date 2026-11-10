@@ -1338,10 +1338,9 @@ struct Args {
     /// rskj's: orchid to vetiver900, and afterBridgeSync, where the
     /// federators' and authorizers' Bridge transactions start to be paid.
     /// bahamas and hop401 are accepted at the height this node already reads
-    /// them at; orchid060, cardamom1000 and tbd1000 are accepted and change
-    /// nothing (cardamom1000 turns on RSKIP378, RSKIP455 and RSKIP559 in the
-    /// Bridge's pegout code, which this node doesn't implement yet; tbd1000
-    /// is perf-lab's name for RSKIP559's upgrade).
+    /// them at; orchid060 and tbd1000 are accepted and change nothing
+    /// (tbd1000 is rskj's upgrade for RSKIP559, which no network schedules
+    /// and this node doesn't implement).
     #[arg(long, value_name = "NAME=HEIGHT")]
     hardfork: Vec<String>,
 
