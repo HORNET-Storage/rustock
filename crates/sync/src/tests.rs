@@ -4043,7 +4043,7 @@ async fn a_block_a_peer_sends_is_handed_to_the_sync_service() {
     assert_eq!(got.hash(), block.hash());
 }
 
-// -- rskj's peer.bannedMiners (task 285) ------------------------------------
+// -- rskj's peer.bannedMiners -----------------------------------------------
 
 /// A handler refusing blocks mined by `banned`, and its event channel.
 fn handler_banning(

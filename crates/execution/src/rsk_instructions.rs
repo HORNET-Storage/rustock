@@ -268,9 +268,10 @@ pub fn install<WIRE, HOST>(
             Instruction::new(rsk_selfbalance::<WIRE, HOST>, 5),
         );
     } else {
-        // Pre-papyrus rskj throws invalid-opcode (all frame gas consumed);
-        // revm's spec-checked impls would halt NotActivated returning the
-        // remaining gas instead.
+        // Pre-papyrus rskj throws invalid-opcode (all frame gas consumed).
+        // revm's spec-checked impls would halt NotActivated, which spends the
+        // frame's gas too; the invalid-opcode handler halts as for any other
+        // opcode a height doesn't have (OpcodeNotFound).
         instructions.insert_instruction(
             opcode::CHAINID,
             Instruction::new(invalid_opcode::<WIRE, HOST>, 0),

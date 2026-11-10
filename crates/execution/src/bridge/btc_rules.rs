@@ -1,5 +1,5 @@
 //! bitcoinj-thin's checks on a Bitcoin header the Bridge adds to its chain
-//! (`BtcAbstractBlockChain.add`, tag `v0.14.4-rsk-20`). The header's target
+//! (`BtcAbstractBlockChain.add`, tag `v0.14.4-rsk-18`). The header's target
 //! must be in range and its hash under it (`BtcBlock.verifyHeader`), and the
 //! target must be the one its parent's chain calls for
 //! (`NetworkParameters.checkDifficultyTransitions`, as each network has it).

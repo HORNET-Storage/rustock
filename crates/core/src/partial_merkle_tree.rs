@@ -1,5 +1,5 @@
 //! A Bitcoin partial Merkle tree, as bitcoinj-thin's `PartialMerkleTree`
-//! (`v0.14.4-rsk-20`) reads and walks it, and as rskj's
+//! (`v0.14.4-rsk-18`) reads and walks it, and as rskj's
 //! `PartialMerkleTreeFormatUtils.hasExpectedSize` sizes it.
 //!
 //! rskj reads one wherever it has to be shown that a Bitcoin transaction is

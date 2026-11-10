@@ -1472,7 +1472,7 @@ mod tests {
     /// are standard multisig, as rskj's public nodes answer
     /// `getFederationAddress` at block 1. rskj's regtest's is a P2SH-P2WSH ERP
     /// federation, as an independent port of rskj's `P2shErpRedeemScriptBuilder`
-    /// computes it (scratch `t294/regtest_genesis_fed.py`); before, rustock built
+    /// computes it; before, rustock built
     /// every genesis federation as standard multisig.
     #[test]
     fn the_genesis_federation_is_built_in_its_networks_format() {

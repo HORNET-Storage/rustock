@@ -1,4 +1,4 @@
-//! Whether bitcoinj-thin's `BtcBlock` (`v0.14.4-rsk-20`) makes a Bitcoin
+//! Whether bitcoinj-thin's `BtcBlock` (`v0.14.4-rsk-18`) makes a Bitcoin
 //! block of some bytes, or throws.
 //!
 //! Below RSKIP98 (orchid), rskj's `ProofOfWorkRule` takes a merge-mined

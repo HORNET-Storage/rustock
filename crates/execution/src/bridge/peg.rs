@@ -4590,7 +4590,7 @@ pub fn add_signature<CTX: crate::RskContextTr>(
     config: &BridgeConstants,
     hardfork_cfg: &RskHardforkConfig,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    // rskj `Bridge.addSignature` (Bridge.java:615) parses the federator key
+    // rskj `Bridge.addSignature` (Bridge.java:617) parses the federator key
     // (`BtcECKey.fromPublicOnly`), refuses an empty signature list, runs every
     // signature through `BtcECKey.ECDSASignature.decodeFromDER` and wraps the
     // RSK transaction hash in a `Keccak256`, all before `bridgeSupport` sees

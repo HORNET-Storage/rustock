@@ -149,7 +149,7 @@ fn mainnet_block_9257552() -> Header {
 }
 
 /// A block prints each property rskj's `BlockResultDTO` has, as `fromBlock`
-/// fills them (task 284). Mainnet #9,257,552 against what
+/// fills them. Mainnet #9,257,552 against what
 /// public-node.rsk.co answered for it: the merged-mining fields as held,
 /// the merged-mining hash with the fork-detection data its coinbase
 /// commits to in its last 12 bytes (RSKIP110), the paid fees, and the
@@ -4159,7 +4159,7 @@ async fn test_eth_gas_price_falls_back_to_the_block_minimum() {
     assert_eq!(r.result.unwrap(), json!("0x3e252e0"), "59,240,000 x 1.1");
 }
 
-/// rskj's arithmetic, not an exact 1.1 (task 280): the minimum as a double,
+/// rskj's arithmetic, not an exact 1.1: the minimum as a double,
 /// times 1.1 in doubles, read back through Java 17's `Double.toString`; and
 /// either answer printed as its low 64 bits (`Long.toHexString(longValue())`).
 #[tokio::test]
@@ -4646,7 +4646,7 @@ fn setup_defaults_state(count: u32) -> (RpcState, tempfile::TempDir, Address, Ad
     (state, tmp, reader, burner)
 }
 
-/// A call's defaults are rskj's (task 282, `CallArgumentsToByteArray`): a gas
+/// A call's defaults are rskj's (`CallArgumentsToByteArray`): a gas
 /// price of 0, not the block's minimum, and `rpc.callGasCap`'s 10,000,000 gas,
 /// not the block's limit -- the cap on the gas a call names, too. An
 /// estimate runs at `rpc.gasEstimationCap`'s 6,800,000, whatever the call
@@ -4693,8 +4693,8 @@ async fn a_calls_defaults_are_rskjs() {
     assert_eq!(resp.result, Some(json!("0x")), "{:?}", resp.error);
 }
 
-/// A sent transaction's defaults are rskj's (task 282,
-/// `TransactionArgumentsUtil.processArguments`): a gas price of 0, not the
+/// A sent transaction's defaults are rskj's
+/// (`TransactionArgumentsUtil.processArguments`): a gas price of 0, not the
 /// node's price, and the gas named as `gas`, else as `gasLimit`, else 90,000,
 /// not the head's whole gas limit.
 #[tokio::test]

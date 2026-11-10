@@ -1346,7 +1346,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Values as rskj reads them: `long`s (task 279)
+    // Values as rskj reads them: `long`s
     // -----------------------------------------------------------------------
 
     /// 2^63 + `n`, which rskj reads as `Long.MIN_VALUE + n`.

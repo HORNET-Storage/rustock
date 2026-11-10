@@ -3094,7 +3094,7 @@ mod tests {
     /// traced) and as `debug_traceTransaction` does (each transaction in
     /// turn), and requires the same state and receipts of all of them. The
     /// traced runs go through `inspect_run`, so they agree only while it runs
-    /// the loop the chain runs (task 277). Returns the chain's run.
+    /// the loop the chain runs. Returns the chain's run.
     fn assert_traced_runs_agree(
         executor: &RskExecutor,
         header: &Header,
@@ -3177,7 +3177,7 @@ mod tests {
         init
     }
 
-    /// A trace and an estimate run the loop the chain runs (task 277): here
+    /// A trace and an estimate run the loop the chain runs: here
     /// RSKIP150's call depth of 400, where revm's own loop recurses to 1024,
     /// and the nonce a top-level create leaves its contract, 0, where revm's
     /// loop leaves 1. The contract counts its depth in slot 0 and calls
@@ -3252,7 +3252,7 @@ mod tests {
         assert_eq!(depth, 400);
     }
 
-    /// A trace and an estimate run the loop the chain runs (task 277): before
+    /// A trace and an estimate run the loop the chain runs: before
     /// RSKIP453 an internal create whose code deposit can't be paid deploys
     /// empty code (`Program.finalizeContractCreation`), where revm's loop
     /// fails the create. Mainnet #1,071,481's RNS Deed.
@@ -3304,7 +3304,7 @@ mod tests {
         assert_estimate_run_agrees(&executor, &header, &call, sender, &root, &store);
     }
 
-    /// A trace and an estimate run the loop the chain runs (task 277): a
+    /// A trace and an estimate run the loop the chain runs: a
     /// nested constructor's refund is dropped (`Program.finalizeContractCreation`
     /// passes on no `futureRefund`), where revm's loop keeps it. Mainnet
     /// #6,362,186.
@@ -3353,7 +3353,7 @@ mod tests {
         assert_estimate_run_agrees(&executor, &header, &call, sender, &root, &store);
     }
 
-    /// A trace and an estimate run the loop the chain runs (task 277): before
+    /// A trace and an estimate run the loop the chain runs: before
     /// RSKIP197 a contract whose call to a precompile throws stops there with
     /// all its gas spent (`VM.steps`), where revm's loop lets it go on. And
     /// the trace stops at its CALL, as rskj's VM traces no step after it.
@@ -3423,9 +3423,9 @@ mod tests {
         );
     }
 
-    /// A trace and an estimate run the loop the chain runs (task 277): a frame
+    /// A trace and an estimate run the loop the chain runs: a frame
     /// that fails takes back what the precompiles under it wrote outside
-    /// revm's journal (`9821143`), where revm's loop keeps it. A contract
+    /// revm's journal, where revm's loop keeps it. A contract
     /// seeds the Bridge's BTC store through a getter and reverts.
     #[test]
     fn a_trace_or_an_estimate_takes_back_a_failed_frames_precompile_writes() {
@@ -13007,8 +13007,8 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
             .and_then(|data| AccountState::decode(&data).ok())
     }
 
-    /// REMASC's payments are CALL subtraces of the REMASC transaction's trace
-    /// (task 283): rskj's `RemascFeesPayer.payMiningFees` makes one in
+    /// REMASC's payments are CALL subtraces of the REMASC transaction's
+    /// trace: rskj's `RemascFeesPayer.payMiningFees` makes one in
     /// `transferPayment` for every payment it logs, from REMASC with gas 0,
     /// to the payee's word -- zero for the null address -- and
     /// `TransactionExecutor.call` keeps them for `extractTrace`.
@@ -13367,7 +13367,7 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
         assert_eq!(bridge_balance, one_rbtc - burned, "burn debits the Bridge");
 
         // rskj's `transferTo(BURN_ADDRESS, ...)` is a CALL subtrace of the
-        // transaction's trace, from the Bridge with gas 0 (task 283).
+        // transaction's trace, from the Bridge with gas 0.
         let (_, traces) = executor
             .execute_block_call_traced(&header, &[(tx, sender)], &root, store.clone())
             .expect("block executes traced");
@@ -13392,7 +13392,7 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
     }
 
     /// A transaction sent straight to the Bridge carries the Bridge's
-    /// transfers as CALL subtraces (task 283): rskj's `BridgeSupport.transferTo`
+    /// transfers as CALL subtraces: rskj's `BridgeSupport.transferTo`
     /// adds one, `TransactionExecutor.call` keeps them once `execute` returns
     /// and `extractTrace` hangs them under the transaction's trace. Here the
     /// refund of what a sender other than the union bridge sent

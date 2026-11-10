@@ -523,7 +523,7 @@ pub fn receive_headers<CTX: crate::RskContextTr>(
     let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
 
     // rskj `Bridge.receiveHeaders` refuses the whole call when any header is
-    // not a header's size, before it parses one (Bridge.java:537-542), and
+    // not a header's size, before it parses one (Bridge.java:539-544), and
     // then when it can't parse one (`makeBlock`). Both throw
     // `BridgeIllegalArgumentException`, which `Bridge.execute` answers with
     // null before RSKIP88: a success with no output, nothing saved.
