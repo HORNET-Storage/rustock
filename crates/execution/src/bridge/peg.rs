@@ -5217,21 +5217,45 @@ fn p2pkh_output_script(hash160: &[u8; 20]) -> bitcoin::ScriptBuf {
 
 /// Build the federation P2SH redeem script from member public keys.
 ///
-/// m-of-n multisig: OP_m <key1> ... <keyn> OP_n OP_CHECKMULTISIG
-/// Keys are sorted (matching bitcoinj's createRedeemScript behavior).
+/// m-of-n multisig: <m> <key1> ... <keyn> <n> OP_CHECKMULTISIG, the counts
+/// written as bitcoinj-thin's `ScriptBuilder.number` writes them
+/// ([`script_number`]). Keys are sorted (matching bitcoinj's
+/// createRedeemScript behavior).
 pub fn build_federation_redeem_script(keys: &[[u8; 33]], threshold: usize) -> Vec<u8> {
     let mut sorted_keys = keys.to_vec();
     sorted_keys.sort();
 
-    let mut script = Vec::new();
-    script.push(0x50 + threshold as u8); // OP_m
+    let mut script = script_number(threshold);
     for key in &sorted_keys {
         script.push(33); // OP_PUSHBYTES_33
         script.extend_from_slice(key);
     }
-    script.push(0x50 + sorted_keys.len() as u8); // OP_n
+    script.extend_from_slice(&script_number(sorted_keys.len()));
     script.push(0xAE); // OP_CHECKMULTISIG
     script
+}
+
+/// bitcoinj-thin's `ScriptBuilder.number` as RSKj's release has it
+/// (`v0.14.4-rsk-18`): OP_0 to OP_15 for 0 to 15, and from 16 on the
+/// number's minimal little-endian bytes as a push (`bigNum`). So a
+/// federation of 16 to 20 members writes its size as `0x01 <n>`, not as
+/// OP_16 and the opcodes past it. `rsk-20` writes 16 as OP_16, but no
+/// release of RSKj runs it.
+fn script_number(n: usize) -> Vec<u8> {
+    if n < 16 {
+        // `Script.encodeToOpN`: OP_0, then OP_1 (0x51) to OP_15.
+        return vec![if n == 0 { 0x00 } else { 0x50 + n as u8 }];
+    }
+    let mut bytes = (n as u64).to_le_bytes().to_vec();
+    while bytes.last() == Some(&0) {
+        bytes.pop();
+    }
+    if bytes.last().is_some_and(|b| b & 0x80 != 0) {
+        bytes.push(0x00);
+    }
+    let mut push = vec![bytes.len() as u8];
+    push.extend_from_slice(&bytes);
+    push
 }
 
 /// rskj `Utils.signedLongToByteArrayLE`: `reverseBytes(BigInteger.valueOf(v)
@@ -6974,6 +6998,44 @@ mod tests {
         assert_eq!(script[script.len() - 2], 0x53); // OP_3
         assert_eq!(script[script.len() - 1], 0xAE); // OP_CHECKMULTISIG
         assert_eq!(script.len(), 1 + 3 * 34 + 2);
+    }
+
+    /// A federation of 16 to 20 members: RSKj's release builds its multisig
+    /// with bitcoinj-thin `v0.14.4-rsk-18`, whose `ScriptBuilder.number`
+    /// writes 16 and up as a push (`bigNum`), so the size goes in as
+    /// `0x01 <n>`. 15 is still OP_15, and so is every threshold up to 20
+    /// members' 11.
+    #[test]
+    fn a_federation_of_16_or_more_writes_its_size_as_a_push() {
+        let keys: Vec<[u8; 33]> = (0..20u8)
+            .map(|i| {
+                let mut key = [0x02; 33];
+                key[32] = i;
+                key
+            })
+            .collect();
+        for (n, size) in [
+            (15, vec![0x5f]),
+            (16, vec![0x01, 0x10]),
+            (20, vec![0x01, 0x14]),
+        ] {
+            let threshold = n / 2 + 1;
+            let script = build_federation_redeem_script(&keys[..n], threshold);
+            assert_eq!(
+                script[0],
+                0x50 + threshold as u8,
+                "{n} members: the threshold"
+            );
+            let mut tail = size.clone();
+            tail.push(0xae);
+            assert_eq!(&script[1 + n * 34..], &tail[..], "{n} members: the size");
+        }
+        assert_eq!(script_number(0), vec![0x00]);
+        assert_eq!(
+            script_number(128),
+            vec![0x02, 0x80, 0x00],
+            "a sign byte past 0x7f"
+        );
     }
 
     /// Redeem script hash160.
