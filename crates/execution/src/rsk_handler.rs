@@ -133,6 +133,25 @@ invisible_exception: Arc<AtomicBool>,
     /// create that reverts or fails, with what the calls under it committed
     /// into it.
     frames: Vec<(usize, usize)>,
+    /// A local call: rskj's `TransactionExecutor` with `setLocalCall(true)`,
+    /// which serves `eth_call` and `eth_estimateGas`
+    /// (`ReversibleTransactionExecutor.reversibleExecution`). `init()` returns
+    /// as soon as it has worked out the intrinsic cost, before every gate it
+    /// holds a transaction of a block to: the block's gas limit, the
+    /// intrinsic cost, the initcode's size, the nonce and the balance
+    /// (TransactionExecutor.java:162-217). `execute()` neither bumps the
+    /// nonce nor charges the gas (292-301), and `localCallFinalization`
+    /// refunds nothing and pays nobody (631-673).
+    local_call: bool,
+    /// RSKIP136, for a local call's own call to a precompile: from it, a gas
+    /// limit short of the precompile's cost and the intrinsic cost throws out
+    /// of rskj's `TransactionExecutor.call` (`GasCost.subtract`, 360).
+    rskip136_active: bool,
+    /// Set by `validate` for a local call whose gas limit can't pay its
+    /// intrinsic cost but that runs a program, which rskj's `go()` fails with
+    /// all its gas as it charges that cost (455): the loop halts it as it
+    /// opens.
+    starved: std::cell::Cell<bool>,
     _phantom: core::marker::PhantomData<(CTX, ERROR, FRAME)>,
 }
 
@@ -173,6 +192,14 @@ impl<CTX, ERROR, FRAME> RskHandler<CTX, ERROR, FRAME> {
         self
     }
 
+    /// Run the transaction as a local call, as rskj runs `eth_call` and
+    /// `eth_estimateGas`. See the field.
+    pub fn as_local_call(mut self, local_call: bool, rskip136_active: bool) -> Self {
+        self.local_call = local_call;
+        self.rskip136_active = rskip136_active;
+        self
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn with_rskip125(
         empty_create_on_unpayable_deposit: bool,
@@ -196,6 +223,9 @@ impl<CTX, ERROR, FRAME> RskHandler<CTX, ERROR, FRAME> {
             fail_programs: false,
             called_precompiles: None,
             frames: Vec::new(),
+            local_call: false,
+            rskip136_active: true,
+            starved: std::cell::Cell::new(false),
             _phantom: core::marker::PhantomData,
         }
     }
@@ -233,6 +263,91 @@ where
     type Error = ERROR;
     type HaltReason = HaltReason;
 
+    /// A transaction of a block is held to revm's gates. A local call is held
+    /// to none (see `local_call`), and its intrinsic cost is worked out as for
+    /// any transaction. Where its gas limit can't pay that cost, rskj throws
+    /// out of `executeTransaction` if no program runs: `GasCost.subtract` in
+    /// `call()` for a precompile or an account without code
+    /// (TransactionExecutor.java:360, 384) and in `create()` for a creation
+    /// without data (406). If a program runs, `go()` fails it with all its gas
+    /// as it charges the cost (455), before it runs anything (`starved`). A
+    /// precompile's account holds no code.
+    fn validate(
+        &self,
+        evm: &mut Self::Evm,
+    ) -> Result<revm::interpreter::InitialAndFloorGas, Self::Error> {
+        if !self.local_call {
+            self.validate_env(evm)?;
+            return self.validate_initial_tx_gas(evm);
+        }
+        use revm::context_interface::Transaction;
+        use revm::primitives::TxKind;
+        let ctx = evm.ctx();
+        let mut gas = revm::context_interface::cfg::gas::calculate_initial_tx_gas_for_tx(
+            ctx.tx(),
+            ctx.cfg().spec().into(),
+        );
+        let gas_limit = ctx.tx().gas_limit();
+        let starved = gas.initial_gas > gas_limit;
+        if starved {
+            let runs_program = match ctx.tx().kind() {
+                TxKind::Create => !ctx.tx().input().is_empty(),
+                TxKind::Call(to) => ctx
+                    .journal_mut()
+                    .load_account_with_code(to)
+                    .map_err(|e| ERROR::from(e))?
+                    .info
+                    .code
+                    .as_ref()
+                    .is_some_and(|code| !code.is_empty()),
+            };
+            if !runs_program {
+                return Err(
+                    revm::context_interface::result::InvalidTransaction::CallGasCostMoreThanGasLimit {
+                        gas_limit,
+                        initial_gas: gas.initial_gas,
+                    }
+                    .into(),
+                );
+            }
+            gas.initial_gas = gas_limit;
+        }
+        self.starved.set(starved);
+        Ok(gas)
+    }
+
+    /// A local call's sender (see `local_call`): its nonce and balance go
+    /// unchecked, as does code at its address, which rskj never refuses
+    /// (revm's EIP-3607). It's charged no gas and keeps its nonce
+    /// (TransactionExecutor.java:292-301). rskj moves the value with
+    /// `Repository.transfer` (397, 427), which creates the sender's account
+    /// and takes its balance below zero rather than fail. One here can't go
+    /// below zero, so a sender short of the value is lifted to it, as revm
+    /// lifts one for a simulation (`disable_balance_check`), and holds nothing
+    /// where rskj's holds less than nothing.
+    fn validate_against_state_and_deduct_caller(
+        &self,
+        evm: &mut Self::Evm,
+    ) -> Result<(), Self::Error> {
+        if !self.local_call {
+            return revm::handler::pre_execution::validate_against_state_and_deduct_caller(
+                evm.ctx(),
+            );
+        }
+        use revm::context_interface::Transaction;
+        let ctx = evm.ctx();
+        let (caller, value) = (ctx.tx().caller(), ctx.tx().value());
+        let mut sender = ctx
+            .journal_mut()
+            .load_account_mut(caller)
+            .map_err(|e| ERROR::from(e))?;
+        sender.touch();
+        if *sender.balance() < value {
+            sender.set_balance(value);
+        }
+        Ok(())
+    }
+
     fn load_accounts(&self, evm: &mut Self::Evm) -> Result<(), Self::Error> {
         // Clear any stale flag a previous tx left set.
         self.invisible_exception.store(false, Ordering::Relaxed);
@@ -252,6 +367,11 @@ where
         evm: &mut Self::Evm,
         exec_result: &mut FrameResult,
     ) -> Result<(), Self::Error> {
+        // A local call was charged nothing, and `localCallFinalization` hands
+        // nothing back (TransactionExecutor.java:631-673).
+        if self.local_call {
+            return Ok(());
+        }
         if self.invisible_exception.load(Ordering::Relaxed) {
             return Ok(());
         }
@@ -273,6 +393,10 @@ where
     ) -> Result<(), Self::Error> {
         use revm::context_interface::journaled_state::account::JournaledAccountTr;
         use revm::context_interface::{Block, Transaction};
+        // A local call pays nobody (`localCallFinalization`).
+        if self.local_call {
+            return Ok(());
+        }
         if self.postpone_fees {
             // The executor accumulates the same total and settles it at the
             // REMASC transaction, as rskj does where a block runs as its sublists.
@@ -347,6 +471,21 @@ where
         frame_result: &mut FrameResult,
     ) -> Result<(), Self::Error> {
         use revm::context_interface::Transaction;
+        // A local call's own call to a precompile whose cost its gas can't
+        // pay: rskj leaves out the check for a local call
+        // (TransactionExecutor.java:350), and from RSKIP136 works out the
+        // leftover with `GasCost.subtract` (360), which throws out of
+        // `executeTransaction`. Before RSKIP136 rskj runs the precompile all
+        // the same, which isn't done here.
+        if self.local_call
+            && self.rskip136_active
+            && frame_result.interpreter_result().result == InstructionResult::PrecompileOOG
+        {
+            return Err(ERROR::from_string(format!(
+                "a local call's gas limit of {} can't pay the precompile it calls",
+                evm.ctx().tx().gas_limit()
+            )));
+        }
         if self.invisible_exception.load(Ordering::Relaxed) {
             frame_result.interpreter_result_mut().result = InstructionResult::Return;
         }
@@ -435,6 +574,15 @@ where
         // bumps the nonce (even post-RSKIP125), so it stays 0.
         set_created_contract_nonce(evm, 0);
         self.open_frame(evm);
+        // A local call whose gas limit can't pay its intrinsic cost (see
+        // `validate`): rskj's `go()` throws as it charges the cost, before the
+        // program runs, and takes back what opening it did.
+        if self.starved.get() {
+            evm.frame_stack()
+                .get()
+                .interpreter
+                .halt(InstructionResult::OutOfGas);
+        }
 
         loop {
             let call_or_result = D::run(evm, self.empty_create_on_unpayable_deposit)?;

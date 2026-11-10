@@ -3989,6 +3989,42 @@ async fn a_transaction_is_looked_up_on_the_main_chain_only() {
     );
 }
 
+/// `eth_call` and `eth_estimateGas` answer where a transaction of a block is
+/// refused, as rskj's local call does (upstream #294): from a sender that
+/// can't pay for its gas, and with more gas than the block holds. At #41,
+/// which holds the fixture's state.
+#[tokio::test]
+async fn eth_call_answers_where_a_transaction_would_be_refused() {
+    let (state, _tmp, _, _, _, callee) = setup_state_for_tracing();
+    let to = format!("{callee:#x}");
+    let stranger = format!("{:#x}", Address::repeat_byte(0x99));
+    for (case, call) in [
+        (
+            "a sender that can't pay for its gas",
+            json!({"from": stranger, "to": to, "gas": "0x186a0", "gasPrice": "0x1"}),
+        ),
+        (
+            "more gas than the block holds",
+            json!({"to": to, "gas": "0x7a1201"}),
+        ),
+    ] {
+        let params = json!([call, "0x29"]);
+        let resp = dispatch_for_test(&state, make_request("eth_call", params.clone())).await;
+        assert_eq!(
+            resp.result,
+            Some(json!(format!("0x{:064x}", 0x2a))),
+            "{case}: {:?}",
+            resp.error
+        );
+        let resp = dispatch_for_test(&state, make_request("eth_estimateGas", params)).await;
+        assert!(
+            resp.result.is_some_and(|gas| gas.is_string()),
+            "{case}: {:?}",
+            resp.error
+        );
+    }
+}
+
 /// `eth_getBlockBy*` with full transactions must name the real sender.
 ///
 /// It used to hardcode `from` to the zero address, so every transaction in

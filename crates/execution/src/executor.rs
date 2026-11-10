@@ -344,13 +344,16 @@ impl RskExecutor {
     /// `eth_estimateGas` and marks the transaction with
     /// `TransactionExecutor.setLocalCall(true)`.
     ///
-    /// The only behavioural difference is that Bridge methods marked
-    /// `LocalOnly` run instead of throwing (`Bridge.validateLocalCall`,
-    /// Bridge.java:431). Those are the read-only getters -- the federation
-    /// address, the BTC blockchain head, the peg-out queue sizes -- which rskj
-    /// deliberately refuses to answer on-chain so that no contract can depend
-    /// on them. Nothing here is reachable from block execution, so it cannot
-    /// affect consensus.
+    /// It differs from a transaction of a block in two ways, neither of them
+    /// reachable from block execution:
+    /// - it passes every gate `TransactionExecutor.init()` holds a transaction
+    ///   to, is charged no gas and keeps the sender's nonce (see
+    ///   `RskHandler`'s `local_call`);
+    /// - Bridge methods marked `LocalOnly` run instead of throwing
+    ///   (`Bridge.validateLocalCall`, Bridge.java:431). Those are the read-only
+    ///   getters -- the federation address, the BTC blockchain head, the
+    ///   peg-out queue sizes -- which rskj deliberately refuses to answer
+    ///   on-chain so that no contract can depend on them.
     pub fn execute_local_call(
         &self,
         header: &Header,
@@ -451,7 +454,8 @@ impl RskExecutor {
                 active_precompiles,
                 self.hardfork_cfg.has_rskip171(header.number),
             )
-            .failing_programs(!header_fits_program_invoke(header));
+            .failing_programs(!header_fits_program_invoke(header))
+            .as_local_call(local_call, self.hardfork_cfg.has_rskip136(header.number));
             let out = handler
                 .run(&mut evm)
                 .map_err(|e: revm::context::result::EVMError<_>| {
@@ -588,7 +592,8 @@ impl RskExecutor {
                 active_precompiles,
                 self.hardfork_cfg.has_rskip171(header.number),
             )
-            .failing_programs(!header_fits_program_invoke(header));
+            .failing_programs(!header_fits_program_invoke(header))
+            .as_local_call(local_call, self.hardfork_cfg.has_rskip136(header.number));
             use revm::inspector::InspectorHandler;
             let out = handler
                 .inspect_run(&mut evm)
@@ -760,7 +765,8 @@ impl RskExecutor {
                 active_precompiles,
                 self.hardfork_cfg.has_rskip171(header.number),
             )
-            .failing_programs(!header_fits_program_invoke(header));
+            .failing_programs(!header_fits_program_invoke(header))
+            .as_local_call(local_call, self.hardfork_cfg.has_rskip136(header.number));
             use revm::inspector::InspectorHandler;
             let out = handler
                 .inspect_run(&mut evm)
@@ -3402,6 +3408,326 @@ mod tests {
         );
         assert!(!block.markers.precompiles.contains(&bridge));
         assert_estimate_run_agrees(&executor, &header, &tx, sender, &root, &store);
+    }
+
+    /// An executor over an empty block store, at mainnet's heights.
+    fn mainnet_executor() -> RskExecutor {
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        RskExecutor::new(RskHardforkConfig::mainnet(), block_store)
+    }
+
+    /// A local call passes every gate rskj's `TransactionExecutor.init()`
+    /// holds a transaction of a block to (upstream #294): with `localCall` set
+    /// it returns as soon as it has the intrinsic cost
+    /// (TransactionExecutor.java:165-167). Each case breaks one gate, and the
+    /// local call runs all the same. It's charged no gas either (`execute()`,
+    /// 292-301): the contract it calls reads the caller's balance less only
+    /// the value, where the chain's transaction has paid for its gas. Nor is
+    /// any fee paid after it (`localCallFinalization`, 631-673), which at a
+    /// price no balance could pay would overflow. A trace and an estimate of
+    /// a local call run the same way.
+    #[test]
+    fn a_local_call_passes_the_gates_a_transaction_of_a_block_is_held_to() {
+        // BALANCE(CALLER), then CALLVALUE: two words.
+        let reader = [
+            0x33, 0x31, 0x60, 0x00, 0x52, 0x34, 0x60, 0x20, 0x52, 0x60, 0x40, 0x60, 0x00, 0xf3,
+        ];
+        let contract = Address::repeat_byte(0xC0);
+        let sender = Address::repeat_byte(0x5E);
+        // A sender with code of its own, which rskj never refuses (revm's
+        // EIP-3607 does, on chain).
+        let coded = Address::repeat_byte(0xC5);
+        let balance = U256::from(10u64).pow(U256::from(18));
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+        let root = put_account_with_code(&root, store.as_ref(), &contract, 0, U256::ZERO, &reader);
+        let root = put_account(&root, store.as_ref(), &sender, 5, balance);
+        let root = put_account_with_code(&root, store.as_ref(), &coded, 5, balance, &[0x00]);
+        let executor = mainnet_executor();
+        let header = Header {
+            minimum_gas_price: U256::from(10),
+            ..dummy_header(8_000_000)
+        };
+        let call =
+            |nonce: u64, gas_price: u128, gas_limit: u64, value: U256| rustock_core::Transaction {
+                nonce,
+                gas_price: U256::from(gas_price),
+                gas_limit: U256::from(gas_limit),
+                to: Bytes::copy_from_slice(contract.as_slice()),
+                value,
+                input: Bytes::new(),
+                v: 0,
+                r: U256::ZERO,
+                s: U256::ZERO,
+                cached_rlp: None,
+            };
+        let words = |result: &TxExecutionResult| {
+            assert_eq!(result.output.len(), 64);
+            (
+                U256::from_be_slice(&result.output[..32]),
+                U256::from_be_slice(&result.output[32..]),
+            )
+        };
+        let one = U256::from(1);
+
+        // The chain takes this one, and charges its gas up front.
+        let fits = call(5, 10, 100_000, one);
+        let on_chain = executor
+            .execute_tx(&header, &fits, sender, &root, store.clone())
+            .unwrap();
+        assert_eq!(
+            words(&on_chain),
+            (balance - one - U256::from(10 * 100_000), one)
+        );
+        let local = executor
+            .execute_local_call(&header, &fits, sender, &root, store.clone())
+            .unwrap();
+        assert_eq!(words(&local), (balance - one, one));
+
+        // What the caller is left with, where rskj and this node agree on it:
+        // a sender short of the value goes below zero in rskj, which a balance
+        // here can't.
+        let cases = [
+            (
+                "a nonce ahead of the sender's",
+                sender,
+                call(6, 10, 100_000, one),
+                Some(balance - one),
+                one,
+            ),
+            (
+                "a nonce behind the sender's",
+                sender,
+                call(4, 10, 100_000, one),
+                Some(balance - one),
+                one,
+            ),
+            (
+                "a gas price under the block's minimum",
+                sender,
+                call(5, 9, 100_000, one),
+                Some(balance - one),
+                one,
+            ),
+            (
+                "a gas price no balance could pay",
+                sender,
+                call(5, u128::MAX, 100_000, one),
+                Some(balance - one),
+                one,
+            ),
+            (
+                "a gas limit over the block's",
+                sender,
+                call(5, 10, 6_800_001, one),
+                Some(balance - one),
+                one,
+            ),
+            (
+                "the whole balance and the gas",
+                sender,
+                call(5, 10, 100_000, balance),
+                Some(U256::ZERO),
+                balance,
+            ),
+            (
+                "more than the balance",
+                sender,
+                call(5, 10, 100_000, balance + one),
+                None,
+                balance + one,
+            ),
+            (
+                "a sender with code",
+                coded,
+                call(5, 10, 100_000, one),
+                Some(balance - one),
+                one,
+            ),
+        ];
+        for (case, from, tx, left, value) in cases {
+            if from == sender {
+                assert!(
+                    executor
+                        .execute_tx(&header, &tx, from, &root, store.clone())
+                        .is_err(),
+                    "the chain takes {case}"
+                );
+            }
+            let local = executor
+                .execute_local_call(&header, &tx, from, &root, store.clone())
+                .unwrap_or_else(|e| panic!("a local call with {case}: {e:?}"));
+            assert!(local.success, "{case}");
+            let (caller, sent) = words(&local);
+            assert_eq!(sent, value, "{case}");
+            if let Some(left) = left {
+                assert_eq!(caller, left, "{case}");
+            }
+            let (traced, _) = executor
+                .execute_tx_traced(&header, &tx, from, &root, store.clone(), true, 50)
+                .unwrap_or_else(|e| panic!("a traced local call with {case}: {e:?}"));
+            let (estimated, _) = executor
+                .execute_tx_for_estimate(&header, &tx, from, &root, store.clone(), true)
+                .unwrap_or_else(|e| panic!("an estimate with {case}: {e:?}"));
+            assert_eq!(traced.output, local.output, "{case}");
+            assert_eq!(estimated.output, local.output, "{case}");
+        }
+    }
+
+    /// A local creation isn't held to RSKIP438's limit on initcode, which
+    /// `init()` checks after a local call has returned
+    /// (TransactionExecutor.java:169).
+    #[test]
+    fn a_local_creation_passes_the_limit_on_initcode() {
+        let sender = Address::repeat_byte(0x5E);
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = put_account(
+            &TrieNode::empty(),
+            store.as_ref(),
+            &sender,
+            0,
+            U256::from(10u64).pow(U256::from(18)),
+        );
+        let executor = mainnet_executor();
+        let header = dummy_header(8_000_000);
+        // A STOP, and past 49,152 bytes.
+        let tx = unsigned_tx(0, None, 0, 1_000_000, vec![0; 49_153]);
+        assert!(executor
+            .execute_tx(&header, &tx, sender, &root, store.clone())
+            .is_err());
+        let local = executor
+            .execute_local_call(&header, &tx, sender, &root, store)
+            .unwrap();
+        assert!(local.success);
+    }
+
+    /// A local call leaves its sender's nonce as it found it (`execute()`,
+    /// TransactionExecutor.java:292-301), where a transaction of a block bumps
+    /// it before its call runs. Seen from a sender with code that creates a
+    /// contract: the address comes from the nonce the sender holds.
+    #[test]
+    fn a_local_call_leaves_its_senders_nonce() {
+        // CREATE(0, 0, 0), and return the address it made.
+        let creator = [
+            0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0xf0, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00,
+            0xf3,
+        ];
+        let sender = Address::repeat_byte(0xC5);
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = put_account_with_code(
+            &TrieNode::empty(),
+            store.as_ref(),
+            &sender,
+            7,
+            U256::ZERO,
+            &creator,
+        );
+        let tx = unsigned_tx(7, Some(sender), 0, 1_000_000, Vec::new());
+        let local = mainnet_executor()
+            .execute_local_call(&dummy_header(8_000_000), &tx, sender, &root, store)
+            .unwrap();
+        assert!(local.success);
+        assert_eq!(Address::from_slice(&local.output[12..]), sender.create(7));
+    }
+
+    /// A local call's sender has an account by the time its program runs:
+    /// rskj's `Repository.transfer` of the value makes one for it, even of
+    /// nothing (`call()`, TransactionExecutor.java:397). So EXTCODEHASH reads
+    /// it as the empty code's hash, not the zero a missing account reads as.
+    #[test]
+    fn a_local_calls_sender_has_an_account() {
+        // EXTCODEHASH(CALLER)
+        let hasher = [0x33, 0x3f, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3];
+        let contract = Address::repeat_byte(0xC0);
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = put_account_with_code(
+            &TrieNode::empty(),
+            store.as_ref(),
+            &contract,
+            0,
+            U256::ZERO,
+            &hasher,
+        );
+        let tx = unsigned_tx(0, Some(contract), 0, 100_000, Vec::new());
+        let local = mainnet_executor()
+            .execute_local_call(
+                &dummy_header(8_000_000),
+                &tx,
+                Address::repeat_byte(0x99),
+                &root,
+                store,
+            )
+            .unwrap();
+        assert_eq!(
+            B256::from_slice(&local.output),
+            revm::primitives::KECCAK_EMPTY
+        );
+    }
+
+    /// A local call whose gas limit can't pay its intrinsic cost: where a
+    /// program runs, rskj's `go()` fails it with all its gas as it charges
+    /// the cost, before it runs (TransactionExecutor.java:455), so not even a
+    /// STOP succeeds; where none does, `GasCost.subtract` throws out of
+    /// `executeTransaction`, for an account without code (384), a precompile
+    /// (360) and a creation without data (406). The chain refuses all of
+    /// them. And from RSKIP136 a local call's own call to a precompile whose
+    /// cost its gas can't pay throws too (350, 360).
+    #[test]
+    fn a_local_call_short_of_its_costs_fails_or_throws_as_rskj_does() {
+        let contract = Address::repeat_byte(0xC0);
+        let sender = Address::repeat_byte(0x5E);
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+        let root = put_account_with_code(&root, store.as_ref(), &contract, 0, U256::ZERO, &[0x00]);
+        let root = put_account(
+            &root,
+            store.as_ref(),
+            &sender,
+            0,
+            U256::from(10u64).pow(U256::from(18)),
+        );
+        let executor = mainnet_executor();
+        let header = dummy_header(8_000_000);
+        let identity = Address::with_last_byte(4);
+        let run = |to: Option<Address>, gas: u64, input: Vec<u8>| {
+            let tx = unsigned_tx(0, to, 0, gas, input);
+            (
+                executor.execute_tx(&header, &tx, sender, &root, store.clone()),
+                executor.execute_local_call(&header, &tx, sender, &root, store.clone()),
+            )
+        };
+
+        for (case, to, input) in [
+            ("a call to code", Some(contract), vec![]),
+            ("a creation", None, vec![0x00]),
+        ] {
+            let (on_chain, local) = run(to, 20_000, input);
+            assert!(on_chain.is_err(), "the chain takes {case}");
+            let local = local.unwrap_or_else(|e| panic!("{case}: {e:?}"));
+            assert!(!local.success, "{case}");
+            assert_eq!(local.gas_used, 20_000, "{case}");
+            assert!(local.output.is_empty(), "{case}");
+        }
+        for (case, to, input) in [
+            (
+                "a call to no code",
+                Some(Address::repeat_byte(0x77)),
+                vec![],
+            ),
+            ("a call to a precompile", Some(identity), vec![1; 32]),
+            ("a creation without data", None, vec![]),
+        ] {
+            let (on_chain, local) = run(to, 20_000, input);
+            assert!(on_chain.is_err(), "the chain takes {case}");
+            assert!(local.is_err(), "a local call answers {case}");
+        }
+
+        // The intrinsic cost, 21,000 and 16 a byte, and 10 of the 18 the
+        // identity precompile costs a word.
+        let short = 21_000 + 32 * 16 + 10;
+        assert!(run(Some(identity), short, vec![1; 32]).1.is_err());
+        let (_, local) = run(Some(identity), short + 8, vec![1; 32]);
+        assert_eq!(local.unwrap().output, vec![1; 32]);
     }
 
     #[test]
