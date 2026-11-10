@@ -1278,10 +1278,10 @@ struct Args {
     /// Private keys this node may sign with, one 32-byte hex key per line.
     ///
     /// Off by default, and the only way the node ever holds a key for
-    /// signing. Without it `eth_accounts` is empty and `eth_sign`,
-    /// `eth_signTransaction` and `eth_sendTransaction` report as unknown
-    /// methods, so a node with no wallet is indistinguishable from one
-    /// built without the feature.
+    /// signing. Without it `eth_accounts` is empty, `eth_sign` and
+    /// `eth_sendTransaction` are refused as rskj refuses them with its
+    /// wallet off, and `eth_signTransaction`, which rskj doesn't have, is an
+    /// unknown method.
     ///
     /// A file rather than a flag taking the key itself, because a private
     /// key on the command line is visible in `ps` to every user on the

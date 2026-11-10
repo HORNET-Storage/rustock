@@ -6,8 +6,16 @@ use rustock_core::Header;
 use rustock_storage::BlockStore;
 use serde_json::{json, Value};
 
+/// The highest `rsk` capability rskj's configuration offers
+/// (`Web3Impl.rsk_protocolVersion` L280-298). `ConfigCapabilitiesImpl` takes
+/// them from `EthVersion.supported()` (L52), where the only version is V62
+/// (`EthVersion` L33-36). This node also offers rsk/63, its own extension,
+/// which rskj never takes (`Handshake::capabilities`), so it answers as rskj
+/// does.
+const RSK_PROTOCOL_VERSION: u64 = 62;
+
 pub fn rsk_protocol_version(id: Value) -> JsonRpcResponse {
-    JsonRpcResponse::success(id, json!("0x1"))
+    JsonRpcResponse::success(id, json!(format!("{RSK_PROTOCOL_VERSION:#x}")))
 }
 
 pub fn rsk_get_raw_block_header_by_hash(

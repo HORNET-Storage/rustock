@@ -9,8 +9,10 @@ use rustock_storage::BlockStore;
 use serde_json::{json, Value};
 use std::sync::Arc;
 
+/// rskj's `eth_protocolVersion` answers `rsk_protocolVersion()` (`Web3Impl`
+/// L300-303).
 pub fn eth_protocol_version(id: Value) -> JsonRpcResponse {
-    JsonRpcResponse::success(id, json!("0x3e"))
+    crate::rsk::rsk_protocol_version(id)
 }
 
 pub fn eth_chain_id(id: Value, config: &ChainConfig) -> JsonRpcResponse {

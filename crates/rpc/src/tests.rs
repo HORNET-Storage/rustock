@@ -729,12 +729,16 @@ async fn test_rpc_modules() {
 
 // ========== rsk ==========
 
+/// rskj's `rsk_protocolVersion` is the highest `rsk` capability its
+/// configuration offers, 62, and its `eth_protocolVersion` answers the same
+/// (`Web3Impl` L280-303), as rskj's public nodes answer it.
 #[tokio::test]
 async fn test_rsk_protocol_version() {
     let (state, _tmp) = setup_state();
-    let req = make_request("rsk_protocolVersion", json!([]));
-    let resp = dispatch_for_test(&state, req).await;
-    assert_eq!(resp.result.unwrap(), json!("0x1"));
+    for method in ["rsk_protocolVersion", "eth_protocolVersion"] {
+        let resp = dispatch_for_test(&state, make_request(method, json!([]))).await;
+        assert_eq!(resp.result.unwrap(), json!("0x3e"), "{method}");
+    }
 }
 
 #[tokio::test]
@@ -761,27 +765,57 @@ async fn test_rsk_get_raw_block_header_by_hash() {
 
 // ========== dispatch / error handling ==========
 
+/// A name rskj's `Web3` service doesn't have is -32601 "method not found",
+/// whatever its parameters and in every namespace (`JsonRpcCustomServer`
+/// L57-60), as rskj's public nodes answer `eth_foo` and `personal_sign`.
 #[tokio::test]
 async fn test_method_not_found() {
     let (state, _tmp) = setup_state();
-    let req = make_request("nonexistent_method", json!([]));
-    let resp = dispatch_for_test(&state, req).await;
-    assert!(resp.error.is_some());
-    assert_eq!(resp.error.unwrap().code, METHOD_NOT_FOUND);
+    for method in [
+        "nonexistent_method",
+        "eth_foo",
+        "debug_foo",
+        "trace_call",
+        "txpool_foo",
+        "evm_foo",
+        "db_foo",
+        "personal_sign",
+    ] {
+        let resp = dispatch_for_test(&state, make_request(method, json!([1, 2]))).await;
+        assert!(resp.result.is_none(), "{method}");
+        let err = resp.error.unwrap();
+        assert_eq!(
+            (err.code, err.message.as_str()),
+            (METHOD_NOT_FOUND, "method not found"),
+            "{method}"
+        );
+    }
 }
 
-/// `eth_sendTransaction` moved out of this list when the node learned to
-/// hold keys -- it is refused for want of a wallet now, not for want of
-/// an execution engine. The compilation methods are what is left.
+/// rskj's `Web3Impl` throws `UnsupportedOperationException` from the
+/// compilers and from `eth_submitWork` and `eth_submitHashrate` (L964-978,
+/// L1112-1120), and `RskErrorResolver` answers it -32601, naming the method
+/// (L51-55), as rskj's public nodes answer `eth_compileSolidity` and
+/// `eth_compileLLL`.
 #[tokio::test]
 async fn test_unsupported_eth_method() {
     let (state, _tmp) = setup_state();
-    let req = make_request("eth_getCompilers", json!([]));
-    let resp = dispatch_for_test(&state, req).await;
-    assert!(resp.error.is_some());
-    let err = resp.error.unwrap();
-    assert_eq!(err.code, METHOD_NOT_FOUND);
-    assert!(err.message.contains("execution engine"));
+    for (method, params) in [
+        ("eth_compileLLL", json!(["(seq)"])),
+        ("eth_compileSerpent", json!(["def f(): return(1)"])),
+        ("eth_compileSolidity", json!(["contract A {}"])),
+        ("eth_submitWork", json!(["0x01", "0x02", "0x03"])),
+        ("eth_submitHashrate", json!(["0x01", "0x02"])),
+    ] {
+        let resp = dispatch_for_test(&state, make_request(method, params)).await;
+        assert!(resp.result.is_none(), "{method}");
+        let err = resp.error.unwrap();
+        assert_eq!(err.code, METHOD_NOT_FOUND, "{method}");
+        assert_eq!(
+            err.message,
+            format!("the method {method} does not exist/is not available")
+        );
+    }
 }
 
 #[tokio::test]
@@ -823,12 +857,53 @@ async fn test_debug_trace_block_without_a_body_is_null() {
     assert_eq!(resp.result.unwrap(), Value::Null);
 }
 
+/// rskj's personal module with its wallet off, which is its default:
+/// `PersonalModuleWalletDisabled` throws `DisabledWalletException` from every
+/// method, -32604 "The local wallet feature is disabled", once `Web3Impl` has
+/// refused a null seed or passphrase (L1130-1144). This node has no personal
+/// module, so the keys `--wallet-file` gives it change nothing here.
 #[tokio::test]
 async fn test_unsupported_personal_method() {
-    let (state, _tmp) = setup_state();
-    let req = make_request("personal_unlockAccount", json!([]));
-    let resp = dispatch_for_test(&state, req).await;
-    assert!(resp.error.is_some());
+    let address = "0x0000000000000000000000000000000000000001";
+    for (state, _tmp) in [setup_state(), setup_state_with_wallet()] {
+        for (method, params) in [
+            ("personal_newAccountWithSeed", json!(["seed"])),
+            ("personal_newAccount", json!(["passphrase"])),
+            ("personal_listAccounts", json!([])),
+            ("personal_importRawKey", json!(["0x0123", "passphrase"])),
+            (
+                "personal_sendTransaction",
+                json!([{"from": address}, "passphrase"]),
+            ),
+            (
+                "personal_unlockAccount",
+                json!([address, "passphrase", "0x3c"]),
+            ),
+            ("personal_lockAccount", json!([address])),
+            ("personal_dumpRawKey", json!([address])),
+        ] {
+            let resp = dispatch_for_test(&state, make_request(method, params)).await;
+            assert!(resp.result.is_none(), "{method}");
+            let err = resp.error.unwrap();
+            assert_eq!(
+                (err.code, err.message.as_str()),
+                (-32604, "The local wallet feature is disabled"),
+                "{method}"
+            );
+        }
+        for (method, message) in [
+            ("personal_newAccountWithSeed", "Seed is null"),
+            ("personal_newAccount", "Passphrase is null"),
+        ] {
+            let resp = dispatch_for_test(&state, make_request(method, json!([null]))).await;
+            let err = resp.error.unwrap();
+            assert_eq!(
+                (err.code, err.message.as_str()),
+                (INVALID_PARAMS, message),
+                "{method}"
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -2434,7 +2509,7 @@ async fn test_admin_methods_are_unknown_without_the_flag() {
         let err = resp.error.expect("an error is expected");
         assert_eq!(err.code, -32601, "{method} must report METHOD_NOT_FOUND");
         assert_eq!(
-            err.message, "Method not found",
+            err.message, "method not found",
             "{method} must not disclose that it exists but is disabled"
         );
     }
@@ -2470,7 +2545,7 @@ async fn test_admin_methods_dispatch_when_enabled() {
     let refused_by_gate = resp
         .error
         .as_ref()
-        .is_some_and(|e| e.code == -32601 && e.message == "Method not found");
+        .is_some_and(|e| e.code == -32601 && e.message == "method not found");
     assert!(
         !refused_by_gate,
         "with admin enabled the method must reach its handler, not the gate"
@@ -2489,21 +2564,33 @@ async fn test_admin_methods_dispatch_when_enabled() {
 /// No key-holding method may answer. A node with no wallet must refuse to
 /// sign rather than sign with something it happens to have -- the node
 /// identity key, a miner key -- which would be a signature the operator never
-/// authorised.
+/// authorised. It refuses as rskj does with its wallet off, which is rskj's
+/// default: `eth_sign` and `eth_sendTransaction` are -32602 "Local wallet is
+/// disabled in this node" (`EthModuleWalletDisabled` L49-53,
+/// `EthModuleTransactionDisabled` L38-42), the transaction unread, and
+/// `eth_signTransaction`, which rskj doesn't have, is "method not found".
 #[tokio::test]
 async fn test_the_node_holds_no_keys_and_refuses_to_sign() {
     let (state, _tmp) = setup_state();
+    let from = "0x0000000000000000000000000000000000000001";
+    let disabled = (INVALID_PARAMS, "Local wallet is disabled in this node");
 
-    for (method, params) in [
-        ("eth_sign", json!(["0x0000000000000000000000000000000000000001", "0xdeadbeef"])),
-        ("eth_signTransaction", json!([{"from": "0x0000000000000000000000000000000000000001"}])),
-        ("eth_sendTransaction", json!([{"from": "0x0000000000000000000000000000000000000001"}])),
+    for (method, params, refusal) in [
+        ("eth_sign", json!([from, "0xdeadbeef"]), disabled),
+        ("eth_sendTransaction", json!([{"from": from}]), disabled),
+        ("eth_sendTransaction", json!([null]), disabled),
+        (
+            "eth_signTransaction",
+            json!([{"from": from}]),
+            (METHOD_NOT_FOUND, "method not found"),
+        ),
     ] {
         let resp = dispatch_for_test(&state, make_request(method, params)).await;
         assert!(resp.result.is_none(), "{method} must not return a result");
+        let err = resp.error.expect("an error is expected");
         assert_eq!(
-            resp.error.expect("an error is expected").code,
-            -32601,
+            (err.code, err.message.as_str()),
+            refusal,
             "{method} must be refused"
         );
     }
@@ -2633,16 +2720,104 @@ fn setup_state_with_pending_tx() -> (RpcState, B256, tempfile::TempDir) {
     (state, hash, tmp)
 }
 
-/// The Solidity compiler methods are refused rather than answered with an
-/// empty list. rskj removed these upstream; answering "no compilers" would
-/// invite a caller to treat compilation as supported-but-unavailable.
+/// rskj answers `eth_getCompilers` with `["solidity"]` (`Web3Impl`
+/// L952-962), though it compiles nothing: `eth_compileSolidity` throws
+/// (L974-977), as `test_unsupported_eth_method` checks.
 #[tokio::test]
-async fn test_compiler_methods_are_refused() {
+async fn test_eth_get_compilers_names_solidity_as_rskj_does() {
     let (state, _tmp) = setup_state();
-    for method in ["eth_getCompilers", "eth_compileSolidity"] {
+    let resp = dispatch_for_test(&state, make_request("eth_getCompilers", json!([]))).await;
+    assert!(resp.error.is_none(), "{:?}", resp.error);
+    assert_eq!(resp.result.unwrap(), json!(["solidity"]));
+}
+
+/// `db_putString`, `db_getString`, `db_putHex` and `db_getHex` do nothing in
+/// rskj's `Web3Impl` (L1104-1128), and `db` isn't one of the modules
+/// `reference.conf` turns on (L486-534), so `JsonRpcMethodFilter` refuses
+/// them (L50-58) and `RskErrorResolver` answers -32601, naming the method
+/// (L51-55), as rskj's public nodes answer `db_getString`.
+#[tokio::test]
+async fn the_db_namespace_is_refused_as_rskjs_default_modules_refuse_it() {
+    let (state, _tmp) = setup_state();
+    for method in ["db_putString", "db_getString", "db_putHex", "db_getHex"] {
         let resp = dispatch_for_test(&state, make_request(method, json!([]))).await;
-        assert!(resp.result.is_none(), "{method} must not answer");
-        assert_eq!(resp.error.unwrap().code, -32601);
+        assert!(resp.result.is_none(), "{method}");
+        let err = resp.error.unwrap();
+        assert_eq!(err.code, METHOD_NOT_FOUND, "{method}");
+        assert_eq!(
+            err.message,
+            format!("the method {method} does not exist/is not available")
+        );
+    }
+}
+
+/// jsonrpc4j counts a call's parameters before the method runs, and a count
+/// rskj's method of that name doesn't take is -32602 "method parameters
+/// invalid" (`JsonRpcBasicServer.handleObject` L440-443), even where the
+/// method would refuse anyway. No parameters, `null` and an empty object
+/// count as none; an object with fields matches none of rskj's methods.
+/// rskj's public nodes answer `eth_getCompilers` with `[1]`,
+/// `eth_compileSolidity` with `[]` and with `{"contract": ...}`, `db_getHex`
+/// with two parameters and `eth_protocolVersion` with `{"a": 1}` so.
+#[tokio::test]
+async fn a_stubbed_methods_parameters_are_counted_as_jsonrpc4j_counts_them() {
+    let address = "0x0000000000000000000000000000000000000001";
+    for (state, _tmp) in [setup_state(), setup_state_with_wallet()] {
+        for (method, params) in [
+            ("eth_getCompilers", json!([1])),
+            ("eth_getCompilers", json!({"a": 1})),
+            ("eth_compileSolidity", json!([])),
+            ("eth_compileSolidity", json!(["contract A {}", "x"])),
+            ("eth_compileSolidity", json!({"contract": "contract A {}"})),
+            ("eth_submitWork", json!(["0x01", "0x02"])),
+            ("eth_submitHashrate", json!(["0x01", "0x02", "0x03"])),
+            ("db_getHex", json!(["a", "b"])),
+            ("db_putString", json!(["testDB", "key", "value"])),
+            ("eth_protocolVersion", json!({"a": 1})),
+            ("rsk_protocolVersion", json!([1])),
+            ("eth_accounts", json!([1])),
+            ("eth_pendingTransactions", json!([1])),
+            ("eth_sign", json!([address])),
+            ("eth_sign", json!([address, "0xdeadbeef", "x"])),
+            ("eth_sendTransaction", json!([])),
+            ("personal_unlockAccount", json!([address, "passphrase"])),
+            ("personal_listAccounts", json!(["x"])),
+        ] {
+            let resp = dispatch_for_test(&state, make_request(method, params.clone())).await;
+            assert!(resp.result.is_none(), "{method} {params}");
+            let err = resp.error.unwrap();
+            assert_eq!(
+                (err.code, err.message.as_str()),
+                (INVALID_PARAMS, "method parameters invalid"),
+                "{method} {params}"
+            );
+        }
+        for params in [json!([]), Value::Null, json!({})] {
+            let resp =
+                dispatch_for_test(&state, make_request("eth_getCompilers", params.clone())).await;
+            assert_eq!(resp.result, Some(json!(["solidity"])), "{params}");
+        }
+    }
+}
+
+/// rskj's `Web3EthModule.eth_sign` reads both arguments before its wallet
+/// module sees them (L46-48), so a null one is a NullPointerException, which
+/// `RskErrorResolver` answers -32603 "Internal server error" (L56-58), wallet
+/// or no wallet.
+#[tokio::test]
+async fn a_null_argument_to_eth_sign_is_rskjs_internal_error() {
+    let account = format!("{:#x}", test_wallet().accounts()[0]);
+    for (state, _tmp) in [setup_state(), setup_state_with_wallet()] {
+        for params in [json!([null, "0xdeadbeef"]), json!([account, null])] {
+            let resp = dispatch_for_test(&state, make_request("eth_sign", params.clone())).await;
+            assert!(resp.result.is_none(), "{params}");
+            let err = resp.error.unwrap();
+            assert_eq!(
+                (err.code, err.message.as_str()),
+                (INTERNAL_ERROR, "Internal server error"),
+                "{params}"
+            );
+        }
     }
 }
 
@@ -5843,7 +6018,10 @@ async fn flush_and_shutdown_are_invisible_without_rpc_admin() {
     for method in ["rsk_flush", "rsk_shutdown"] {
         let resp = dispatch_for_test(&state, make_request(method, json!([]))).await;
         let err = resp.error.expect("must not be served");
-        assert_eq!(err.message, "Method not found", "{method} leaked its existence");
+        assert_eq!(
+            err.message, "method not found",
+            "{method} leaked its existence"
+        );
     }
 }
 

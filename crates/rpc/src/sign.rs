@@ -1,11 +1,12 @@
 //! `eth_accounts`, `eth_sign`, `eth_signTransaction`, `eth_sendTransaction`.
 //!
-//! All four answer out of [`crate::wallet::Wallet`], and all four behave
-//! as they did before it existed when the operator supplied no wallet:
-//! an empty account list, and `METHOD_NOT_FOUND` for the three that sign.
-//! A node that was never given keys is indistinguishable from one built
-//! without the feature, which is the property the tests that predate this
-//! module were written to hold.
+//! All four answer out of [`crate::wallet::Wallet`]. When the operator
+//! supplied none they answer as rskj does with its wallet off, which is its
+//! default (`EthModuleWalletDisabled`, `EthModuleTransactionDisabled`): an
+//! empty account list, and `eth_sign` and `eth_sendTransaction` refused,
+//! -32602 "Local wallet is disabled in this node". rskj has no
+//! `eth_signTransaction`, so without a wallet that one is "method not
+//! found", as rskj answers it.
 //!
 //! `eth_sendTransaction` does not have its own path into the pool. It
 //! fills in what the caller left out, signs, and hands the bytes to the
@@ -19,16 +20,6 @@ use serde_json::{json, Value};
 use crate::server::RpcState;
 use crate::types::{JsonRpcResponse, INTERNAL_ERROR, INVALID_PARAMS, METHOD_NOT_FOUND};
 
-/// The refusal a node with no wallet gives, unchanged from before there
-/// was one to give it.
-fn no_wallet(id: Value, method: &str) -> JsonRpcResponse {
-    JsonRpcResponse::error(
-        id,
-        METHOD_NOT_FOUND,
-        format!("Method {method} requires a wallet, which this node was not given"),
-    )
-}
-
 /// rskj returns the wallet's accounts; with no wallet the list is empty,
 /// which is what it has always been here.
 pub fn eth_accounts(id: Value, state: &RpcState) -> JsonRpcResponse {
@@ -41,7 +32,16 @@ pub fn eth_accounts(id: Value, state: &RpcState) -> JsonRpcResponse {
 
 /// `eth_sign(address, message)` — 65 bytes over the EIP-191 digest.
 pub fn eth_sign(id: Value, params: &Value, state: &RpcState) -> JsonRpcResponse {
-    let Some(wallet) = &state.wallet else { return no_wallet(id, "eth_sign") };
+    // rskj's `Web3EthModule.eth_sign` reads both arguments before its wallet
+    // module sees them (L46-48), so a null one is a NullPointerException,
+    // which `RskErrorResolver` answers as an internal error (L56-58), wallet
+    // or no wallet.
+    if params[0].is_null() || params[1].is_null() {
+        return JsonRpcResponse::error(id, INTERNAL_ERROR, "Internal server error");
+    }
+    let Some(wallet) = &state.wallet else {
+        return crate::stubs::local_wallet_disabled(id);
+    };
 
     let Some(address) = params
         .get(0)
@@ -63,7 +63,8 @@ pub fn eth_sign(id: Value, params: &Value, state: &RpcState) -> JsonRpcResponse 
 /// `eth_signTransaction` — the signed RLP, not sent.
 pub fn eth_sign_transaction(id: Value, params: &Value, state: &RpcState) -> JsonRpcResponse {
     if state.wallet.is_none() {
-        return no_wallet(id, "eth_signTransaction");
+        // rskj has no such method.
+        return crate::stubs::method_not_found(id);
     }
     match build_and_sign(params, state) {
         Ok((_from, raw)) => {
@@ -76,7 +77,7 @@ pub fn eth_sign_transaction(id: Value, params: &Value, state: &RpcState) -> Json
 /// `eth_sendTransaction` — sign, then go through the ordinary relay path.
 pub async fn eth_send_transaction(id: Value, params: &Value, state: &RpcState) -> JsonRpcResponse {
     if state.wallet.is_none() {
-        return no_wallet(id, "eth_sendTransaction");
+        return crate::stubs::local_wallet_disabled(id);
     }
 
     // Built before the relay is looked for, so a request naming an

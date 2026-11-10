@@ -16,6 +16,7 @@ pub mod sco;
 pub mod server;
 pub mod sign;
 pub mod state;
+pub mod stubs;
 pub mod subscribe;
 pub mod tx;
 pub mod trace;

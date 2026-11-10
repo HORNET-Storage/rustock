@@ -241,6 +241,11 @@ async fn route(state: &RpcState, req: JsonRpcRequest) -> JsonRpcResponse {
     let id = req.id.unwrap_or(Value::Null);
     let params = &req.params;
 
+    // jsonrpc4j counts a call's parameters before the method runs.
+    if let Some(refused) = crate::stubs::wrong_arity(&id, &req.method, params) {
+        return refused;
+    }
+
     match req.method.as_str() {
         // -- web3 --
         "web3_clientVersion" => web3::web3_client_version(id),
@@ -345,7 +350,7 @@ async fn route(state: &RpcState, req: JsonRpcRequest) -> JsonRpcResponse {
         | "rsk_flush" | "rsk_shutdown"
             if !state.admin_enabled =>
         {
-            JsonRpcResponse::error(id, METHOD_NOT_FOUND, "Method not found")
+            crate::stubs::method_not_found(id)
         }
         "rsk_collectTrie" => admin::rsk_collect_trie(
             id,
@@ -403,17 +408,26 @@ async fn route(state: &RpcState, req: JsonRpcRequest) -> JsonRpcResponse {
         "eth_getFilterLogs" => logs::eth_get_filter_logs(id, params, state),
         "eth_uninstallFilter" => logs::eth_uninstall_filter(id, params, state),
 
-        // Answered out of the operator-supplied wallet, and refused with
-        // METHOD_NOT_FOUND when there is none -- which is what they did
-        // before a wallet was possible.
+        // Answered out of the operator-supplied wallet. Without one they're
+        // refused as rskj refuses them with its wallet off (`sign.rs`).
         "eth_sendTransaction" => sign::eth_send_transaction(id, params, state).await,
         "eth_sign" => sign::eth_sign(id, params, state),
         "eth_signTransaction" => sign::eth_sign_transaction(id, params, state),
 
-        // -- unsupported methods --
-        "eth_getCompilers" | "eth_compileSolidity" => {
-            execution_not_available(id, &req.method)
+        // -- what rskj's Web3Impl answers with a fixed value or as unsupported --
+        "eth_getCompilers" => crate::stubs::eth_get_compilers(id),
+        "eth_compileLLL"
+        | "eth_compileSerpent"
+        | "eth_compileSolidity"
+        | "eth_submitWork"
+        | "eth_submitHashrate" => crate::stubs::not_available(id, &req.method),
+        // No-ops in Web3Impl, but `db` isn't one of the modules rskj's
+        // reference.conf turns on, so JsonRpcMethodFilter refuses them first,
+        // in the same words.
+        "db_putString" | "db_getString" | "db_putHex" | "db_getHex" => {
+            crate::stubs::not_available(id, &req.method)
         }
+        m if m.starts_with("personal_") => crate::stubs::personal(id, m, params),
 
         "debug_wireProtocolQueueSize" => debug::debug_wire_protocol_queue_size(id, state),
         "debug_traceTransaction" => debug::debug_trace_transaction(id, params, state),
@@ -438,16 +452,7 @@ async fn route(state: &RpcState, req: JsonRpcRequest) -> JsonRpcResponse {
         "txpool_inspect" => txpool::txpool_inspect(id, state),
         "txpool_status" => txpool::txpool_status(id, state),
 
-        m if m.starts_with("debug_")
-            || m.starts_with("trace_")
-            || m.starts_with("personal_")
-            || m.starts_with("evm_")
-            || m.starts_with("txpool_")
-            || m.starts_with("db_") => {
-            execution_not_available(id, m)
-        }
-
-        _ => JsonRpcResponse::error(id, METHOD_NOT_FOUND, "Method not found"),
+        _ => crate::stubs::method_not_found(id),
     }
 }
 

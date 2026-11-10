@@ -10,7 +10,8 @@
 //! That reasoning still holds, and this does not weaken it: **a wallet
 //! exists only when the operator supplies one.** Without
 //! `--wallet-file`, `RpcState::wallet` is `None`, `eth_accounts` is empty
-//! and the three signing methods answer exactly as before. The keys are
+//! and the three signing methods are refused, as rskj refuses them with its
+//! wallet off. The keys are
 //! the ones in the file and nothing else; nothing here can reach the node
 //! identity key or a miner key.
 //!
