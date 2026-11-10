@@ -3221,6 +3221,84 @@ async fn test_serve_skeleton_request() {
     }
 }
 
+/// A node serves `rsk/63` from the uncles its freezer keeps once a block's
+/// body is gone (#270).
+///
+/// A snapshot-synced node holds bodies only for the window under its
+/// checkpoint, and keeps the uncles of the blocks below it in the freezer,
+/// where the sync put them as they arrived beside the headers. Read from
+/// bodies alone, the run it served stopped at the first such block that named
+/// an uncle: it could not serve the sync it had just done.
+#[tokio::test]
+async fn headers_with_uncles_are_served_from_the_freezer_once_the_body_is_gone() {
+    use rustock_networking::protocol::{
+        BlockHeadersQuery, BlockHeadersWithUnclesRequest, P2pHandler, P2pMessage, RskMessage,
+        RskSubMessage,
+    };
+
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let freezer =
+        Arc::new(rustock_storage::freezer::Freezer::open(dir.path().join("freezer")).unwrap());
+    store.set_freezer(freezer.clone());
+
+    // #0 to #3, of which #2 names an uncle and holds no body.
+    let uncle = dummy_header(1, B256::repeat_byte(0x0c), U256::from(1));
+    let mut parent = B256::ZERO;
+    for number in 0..=3u64 {
+        let mut header = dummy_header(number, parent, U256::from(1));
+        if number == 2 {
+            header.uncle_count = 1;
+            header.ommers_hash =
+                rustock_execution::processor::compute_ommers_hash(std::slice::from_ref(&uncle));
+        }
+        parent = header.hash();
+        store.put_header(&header).unwrap();
+        store.put_canonical_hash(number, parent).unwrap();
+    }
+    store.set_head(parent).unwrap();
+    freezer.put_uncles(2, std::slice::from_ref(&uncle)).unwrap();
+    freezer.sync().unwrap();
+
+    let manager = Arc::new(SyncManager::new(
+        store,
+        Arc::new(HeaderVerifier::new()),
+        Arc::new(rustock_networking::peers::PeerStore::new()),
+    ));
+    let (event_tx, _event_rx) = mpsc::unbounded_channel();
+    let handler = SyncHandler::new(manager, event_tx);
+    let request = P2pMessage::RskMessage(RskMessage::new(
+        RskSubMessage::BlockHeadersWithUnclesRequest(BlockHeadersWithUnclesRequest {
+            id: 7,
+            query: BlockHeadersQuery {
+                hash: parent,
+                count: 4,
+            },
+        }),
+    ));
+    let Some(P2pMessage::RskMessage(answer)) = handler.handle_message(B512::ZERO, &request) else {
+        panic!("the request is answered");
+    };
+    let RskSubMessage::BlockHeadersWithUnclesResponse(response) = answer.sub_message else {
+        panic!("answered with headers and their uncles");
+    };
+    let numbers: Vec<u64> = response.entries.iter().map(|e| e.header.number).collect();
+    assert_eq!(
+        numbers,
+        vec![3, 2, 1, 0],
+        "the whole run, past the block without a body"
+    );
+    assert_eq!(
+        response.entries[1]
+            .uncles
+            .iter()
+            .map(Header::hash)
+            .collect::<Vec<_>>(),
+        vec![uncle.hash()],
+        "with the uncle the freezer kept"
+    );
+}
+
 #[tokio::test]
 async fn test_serve_skeleton_request_unknown_start() {
     use rustock_networking::protocol::{P2pMessage, RskMessage, RskSubMessage};

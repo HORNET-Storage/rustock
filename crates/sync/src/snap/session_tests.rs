@@ -2262,6 +2262,86 @@ fn a_passed_gate_hands_over_to_the_ascent_not_the_walk() {
     );
 }
 
+/// A session that keeps the uncles it is sent: a store with a freezer, and a
+/// body window of `bodies` blocks under the checkpoint it is offered.
+fn archiving_session(forward: bool, bodies: u64) -> (SnapSession, Fixture, B256) {
+    let f = fixture(4);
+    let freezer =
+        rustock_storage::freezer::Freezer::open(f._dir.path().join("freezer")).expect("freezer");
+    f.store.set_freezer(Arc::new(freezer));
+    let genesis = f.with_genesis();
+    f.store.set_head(genesis).expect("head");
+    let mut session = SnapSession::new(
+        SnapConfig {
+            client_enabled: true,
+            forward_headers: forward,
+            blocks_required: bodies,
+            ..SnapConfig::default()
+        },
+        f.store.clone(),
+        Arc::new(MemoryTrieStore::new()) as Arc<dyn TrieStore>,
+        Arc::new(HeaderVerifier::new()),
+    );
+    session.set_peer_serves_uncles(forward);
+    (session, f, genesis)
+}
+
+/// The uncles an `rsk/63` peer sends beside the headers of the blocks under
+/// the body window reach the freezer: by either walk, and not only under the
+/// freeze horizon (#270).
+///
+/// Bodies, and the uncles in them, come only for the window under the
+/// checkpoint; the freeze horizon is 20,000 blocks under it. The uncles of
+/// the blocks between came only beside the headers, and both walks dropped
+/// them, so a synced node could neither re-derive its own chain's work there
+/// nor serve the sync it had just done.
+#[test]
+fn the_uncles_below_the_bodies_reach_the_freezer_by_either_walk() {
+    use rustock_networking::protocol::HeaderWithUncles;
+
+    for forward in [true, false] {
+        let (mut session, f, genesis) = archiving_session(forward, 2);
+        // Five blocks from genesis, each naming one uncle. The bodies come
+        // for #3 up.
+        let (blocks, tds) = chain_with_uncles(1, 5, genesis, 100, f.state_root);
+        let checkpoint = blocks.last().expect("a checkpoint");
+        let _ = session.on_status(std::slice::from_ref(checkpoint), &tds[4..], 1024, 0);
+        let entries: Vec<HeaderWithUncles> = blocks
+            .iter()
+            .rev()
+            .map(|b| HeaderWithUncles {
+                header: b.header.clone(),
+                uncles: b.ommers.clone(),
+            })
+            .collect();
+        let _ = session.on_headers_with_uncles(5, &entries);
+
+        let freezer = f.store.freezer().expect("a freezer");
+        for b in &blocks[..2] {
+            let held = freezer
+                .uncles(b.header.number)
+                .expect("read")
+                .unwrap_or_else(|| {
+                    panic!(
+                        "forward={forward}: #{} is under the bodies",
+                        b.header.number
+                    )
+                });
+            assert_eq!(
+                held.iter().map(Header::hash).collect::<Vec<_>>(),
+                b.ommers.iter().map(Header::hash).collect::<Vec<_>>(),
+                "forward={forward}: the uncles #{} named",
+                b.header.number
+            );
+        }
+        assert_eq!(
+            freezer.uncles(3).expect("read"),
+            None,
+            "forward={forward}: #3 gets its body, and its uncles with it"
+        );
+    }
+}
+
 /// An offered header's proof of work is checked against the difficulty it
 /// states, so a peer can name any height for next to nothing. The gate takes
 /// on a window of [`crate::sampler::MAX_SAMPLED_WINDOW`] above the checkpoint

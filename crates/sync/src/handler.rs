@@ -342,10 +342,14 @@ impl SyncHandler {
     /// the plain request would return, each paired with the uncle headers it
     /// references.
     ///
-    /// The uncles come out of the body, which is the only place they exist. A
-    /// block whose body this node no longer holds therefore ends the run --
-    /// never an empty uncle list, which would be a quiet lie about the chain's
-    /// work. Peers learn which blocks are answerable from the served range this
+    /// The uncles come out of the body, or once the body is gone, out of the
+    /// freezer's uncle store, which keeps them by height for the canonical
+    /// chain: where a snapshot sync puts the uncles it was sent for every
+    /// block it fetched no body for. Served from bodies alone, a node that
+    /// synced so could not serve the sync it had just done (#270). A block
+    /// whose uncles this node holds in neither place ends the run -- never an
+    /// empty uncle list, which would be a quiet lie about the chain's work.
+    /// Peers learn which blocks are answerable from the served range this
     /// node announces.
     fn serve_headers_with_uncles_request(
         &self,
@@ -369,9 +373,9 @@ impl SyncHandler {
             let uncles = if header.uncle_count == 0 {
                 Vec::new()
             } else {
-                match store.body(header.hash()) {
-                    Ok(Some((_txs, ommers))) => ommers,
-                    _ => break,
+                match crate::total_difficulty::held_uncles(store, header.hash(), &header) {
+                    Some(uncles) => uncles,
+                    None => break,
                 }
             };
 

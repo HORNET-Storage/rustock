@@ -715,16 +715,22 @@ impl SnapSession {
                         "ascending the header chain from #{number} to #{}, with uncles",
                         header.number
                     );
-                    self.ascent = Some(super::forward::ForwardSync::new(
-                        number,
-                        hash,
-                        work,
-                        header.number,
-                        header.hash(),
-                        self.config.archive_uncles,
-                        self.store.clone(),
-                        self.verifier.clone(),
-                    ));
+                    // Bodies come only for the blocks from `blocks_wanted_to`
+                    // up, so the uncles sent beside every header under it
+                    // are the only copy this node will get.
+                    self.ascent = Some(
+                        super::forward::ForwardSync::new(
+                            number,
+                            hash,
+                            work,
+                            header.number,
+                            header.hash(),
+                            self.config.archive_uncles,
+                            self.store.clone(),
+                            self.verifier.clone(),
+                        )
+                        .with_bodies_from(self.blocks_wanted_to),
+                    );
                 }
                 _ => {
                     warn!(
@@ -737,11 +743,14 @@ impl SnapSession {
             }
         }
 
-        self.walk = Some(super::headers::HeaderWalk::new(
-            header.clone(),
-            self.store.clone(),
-            self.verifier.clone(),
-        ));
+        self.walk = Some(
+            super::headers::HeaderWalk::new(
+                header.clone(),
+                self.store.clone(),
+                self.verifier.clone(),
+            )
+            .with_bodies_from(self.blocks_wanted_to),
+        );
 
         self.checkpoint = Some(header);
         // The walk is built either way, but the gate — when there is one —

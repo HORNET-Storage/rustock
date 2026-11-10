@@ -140,6 +140,9 @@ pub struct ForwardSync {
 
     /// Whether to archive uncle headers; see `SnapConfig::archive_uncles`.
     archive_uncles: bool,
+    /// The blocks under this height have their uncles archived as their run
+    /// is committed: see [`Self::with_bodies_from`].
+    uncles_below: u64,
 
     /// Where skeleton starts are measured from, and how far apart.
     skeleton_base: u64,
@@ -209,6 +212,7 @@ impl ForwardSync {
             target,
             target_hash,
             archive_uncles,
+            uncles_below: target.saturating_sub(rustock_storage::freezer::FREEZE_DEPTH),
             skeleton_base: anchor_number,
             skeleton_span: span,
             skeleton_todo,
@@ -221,6 +225,21 @@ impl ForwardSync {
             counted_uncles: std::collections::VecDeque::new(),
             done: anchor_number >= target,
         }
+    }
+
+    /// The lowest block whose body the sync goes on to fetch. The uncles sent
+    /// beside every header under it are archived as its run is committed:
+    /// they are the only copy this node will get, and without them it can
+    /// neither re-derive its own chain's work nor serve `rsk/63`.
+    ///
+    /// Without this they were archived only under the freeze horizon, 20,000
+    /// blocks below the target, on the reasoning that every block above it is
+    /// inside the body window and gets its uncles with its body. The window is
+    /// 6,000 blocks (rskj's `BLOCKS_REQUIRED`), so the blocks between got
+    /// neither, and their uncles were lost (#270).
+    pub fn with_bodies_from(mut self, lowest: u64) -> Self {
+        self.uncles_below = lowest;
+        self
     }
 
     pub fn done(&self) -> bool {
@@ -405,15 +424,12 @@ impl ForwardSync {
         // own chain's work and cannot serve `rsk/63` to anyone else -- which
         // is to say, cannot serve the sync it just performed.
         //
-        // Only below the freeze horizon. Nearer the target the chain can still
-        // move, and the freezer is for settled history; those blocks are
-        // inside the body window the sync fetches anyway, so their uncles
-        // arrive with the bodies.
+        // Only below the blocks whose bodies the sync fetches: those bring
+        // their uncles with them (`with_bodies_from`).
         if self.archive_uncles {
           if let Some(freezer) = self.store.freezer() {
-            let horizon = self.target.saturating_sub(rustock_storage::freezer::FREEZE_DEPTH);
             for (number, uncles) in &run.uncle_headers {
-                if *number < horizon {
+                if *number < self.uncles_below {
                     if let Err(e) = freezer.put_uncles(*number, uncles) {
                         warn!(
                             target: "rustock::snap",

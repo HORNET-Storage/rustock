@@ -191,6 +191,9 @@ pub struct HeaderWalk {
 
     /// Blocks strictly below this may be frozen: `top - FREEZE_DEPTH`.
     freeze_horizon: u64,
+    /// The blocks under this height have their uncles staged beside the
+    /// headers: see [`Self::with_bodies_from`].
+    uncles_below: u64,
     /// Headers written against a checkpoint that is still only a peer's claim.
     ///
     /// `None` when there is no freezer, or when it already holds something --
@@ -266,8 +269,23 @@ impl HeaderWalk {
             reaching: Vec::new(),
             anchor_difficulty: None,
             freeze_horizon: number.saturating_sub(rustock_storage::freezer::FREEZE_DEPTH),
+            uncles_below: number.saturating_sub(rustock_storage::freezer::FREEZE_DEPTH),
             staging,
         }
+    }
+
+    /// The lowest block whose body the sync goes on to fetch. The uncles sent
+    /// beside every header under it are staged with the headers: they are the
+    /// only copy this node will get.
+    ///
+    /// Without this they were staged only under the freeze horizon, 20,000
+    /// blocks below the top, on the reasoning that every block above it is
+    /// inside the body window. The window is 6,000 blocks (rskj's
+    /// `BLOCKS_REQUIRED`), so the blocks between got neither, and their uncles
+    /// were lost (#270).
+    pub fn with_bodies_from(mut self, lowest: u64) -> Self {
+        self.uncles_below = lowest;
+        self
     }
 
     /// Difficulty summed across the headers of every run that has joined the
@@ -562,12 +580,9 @@ impl HeaderWalk {
         Ok(())
     }
 
-    /// Writes a verified run to the staging freezer.
-    ///
-    /// Only blocks below the freeze horizon: anything younger can still be
-    /// replaced by a reorg, and a file addressed by height has no way to say
-    /// "this height means something else now".
-    /// Stage the uncles a run of headers referenced, beside the headers.
+    /// Stage the uncles a run of headers referenced, beside the headers: those
+    /// of the blocks below the ones whose bodies the sync fetches
+    /// ([`Self::with_bodies_from`]), which bring their own.
     ///
     /// Same provisional footing as the headers: the chain is a peer's word
     /// until the walk reaches ground, so these go to the staging freezer and
@@ -578,17 +593,22 @@ impl HeaderWalk {
     /// chain's work nor serve `rsk/63` -- the sync it just performed.
     pub fn stage_uncles(&mut self, uncles: &[(u64, Vec<rustock_core::Header>)]) {
         let Some(staging) = self.staging.as_ref() else { return };
-        let horizon = self.freeze_horizon;
-        if horizon == 0 {
+        let below = self.uncles_below;
+        if below == 0 {
             return;
         }
         for (number, list) in uncles {
-            if *number < horizon {
+            if *number < below {
                 let _ = staging.put_uncles(*number, list);
             }
         }
     }
 
+    /// Writes a verified run to the staging freezer.
+    ///
+    /// Only blocks below the freeze horizon: anything younger can still be
+    /// replaced by a reorg, and a file addressed by height has no way to say
+    /// "this height means something else now".
     fn freeze_provisionally(&mut self, headers: &[rustock_core::Header]) {
         let Some(staging) = self.staging.as_ref() else { return };
         let horizon = self.freeze_horizon;
