@@ -881,6 +881,7 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
             let _ = ctx.journal_mut().load_account(dest);
             ctx.journal_mut().touch_account(dest);
         }
+        crate::tracer::record_precompile_transfer(ctx, BRIDGE_ADDR, dest, rbtc_amount);
         // RSKIP170 is required for v1, so pegin_btc (protocolVersion = 1).
         super::events::log_pegin_btc(ctx, dest, &btc_txid_event_bytes(&btc_tx), total_value, 1);
         record_pegin(
@@ -1099,6 +1100,7 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
             let _ = ctx.journal_mut().load_account(dest);
             ctx.journal_mut().touch_account(dest);
         }
+        crate::tracer::record_precompile_transfer(ctx, BRIDGE_ADDR, dest, rbtc_amount);
 
         // Peg-in events: lock_btc from RSKIP146, pegin_btc from RSKIP170
         // (a legacy peg-in past RSKIP170 logs pegin_btc with protocolVersion 0).
@@ -2013,6 +2015,7 @@ pub fn register_fast_bridge_btc_transaction<CTX: crate::RskContextTr>(
     if !rbtc_amount.is_zero() {
         let _ = ctx.journal_mut().transfer(BRIDGE_ADDR, lbc_address, rbtc_amount);
     }
+    crate::tracer::record_precompile_transfer(ctx, BRIDGE_ADDR, lbc_address, rbtc_amount);
 
     // saveFlyoverActiveFederationDataInStorage:
     //   - mark the flyover hash used (keyed by the legacy txid)
@@ -2969,6 +2972,12 @@ pub fn update_collections<CTX: crate::RskContextTr>(
                         if spent_by_federation < amount {
                             let to_burn = amount - spent_by_federation;
                             let _ = ctx.journal_mut().transfer(
+                                BRIDGE_ADDR,
+                                BURN_ADDR,
+                                btc_satoshi_to_rbtc_wei(to_burn),
+                            );
+                            crate::tracer::record_precompile_transfer(
+                                ctx,
                                 BRIDGE_ADDR,
                                 BURN_ADDR,
                                 btc_satoshi_to_rbtc_wei(to_burn),

@@ -622,6 +622,14 @@ impl RskExecutor {
         // reverted transaction looks like.
         let mut trace = evm.inspector.take_trace();
         outcome.apply_to(&mut trace);
+        let transfers = {
+            use revm::context_interface::ContextTr;
+            std::mem::take(&mut evm.ctx.chain_mut().precompile_transfers)
+        };
+        let to = Address::try_from(tx.to.as_ref()).ok();
+        if let Some(subtraces) = crate::tracer::precompile_subtraces(to, success, transfers) {
+            trace.subtraces = subtraces;
+        }
 
         Ok((
             TxExecutionResult {
@@ -1636,15 +1644,6 @@ impl RskExecutor {
 
             if is_remasc {
                 debug!(tx_index = i, "executing REMASC system call");
-                if traced.includes(i) {
-                    // REMASC never enters the EVM here, so the tracer records
-                    // nothing -- but rskj still produces a trace for it
-                    // (`TransactionExecutor.extractTrace`'s `program == null`
-                    // branch), and `trace_block` would otherwise be short one
-                    // entry per block. An empty trace renders as the
-                    // zero-gas, no-subtrace `call` rskj emits.
-                    traces.insert(i, crate::tracer::ProgramTrace::default());
-                }
                 // rskj `TransactionListExecutor.addFeesToRemascIfEnabled`:
                 // with the fees postponed, the block's whole total is
                 // credited to REMASC immediately BEFORE the REMASC
@@ -1683,6 +1682,28 @@ impl RskExecutor {
                     Some(&self.block_store),
                 )
                 .map_err(|e| ExecutionError::Evm(format!("REMASC: {e:?}")))?;
+                let transfers = {
+                    use revm::context_interface::ContextTr;
+                    std::mem::take(&mut evm.ctx.chain_mut().precompile_transfers)
+                };
+                if traced.includes(i) {
+                    // REMASC never enters the EVM here, so the tracer records
+                    // nothing -- but rskj still produces a trace for it
+                    // (`TransactionExecutor.extractTrace`'s `program == null`
+                    // branch), and `trace_block` would otherwise be short one
+                    // entry per block: the zero-gas `call` rskj emits, with a
+                    // CALL subtrace for each payment REMASC made
+                    // (`RemascFeesPayer.transferPayment`).
+                    let subtraces =
+                        crate::tracer::precompile_subtraces(Some(REMASC_ADDR), true, transfers);
+                    traces.insert(
+                        i,
+                        crate::tracer::ProgramTrace {
+                            subtraces: subtraces.unwrap_or_default(),
+                            ..Default::default()
+                        },
+                    );
+                }
                 {
                     use revm::context_interface::ContextTr;
                     // rskj `RemascStorageProvider.saveSiblings` runs on every
@@ -2112,12 +2133,23 @@ impl RskExecutor {
             let success = result.is_success();
             let gas_used = result.gas_used();
             let output = result.output().map(|o| o.to_vec()).unwrap_or_default();
+            // Every transaction's, traced or not, so that one's can't reach the
+            // next transaction's trace.
+            let transfers = {
+                use revm::context_interface::ContextTr;
+                std::mem::take(&mut evm.ctx.chain_mut().precompile_transfers)
+            };
             if traced.includes(i) {
                 // Taken here, not after the block: `take_trace` resets the
                 // tracer so the next transaction starts with an empty tree,
                 // and `result` is about to be consumed by `into_logs`.
                 let mut trace = evm.inspector.take_trace();
                 TracedOutcome::of(tx, *sender, &result, &output).apply_to(&mut trace);
+                let to = Address::try_from(tx.to.as_ref()).ok();
+                if let Some(subtraces) = crate::tracer::precompile_subtraces(to, success, transfers)
+                {
+                    trace.subtraces = subtraces;
+                }
                 traces.insert(i, trace);
             }
             let logs = result.into_logs();
@@ -12820,6 +12852,89 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
             .and_then(|data| AccountState::decode(&data).ok())
     }
 
+    /// REMASC's payments are CALL subtraces of the REMASC transaction's trace
+    /// (task 283): rskj's `RemascFeesPayer.payMiningFees` makes one in
+    /// `transferPayment` for every payment it logs, from REMASC with gas 0,
+    /// to the payee's word -- zero for the null address -- and
+    /// `TransactionExecutor.call` keeps them for `extractTrace`.
+    #[test]
+    fn remasc_payments_are_call_subtraces_of_its_trace() {
+        use alloy_rlp::Decodable;
+        let miner = Address::repeat_byte(0x11);
+        let fees = U256::from(21_000);
+        let cases: [(fn(Header) -> Header, Address); 2] =
+            [(|block| block, miner), (with_null_coinbase, Address::ZERO)];
+        for (coinbase, payee) in cases {
+            let chain: Vec<(Header, Vec<Header>)> = (0..15)
+                .map(|number| {
+                    let mut block = dummy_header(number);
+                    if number == 5 {
+                        block.beneficiary = miner;
+                        block.paid_fees = fees;
+                        block = coinbase(block);
+                    }
+                    (block, vec![])
+                })
+                .collect();
+            let blocks = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+            let mut parent_hash = B256::ZERO;
+            for (number, (block, _)) in chain.iter().enumerate() {
+                let mut block = block.clone();
+                block.parent_hash = parent_hash;
+                parent_hash = block.hash();
+                blocks.put_header_with_hash(parent_hash, &block).unwrap();
+                blocks
+                    .put_canonical_hash(number as u64, parent_hash)
+                    .unwrap();
+            }
+            let store = Arc::new(MemoryTrieStore::new());
+            let sender = Address::repeat_byte(0xAA);
+            let root = put_account(&TrieNode::empty(), store.as_ref(), &REMASC_ADDR, 0, fees);
+            let header = dummy_header(chain.len() as u64);
+            let remasc = rustock_core::Transaction::remasc(header.number);
+            let (result, traces) = RskExecutor::new(RskHardforkConfig::all_active(33), blocks)
+                .with_remasc_config(crate::remasc::RemascConfig::regtest())
+                .with_bridge_constants(crate::bridge::constants::BridgeConstants::mainnet())
+                .execute_block_call_traced(&header, &[(remasc, sender)], &root, store.clone())
+                .unwrap();
+
+            let topic = crate::bridge::events::legacy_topic("mining_fee_topic");
+            let paid: Vec<_> = result.tx_results[0]
+                .logs
+                .iter()
+                .filter(|log| log.topics()[0] == topic)
+                .map(|log| {
+                    let mut data = &log.data.data[..];
+                    alloy_rlp::Header::decode(&mut data).unwrap();
+                    B256::decode(&mut data).unwrap();
+                    (
+                        Address::from_word(log.topics()[1]),
+                        U256::decode(&mut data).unwrap(),
+                    )
+                })
+                .collect();
+            assert!(paid.contains(&(payee, U256::from(3_327))), "{paid:?}");
+            let call = Some(crate::tracer::CallKind::Call);
+            let subtraces: Vec<_> = traces[0]
+                .subtraces
+                .iter()
+                .map(|s| {
+                    let shape = (
+                        s.call_kind,
+                        s.caller,
+                        s.gas,
+                        s.gas_used,
+                        &s.input,
+                        &s.output,
+                    );
+                    assert_eq!(shape, (call, REMASC_ADDR, 0, 0, &vec![], &vec![]));
+                    (s.owner, s.value)
+                })
+                .collect();
+            assert_eq!(subtraces, paid, "one CALL per payment, in order");
+        }
+    }
+
     /// rskj pays an empty coinbase at its null address, an account of no
     /// address bytes, what it would pay any coinbase: the same sums, the same
     /// log but for a payee word of zero, and an account at its own trie key.
@@ -13075,7 +13190,7 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
 
         let header = dummy_header(3_103_055);
         let result = executor
-            .execute_block(&header, &[(tx, sender)], &root, store.clone())
+            .execute_block(&header, &[(tx.clone(), sender)], &root, store.clone())
             .expect("block executes");
         assert!(result.tx_results[0].success, "updateCollections succeeds");
 
@@ -13095,6 +13210,130 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
             .map(|a| a.info.balance)
             .unwrap_or_default();
         assert_eq!(bridge_balance, one_rbtc - burned, "burn debits the Bridge");
+
+        // rskj's `transferTo(BURN_ADDRESS, ...)` is a CALL subtrace of the
+        // transaction's trace, from the Bridge with gas 0 (task 283).
+        let (_, traces) = executor
+            .execute_block_call_traced(&header, &[(tx, sender)], &root, store.clone())
+            .expect("block executes traced");
+        let subtraces: Vec<_> = traces[0]
+            .subtraces
+            .iter()
+            .map(|s| {
+                (
+                    s.call_kind,
+                    s.caller,
+                    s.owner,
+                    s.value,
+                    s.gas,
+                    s.gas_used,
+                    s.input.len(),
+                )
+            })
+            .collect();
+        let call = Some(crate::tracer::CallKind::Call);
+        let bridge = crate::precompiles::BRIDGE_ADDR;
+        assert_eq!(subtraces, vec![(call, bridge, burn_addr, burned, 0, 0, 0)]);
+    }
+
+    /// A transaction sent straight to the Bridge carries the Bridge's
+    /// transfers as CALL subtraces (task 283): rskj's `BridgeSupport.transferTo`
+    /// adds one, `TransactionExecutor.call` keeps them once `execute` returns
+    /// and `extractTrace` hangs them under the transaction's trace. Here the
+    /// refund of what a sender other than the union bridge sent
+    /// `releaseUnionBridgeRbtc()` (`BridgeSupport.releaseUnionBridgeRbtc`). The
+    /// same call from a contract carries none: `callToPrecompiledAddress`
+    /// reads no subtraces.
+    #[test]
+    fn a_bridge_transfer_is_a_call_subtrace_of_a_transaction_to_the_bridge() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let bridge = crate::precompiles::BRIDGE_ADDR;
+        let sender = Address::repeat_byte(0x5e);
+        let contract = Address::repeat_byte(0xca);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let selector = alloy_primitives::keccak256(b"releaseUnionBridgeRbtc()")[..4].to_vec();
+        // MSTORE the selector at 0; CALL(100000, Bridge, 5, 0, 4, 0, 0); STOP.
+        let mut code = vec![0x7f];
+        code.extend_from_slice(&selector);
+        code.extend_from_slice(&[0; 28]);
+        code.extend_from_slice(&[0x60, 0x00, 0x52, 0x60, 0x00, 0x60, 0x00, 0x60, 0x04]);
+        code.extend_from_slice(&[0x60, 0x00, 0x60, 0x05, 0x73]);
+        code.extend_from_slice(bridge.as_slice());
+        code.extend_from_slice(&[0x62, 0x01, 0x86, 0xa0, 0xf1, 0x00]);
+        let root = put_account(&TrieNode::empty(), store.as_ref(), &sender, 0, one_rbtc);
+        let root = put_account_with_code(&root, store.as_ref(), &contract, 0, one_rbtc, &code);
+        let executor = RskExecutor::new(
+            // reed810, for RSKIP502's union bridge methods.
+            RskHardforkConfig::all_active_parallel(33),
+            Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap()),
+        );
+        let tx = |nonce: u64, to: Address, input: &[u8]| rustock_core::Transaction {
+            nonce,
+            gas_price: U256::ZERO,
+            gas_limit: U256::from(300_000),
+            to: Bytes::copy_from_slice(to.as_slice()),
+            value: U256::from(5),
+            input: Bytes::copy_from_slice(input),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
+        };
+        let subtraces = |trace: &crate::tracer::ProgramTrace| {
+            trace
+                .subtraces
+                .iter()
+                .map(|s| (s.call_kind, s.caller, s.owner, s.value, s.gas, s.gas_used))
+                .collect::<Vec<_>>()
+        };
+        let call = Some(crate::tracer::CallKind::Call);
+        let refund = vec![(call, bridge, sender, U256::from(5), 0, 0)];
+
+        // As `trace_*` runs a block. The contract's call comes first, and what
+        // the Bridge transferred in it stays out of the next one's trace.
+        let header = dummy_header(1_000);
+        let transactions = [
+            (tx(0, contract, &[]), sender),
+            (tx(1, bridge, &selector), sender),
+        ];
+        let (result, traces) = executor
+            .execute_block_call_traced(&header, &transactions, &root, store.clone())
+            .expect("the block executes");
+        assert!(result.tx_results.iter().all(|r| r.success));
+        assert_eq!(
+            subtraces(&traces[0]),
+            vec![],
+            "nothing from a contract's call"
+        );
+        assert_eq!(
+            subtraces(&traces[1]),
+            refund,
+            "the refund, under its own trace"
+        );
+
+        // And as one transaction is traced.
+        let (one, trace) = executor
+            .execute_tx_traced(
+                &header,
+                &tx(0, bridge, &selector),
+                sender,
+                &root,
+                store.clone(),
+                false,
+                0,
+            )
+            .expect("the transaction executes");
+        assert!(one.success);
+        assert_eq!(subtraces(&trace), refund);
+
+        // Only a successful call straight to a precompile that transfers.
+        let transfers = || vec![(bridge, sender, U256::from(5))];
+        let attached = |to, success| crate::tracer::precompile_subtraces(to, success, transfers());
+        assert!(attached(Some(bridge), true).is_some());
+        assert!(attached(Some(crate::precompiles::REMASC_ADDR), true).is_some());
+        assert!(attached(Some(bridge), false).is_none());
+        assert!(attached(Some(contract), true).is_none());
+        assert!(attached(None, true).is_none());
     }
 
     /// Deploying onto an address that already holds a balance destroys that

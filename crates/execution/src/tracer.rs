@@ -195,6 +195,61 @@ pub struct Subtrace {
     pub subtraces: Vec<Subtrace>,
 }
 
+/// Notes a value transfer that rskj reports as a CALL subtrace of a call to
+/// a precompile: `BridgeSupport.transferTo` and
+/// `RemascFeesPayer.transferPayment` add one for every transfer they make, a
+/// zero one included.
+pub fn record_precompile_transfer<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    from: Address,
+    to: Address,
+    value: U256,
+) {
+    ctx.chain_mut().precompile_transfers.push((from, to, value));
+}
+
+/// The subtraces rskj hangs under a transaction sent straight to a
+/// precompile, if `success` and `to` is one that transfers: one CALL per
+/// transfer it made, from the precompile to the payee, with gas 0 and an empty
+/// result (`TransferInvoke(from, to, 0L, value)`,
+/// `ProgramSubtrace.newCallSubtrace`). `TransactionExecutor.call` takes
+/// `precompiledContract.getSubtraces()` once `execute` returns and
+/// `extractTrace` hangs them under the transaction's trace; a precompile a
+/// contract calls adds nothing (`Program.callToPrecompiledAddress` reads no
+/// subtraces), so its transfers are dropped.
+pub fn precompile_subtraces(
+    to: Option<Address>,
+    success: bool,
+    transfers: Vec<(Address, Address, U256)>,
+) -> Option<Vec<Subtrace>> {
+    let to = to?;
+    if !success || (to != crate::BRIDGE_ADDR && to != crate::REMASC_ADDR) {
+        return None;
+    }
+    Some(
+        transfers
+            .into_iter()
+            .map(|(from, to, value)| Subtrace {
+                kind: SubtraceKind::Call,
+                call_kind: Some(CallKind::Call),
+                is_create2: false,
+                caller: from,
+                owner: to,
+                code_address: None,
+                gas: 0,
+                gas_used: 0,
+                value,
+                input: Vec::new(),
+                output: Vec::new(),
+                created_address: None,
+                error: None,
+                reverted: false,
+                subtraces: Vec::new(),
+            })
+            .collect(),
+    )
+}
+
 /// A frame the tracer has entered and not yet left.
 struct OpenFrame {
     kind: SubtraceKind,

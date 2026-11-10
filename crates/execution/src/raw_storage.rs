@@ -46,6 +46,13 @@ pub struct RskChainExt {
     /// has no bytes, so revm can't hold its account, and the trie is
     /// credited at the block's end instead (`ContractMarkers::null_account`).
     pub null_account: Option<U256>,
+    /// The value transfers rskj's Bridge and REMASC each report as a CALL
+    /// subtrace (`BridgeSupport.transferTo`, `RemascFeesPayer.transferPayment`),
+    /// in order: from, to, value. Trace-only: the executor takes it after every
+    /// transaction and hangs it under the transaction's trace when the
+    /// transaction called the precompile itself
+    /// (`crate::tracer::record_precompile_transfer`).
+    pub precompile_transfers: Vec<(Address, Address, U256)>,
 }
 
 /// Raw-bytes storage overlay for the block being executed.

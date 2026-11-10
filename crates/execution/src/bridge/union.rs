@@ -536,6 +536,8 @@ fn transfer_from_bridge<CTX: crate::RskContextTr>(
     ctx.journal_mut()
         .transfer(crate::precompiles::BRIDGE_ADDR, to, amount)
         .map_err(|e| PrecompileError::other(format!("union bridge transfer: {e:?}")))?;
+    // rskj `BridgeSupport.transferTo` reports it as a CALL subtrace.
+    crate::tracer::record_precompile_transfer(ctx, crate::precompiles::BRIDGE_ADDR, to, amount);
     Ok(())
 }
 

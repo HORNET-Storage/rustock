@@ -425,6 +425,9 @@ fn pay_mining_fees<CTX: crate::RskContextTr>(
         }
         None => pay_null_address(ctx, value),
     }
+    // rskj `transferPayment` reports the payment as a CALL subtrace to the
+    // payee, whose word is zero for the null address.
+    crate::tracer::record_precompile_transfer(ctx, REMASC_ADDR, to.unwrap_or(Address::ZERO), value);
 
     let mut inner = Vec::with_capacity(40);
     processing_block_hash.as_slice().encode(&mut inner);
