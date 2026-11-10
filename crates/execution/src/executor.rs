@@ -8571,6 +8571,187 @@ mod tests {
         }
     }
 
+    /// rskj reads a pegout's satoshis as a Java `long` (`Coin.toBitcoin`,
+    /// `longValue()`), so 2^63 satoshis or more wrap, as regtest's balances
+    /// of 10^30 wei can reach, and the long decides the rejection. Before
+    /// RSKIP427 a rejection's event carries that long, sign-extended where
+    /// it is negative (`SolidityType.IntType.encodeInt`), and its refund is
+    /// `Coin.fromBitcoin` of it, which `Repository.transfer` moves from the
+    /// sender to the Bridge where it is negative. A contract's call is
+    /// refused with no refund, and its event carries the long alike. From
+    /// RSKIP427 the refund and the event are the call's wei.
+    #[test]
+    fn a_pegout_whose_satoshis_wrap_is_logged_and_refunded_as_rskj_does() {
+        let bridge = crate::precompiles::BRIDGE_ADDR;
+        let sender = Address::repeat_byte(0xAA);
+        let contract = Address::repeat_byte(0xC5);
+        let plenty = U256::from(10u64).pow(U256::from(30));
+        let in_wei = |satoshis: U256| satoshis * U256::from(10_000_000_000u64);
+        let two_63 = U256::from(1u64) << 63;
+        // A pegout of `satoshis` on mainnet at `height`, past RSKIP185 and
+        // RSKIP219, sent by the sender or through a contract that sends it
+        // to the Bridge with no data, which is releaseBtc: the rejection's
+        // sender and words, and what the sender (its fee aside), the
+        // contract and the Bridge hold after.
+        let run = |height: u64, satoshis: U256, through_contract: bool| {
+            let value = in_wei(satoshis);
+            let store = Arc::new(MemoryTrieStore::new());
+            let mut root = put_account(&TrieNode::empty(), store.as_ref(), &sender, 0, plenty);
+            let (to, tx_value) = if through_contract {
+                // No return area, no data; the value; the Bridge; all the gas.
+                let mut code = vec![0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x7f];
+                code.extend_from_slice(&value.to_be_bytes::<32>());
+                code.push(0x73);
+                code.extend_from_slice(bridge.as_slice());
+                code.extend_from_slice(&[0x5a, 0xf1, 0x50, 0x00]); // GAS, CALL, POP, STOP
+                root = put_account_with_code(&root, store.as_ref(), &contract, 1, plenty, &code);
+                (contract, U256::ZERO)
+            } else {
+                (bridge, value)
+            };
+            let gas_price = U256::from(60_000_000u64);
+            let tx = rustock_core::Transaction {
+                nonce: 0,
+                gas_price,
+                gas_limit: U256::from(1_000_000),
+                to: Bytes::copy_from_slice(to.as_slice()),
+                value: tx_value,
+                input: Bytes::new(),
+                v: 0,
+                r: U256::ZERO,
+                s: U256::ZERO,
+                cached_rlp: None,
+            };
+            let block_store =
+                Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+            let result = RskExecutor::new(RskHardforkConfig::mainnet(), block_store)
+                .execute_block(&dummy_header(height), &[(tx, sender)], &root, store)
+                .expect("block executes");
+            let tx = &result.tx_results[0];
+            assert!(tx.success);
+            let [log] = &tx.logs[..] else {
+                panic!("one event, not {}", tx.logs.len());
+            };
+            let topics = log.data.topics();
+            assert_eq!(
+                topics[0],
+                alloy_primitives::keccak256("release_request_rejected(address,uint256,int256)")
+            );
+            let words: Vec<U256> = log.data.data.chunks(32).map(U256::from_be_slice).collect();
+            let holds = |address: &Address| {
+                result
+                    .state_changes
+                    .get(address)
+                    .map_or(U256::ZERO, |account| account.info.balance)
+            };
+            let fee = U256::from(tx.gas_used) * gas_price;
+            (
+                Address::from_word(topics[1]),
+                words,
+                holds(&sender) + fee,
+                holds(&contract),
+                holds(&bridge),
+            )
+        };
+
+        // Short of RSKIP427. Whichever minimum binds, a satoshi is below it.
+        let before = 7_000_000;
+        let reason = run(before, U256::from(1u64), false).1[1];
+        let negative = two_63 + U256::from(5u64); // a long of 5 - 2^63
+        let below_zero = U256::ZERO.wrapping_sub(two_63 - U256::from(5u64));
+        let positive = (two_63 << 1) + U256::from(5u64); // a long of 5
+        let two_64 = in_wei(two_63 << 1);
+        // A long that wraps negative is logged sign-extended and refunded
+        // negative: the Bridge takes 2^63 - 5 satoshis more from the sender.
+        assert_eq!(
+            run(before, negative, false),
+            (
+                sender,
+                vec![below_zero, reason],
+                plenty - two_64,
+                U256::ZERO,
+                two_64
+            )
+        );
+        // One that wraps positive is logged and refunded as the long it is.
+        assert_eq!(
+            run(before, positive, false),
+            (
+                sender,
+                vec![U256::from(5u64), reason],
+                plenty - two_64,
+                U256::ZERO,
+                two_64
+            )
+        );
+        // A contract's is refused with no refund, its long logged alike.
+        let sent = in_wei(negative);
+        assert_eq!(
+            run(before, negative, true),
+            (
+                contract,
+                vec![below_zero, U256::from(2u64)],
+                plenty,
+                plenty - sent,
+                sent
+            )
+        );
+
+        // From RSKIP427 (lovell700) the long still refuses the pegout, and
+        // the sender gets all its wei back, which the event carries.
+        let lovell700 = 7_338_024;
+        let reason = run(lovell700, U256::from(1u64), false).1[1];
+        assert_eq!(
+            run(lovell700, negative, false),
+            (sender, vec![sent, reason], plenty, U256::ZERO, U256::ZERO)
+        );
+    }
+
+    /// rskj `BridgeSupport.requestRelease`: from RSKIP219 a pegout of the
+    /// minimum itself is queued and one a satoshi short refused; before it,
+    /// one of the legacy minimum is refused and one a satoshi over queued.
+    #[test]
+    fn a_pegout_of_the_minimum_is_queued_from_rskip219_and_refused_before_it() {
+        use crate::bridge::storage::{
+            bridge_storage_key, RELEASE_REQUEST_QUEUE_KEY, RELEASE_REQUEST_QUEUE_WITH_TXHASH_KEY,
+        };
+        let bridge = crate::precompiles::BRIDGE_ADDR;
+        let queues = [
+            RELEASE_REQUEST_QUEUE_KEY,
+            RELEASE_REQUEST_QUEUE_WITH_TXHASH_KEY,
+        ]
+        .map(bridge_storage_key);
+        let rejected =
+            alloy_primitives::keccak256("release_request_rejected(address,uint256,int256)");
+        // Whether a pegout of `satoshis` at `height` reaches a release queue,
+        // and the reason its rejection logs, if it logs one.
+        let run = |cfg: RskHardforkConfig, height: u64, satoshis: u64| {
+            let value = U256::from(satoshis) * U256::from(10_000_000_000u64);
+            let result = execute_alone(cfg, height, bridge, value, 1_000_000, &[], &[]);
+            let tx = &result.tx_results[0];
+            assert!(tx.success);
+            let raw = &result.markers.raw_storage;
+            let queued = raw
+                .iter()
+                .any(|(address, key, _)| *address == bridge && queues.contains(key));
+            let log = tx.logs.iter().find(|log| log.data.topics()[0] == rejected);
+            (
+                queued,
+                log.map(|log| U256::from_be_slice(&log.data.data[32..])),
+            )
+        };
+        // rustock's regtest has no federation, so its fee estimate is far
+        // below its 250,000-satoshi minimum, which binds: LOW_AMOUNT.
+        let regtest = RskHardforkConfig::regtest;
+        assert_eq!(run(regtest(), 1, 250_000), (true, None));
+        assert_eq!(run(regtest(), 1, 249_999), (false, Some(U256::from(1u64))));
+        // Mainnet before iris300, which brings RSKIP219 and RSKIP185's
+        // events and refunds: the legacy 800,000 satoshis are refused.
+        let mainnet = RskHardforkConfig::mainnet;
+        assert_eq!(run(mainnet(), 3_000_000, 800_001), (true, None));
+        assert_eq!(run(mainnet(), 3_000_000, 800_000), (false, None));
+    }
+
     /// **No call to a precompile panics the node.**
     ///
     /// Anyone can send a transaction, or ask for an `eth_call`, that calls a

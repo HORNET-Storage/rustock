@@ -2436,13 +2436,14 @@ pub fn release_btc<CTX: crate::RskContextTr>(
     let satoshis_per_wei = U256::from(10_000_000_000u64);
     let amount_satoshis_u256 = call_value_wei / satoshis_per_wei;
     // rskj `co.rsk.core.Coin.toBitcoin()` takes the satoshis' `longValue()`,
-    // their low 64 bits, and the minimum, the event and the refund before
-    // RSKIP427 all use that long. No mainnet or testnet balance comes near
-    // 2^63 satoshis, but regtest's genesis funds accounts with 10^30 wei,
-    // which wrap. A long that wraps negative is below every minimum; rskj
-    // would then log it negative and refund a negative amount, which this
-    // reads as zero (a regtest-only difference).
-    let amount_satoshis = u64::try_from(amount_satoshis_u256.as_limbs()[0] as i64).unwrap_or(0);
+    // their low 64 bits as a signed long, and the minimum, the events and the
+    // refund before RSKIP427 all use that long. No mainnet or testnet balance
+    // comes near 2^63 satoshis, but regtest's genesis funds accounts with
+    // 10^30 wei, which wrap, and wrap negative past 2^63: a negative long is
+    // below every minimum, and rskj logs and refunds it as it is.
+    let satoshis = amount_satoshis_u256.as_limbs()[0] as i64;
+    // The amount the events carry before RSKIP427.
+    let satoshis_word = long_word(satoshis);
 
     // rskj `BridgeSupport.releaseBtc` (BridgeSupport.java:891) rejects a peg-out
     // requested by a CONTRACT before any min-value check, because a BTC address
@@ -2460,7 +2461,7 @@ pub fn release_btc<CTX: crate::RskContextTr>(
             let event_amount = if hardfork_cfg.has_rskip427(block_number) {
                 call_value_wei
             } else {
-                U256::from(amount_satoshis)
+                satoshis_word
             };
             super::events::log_release_request_rejected(
                 ctx,
@@ -2495,14 +2496,14 @@ pub fn release_btc<CTX: crate::RskContextTr>(
             config,
         );
         let min_value = config.minimum_pegout_tx_value.max(require_funds_for_fee);
-        if amount_satoshis < min_value {
+        if i128::from(satoshis) < i128::from(min_value) {
             // rskj: FEE_ABOVE_VALUE when minValue == requireFundsForFee, else
             // LOW_AMOUNT. RejectedPegoutReason: LOW_AMOUNT=1, FEE_ABOVE_VALUE=3.
             Some(if min_value == require_funds_for_fee { 3 } else { 1 })
         } else {
             None
         }
-    } else if amount_satoshis <= config.legacy_minimum_pegout_tx_value {
+    } else if i128::from(satoshis) <= i128::from(config.legacy_minimum_pegout_tx_value) {
         Some(1) // legacy: always LOW_AMOUNT
     } else {
         None
@@ -2518,21 +2519,28 @@ pub fn release_btc<CTX: crate::RskContextTr>(
             // `Coin.fromBitcoin(weis.toBitcoin())` — the wei truncated to satoshi
             // granularity, which silently kept the sub-satoshi remainder in the
             // Bridge (mainnet #8,010,127: a 340,353-sat pegout below the 400,000
-            // minimum, 4,349,191,903 wei of sub-satoshi remainder).
-            let refund_wei = if hardfork_cfg.has_rskip427(block_number) {
-                call_value_wei
+            // minimum, 4,349,191,903 wei of sub-satoshi remainder). That is the
+            // long's satoshis back in wei, negative where the long is, and
+            // rskj's `Repository.transfer` moves a negative amount the other way:
+            // from the sender to the Bridge. A sender holding less would go
+            // below zero in rskj, which no balance here can; then nothing moves.
+            let (from, to, refund_wei) = if hardfork_cfg.has_rskip427(block_number) {
+                (BRIDGE_ADDR, tx_ctx.rsk_sender, call_value_wei)
             } else {
-                U256::from(amount_satoshis) * satoshis_per_wei
+                let refund = U256::from(satoshis.unsigned_abs()) * satoshis_per_wei;
+                if satoshis < 0 {
+                    (tx_ctx.rsk_sender, BRIDGE_ADDR, refund)
+                } else {
+                    (BRIDGE_ADDR, tx_ctx.rsk_sender, refund)
+                }
             };
-            let _ = ctx
-                .journal_mut()
-                .transfer(BRIDGE_ADDR, tx_ctx.rsk_sender, refund_wei);
+            let _ = ctx.journal_mut().transfer(from, to, refund_wei);
             // Pre-RSKIP427 the event amount is in satoshis; post-427 it is the
             // full wei call value (rskj logs `releaseRequestedValueInWeis`).
             let event_amount = if hardfork_cfg.has_rskip427(block_number) {
                 call_value_wei
             } else {
-                U256::from(amount_satoshis)
+                satoshis_word
             };
             super::events::log_release_request_rejected(
                 ctx,
@@ -2543,6 +2551,9 @@ pub fn release_btc<CTX: crate::RskContextTr>(
         }
         return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
     }
+
+    // Accepted: the long is at least the minimum, so not negative.
+    let amount_satoshis = satoshis.unsigned_abs();
 
     // BTC destination: RIPEMD160(SHA256(compressed_pubkey)) derived from tx sender.
     // tx_ctx.btc_sender_hash160 was computed by the executor from the RSK tx signature,
@@ -2587,7 +2598,7 @@ pub fn release_btc<CTX: crate::RskContextTr>(
         let event_amount = if hardfork_cfg.has_rskip427(block_number) {
             call_value_wei
         } else {
-            U256::from(amount_satoshis)
+            satoshis_word
         };
         super::events::log_release_request_received(
             ctx,
@@ -2600,6 +2611,18 @@ pub fn release_btc<CTX: crate::RskContextTr>(
     }
 
     Ok(PrecompileOutput::new(gas_cost, Bytes::new()))
+}
+
+/// A Java `long` as rskj writes it into an event's word
+/// (`SolidityType.IntType.encodeInt`): sign-extended to 32 bytes, in a
+/// `uint256` field as in an `int256` one.
+fn long_word(long: i64) -> U256 {
+    let magnitude = U256::from(long.unsigned_abs());
+    if long < 0 {
+        magnitude.wrapping_neg()
+    } else {
+        magnitude
+    }
 }
 
 // ---------------------------------------------------------------------------
