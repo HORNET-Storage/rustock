@@ -4043,6 +4043,128 @@ async fn a_block_a_peer_sends_is_handed_to_the_sync_service() {
     assert_eq!(got.hash(), block.hash());
 }
 
+// -- rskj's peer.bannedMiners (task 285) ------------------------------------
+
+/// A handler refusing blocks mined by `banned`, and its event channel.
+fn handler_banning(
+    banned: Address,
+) -> (
+    SyncHandler,
+    mpsc::UnboundedReceiver<crate::SyncEvent>,
+    tempfile::TempDir,
+) {
+    let dir = tempdir().unwrap();
+    let manager = Arc::new(SyncManager::new(
+        Arc::new(BlockStore::open(dir.path()).unwrap()),
+        Arc::new(HeaderVerifier::new()),
+        Arc::new(rustock_networking::peers::PeerStore::new()),
+    ));
+    let (event_tx, event_rx) = mpsc::unbounded_channel();
+    let handler = SyncHandler::new(manager, event_tx)
+        .with_banned_miners(std::collections::HashSet::from([banned]));
+    (handler, event_rx, dir)
+}
+
+/// A `BlockMessage` carrying `header`'s block.
+fn block_message(header: Header) -> rustock_networking::protocol::P2pMessage {
+    use rustock_networking::protocol::{P2pMessage, RskMessage, RskSubMessage};
+    P2pMessage::RskMessage(RskMessage::new(RskSubMessage::Block(Box::new(whole(
+        header,
+    )))))
+}
+
+/// rskj `NodeMessageHandler.allowByMinerNotBanned`: a block a peer sends
+/// whole is not taken when its coinbase is on `peer.bannedMiners`, and one
+/// mined by anyone else is.
+#[tokio::test]
+async fn a_block_from_a_banned_miner_is_not_taken() {
+    use rustock_networking::protocol::P2pHandler;
+
+    let banned = Address::repeat_byte(0xBA);
+    let (handler, mut event_rx, _dir) = handler_banning(banned);
+    let mined_by = |coinbase: Address| {
+        let mut header = dummy_header(1, B256::repeat_byte(1), U256::from(1));
+        header.beneficiary = coinbase;
+        block_message(header)
+    };
+
+    let sender = B512::repeat_byte(4);
+    assert!(handler.handle_message(sender, &mined_by(banned)).is_none());
+    let taken = event_rx.try_recv().is_ok();
+    assert!(!taken, "a banned miner's block was taken");
+
+    handler.handle_message(sender, &mined_by(Address::repeat_byte(0x0C)));
+    assert!(matches!(
+        event_rx.try_recv(),
+        Ok(crate::SyncEvent::NewBlock { .. })
+    ));
+}
+
+/// The coinbase compared is the one rskj reads (`Header::coinbase`): an
+/// empty one is its null address, which a banned zero address doesn't match.
+/// The zero address written out is banned like any other.
+#[tokio::test]
+async fn an_empty_coinbase_is_not_a_banned_zero_address() {
+    use rustock_networking::protocol::P2pHandler;
+
+    let (handler, mut event_rx, _dir) = handler_banning(Address::ZERO);
+    let mut empty = dummy_header(1, B256::repeat_byte(1), U256::from(1));
+    empty.kept = Some(Box::new(rustock_core::types::header::KeptFields {
+        null_coinbase: true,
+        ..Default::default()
+    }));
+    assert_eq!(empty.beneficiary, Address::ZERO);
+
+    handler.handle_message(B512::repeat_byte(4), &block_message(empty));
+    assert!(
+        matches!(event_rx.try_recv(), Ok(crate::SyncEvent::NewBlock { .. })),
+        "a block with an empty coinbase was refused"
+    );
+
+    let zero = dummy_header(2, B256::repeat_byte(1), U256::from(1));
+    handler.handle_message(B512::repeat_byte(4), &block_message(zero));
+    let taken = event_rx.try_recv().is_ok();
+    assert!(!taken, "the zero address's block was taken");
+}
+
+/// `peer.bannedMiners` entries read as rskj reads them, `new
+/// RskAddress(String)` (`HexUtils.stringHexToByteArray`, then exactly 20
+/// bytes); one that doesn't read stops the node starting, as rskj's does.
+#[test]
+fn banned_miners_are_read_as_rskj_reads_them() {
+    let read = |entries: &[&str]| {
+        let entries: Vec<String> = entries.iter().map(|e| e.to_string()).collect();
+        crate::parse_banned_miners(&entries)
+    };
+    let ones = Address::repeat_byte(0x11);
+    let set = |a: Address| Ok(std::collections::HashSet::from([a]));
+    for entry in [
+        "0x1111111111111111111111111111111111111111",
+        "1111111111111111111111111111111111111111",
+    ] {
+        assert_eq!(read(&[entry]), set(ones), "{entry:?}");
+    }
+    // An odd number of digits is read with a leading zero.
+    let mut padded = [0x11u8; 20];
+    padded[0] = 0x01;
+    assert_eq!(
+        read(&["0x111111111111111111111111111111111111111"]),
+        set(Address::from(padded))
+    );
+    // A lowercase prefix, once; hex; twenty bytes, no more and no fewer.
+    for bad in [
+        "0X1111111111111111111111111111111111111111",
+        "0x0x1111111111111111111111111111111111111111",
+        "0xzz11111111111111111111111111111111111111",
+        "0x11111111111111111111111111111111111111",
+        "0x111111111111111111111111111111111111111111",
+        "0x",
+        "",
+    ] {
+        assert!(read(&[bad]).is_err(), "{bad:?} was read as an address");
+    }
+}
+
 /// The edges of rskj's two distance guards are taken: a block a whole
 /// skeleton above the best one, and one just young enough to be an uncle. Each
 /// has no parent here, so each is taken as an announcement of itself: its

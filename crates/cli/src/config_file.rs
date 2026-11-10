@@ -196,6 +196,9 @@ pub struct PeersSection {
     /// Addresses or CIDR blocks refused at connection time, as rskj's
     /// `peer.bannedPeerIPs`.
     pub banned_peers: Option<Vec<String>>,
+    /// Coinbases whose blocks are refused when a peer sends them whole, as
+    /// rskj's `peer.bannedMiners`.
+    pub banned_miners: Option<Vec<String>>,
     /// Discovery bootstrap addresses, `HOST:PORT`. **Replaces** the chain's
     /// built-in list rather than adding to it, which is what makes a private
     /// two-node network possible.
@@ -446,6 +449,7 @@ pub const CONFIGURABLE: &[&str] = &[
     "max_inbound_per_cidr",
     "inbound_cidr_prefix",
     "banned_peers",
+    "banned_miners",
     "bootnodes",
     "no_peer_punishment",
     "btc_block_cache_entries",

@@ -1,12 +1,13 @@
 use crate::events::SyncEvent;
 use crate::manager::SyncManager;
-use alloy_primitives::B512;
+use alloy_primitives::{Address, B512};
 use crate::snap::server::SnapServer;
 use rustock_networking::protocol::{
     BlockHashResponse, BlockHeadersResponse, BlockHeadersWithUnclesResponse, BlockIdentifier,
     BodyResponse, HeaderWithUncles,
     P2pHandler, P2pMessage, RskMessage, RskSubMessage, SkeletonResponse,
 };
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, trace, warn};
@@ -70,6 +71,39 @@ pub struct SyncHandler {
     /// applying mainnet's to a testnet peer is a category error that happens to
     /// be harmless only because testnet totals are too small to trip it.
     checkpoint: Option<rustock_core::checkpoint::DifficultyCheckpoint>,
+    /// Coinbases whose blocks are not taken from a peer that sends them
+    /// whole: rskj's `peer.bannedMiners` (`NodeMessageHandler.bannedMiners`).
+    banned_miners: HashSet<Address>,
+}
+
+/// rskj's `peer.bannedMiners` entries as its `NodeMessageHandler` reads them,
+/// `new RskAddress(String)` each (L134-136): a `0x` prefix dropped, an odd
+/// number of digits read with a leading zero (`HexUtils.stringHexToByteArray`),
+/// and anything but 20 bytes refused, which keeps rskj from starting.
+pub fn parse_banned_miners(entries: &[String]) -> Result<HashSet<Address>, String> {
+    entries
+        .iter()
+        .map(|entry| {
+            let digits = entry.strip_prefix("0x").unwrap_or(entry);
+            let digits = if digits.len() % 2 == 1 {
+                format!("0{digits}")
+            } else {
+                digits.to_string()
+            };
+            // Checked here, so a second `0x` is refused as rskj's decoder
+            // refuses it rather than dropped as `hex::decode` would.
+            if !digits.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Err(format!("{entry:?} is not hex"));
+            }
+            let bytes = alloy_primitives::hex::decode(&digits)
+                .map_err(|e| format!("{entry:?} is not hex: {e}"))?;
+            if bytes.len() != Address::len_bytes() {
+                let len = bytes.len();
+                return Err(format!("{entry:?} is {len} bytes; an address is 20"));
+            }
+            Ok(Address::from_slice(&bytes))
+        })
+        .collect()
 }
 
 impl SyncHandler {
@@ -82,6 +116,7 @@ impl SyncHandler {
             serve_ceiling: None,
             checkpoint_defence: rustock_core::checkpoint::CheckpointDefence::NONE,
             checkpoint: None,
+            banned_miners: HashSet::new(),
         }
     }
 
@@ -107,6 +142,13 @@ impl SyncHandler {
     /// Serve nothing above `height`. See [`Self::serve_ceiling`].
     pub fn with_serve_ceiling(mut self, height: Option<u64>) -> Self {
         self.serve_ceiling = height;
+        self
+    }
+
+    /// Refuse a block a peer sends whole when its coinbase is one of these:
+    /// rskj's `peer.bannedMiners`. See [`parse_banned_miners`].
+    pub fn with_banned_miners(mut self, banned_miners: HashSet<Address>) -> Self {
+        self.banned_miners = banned_miners;
         self
     }
 
@@ -647,6 +689,23 @@ impl P2pHandler for SyncHandler {
                     });
                 }
                 RskSubMessage::Block(block) => {
+                    // rskj `NodeMessageHandler.allowByMinerNotBanned`
+                    // (L244-256), which `controlMessageIngress` asks before the
+                    // block is queued: one mined by a banned coinbase is not
+                    // taken. An empty coinbase is rskj's null address, which
+                    // no listed address is, the zero address included.
+                    let banned = block
+                        .header
+                        .coinbase()
+                        .filter(|miner| self.banned_miners.contains(miner));
+                    if let Some(miner) = banned {
+                        trace!(
+                            target: "rustock::sync",
+                            "Received block mined by banned miner {miner} from peer {:?}, not taken",
+                            &id.0[..4]
+                        );
+                        return None;
+                    }
                     let _ = self.event_tx.send(SyncEvent::NewBlock {
                         peer: id,
                         block: block.clone(),

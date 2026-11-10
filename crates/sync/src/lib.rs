@@ -27,7 +27,7 @@ pub mod watchdog;
 // Re-exports for external consumers
 pub use announce::{broadcast_block, on_mined};
 pub use events::SyncEvent;
-pub use handler::SyncHandler;
+pub use handler::{parse_banned_miners, SyncHandler};
 pub use manager::SyncManager;
 pub use service::{BestBlockListeners, ExternalBlockSource, SyncService};
 pub use state::{InFlightBody, SyncState};

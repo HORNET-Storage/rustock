@@ -115,6 +115,9 @@
 # inbound_cidr_prefix = 24          # default
 # bootnodes = ["127.0.0.1:30304"]   # default: unset — replaces the chain's built-in list; port is listen+1
 # banned_peers = ["203.0.113.0/24"] # default: unset — refused at connection time; rskj's peer.bannedPeerIPs
+# A block a peer sends whole is refused when its coinbase is one of these
+# 20-byte addresses, hex with or without 0x (rskj's peer.bannedMiners).
+# banned_miners = ["0x1111111111111111111111111111111111111111"] # default: unset
 # no_peer_punishment = false        # default — count scoring events but never act on them
 # Never learn node ids from peers and never dial them. With `bootnodes` this
 # pins the node to exactly the addresses named there, which is what makes a

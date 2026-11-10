@@ -216,6 +216,16 @@ struct Args {
     #[arg(long, value_name = "ADDRESS_OR_CIDR")]
     banned_peers: Vec<String>,
 
+    /// Coinbases whose blocks this node won't take from peers, as rskj's
+    /// `peer.bannedMiners`. Repeatable; each a 20-byte address in hex, with
+    /// or without `0x`.
+    ///
+    /// What is refused is a block a peer sends whole
+    /// (`NodeMessageHandler.allowByMinerNotBanned`); the same block fetched
+    /// while syncing is taken, as on rskj.
+    #[arg(long, value_name = "ADDRESS")]
+    banned_miners: Vec<String>,
+
     /// Record peer scoring but never act on it.
     ///
     /// rskj's `scoring.punishmentEnabled = false`. Events are still counted
@@ -1474,6 +1484,14 @@ fn apply_file_config(
             }
         }
     }
+    // Combined in the same way.
+    if let Some(banned) = &f.peers.banned_miners {
+        for entry in banned {
+            if !a.banned_miners.contains(entry) {
+                a.banned_miners.push(entry.clone());
+            }
+        }
+    }
     // Unlike `banned_peers` this one **replaces** rather than combines: the
     // flag exists to say "bootstrap from these and nothing else", and merging
     // it with a file's list would quietly defeat that.
@@ -2189,12 +2207,14 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
     let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
     // The miner's: it tells the sync service of every block it commits (#323).
     let mined_events = event_tx.clone();
-    let sync_handler = Arc::new(
-        SyncHandler::new(sync_manager.clone(), event_tx)
-            .with_serve_ceiling(args.simulate_height)
-            .with_checkpoint_defence(checkpoint_defence)
-            .with_checkpoint(snap_checkpoint_for(args.network_id)),
-    );
+    let sync_handler = Arc::new(sync_handler_for(
+        sync_manager.clone(),
+        event_tx,
+        args.simulate_height,
+        checkpoint_defence,
+        args.network_id,
+        &args.banned_miners,
+    )?);
     let gc_config = rustock_storage::epoch_store::EpochConfig {
         epochs: args.gc_epochs,
         burial_depth: args.gc_burial,
@@ -4854,6 +4874,28 @@ fn snap_checkpoint_for(
     }
 }
 
+/// The handler the node serves peers through, as the arguments shape it: the
+/// serve ceiling (`--simulate-height`), the checkpoint defences, the chain's
+/// checkpoint, and rskj's `peer.bannedMiners` (`--banned-miners`). rskj
+/// reads the banned miners as addresses where its `NodeMessageHandler` is
+/// built, and doesn't start with one that isn't; nor does this.
+fn sync_handler_for(
+    manager: Arc<SyncManager>,
+    events: tokio::sync::mpsc::UnboundedSender<rustock_sync::SyncEvent>,
+    simulate_height: Option<u64>,
+    checkpoint_defence: rustock_core::checkpoint::CheckpointDefence,
+    network_id: u64,
+    banned_miners: &[String],
+) -> anyhow::Result<SyncHandler> {
+    let banned_miners = rustock_sync::parse_banned_miners(banned_miners)
+        .map_err(|e| anyhow::anyhow!("--banned-miners: {e}"))?;
+    Ok(SyncHandler::new(manager, events)
+        .with_serve_ceiling(simulate_height)
+        .with_checkpoint_defence(checkpoint_defence)
+        .with_checkpoint(snap_checkpoint_for(network_id))
+        .with_banned_miners(banned_miners))
+}
+
 /// Seconds as `2h 04m 31s`, for progress lines a human reads.
 fn fmt_duration(secs: f64) -> String {
     let s = secs.max(0.0) as u64;
@@ -5673,5 +5715,76 @@ mod genesis_tests {
         let m = build_genesis_state(&ChainConfig::mainnet(), &store_m).unwrap();
         let t = build_genesis_state(&ChainConfig::testnet(), &store_t).unwrap();
         assert_ne!(m.compute_hash(&store_m), t.compute_hash(&store_t));
+    }
+}
+
+#[cfg(test)]
+mod sync_handler_tests {
+    use super::*;
+    use rustock_networking::protocol::{P2pHandler, P2pMessage, RskMessage, RskSubMessage};
+
+    type Built = (
+        SyncHandler,
+        tokio::sync::mpsc::UnboundedReceiver<rustock_sync::SyncEvent>,
+        tempfile::TempDir,
+    );
+
+    /// The handler `run` builds from `argv`, its events, and its store's
+    /// directory.
+    fn handler_from(argv: &[&str]) -> anyhow::Result<Built> {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = Arc::new(SyncManager::new(
+            Arc::new(BlockStore::open(dir.path()).unwrap()),
+            Arc::new(HeaderVerifier::new()),
+            Arc::new(rustock_networking::peers::PeerStore::new()),
+        ));
+        let (events, received) = tokio::sync::mpsc::unbounded_channel();
+        let args = Args::parse_from(argv);
+        let handler = sync_handler_for(
+            manager,
+            events,
+            args.simulate_height,
+            rustock_core::checkpoint::CheckpointDefence::NONE,
+            args.network_id,
+            &args.banned_miners,
+        )?;
+        Ok((handler, received, dir))
+    }
+
+    /// `--banned-miners` reaches the handler: a block a peer sends whole,
+    /// mined by a coinbase named there, is not taken, and one mined by
+    /// anyone else is.
+    #[tokio::test]
+    async fn a_miner_banned_on_the_command_line_is_refused_by_the_handler() {
+        let banned = "0xbabababababababababababababababababababa";
+        let (handler, mut received, _dir) =
+            handler_from(&["rustock-cli", "--banned-miners", banned]).unwrap();
+        let sent = |coinbase: alloy_primitives::Address| {
+            let mut header = ChainConfig::regtest().genesis_header();
+            header.number = 1;
+            header.beneficiary = coinbase;
+            let block = rustock_core::Block {
+                header,
+                transactions: Vec::new(),
+                ommers: Vec::new(),
+            };
+            P2pMessage::RskMessage(RskMessage::new(RskSubMessage::Block(Box::new(block))))
+        };
+        let peer = alloy_primitives::B512::repeat_byte(4);
+
+        handler.handle_message(peer, &sent(banned.parse().unwrap()));
+        let taken = received.try_recv().is_ok();
+        assert!(!taken, "the banned miner's block was taken");
+        handler.handle_message(peer, &sent(alloy_primitives::Address::repeat_byte(0x0c)));
+        let taken = received.try_recv().is_ok();
+        assert!(taken, "another miner's block was refused");
+    }
+
+    /// An entry that isn't an address stops the node starting, as on rskj.
+    #[test]
+    fn a_banned_miner_that_is_not_an_address_stops_the_start() {
+        let refused = handler_from(&["rustock-cli", "--banned-miners", "0xbaba"]);
+        let err = refused.err().expect("a two-byte address was taken");
+        assert!(err.to_string().contains("--banned-miners"), "{err}");
     }
 }
