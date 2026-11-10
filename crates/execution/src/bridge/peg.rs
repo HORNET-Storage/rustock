@@ -659,6 +659,7 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
                         total_value,
                         "PEGIN_V1_INVALID_PAYLOAD",
                         vec![
+                            ("logged", FieldValue::Flag(hardfork_cfg.has_rskip181(rsk_height))),
                             ("senderType", FieldValue::Text("UNDETERMINED".into())),
                             ("peginVersion", FieldValue::U64(1)),
                         ],
@@ -726,6 +727,7 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
                     total_value,
                     "PEGIN_CAP_SURPASSED",
                     vec![
+                        ("logged", FieldValue::Flag(hardfork_cfg.has_rskip181(rsk_height))),
                         ("senderType", FieldValue::Text("UNDETERMINED".into())),
                         ("peginVersion", FieldValue::U64(1)),
                     ],
@@ -794,6 +796,9 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
             total_value,
             "LEGACY_PEGIN_UNDETERMINED_SENDER",
             vec![
+                // Post-RSKIP379 this path logs rejected_pegin then
+                // unrefundable_pegin; pre-379 it aborts silently.
+                ("logged", FieldValue::Flag(hardfork_cfg.has_rskip379(rsk_height))),
                 ("senderType", FieldValue::Text("UNDETERMINED".into())),
                 ("inputShape", FieldValue::Text(undetermined_input_shape(&btc_tx).into())),
                 (
@@ -987,9 +992,19 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
                     FieldValue::Text(sender_base58_address(&sender_hash160, sender_is_p2sh, config)),
                 ),
                 ("peginVersion", FieldValue::U64(0)),
-                // lock_btc arrives with RSKIP146 and pegin_btc with RSKIP170;
-                // before either, a credited peg-in left no trace but the balance.
-                ("logged", FieldValue::Flag(hardfork_cfg.has_rskip146(rsk_height))),
+                // `logged` is PER TOPIC, and the topic reconstructed for an
+                // accepted peg-in is `pegin_btc` -- so the test is RSKIP170,
+                // not RSKIP146.
+                //
+                // Between papyrus200 and iris300 the Bridge logs `lock_btc`
+                // instead. That peg-in is therefore visible in the real index
+                // under a different topic, and reconstructing `pegin_btc` for
+                // it duplicates nothing: a scan of either topic over the union
+                // of the two stores returns each peg-in exactly once, and a
+                // scan of `pegin_btc` alone spans all of history, which is the
+                // point of reconstructing the modern event rather than the
+                // contemporaneous one.
+                ("logged", FieldValue::Flag(hardfork_cfg.has_rskip170(rsk_height))),
             ],
         );
         if hardfork_cfg.has_rskip170(rsk_height) {

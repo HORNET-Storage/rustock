@@ -462,7 +462,20 @@ fn main() -> Result<()> {
             rustock_storage::RocksDbTrieStore::open_read_only(&unitrie_dir)
                 .with_context(|| format!("opening rustock trie store at {unitrie_dir}"))?,
         ),
-        other => anyhow::bail!("--state-format must be rskj or rustock, not {other:?}"),
+        // The live node's own backend. Useful for the recent chain, where it
+        // is the only store that has the state at all -- an archival import
+        // stops at whatever height it was taken.
+        "epoch" => Arc::new(
+            rustock_storage::epoch_store::EpochTrieStore::open_read_only_with(
+                &unitrie_dir,
+                rustock_storage::epoch_store::EpochConfig::default(),
+                Arc::new(rustock_storage::epoch_backend::FlatFactory::new(0)),
+            )
+            .with_context(|| format!("opening epoch trie store at {unitrie_dir}"))?,
+        ),
+        other => {
+            anyhow::bail!("--state-format must be rskj, rustock or epoch, not {other:?}")
+        }
     };
 
     // Somewhere for the replay's own writes that is neither database. Kept on
@@ -909,9 +922,19 @@ fn main() -> Result<()> {
                 for d in &decisions {
                     // Never reconstruct what the Bridge really logged: the
                     // node's own index already has it, and a duplicate would
-                    // double-count in the union of the two.
-                    if rustock_execution::bridge::legacy_events::was_logged(d) {
-                        continue;
+                    // double-count in the union of the two. A record that
+                    // does not say is REFUSED, not assumed -- see
+                    // `legacy_events::reconstructable`.
+                    match rustock_execution::bridge::legacy_events::reconstructable(d) {
+                        Ok(true) => {}
+                        Ok(false) => continue,
+                        Err(why) => {
+                            legacy_skipped += 1;
+                            *legacy_skip_kinds
+                                .entry(format!("{}/UNGATED({why})", d.kind.name()))
+                                .or_insert(0) += 1;
+                            continue;
+                        }
                     }
                     // A flyover peg-in is the case this whole exercise is
                     // about, and it is rare enough to name individually.

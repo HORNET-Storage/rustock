@@ -76,13 +76,62 @@ fn text_of<'a>(r: &'a SilentRecord, name: &str) -> Option<&'a str> {
     }
 }
 
-/// Whether the Bridge really logged this decision, from the record's own
-/// `logged` flag. A record without the flag is treated as not logged, which
-/// is the safe direction: the builder refuses to reconstruct anything for a
-/// height where the real index already has it, so the worst case is a
-/// reconstruction the caller then filters out by height.
-pub fn was_logged(r: &SilentRecord) -> bool {
-    matches!(field(r, "logged"), Some(FieldValue::Flag(true)))
+/// Whether the Bridge really logged this decision.
+///
+/// `Some(true)` it did, `Some(false)` it did not, **`None` the record does not
+/// say** — and that third case is not a synonym for either.
+///
+/// An earlier version returned a bare `bool` and read a missing flag as "not
+/// logged", on the reasoning that reconstructing too much was the safe
+/// direction. It is not. Of nine rejection call sites, three set no flag, so
+/// a replay over #5,000,000 reconstructed 117 `rejected_pegin` and 117
+/// `unrefundable_pegin` for a height at which the Bridge logs both itself.
+/// Duplicating the real index is worse than omitting from it: the union is
+/// supposed to contain each event once, and a double-counted rejection looks
+/// exactly like a real one.
+///
+/// The flag is **per topic**, not per decision: an accepted peg-in between
+/// papyrus200 and iris300 is logged as `lock_btc` while the topic
+/// reconstructed here is `pegin_btc`, so `logged` is false for it. Flyover
+/// peg-ins set it false at every height, because `registerFlyoverBtcTransaction`
+/// emits nothing at any height.
+pub fn was_logged(r: &SilentRecord) -> Option<bool> {
+    match field(r, "logged") {
+        Some(FieldValue::Flag(b)) => Some(*b),
+        _ => None,
+    }
+}
+
+/// Decisions whose kind can never carry a `logged` flag, because the Bridge
+/// has never logged them in any era and nothing is reconstructed for them.
+fn never_logged(kind: SilentKind) -> bool {
+    matches!(
+        kind,
+        SilentKind::BtcTxMarkedProcessed
+            | SilentKind::WhitelistEntryConsumed
+            | SilentKind::RefundBuildFailed
+            | SilentKind::PegoutRequested
+    )
+}
+
+/// Whether this record may be reconstructed at all.
+///
+/// Refuses on a missing flag rather than guessing. A caller should count the
+/// refusals — a non-zero count means a recording site was added without
+/// saying whether the Bridge logs there, which is a bug in the recorder, not
+/// a property of the chain.
+pub fn reconstructable(r: &SilentRecord) -> Result<bool, &'static str> {
+    if never_logged(r.kind) {
+        // `PegoutRequested` is only recorded on the branch where the event
+        // was NOT emitted (see `release_requested_or_record`), so its very
+        // existence means "not logged".
+        return Ok(true);
+    }
+    match was_logged(r) {
+        Some(true) => Ok(false),
+        Some(false) => Ok(true),
+        None => Err("record carries no `logged` flag"),
+    }
 }
 
 /// `rejected_pegin`'s `RejectedPeginReason`, from the recorded reason text.
@@ -361,10 +410,37 @@ mod tests {
     fn a_record_the_bridge_really_logged_is_recognised_as_such() {
         let logged = rec(SilentKind::PeginAccepted, vec![("logged", FieldValue::Flag(true))]);
         let silent = rec(SilentKind::PeginAccepted, vec![("logged", FieldValue::Flag(false))]);
+        assert_eq!(was_logged(&logged), Some(true));
+        assert_eq!(was_logged(&silent), Some(false));
+        assert_eq!(reconstructable(&logged), Ok(false), "already in the real index");
+        assert_eq!(reconstructable(&silent), Ok(true));
+    }
+
+    /// The bug this guards against: three of nine rejection sites set no
+    /// flag, and reading its absence as "not logged" reconstructed 234 events
+    /// at #5,000,000 that the Bridge had already logged itself.
+    #[test]
+    fn a_missing_flag_is_refused_rather_than_assumed() {
         let absent = rec(SilentKind::PeginAccepted, vec![]);
-        assert!(was_logged(&logged));
-        assert!(!was_logged(&silent));
-        assert!(!was_logged(&absent), "a missing flag must not read as logged");
+        assert_eq!(was_logged(&absent), None);
+        assert!(
+            reconstructable(&absent).is_err(),
+            "a missing flag must refuse, not default to reconstructing"
+        );
+    }
+
+    /// Kinds the Bridge has never logged need no flag, and a `PegoutRequested`
+    /// record only exists on the not-logged branch.
+    #[test]
+    fn kinds_that_were_never_logged_need_no_flag() {
+        for k in [
+            SilentKind::BtcTxMarkedProcessed,
+            SilentKind::WhitelistEntryConsumed,
+            SilentKind::RefundBuildFailed,
+            SilentKind::PegoutRequested,
+        ] {
+            assert_eq!(reconstructable(&rec(k, vec![])), Ok(true), "{k:?}");
+        }
     }
 
     /// The label has to name the reason, because the reason is the thing that
