@@ -17,6 +17,7 @@ pub mod window_store;
 pub mod position;
 pub mod pruner;
 pub mod freezer;
+pub mod legacy_event_store;
 pub mod silent_store;
 pub use cached_trie_store::CachedTrieStore;
 pub use flat_trie_store::FlatTrieStore;
@@ -1753,7 +1754,22 @@ impl BlockStore {
         from_block: u64,
         to_block: u64,
     ) -> Result<Vec<(u64, u32, u32, B256, Vec<B256>, Vec<u8>)>> {
-        let cf = self.cf(CF_BRIDGE_EVENTS)?;
+        self.scan_events_in(CF_BRIDGE_EVENTS, topic0, from_block, to_block)
+    }
+
+    /// The shared prefix scan behind [`Self::scan_bridge_events`] and
+    /// [`Self::scan_legacy_bridge_events`]. The two column families hold the
+    /// same layout on purpose, so they decode with one implementation and
+    /// cannot drift apart.
+    #[allow(clippy::type_complexity)]
+    fn scan_events_in(
+        &self,
+        cf_name: &str,
+        topic0: B256,
+        from_block: u64,
+        to_block: u64,
+    ) -> Result<Vec<(u64, u32, u32, B256, Vec<B256>, Vec<u8>)>> {
+        let cf = self.cf(cf_name)?;
         let mut start = Vec::with_capacity(40);
         start.extend_from_slice(topic0.as_slice());
         start.extend_from_slice(&from_block.to_be_bytes());

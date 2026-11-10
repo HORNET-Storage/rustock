@@ -100,7 +100,7 @@ pub fn log_legacy_commit_federation<CTX: crate::RskContextTr>(
 // ---------------------------------------------------------------------------
 
 /// keccak256 of the Solidity event signature.
-fn solidity_topic(signature: &str) -> B256 {
+pub(crate) fn solidity_topic(signature: &str) -> B256 {
     alloy_primitives::keccak256(signature.as_bytes())
 }
 
@@ -108,14 +108,14 @@ fn emit_topics<CTX: crate::RskContextTr>(ctx: &mut CTX, topics: Vec<B256>, data:
     ctx.journal_mut().log(Log::new_unchecked(BRIDGE_ADDR, topics, Bytes::from(data)));
 }
 
-fn address_word(addr: Address) -> B256 {
+pub(crate) fn address_word(addr: Address) -> B256 {
     let mut word = [0u8; 32];
     word[12..].copy_from_slice(addr.as_slice());
     B256::new(word)
 }
 
 /// ABI head word for a U256 value.
-fn u256_word(value: alloy_primitives::U256) -> [u8; 32] {
+pub(crate) fn u256_word(value: alloy_primitives::U256) -> [u8; 32] {
     value.to_be_bytes::<32>()
 }
 

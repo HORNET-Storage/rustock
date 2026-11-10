@@ -145,6 +145,17 @@ pub struct BlockResultDto {
     pub timestamp: String,
     pub extra_data: String,
     pub minimum_gas_price: String,
+    /// Total fees paid by this block's transactions, in wei.
+    ///
+    /// An RSK header field (number 14, where Ethereum has `mixHash`), so this
+    /// is the chain's own figure rather than one recomputed here: it is
+    /// committed to by the block hash. Summing `gasUsed * gasPrice` over the
+    /// block's receipts reproduces it exactly, which is what `block_fees
+    /// --verify` checks.
+    ///
+    /// rskj's `BlockResultDTO` also carries it, so serving it is parity, not
+    /// an extension.
+    pub paid_fees: String,
     pub transactions: Vec<serde_json::Value>,
     pub uncles: Vec<serde_json::Value>,
     pub size: String,
@@ -208,6 +219,7 @@ impl BlockResultDto {
             timestamp: to_hex_u64(header.timestamp),
             extra_data: to_hex_bytes(&header.extra_data),
             minimum_gas_price: to_hex_u256(&header.minimum_gas_price),
+            paid_fees: to_hex_u256(&header.paid_fees),
             transactions,
             uncles,
             size: to_hex_u64(size),

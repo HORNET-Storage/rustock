@@ -40,6 +40,11 @@ pub enum SilentKind {
     /// A refund was due but the pegout could not be built, so nothing was
     /// returned. rskj records this as a panic line and no event.
     RefundBuildFailed,
+    /// A peg-out was queued for confirmations. `release_requested` covers this
+    /// from RSKIP146 (papyrus200); before it the request was made and left no
+    /// trace in the receipts. Recorded with the fields that event carries, so
+    /// the legacy-event store can reconstruct it exactly.
+    PegoutRequested,
 }
 
 impl SilentKind {
@@ -51,6 +56,7 @@ impl SilentKind {
             Self::BtcTxMarkedProcessed => "btc_tx_marked_processed",
             Self::WhitelistEntryConsumed => "whitelist_entry_consumed",
             Self::RefundBuildFailed => "refund_build_failed",
+            Self::PegoutRequested => "pegout_requested",
         }
     }
 
@@ -62,6 +68,7 @@ impl SilentKind {
             Self::BtcTxMarkedProcessed,
             Self::WhitelistEntryConsumed,
             Self::RefundBuildFailed,
+            Self::PegoutRequested,
         ]
     }
 }

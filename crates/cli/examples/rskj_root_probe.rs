@@ -1,5 +1,12 @@
 //! Does this rskj database still hold the state for a given block?
 //!
+//! **rskj stores only.** This opens the default RocksDB column family, which
+//! is where rskj's flat unitrie keeps its nodes. Our own trie stores — a
+//! scratch trie, a segbuild chunk's `sealed` directory — use `trie_nodes`
+//! instead, so pointing this at one reports ABSENT for every hash whatever
+//! it holds. That has already been mistaken for a real result once. Use
+//! `trie_probe` for a rustock-format store.
+//!
 //! Answers the question that decides whether a historical range can be
 //! verified at all: an archival rskj keeps every trie node ever written, a
 //! pruned one keeps only state near its head. Re-executing block N needs the

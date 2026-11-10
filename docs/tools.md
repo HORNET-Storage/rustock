@@ -27,13 +27,18 @@ usage.
 |---|---|
 | [`powpeg_signature_audit`](../crates/cli/examples/powpeg_signature_audit.rs) | Did a PowPeg functionary ever submit a signature the Bridge refused? |
 | [`federation_intervals`](../crates/cli/examples/federation_intervals.rs) | Which PowPeg functionary keys were active over which block range. |
+| [`block_fees`](../crates/cli/examples/block_fees.rs) | What did a block's transactions pay in fees? Reads `paidFees` from the header rather than summing receipts or reading REMASC payouts; parallel, `--verify` checks it against the receipts sum. |
 | [`bridge_events`](../crates/cli/examples/bridge_events.rs) | Query the Bridge event index: every occurrence of one event, in block order. |
 | [`bridge_method`](../crates/cli/examples/bridge_method.rs) | Identify a Bridge method from its 4-byte ABI selector, using the node's own table rather than a guess. |
 | [`bridge_subtree`](../crates/cli/examples/bridge_subtree.rs) | How big is the Bridge's storage subtree, and how much of it is missing from a chunk? |
 | [`pegin_refunds`](../crates/cli/examples/pegin_refunds.rs) | Did the Bridge's peg-in refund path ever execute on mainnet? |
 | [`scan_pegin_calls`](../crates/cli/examples/scan_pegin_calls.rs) | Find `registerBtcTransaction` calls by reading blocks, without executing them. |
 | [`scan_silent`](../crates/cli/examples/scan_silent.rs) | Read the silent-decision store: what the Bridge decided without logging it. |
+| [`flyover_find`](../crates/cli/examples/flyover_find.rs) | At which block did the Bridge register each Flyover peg-in? Binary-searches the `fastBridgeFederationInformation` slot, which is absent before registration and present after — ~24 probes per address instead of replaying the chain. |
+| [`flyover_registry`](../crates/cli/examples/flyover_registry.rs) | Did the Bridge register this flyover address, and under which derivation? One trie read per address, no replay — and it separates "never registered" from "this store is pruned and cannot say". |
+| [`legacy_events`](../crates/cli/examples/legacy_events.rs) | Query the peg events reconstructed for the era the Bridge logged nothing, and merge them with the node's real event index into one history. |
 | [`check_supply`](../crates/cli/examples/check_supply.rs) | Replay canonical blocks and report any that do not conserve the native supply, changing nothing on disk. |
+| [`bridge_btc_holdings`](../crates/cli/examples/bridge_btc_holdings.rs) | How much bitcoin the peg holds and where it sits, listed outpoint by outpoint — the federation's own script and every Flyover-derived address, read from the unitrie without executing anything. |
 
 ## Chain and block inspection
 
@@ -57,6 +62,9 @@ usage.
 | [`diff_state`](../crates/cli/examples/diff_state.rs) | Localize a post-wasabi state-root divergence to the exact diverging trie leaves. Replays canonical blocks from the executed head up to `<number>` in memory (computing rustock's — possibly wrong — post-state trie), then diffs it against rskj's own unitrie for the *header's* state root, read directly from rskj's LevelDB. The dual walk descends only where the two tries' subtree hashes differ, so it visits a handful of nodes and finishes instantly even on a multi-million-leaf state. |
 | [`diff_roots`](../crates/cli/examples/diff_roots.rs) | Diff two unitrie roots that live in two different stores. |
 | [`diff_self`](../crates/cli/examples/diff_self.rs) | Diagnostic: show the unitrie leaf delta produced by executing a single block. Replays from the executed head to <number>-1 (the base), then executes <number> and hash-prune-diffs the two rustock-computed tries. Prints only the leaves that changed — the exact state delta of <number>. No rskj DB needed (both sides are rustock-computed); use when rskj isn't synced past the target. |
+| [`trie_census`](../crates/cli/examples/trie_census.rs) | What the state contains at one block — accounts, contracts, storage cells, code sizes — as JSON for a recurring consumer. Parallel, ~200k nodes/s, full mainnet trie in about a minute. See [`trie-census.md`](trie-census.md). |
+| [`rbtc_supply`](../crates/cli/examples/rbtc_supply.rs) | Sum every rBTC balance in the unitrie at one block: a parallel whole-trie walk split by the committed `children_size`, reporting the account census, the conservation check against the premine, and the Bridge and REMASC balances. |
+| [`trie_probe`](../crates/cli/examples/trie_probe.rs) | Is this node hash in this rustock-format trie store? Opens the `trie_nodes` column family, which `rskj_root_probe` does not — probing one of our stores with that tool reports ABSENT for everything. |
 | [`trie_footprint`](../crates/cli/examples/trie_footprint.rs) | Measure the trie working set of a range of blocks. |
 | [`trie_window`](../crates/cli/examples/trie_window.rs) | Measure the miss rate of a sliding-window trie cache against window length. |
 | [`lsm_stats`](../crates/cli/examples/lsm_stats.rs) | LSM shape and table properties of a trie store: level layout, and whether the SSTs carry bloom filters at all. |
@@ -120,6 +128,36 @@ usage.
 | tool | what it answers |
 |---|---|
 | [`check_alerts_config`](../crates/cli/examples/check_alerts_config.rs) | Validate a peg-out alert configuration without starting a node or sending mail: parse it, resolve `${NAME}` references against the env file, and report what would happen. Secrets are never printed — only whether they resolved and how long they are. |
+
+## How the RSK EVM differs from other EVMs
+
+[`rsk-evm-consensus-rules.md`](rsk-evm-consensus-rules.md) states the rules
+themselves — gas schedule, account existence without EIP-161, call semantics,
+block context — organised by EVM subsystem and naming no client. It is a view
+over the `java-compatibility.md` catalogue and cites its § numbers for the
+derivations.
+
+## Flyover peg-ins leave no event
+
+`registerFlyoverBtcTransaction` calls no `eventLogger`, in rskj or in our
+port, so from iris300 (#3,614,800) every successful Flyover peg-in is missing
+from `bridge_events` — there is nothing to index. The Bridge's *state* knows,
+though, and `flyover_registry` reads it.
+[`flyover-peg-ins.md`](flyover-peg-ins.md) has the evidence on both sides, the
+contract-only caller rule, three flyover-shaped addresses that were never
+registered and had to be recovered by hand, and the three tooling traps that
+each produced a wrong answer along the way.
+
+## Auditing the peg, in more detail
+
+`rbtc_supply` and `bridge_btc_holdings` answer one question between them —
+how much rBTC is outstanding, and how much bitcoin backs it — but their two
+figures cannot simply be subtracted. Locked REMASC fees, bitcoin the Bridge
+has not yet registered, and peg-out fees paid from peg funds all sit between
+them, and the terms are large enough to flip the sign of the result.
+[`peg-accounting.md`](peg-accounting.md) gives the method, how to read each
+tool's output, and a worked example where the naive subtraction gets it
+backwards.
 
 ## The PowPeg signature audit, in more detail
 
