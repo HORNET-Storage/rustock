@@ -252,15 +252,15 @@ impl ActivationHeights {
             iris300: 0,
             fingerroot500: 0,
             hop400: 0,
-            // regtest.conf: `reed810 = 0`, though rustock's regtest ladder
-            // does not schedule it yet; RSKIP144 and RSKIP351 have their
-            // own heights below, so they do not move with it.
+            // regtest.conf: `reed810 = 0`, which rskj's regtest ladder
+            // schedules (`--genesis`) and rustock's own doesn't; RSKIP144 and
+            // RSKIP351 have their own heights below, so they don't move with it.
             reed810: 0,
             // regtest.conf: `rskip97 = -1`, same as testnet.
             rskip97: None,
-            // regtest.conf: `rskip144 = 1`. rustock's regtest ladder does not
-            // run blocks as their sublists yet, so its blocks run as one
-            // list and carry empty edges.
+            // regtest.conf: `rskip144 = 1`. On rskj's regtest blocks run as
+            // their sublists from here; rustock's own regtest ladder runs
+            // none, so its blocks run as one list and carry empty edges.
             rskip144: Some(1),
             // regtest.conf: `rskip351 = 1`.
             rskip351: Some(1),

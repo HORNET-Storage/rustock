@@ -2338,6 +2338,37 @@ mod tests {
         assert!(matches!(err, PoolError::IntrinsicGasTooHigh), "got {err}");
     }
 
+    /// rskj's regtest never reaches `afterBridgeSync`, so a free sender's
+    /// Bridge call costs nothing at any height there, as the block processor
+    /// counts it; on rustock's own regtest the same call is paid from block 0.
+    /// The head is at #100, past every height regtest moves a rule to.
+    #[test]
+    fn on_rskj_regtest_a_free_senders_bridge_call_stays_free() {
+        let (_, _, addr) = setup_pool_with_rules(U256::ZERO, 0, test_config(), None);
+        let rules = |ladder| {
+            let mut rules = ChainRules::for_chain(ladder, 6_800_000);
+            rules.free_bridge_senders = vec![addr];
+            rules
+        };
+        let call = |key: &SigningKey| {
+            let mut tx = bridge_tx(0, 21_071, &[0x00, 0x01]);
+            sign_tx(&mut tx, key, 33);
+            encode_tx(&tx)
+        };
+        let rskj = rules(rustock_execution::hardfork::RskHardforkConfig::rskj_regtest());
+        let (pool, key, _) = setup_pool_with_rules(U256::ZERO, 0, test_config(), Some(rskj));
+        pool.add_transaction(&call(&key))
+            .expect("free on rskj's regtest");
+
+        let own = rules(rustock_execution::hardfork::RskHardforkConfig::regtest());
+        let (pool, key, _) = setup_pool_with_rules(U256::ZERO, 0, test_config(), Some(own));
+        let err = pool.add_transaction(&call(&key)).unwrap_err();
+        assert!(
+            matches!(err, PoolError::InsufficientFunds),
+            "paid on rustock's own: {err}"
+        );
+    }
+
     /// rskj `TxValidatorNonceRangeValidatorTest.illegalAccountSlotsValue_Zero`:
     /// a pool with no slots would refuse everything, so it is refused itself.
     #[test]

@@ -2092,6 +2092,34 @@ mod partitioned_templates {
             .expect("the block validates");
     }
 
+    /// rskj's regtest, as a node started from an rskj genesis file runs it,
+    /// runs its blocks as their sublists from block 1: the miner splits
+    /// independent transfers across both parallel sublists, and the
+    /// validator takes the split.
+    #[test]
+    fn rskj_regtest_blocks_run_as_their_sublists() {
+        let ladder = RskHardforkConfig::rskj_regtest();
+        let (builder, parent, keys, trie_store, store) = fixture_with_forks(4, ladder.clone());
+        let pool = Pool(
+            keys.iter()
+                .enumerate()
+                .map(|(i, k)| transfer(k, Address::repeat_byte(0xB0 + i as u8), 0, 33))
+                .collect(),
+        );
+        let template = builder
+            .build(std::slice::from_ref(&parent), Vec::new(), &pool)
+            .expect("the template builds");
+        let fields = template.block.header.version_fields.as_ref();
+        let edges = fields.and_then(|v| v.edges.as_ref()).map(Vec::len);
+        assert_eq!(edges, Some(2), "both parallel sublists in use");
+
+        let processor = BlockProcessor::new(ladder, store);
+        let parent_state = builder.load_state_root(parent.state_root).unwrap();
+        processor
+            .process_block(&template.block, &parent_state, trie_store)
+            .expect("the validator takes the split");
+    }
+
     /// rskj `BlockHeaderBuilder`, `ActivationConfig.getHeaderVersion` and
     /// `BlockExecutor.fill`: the fields a template carries by its height,
     /// partitioned or not. RSKIP351 makes it version 1 and RSKIP535 version

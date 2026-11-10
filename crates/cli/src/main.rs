@@ -1300,6 +1300,8 @@ struct Args {
 
     /// Regtest: start from this rskj genesis JSON file instead of the
     /// built-in genesis, so blocks an rskj node mined from it connect here.
+    /// The chain is then rskj's regtest: its `regtest.conf` schedule, its
+    /// Bridge constants and its genesis federation.
     #[arg(long, value_name = "FILE")]
     genesis: Option<std::path::PathBuf>,
 
@@ -1311,7 +1313,8 @@ struct Args {
 
     /// Regtest: override an rskj consensus rule, as `name=height` (`-1`
     /// disables it), like rskj's `blockchain.config.consensusRules`.
-    /// Repeatable. Supported: rskip97.
+    /// Repeatable. Supported: rskip97, rskip144, rskip351, rskip535,
+    /// rskip536 and rskipUMM.
     #[arg(long, value_name = "NAME=HEIGHT")]
     consensus_rule: Vec<String>,
 
@@ -1322,11 +1325,13 @@ struct Args {
     /// Regtest: schedule an rskj network upgrade, as `name=height` (`-1`
     /// takes it off the ladder), like rskj's
     /// `blockchain.config.hardforkActivationHeights`. Repeatable. Names are
-    /// rskj's, orchid to vetiver900. bahamas, afterBridgeSync and hop401 are
-    /// accepted at the height this node already reads them at; orchid060 and
-    /// tbd1000 are accepted and change nothing (tbd1000 only turns on
-    /// RSKIP-559, pegout sorting in the Bridge, which this node does not
-    /// implement).
+    /// rskj's: orchid to vetiver900, and afterBridgeSync, where the
+    /// federators' and authorizers' Bridge transactions start to be paid.
+    /// bahamas and hop401 are accepted at the height this node already reads
+    /// them at; orchid060, cardamom1000 and tbd1000 are accepted and change
+    /// nothing (cardamom1000 turns on RSKIP378, RSKIP455 and RSKIP559 in the
+    /// Bridge's pegout code, which this node doesn't implement yet; tbd1000
+    /// is perf-lab's name for RSKIP559's upgrade).
     #[arg(long, value_name = "NAME=HEIGHT")]
     hardfork: Vec<String>,
 
@@ -2471,13 +2476,6 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         info!("Sender cache disabled (--sigcache=false); every sender is recovered");
     }
 
-    // The checks that read the chain's activations and constants, as rskj's
-    // TxPendingValidator does: the RSKIP252 per-transaction price cap, the
-    // sublist gas limit under RSKIP144, the free Bridge transactions.
-    // The same ladder `hardfork_cfg` below is built from, needed earlier
-    // because the pool is constructed before it.
-    let hardfork_cfg_for_pool =
-        rustock_execution::RskHardforkConfig::for_network(config.chain_id as u64);
     let mut pool_builder = rustock_sync::TransactionPool::new(
         pool_config,
         config.chain_id.into(),
@@ -2485,21 +2483,7 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         trie_store_for_pool.clone(),
     )
     .with_gas_price_tracker(gas_price_tracker.clone())
-    .with_chain_rules({
-        let rules = rustock_sync::txpool::ChainRules::for_chain(
-            hardfork_cfg_for_pool,
-            config.min_sequential_set_gas_limit,
-        );
-        // A chain from an rskj genesis file is rskj's regtest: its federators'
-        // and authorizers' Bridge calls are free, as the block processor counts.
-        if config.genesis_spec.is_some() {
-            rules.with_bridge_constants(
-                &rustock_execution::bridge::constants::BridgeConstants::rskj_regtest(),
-            )
-        } else {
-            rules
-        }
-    });
+    .with_chain_rules(pool_chain_rules(&config)?);
     if let Some(cache) = &sender_cache {
         pool_builder = pool_builder.with_sender_cache(cache.clone());
     }
@@ -3775,13 +3759,39 @@ fn run_import_blocks(
 
 /// The execution ladder for `config`: the chain's own, with the operator's
 /// `--hardfork` and `--consensus-rule` overrides applied. Also returns the
-/// names accepted without effect.
+/// names accepted without effect. A chain from an rskj genesis file is
+/// rskj's regtest, on its `regtest.conf`'s schedule.
 fn hardfork_config(
     config: &ChainConfig,
 ) -> Result<(rustock_execution::RskHardforkConfig, Vec<String>)> {
-    rustock_execution::RskHardforkConfig::for_network(config.chain_id as u64)
+    let ladder = if config.genesis_spec.is_some() {
+        rustock_execution::RskHardforkConfig::rskj_regtest()
+    } else {
+        rustock_execution::RskHardforkConfig::for_network(config.chain_id as u64)
+    };
+    ladder
         .with_rskj_overrides(&config.hardfork_overrides, &config.consensus_rule_overrides)
         .map_err(anyhow::Error::msg)
+}
+
+/// The checks the pool makes that read the chain's activations and
+/// constants, as rskj's `TxPendingValidator` does: the RSKIP252
+/// per-transaction price cap, the sublist gas limit under RSKIP144 and the
+/// free Bridge transactions. On the ladder the block processor runs, the
+/// operator's overrides included. A chain from an rskj genesis file is
+/// rskj's regtest, whose federators' and authorizers' Bridge calls are free,
+/// as the block processor counts them.
+fn pool_chain_rules(config: &ChainConfig) -> Result<rustock_sync::txpool::ChainRules> {
+    let (ladder, _) = hardfork_config(config)?;
+    let rules =
+        rustock_sync::txpool::ChainRules::for_chain(ladder, config.min_sequential_set_gas_limit);
+    Ok(if config.genesis_spec.is_some() {
+        rules.with_bridge_constants(
+            &rustock_execution::bridge::constants::BridgeConstants::rskj_regtest(),
+        )
+    } else {
+        rules
+    })
 }
 
 /// `name=height` as rskj's config writes it, `-1` for never.
@@ -5353,6 +5363,67 @@ mod genesis_tests {
         assert_eq!(header.hash(), config.known_genesis_hash().unwrap());
         assert_eq!(header.gas_limit, U256::from(25_000_000));
         assert_eq!(config.genesis_alloc().len(), 16);
+    }
+
+    /// A chain from an rskj genesis file runs on rskj's regtest schedule:
+    /// its blocks as their sublists from block 1, with the header's edges
+    /// there too, the union Bridge open, and the free Bridge calls never
+    /// paid. An operator's `--consensus-rule` still moves a rule, as the
+    /// import of rskj's older regtest blocks needs. rustock's own regtest is
+    /// another chain and keeps its own schedule.
+    #[test]
+    fn an_rskj_genesis_file_runs_on_rskjs_regtest_schedule() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/rskj-regtest-genesis.json"
+        );
+        let config =
+            apply_chain_options(ChainConfig::regtest(), &regtest_args(&["--genesis", path]))
+                .unwrap();
+        let (ladder, _) = hardfork_config(&config).unwrap();
+        assert!(!ladder.runs_sublists(0) && ladder.runs_sublists(1));
+        let heights = &config.activation_heights;
+        assert!(!heights.edges_active(0) && heights.edges_active(1));
+        assert!(ladder.has_rskip502(0) && ladder.has_rskip529(0));
+        assert!(!ladder.has_are_bridge_txs_paid(1_000_000));
+
+        let older = regtest_args(&["--genesis", path, "--consensus-rule", "rskip144=-1"]);
+        let config = apply_chain_options(ChainConfig::regtest(), &older).unwrap();
+        let (ladder, _) = hardfork_config(&config).unwrap();
+        assert!(ladder.has_rskip351(1) && !ladder.runs_sublists(1));
+
+        let own = apply_chain_options(ChainConfig::regtest(), &regtest_args(&[])).unwrap();
+        let (ladder, _) = hardfork_config(&own).unwrap();
+        assert!(!ladder.runs_sublists(1) && !ladder.has_rskip502(0));
+        assert!(ladder.has_are_bridge_txs_paid(0));
+    }
+
+    /// The pool checks a transaction on the ladder the block processor runs,
+    /// the operator's overrides included, where it read the chain's bare
+    /// schedule: under perf-lab's seed schedule, whose blocks run as their
+    /// sublists from #9,002,504, it held a transaction to the whole block's
+    /// gas, not to the larger sublist's as rskj's pool does. From an rskj
+    /// genesis file the pool is on rskj's regtest, as the processor is.
+    #[test]
+    fn the_pool_checks_on_the_ladder_the_processor_runs() {
+        let seed = apply_chain_options(ChainConfig::mainnet(), &mainnet_args(SEED_FLAGS)).unwrap();
+        let rules = pool_chain_rules(&seed).unwrap();
+        assert!(rules.hardfork_cfg.runs_sublists(9_003_580));
+
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/rskj-regtest-genesis.json"
+        );
+        let rskj = apply_chain_options(ChainConfig::regtest(), &regtest_args(&["--genesis", path]))
+            .unwrap();
+        let rules = pool_chain_rules(&rskj).unwrap();
+        assert!(rules.hardfork_cfg.runs_sublists(1));
+        assert!(!rules.hardfork_cfg.has_are_bridge_txs_paid(1_000_000));
+        let constants = rustock_execution::bridge::constants::BridgeConstants::rskj_regtest();
+        assert_eq!(
+            rules.free_bridge_senders,
+            rustock_execution::executor::free_bridge_senders(&constants)
+        );
     }
 
     #[test]
