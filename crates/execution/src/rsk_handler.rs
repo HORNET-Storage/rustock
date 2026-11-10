@@ -365,23 +365,53 @@ where
         Ok(())
     }
 
-    /// The mainnet exec loop with rskj's rules added, among them:
-    /// - immediately after a CREATE frame is initialized, reset the created
-    ///   account's nonce to 0 (rskj has no EIP-161; revm seeds it to 1 from
-    ///   the per-era CfgEnv spec). Must happen before the constructor runs —
-    ///   addresses the new contract derives via CREATE depend on its nonce.
-    /// - frames run through `rsk_frame_run`, which applies the pre-RSKIP453
-    ///   empty-deploy quirk to internal creates.
-    /// - before RSKIP197, a contract whose call to a precompile threw is
-    ///   halted as it takes the call's result (see `aborts_caller`).
-    /// - what the precompiles called under a frame of contract code write
-    ///   outside revm's journal goes back with the frame if it fails (see
-    ///   `frames`).
+    /// The mainnet exec loop with rskj's rules added (`exec_loop`).
     fn run_exec_loop(
         &mut self,
         evm: &mut Self::Evm,
         first_frame_input: FrameInit,
     ) -> Result<FrameResult, Self::Error> {
+        self.exec_loop::<Plain>(evm, first_frame_input)
+    }
+}
+
+impl<EVM, ERROR> RskHandler<EVM, ERROR, EthFrame<EthInterpreter>>
+where
+    EVM: EvmTr<
+        Context: ContextTr<
+            Chain = crate::raw_storage::RskChainExt,
+            Journal: JournalTr<State = EvmState> + JournalExt,
+        >,
+        Frame = EthFrame<EthInterpreter>,
+        Instructions: InstructionProvider<
+            Context = <EVM as EvmTr>::Context,
+            InterpreterTypes = EthInterpreter,
+        >,
+        Precompiles: PrecompileProvider<<EVM as EvmTr>::Context>,
+    >,
+    ERROR: EvmTrError<EVM>,
+{
+    /// The mainnet exec loop with rskj's rules added, among them:
+    /// - immediately after a CREATE frame is initialized, reset the created
+    ///   account's nonce to 0 (rskj has no EIP-161; revm seeds it to 1 from
+    ///   the per-era CfgEnv spec). Must happen before the constructor runs —
+    ///   addresses the new contract derives via CREATE depend on its nonce.
+    /// - frames return through `rsk_frame_return`, which applies the
+    ///   pre-RSKIP453 empty-deploy quirk to internal creates.
+    /// - before RSKIP197, a contract whose call to a precompile threw is
+    ///   halted as it takes the call's result (see `aborts_caller`).
+    /// - what the precompiles called under a frame of contract code write
+    ///   outside revm's journal goes back with the frame if it fails (see
+    ///   `frames`).
+    ///
+    /// The chain's run (`run_exec_loop`) and a trace's or an estimate's
+    /// (`inspect_run_exec_loop`) both run this loop. They differ only in how
+    /// `D` opens and runs a frame: without the inspector's hooks or with them.
+    fn exec_loop<D: FrameDriver<EVM>>(
+        &mut self,
+        evm: &mut EVM,
+        first_frame_input: FrameInit,
+    ) -> Result<FrameResult, ERROR> {
         // rskj builds a program's invocation only for a transaction that runs
         // code (`TransactionExecutor.call` and `create`); revm opens a frame
         // for a creation with no data too, which runs nothing.
@@ -391,8 +421,7 @@ where
             }
             _ => true,
         };
-        let res = evm.frame_init(first_frame_input)?;
-        if let ItemOrResult::Result(frame_result) = res {
+        if let ItemOrResult::Result(frame_result) = D::init(evm, first_frame_input)? {
             return Ok(frame_result);
         }
         if self.fail_programs && runs_code {
@@ -408,7 +437,7 @@ where
         self.open_frame(evm);
 
         loop {
-            let call_or_result = rsk_frame_run(evm, self.empty_create_on_unpayable_deposit)?;
+            let call_or_result = D::run(evm, self.empty_create_on_unpayable_deposit)?;
 
             // Pre-RSKIP150 unbounded precompile output write, applied to the
             // caller after `frame_return_result` (see field docs).
@@ -452,6 +481,9 @@ where
                                     init.depth
                                 );
                             }
+                            // An inspector hears of the refusal as revm tells it
+                            // of a frame refused at its own limit of 1024.
+                            let synth = D::refuse(evm, init, synth);
                             note_attempted_writes(evm);
                             let returned = evm.frame_return_result(synth)?;
                             forget_reverted_entries(evm);
@@ -468,8 +500,8 @@ where
                             continue;
                         }
                     }
-                    match evm.frame_init(init)? {
-                        ItemOrResult::Item(_) => {
+                    match D::init(evm, init)? {
+                        ItemOrResult::Item(()) => {
                             // Internal CREATE/CREATE2 opcode: post-RSKIP125
                             // (wasabi) rskj's Program.createContract bumps the
                             // created contract's nonce to 1; before, it is 0.
@@ -534,7 +566,7 @@ where
                     }
                 }
                 // A frame of contract code ended, having committed exactly
-                // when its result is ok (`rsk_frame_run`).
+                // when its result is ok (`rsk_frame_return`).
                 ItemOrResult::Result(result) => {
                     self.close_frame(evm, result.instruction_result().is_ok());
                     result
@@ -591,6 +623,117 @@ where
                     .halt(InstructionResult::PrecompileError);
             }
         }
+    }
+}
+
+/// How `exec_loop` opens and runs a frame. The chain's run does it plainly;
+/// a trace's or an estimate's does it as revm's `inspect_run_exec_loop` does,
+/// telling the inspector of every frame that starts or ends and of every
+/// step. Every rule rskj's VM keeps in the loop is the loop's, the same for
+/// both.
+trait FrameDriver<EVM: EvmTr<Frame = EthFrame<EthInterpreter>>> {
+    /// `EvmTr::frame_init`: a frame opened, or a result reached without one.
+    fn init(
+        evm: &mut EVM,
+        init: FrameInit,
+    ) -> Result<ItemOrResult<(), FrameResult>, revm::handler::evm::ContextDbError<EVM::Context>>;
+    /// Runs the top frame until it asks for another or returns.
+    fn run(
+        evm: &mut EVM,
+        empty_create_on_unpayable_deposit: bool,
+    ) -> Result<FrameInitOrResult<EthFrame<EthInterpreter>>, ContextTrDbError<EVM::Context>>;
+    /// A frame the loop refuses itself (RSKIP150's depth), with the result
+    /// revm gives a frame it refuses at its own limit.
+    fn refuse(evm: &mut EVM, init: FrameInit, refused: FrameResult) -> FrameResult;
+}
+
+/// The chain's run: no inspector.
+struct Plain;
+
+impl<EVM> FrameDriver<EVM> for Plain
+where
+    EVM: EvmTr<
+        Context: ContextTr<Journal: JournalTr<State = EvmState>>,
+        Frame = EthFrame<EthInterpreter>,
+        Instructions: InstructionProvider<
+            Context = <EVM as EvmTr>::Context,
+            InterpreterTypes = EthInterpreter,
+        >,
+    >,
+{
+    fn init(
+        evm: &mut EVM,
+        init: FrameInit,
+    ) -> Result<ItemOrResult<(), FrameResult>, revm::handler::evm::ContextDbError<EVM::Context>>
+    {
+        Ok(evm.frame_init(init)?.map_item(|_| ()))
+    }
+
+    fn run(
+        evm: &mut EVM,
+        empty_create_on_unpayable_deposit: bool,
+    ) -> Result<FrameInitOrResult<EthFrame<EthInterpreter>>, ContextTrDbError<EVM::Context>> {
+        rsk_frame_run(evm, empty_create_on_unpayable_deposit)
+    }
+
+    fn refuse(_evm: &mut EVM, _init: FrameInit, refused: FrameResult) -> FrameResult {
+        refused
+    }
+}
+
+/// A trace's or an estimate's run: the inspector is told what revm's
+/// `inspect_frame_init` and `inspect_frame_run` tell it.
+struct Inspected;
+
+impl<EVM> FrameDriver<EVM> for Inspected
+where
+    EVM: revm::inspector::InspectorEvmTr<
+        Context: ContextTr<Journal: JournalTr<State = EvmState>>,
+        Frame = EthFrame<EthInterpreter>,
+    >,
+{
+    fn init(
+        evm: &mut EVM,
+        init: FrameInit,
+    ) -> Result<ItemOrResult<(), FrameResult>, revm::handler::evm::ContextDbError<EVM::Context>>
+    {
+        Ok(evm.inspect_frame_init(init)?.map_item(|_| ()))
+    }
+
+    fn run(
+        evm: &mut EVM,
+        empty_create_on_unpayable_deposit: bool,
+    ) -> Result<FrameInitOrResult<EthFrame<EthInterpreter>>, ContextTrDbError<EVM::Context>> {
+        use revm::inspector::handler::frame_end;
+        use revm::inspector::inspect_instructions;
+        use revm::interpreter::interpreter_types::LoopControl;
+        let (ctx, inspector, frame, instructions) = evm.ctx_inspector_frame_instructions();
+        // A frame the loop halted as it took a call's result (a precompile
+        // it called threw before RSKIP197) runs no instruction more, and the
+        // inspector is told of none: rskj's VM stops it at the CALL.
+        let action = if frame.interpreter.bytecode.is_end() {
+            frame.interpreter.take_next_action()
+        } else {
+            inspect_instructions(
+                ctx,
+                &mut frame.interpreter,
+                &mut *inspector,
+                instructions.instruction_table(),
+            )
+        };
+        let mut result = rsk_frame_return(ctx, frame, action, empty_create_on_unpayable_deposit);
+        if let ItemOrResult::Result(frame_result) = &mut result {
+            frame_end(ctx, inspector, &frame.input, frame_result);
+        }
+        Ok(result)
+    }
+
+    fn refuse(evm: &mut EVM, mut init: FrameInit, refused: FrameResult) -> FrameResult {
+        use revm::inspector::handler::{frame_end, frame_start};
+        let (ctx, inspector) = evm.ctx_inspector();
+        let mut result = frame_start(ctx, inspector, &mut init.frame_input).unwrap_or(refused);
+        frame_end(ctx, inspector, &init.frame_input, &mut result);
+        result
     }
 }
 
@@ -683,13 +826,34 @@ where
         .interpreter
         .run_plain(instructions.instruction_table(), ctx);
 
+    Ok(rsk_frame_return(
+        ctx,
+        frame,
+        action,
+        empty_create_on_unpayable_deposit,
+    ))
+}
+
+/// `EthFrame::process_next_action` with the create-return path replaced by
+/// `rsk_return_create`: what a frame's run ends in, a frame to open or the
+/// frame's result, the frame marked finished once it has one. The chain's
+/// run and an inspected one share it.
+fn rsk_frame_return<CTX>(
+    ctx: &mut CTX,
+    frame: &mut EthFrame<EthInterpreter>,
+    action: InterpreterAction,
+    empty_create_on_unpayable_deposit: bool,
+) -> FrameInitOrResult<EthFrame<EthInterpreter>>
+where
+    CTX: ContextTr<Journal: JournalTr<State = EvmState>>,
+{
     let mut interpreter_result = match action {
         InterpreterAction::NewFrame(frame_input) => {
-            return Ok(ItemOrResult::Item(FrameInit {
+            return ItemOrResult::Item(FrameInit {
                 frame_input,
                 depth: frame.depth + 1,
                 memory: frame.interpreter.memory.new_child_context(),
-            }));
+            });
         }
         InterpreterAction::Return(result) => result,
     };
@@ -734,7 +898,7 @@ where
         }
     };
     frame.set_finished(true);
-    Ok(result)
+    result
 }
 
 /// rskj `Program.finalizeContractCreation` before RSKIP453: a constructor
@@ -872,17 +1036,24 @@ where
     }
 }
 
-/// Inspection support, for `debug_traceTransaction` and the `trace_*` methods.
+/// Inspection support, for `debug_traceTransaction`, the `trace_*` methods,
+/// a traced block's replay and `eth_estimateGas`.
 ///
-/// Every method that matters is defaulted by the trait: `inspect_run` mirrors
-/// `Handler::run` while driving the inspector's `step` / `call` / `create`
-/// hooks. So the traced execution goes through **this same handler** -- the
-/// same RSKIP125 and RSKIP150 behaviour, the same invisible-exception
-/// handling, the same precompile set -- rather than a second implementation
-/// that could drift from it.
+/// `inspect_run` mirrors `Handler::run` while driving the inspector's `step`
+/// / `call` / `create` hooks, and calls this handler's methods -- all but the
+/// loop, which revm defaults to its own mainnet loop. That loop would leave
+/// out every rule rskj's VM keeps there: RSKIP150's depth of 400, a created
+/// contract's nonce, the empty deploy before RSKIP453, a precompile's whole
+/// output before RSKIP150, the return-data buffer before RSKIP171, a nested
+/// constructor's refund, RSKIP-144's attempted writes, the halt of a
+/// precompile's caller before RSKIP197, and a failed frame taking back what
+/// its precompiles wrote. So `inspect_run_exec_loop` runs `exec_loop`, the
+/// loop the chain runs, with the inspector told of each frame and step.
 ///
 /// That matters more than the convenience: a tracer describing a different
-/// execution from the one the chain performed is worse than no tracer.
+/// execution from the one the chain performed is worse than no tracer, an
+/// estimate of one is no estimate, and a traced block's replay would drift
+/// from the chain after the traced transaction.
 impl<EVM, ERROR> revm::inspector::InspectorHandler for RskHandler<EVM, ERROR, EthFrame<EthInterpreter>>
 where
     EVM: revm::inspector::InspectorEvmTr<
@@ -901,4 +1072,12 @@ where
     ERROR: EvmTrError<EVM>,
 {
     type IT = EthInterpreter;
+
+    fn inspect_run_exec_loop(
+        &mut self,
+        evm: &mut Self::Evm,
+        first_frame_input: FrameInit,
+    ) -> Result<FrameResult, Self::Error> {
+        self.exec_loop::<Inspected>(evm, first_frame_input)
+    }
 }

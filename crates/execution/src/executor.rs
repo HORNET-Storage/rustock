@@ -2952,6 +2952,458 @@ mod tests {
         assert!(trace.truncated, "and the trace says it was cut short");
     }
 
+    /// An unsigned transaction from a test's funded sender, at no gas price.
+    fn unsigned_tx(
+        nonce: u64,
+        to: Option<Address>,
+        value: u64,
+        gas_limit: u64,
+        input: Vec<u8>,
+    ) -> rustock_core::Transaction {
+        rustock_core::Transaction {
+            nonce,
+            gas_price: U256::ZERO,
+            gas_limit: U256::from(gas_limit),
+            to: to.map_or_else(Bytes::new, |to| Bytes::copy_from_slice(to.as_slice())),
+            value: U256::from(value),
+            input: Bytes::from(input),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
+        }
+    }
+
+    /// What a block's run leaves, to hold one run against another: the root
+    /// its changes give the parent's state, precompiles' writes and markers
+    /// included, its gas and fees, and each transaction's gas, success,
+    /// output and logs.
+    #[allow(clippy::type_complexity)]
+    fn block_outcome(
+        result: &BlockExecutionResult,
+        parent: &TrieNode,
+        store: &MemoryTrieStore,
+    ) -> (
+        B256,
+        u64,
+        U256,
+        Vec<(u64, bool, Vec<u8>, Vec<revm::primitives::Log>)>,
+    ) {
+        let root = crate::state::apply_state_changes(
+            parent,
+            store,
+            &result.state_changes,
+            &result.markers,
+        );
+        let receipts = result
+            .tx_results
+            .iter()
+            .map(|r| (r.gas_used, r.success, r.output.clone(), r.logs.clone()))
+            .collect();
+        (
+            root.compute_hash(store),
+            result.gas_used,
+            result.paid_fees,
+            receipts,
+        )
+    }
+
+    /// Runs a block as the chain does, as `trace_*` does (every transaction
+    /// traced) and as `debug_traceTransaction` does (each transaction in
+    /// turn), and requires the same state and receipts of all of them. The
+    /// traced runs go through `inspect_run`, so they agree only while it runs
+    /// the loop the chain runs (task 277). Returns the chain's run.
+    fn assert_traced_runs_agree(
+        executor: &RskExecutor,
+        header: &Header,
+        transactions: &[(rustock_core::Transaction, Address)],
+        parent: &TrieNode,
+        store: &Arc<MemoryTrieStore>,
+    ) -> BlockExecutionResult {
+        let plain = executor
+            .execute_block(header, transactions, parent, store.clone())
+            .expect("the block executes");
+        let expected = block_outcome(&plain, parent, store);
+        let (every, traces) = executor
+            .execute_block_call_traced(header, transactions, parent, store.clone())
+            .expect("the block executes with every transaction traced");
+        assert_eq!(traces.len(), transactions.len());
+        assert_eq!(
+            block_outcome(&every, parent, store),
+            expected,
+            "trace_* ran another execution"
+        );
+        for index in 0..transactions.len() {
+            let (one, trace) = executor
+                .execute_block_traced(
+                    header,
+                    transactions,
+                    parent,
+                    store.clone(),
+                    index,
+                    crate::tracer::DEFAULT_MAX_STRUCT_LOGS,
+                )
+                .expect("the block executes with one transaction traced");
+            assert!(trace.is_some());
+            assert_eq!(
+                block_outcome(&one, parent, store),
+                expected,
+                "debug_traceTransaction of transaction {index} ran another execution"
+            );
+        }
+        plain
+    }
+
+    /// An estimate's run of a transaction against the local call's, which
+    /// serves `eth_call`: the same gas, success, output and logs. Returns
+    /// what the estimate's inspector saw.
+    fn assert_estimate_run_agrees(
+        executor: &RskExecutor,
+        header: &Header,
+        tx: &rustock_core::Transaction,
+        sender: Address,
+        state: &TrieNode,
+        store: &Arc<MemoryTrieStore>,
+    ) -> crate::gas_estimator::EstimateTelemetry {
+        let call = executor
+            .execute_local_call(header, tx, sender, state, store.clone())
+            .expect("the call executes");
+        let (estimated, telemetry) = executor
+            .execute_tx_for_estimate(header, tx, sender, state, store.clone(), true)
+            .expect("the estimate executes");
+        assert_eq!(
+            (
+                estimated.gas_used,
+                estimated.success,
+                &estimated.output,
+                &estimated.logs
+            ),
+            (call.gas_used, call.success, &call.output, &call.logs),
+            "eth_estimateGas ran another execution"
+        );
+        telemetry
+    }
+
+    /// A create transaction's data deploying `runtime` (at most 255 bytes):
+    /// CODECOPY it from behind this 12-byte prefix and RETURN it.
+    fn deploying(runtime: &[u8]) -> Vec<u8> {
+        let size = u8::try_from(runtime.len()).unwrap();
+        let mut init = vec![
+            0x60, size, 0x60, 0x0c, 0x60, 0x00, 0x39, 0x60, size, 0x60, 0x00, 0xf3,
+        ];
+        init.extend_from_slice(runtime);
+        init
+    }
+
+    /// A trace and an estimate run the loop the chain runs (task 277): here
+    /// RSKIP150's call depth of 400, where revm's own loop recurses to 1024,
+    /// and the nonce a top-level create leaves its contract, 0, where revm's
+    /// loop leaves 1. The contract counts its depth in slot 0 and calls
+    /// itself, with value only at the depth RSKIP150 refuses, and rskj counts
+    /// that call for the estimate: `VM.getMessageCall` sets
+    /// `callWithValuePerformed` before `Program.callToAddress` checks the
+    /// depth.
+    #[test]
+    fn a_trace_or_an_estimate_stops_at_rskip150s_depth() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let sender = Address::repeat_byte(0xAD);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&TrieNode::empty(), store.as_ref(), &sender, 0, one_rbtc);
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+
+        // n = SLOAD(0) + 1; SSTORE(0, n); CALL(GAS, ADDRESS, n == 401), no
+        // data and no return area; POP; STOP.
+        let runtime = [
+            0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, // return area, data
+            0x60, 0x00, 0x54, 0x60, 0x01, 0x01, // n
+            0x80, 0x60, 0x00, 0x55, // SSTORE(0, n)
+            0x61, 0x01, 0x91, 0x14, // the value: n == 401
+            0x30, 0x5a, 0xf1, 0x50, 0x00, // ADDRESS GAS CALL POP STOP
+        ];
+        // The contract holds a wei, so that revm's loop, which doesn't refuse
+        // the call at depth 401, makes it.
+        let deploy = unsigned_tx(0, None, 1, 1_000_000, deploying(&runtime));
+        let deployed = assert_traced_runs_agree(
+            &executor,
+            &dummy_header(2_500_000),
+            &[(deploy, sender)],
+            &root,
+            &store,
+        );
+        let contract = sender.create(0);
+        assert_eq!(deployed.state_changes[&contract].info.nonce, 0);
+        let root = crate::state::apply_state_changes(
+            &root,
+            store.as_ref(),
+            &deployed.state_changes,
+            &deployed.markers,
+        );
+
+        let call = unsigned_tx(1, Some(contract), 0, 6_000_000, Vec::new());
+        let header = dummy_header(2_500_001);
+        let called =
+            assert_traced_runs_agree(&executor, &header, &[(call.clone(), sender)], &root, &store);
+        assert!(called.tx_results[0].success);
+        assert_eq!(
+            called.state_changes[&contract].storage[&U256::ZERO].present_value,
+            U256::from(401),
+            "frames at depths 0..=400 run; the call at depth 400 is refused"
+        );
+        let telemetry =
+            assert_estimate_run_agrees(&executor, &header, &call, sender, &root, &store);
+        assert!(telemetry.call_with_value, "the refused call carried value");
+
+        // The call tree: 400 calls, each inside the one before.
+        let (_, traces) = executor
+            .execute_block_call_traced(&header, &[(call, sender)], &root, store.clone())
+            .unwrap();
+        let mut level = &traces[0].subtraces;
+        let mut depth = 0;
+        while let [only] = level.as_slice() {
+            if only.error.is_some() {
+                break;
+            }
+            depth += 1;
+            level = &only.subtraces;
+        }
+        assert_eq!(depth, 400);
+    }
+
+    /// A trace and an estimate run the loop the chain runs (task 277): before
+    /// RSKIP453 an internal create whose code deposit can't be paid deploys
+    /// empty code (`Program.finalizeContractCreation`), where revm's loop
+    /// fails the create. Mainnet #1,071,481's RNS Deed.
+    #[test]
+    fn a_trace_or_an_estimate_deploys_empty_code_before_rskip453() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let sender = Address::repeat_byte(0xAA);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&TrieNode::empty(), store.as_ref(), &sender, 0, one_rbtc);
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+
+        // The child's constructor RETURNs 65,536 bytes, whose deposit no
+        // transaction here can pay. The caller CREATEs it and stores the
+        // address it gets in slot 0.
+        let runtime = [
+            0x66, 0x62, 0x01, 0x00, 0x00, 0x60, 0x00, 0xf3, // PUSH7 the child's init
+            0x60, 0x00, 0x52, // MSTORE at word 0
+            0x60, 0x07, 0x60, 0x19, 0x60, 0x00, 0xf0, // CREATE(0, 25, 7)
+            0x60, 0x00, 0x55, // SSTORE(0, created)
+            0x00,
+        ];
+        let deploy = unsigned_tx(0, None, 0, 1_000_000, deploying(&runtime));
+        let deployed = assert_traced_runs_agree(
+            &executor,
+            &dummy_header(1_071_481),
+            &[(deploy, sender)],
+            &root,
+            &store,
+        );
+        let root = crate::state::apply_state_changes(
+            &root,
+            store.as_ref(),
+            &deployed.state_changes,
+            &deployed.markers,
+        );
+
+        let caller = sender.create(0);
+        let call = unsigned_tx(1, Some(caller), 0, 1_000_000, Vec::new());
+        let header = dummy_header(1_071_482);
+        let created =
+            assert_traced_runs_agree(&executor, &header, &[(call.clone(), sender)], &root, &store);
+        let child = caller.create(0);
+        assert_eq!(
+            created.state_changes[&caller].storage[&U256::ZERO].present_value,
+            U256::from_be_slice(child.as_slice()),
+            "the create succeeds, with empty code"
+        );
+        assert_estimate_run_agrees(&executor, &header, &call, sender, &root, &store);
+    }
+
+    /// A trace and an estimate run the loop the chain runs (task 277): a
+    /// nested constructor's refund is dropped (`Program.finalizeContractCreation`
+    /// passes on no `futureRefund`), where revm's loop keeps it. Mainnet
+    /// #6,362,186.
+    #[test]
+    fn a_trace_or_an_estimate_drops_a_nested_constructors_refund() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let sender = Address::repeat_byte(0xAB);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&TrieNode::empty(), store.as_ref(), &sender, 0, one_rbtc);
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+
+        // The child's constructor sets slot 0 and clears it, which earns a
+        // refund, and returns no code. The factory MSTOREs it right-aligned
+        // and CREATEs it.
+        let child_init = [
+            0x60, 0x01, 0x60, 0x00, 0x55, // SSTORE(0, 1)
+            0x60, 0x00, 0x60, 0x00, 0x55, // SSTORE(0, 0)
+            0x60, 0x00, 0x60, 0x00, 0xf3, // RETURN nothing
+        ];
+        let size = u8::try_from(child_init.len()).unwrap();
+        let mut runtime = vec![0x5f + size];
+        runtime.extend_from_slice(&child_init);
+        runtime.extend_from_slice(&[0x60, 0x00, 0x52, 0x60, size, 0x60, 32 - size]);
+        runtime.extend_from_slice(&[0x60, 0x00, 0xf0, 0x00]); // CREATE, STOP
+        let deploy = unsigned_tx(0, None, 0, 2_000_000, deploying(&runtime));
+        let deployed = assert_traced_runs_agree(
+            &executor,
+            &dummy_header(6_362_186),
+            &[(deploy, sender)],
+            &root,
+            &store,
+        );
+        let root = crate::state::apply_state_changes(
+            &root,
+            store.as_ref(),
+            &deployed.state_changes,
+            &deployed.markers,
+        );
+
+        let call = unsigned_tx(1, Some(sender.create(0)), 0, 2_000_000, Vec::new());
+        let header = dummy_header(6_362_187);
+        let created =
+            assert_traced_runs_agree(&executor, &header, &[(call.clone(), sender)], &root, &store);
+        assert!(created.tx_results[0].success);
+        assert_estimate_run_agrees(&executor, &header, &call, sender, &root, &store);
+    }
+
+    /// A trace and an estimate run the loop the chain runs (task 277): before
+    /// RSKIP197 a contract whose call to a precompile throws stops there with
+    /// all its gas spent (`VM.steps`), where revm's loop lets it go on. And
+    /// the trace stops at its CALL, as rskj's VM traces no step after it.
+    #[test]
+    fn a_trace_or_an_estimate_stops_a_precompiles_caller_before_rskip197() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let sender = Address::repeat_byte(0xAA);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&TrieNode::empty(), store.as_ref(), &sender, 0, one_rbtc);
+        // The inner contract calls HDWalletUtils with no payload, which names
+        // no method and throws, and stops. The outer one gives it 200,000 gas
+        // and returns what its CALL pushed.
+        let outer = Address::repeat_byte(0xB1);
+        let inner = Address::repeat_byte(0xB2);
+        let mut inner_code = vec![
+            0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x73,
+        ];
+        inner_code.extend_from_slice(crate::precompiles::HD_WALLET_UTILS_ADDR.as_slice());
+        inner_code.extend_from_slice(&[0x5a, 0xf1, 0x00]); // GAS, CALL, STOP
+        let outer_code = call_and_return_pushed(inner, 200_000);
+        let root = put_account_with_code(&root, store.as_ref(), &outer, 1, U256::ZERO, &outer_code);
+        let root = put_account_with_code(&root, store.as_ref(), &inner, 1, U256::ZERO, &inner_code);
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+        let header = dummy_header(2_000_000);
+
+        let to_outer = unsigned_tx(0, Some(outer), 0, 1_000_000, Vec::new());
+        let block = assert_traced_runs_agree(
+            &executor,
+            &header,
+            &[(to_outer.clone(), sender)],
+            &root,
+            &store,
+        );
+        assert_eq!(
+            U256::from_be_slice(&block.tx_results[0].output),
+            U256::ZERO,
+            "the outer contract's CALL pushes 0"
+        );
+        assert_estimate_run_agrees(&executor, &header, &to_outer, sender, &root, &store);
+
+        // The transaction's own frame is the caller: it fails, and its trace
+        // ends at the CALL.
+        let to_inner = unsigned_tx(0, Some(inner), 0, 1_000_000, Vec::new());
+        let plain = executor
+            .execute_tx(&header, &to_inner, sender, &root, store.clone())
+            .unwrap();
+        assert!(!plain.success);
+        let (traced, trace) = executor
+            .execute_tx_traced(
+                &header,
+                &to_inner,
+                sender,
+                &root,
+                store.clone(),
+                false,
+                crate::tracer::DEFAULT_MAX_STRUCT_LOGS,
+            )
+            .unwrap();
+        assert_eq!(
+            (traced.gas_used, traced.success),
+            (plain.gas_used, plain.success)
+        );
+        assert_eq!(
+            trace.struct_logs.last().map(|step| step.op.as_str()),
+            Some("CALL")
+        );
+    }
+
+    /// A trace and an estimate run the loop the chain runs (task 277): a frame
+    /// that fails takes back what the precompiles under it wrote outside
+    /// revm's journal (`9821143`), where revm's loop keeps it. A contract
+    /// seeds the Bridge's BTC store through a getter and reverts.
+    #[test]
+    fn a_trace_or_an_estimate_takes_back_a_failed_frames_precompile_writes() {
+        // Code that CALLs `to` with `data` (32 bytes at most), all its gas
+        // and no value, and drops what the CALL pushed.
+        fn call(to: Address, data: &[u8]) -> Vec<u8> {
+            let mut word = [0u8; 32];
+            word[..data.len()].copy_from_slice(data);
+            let mut code = vec![0x7f]; // PUSH32 the data, left-aligned
+            code.extend_from_slice(&word);
+            code.extend_from_slice(&[0x60, 0x00, 0x52]); // MSTORE it at 0
+            let size = u8::try_from(data.len()).unwrap();
+            code.extend_from_slice(&[0x60, 0x00, 0x60, 0x00, 0x60, size, 0x60, 0x00, 0x60, 0x00]);
+            code.push(0x73); // PUSH20 to
+            code.extend_from_slice(to.as_slice());
+            code.extend_from_slice(&[0x5a, 0xf1, 0x50]); // GAS, CALL, POP
+            code
+        }
+        let bridge = crate::precompiles::BRIDGE_ADDR;
+        let seed = crate::abi::selector("getBtcBlockchainBestChainHeight()");
+        let seeds_and_reverts = Address::repeat_byte(0xC2);
+        let mut seeds_and_reverts_code = call(bridge, &seed);
+        seeds_and_reverts_code.extend_from_slice(&[0x60, 0x00, 0x60, 0x00, 0xfd]); // REVERT
+        let entry = Address::repeat_byte(0xE0);
+        let mut entry_code = call(seeds_and_reverts, &[]);
+        entry_code.push(0x00); // STOP
+
+        let store = Arc::new(MemoryTrieStore::new());
+        let sender = Address::repeat_byte(0xAA);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&TrieNode::empty(), store.as_ref(), &sender, 0, one_rbtc);
+        let root = put_account_with_code(&root, store.as_ref(), &entry, 1, U256::ZERO, &entry_code);
+        let root = put_account_with_code(
+            &root,
+            store.as_ref(),
+            &seeds_and_reverts,
+            1,
+            U256::ZERO,
+            &seeds_and_reverts_code,
+        );
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let executor = RskExecutor::new(RskHardforkConfig::all_active(33), block_store);
+        let header = dummy_header(8_000_000);
+
+        let tx = unsigned_tx(0, Some(entry), 0, 1_000_000, Vec::new());
+        let block =
+            assert_traced_runs_agree(&executor, &header, &[(tx.clone(), sender)], &root, &store);
+        assert!(block.tx_results[0].success);
+        assert!(
+            !block
+                .markers
+                .raw_storage
+                .iter()
+                .any(|(address, _, _)| *address == bridge),
+            "the Bridge's seeding went back with the frame"
+        );
+        assert!(!block.markers.precompiles.contains(&bridge));
+        assert_estimate_run_agrees(&executor, &header, &tx, sender, &root, &store);
+    }
+
     #[test]
     fn test_rskj_call_stipend_is_charged_to_caller() {
         let store = Arc::new(MemoryTrieStore::new());
