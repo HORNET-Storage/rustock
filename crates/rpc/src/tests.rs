@@ -115,6 +115,237 @@ fn the_null_address_prints_as_no_bytes() {
     assert_eq!(notified["miner"], json!(twenty));
 }
 
+/// RSK mainnet block #9,257,552, the header `rustock-core` checks its
+/// hashes on, as public-node.rsk.co holds it.
+fn mainnet_block_9257552() -> Header {
+    let bytes = |hex: &str| Bytes::from(hex::decode(hex).unwrap());
+    Header {
+        parent_hash: alloy_primitives::b256!("8b46403b2df22f81f450bd631db76cb47fe104ed48ab9b94a441f64be823c292"),
+        ommers_hash: alloy_primitives::b256!("e4d62e0f38c8a425952f64f56c6897c8fd4d9fdd09faeaddb904ec3a8362ae3b"),
+        beneficiary: alloy_primitives::address!("4e5dabc28e4a0f5e5b19fcb56b28c5a1989352c1"),
+        state_root: alloy_primitives::b256!("1f0d9418721c8a28c019e21a8af2af203ba43f68bfb8fa3b884642a55b5eedaf"),
+        transactions_root: alloy_primitives::b256!("2af4a2f53589d9f78b09adfefe9dd8e34f22143743dd0d3b584af8f6ac4d21ad"),
+        receipts_root: alloy_primitives::b256!("fa059fb22aad8c60ca36bc9d9820ae3c4310dc3d9363bcd2b2624eccb88ed1a6"),
+        logs_bloom: Bloom::from_slice(&hex::decode("00000000000000000000301800100020000100000010000000000200000000100000000000010000000000000000000000000000000000000000800000000000000000000004000000000000400040000000000000000000200200000000000000000000000000000040000000000100000000020000000000000000000000000000400000000001000000000004000000000000000000000000000020000000000000000200000000000000000000000080400000000180000000000000000000000000000800000000040000008000000000000000000000000000000000000000000000000000002000000000000000000400000000000000200000000000").unwrap()),
+        extension_data: None,
+        difficulty: U256::from(0x175cf1ea6738d50d56au128),
+        number: 9_257_552,
+        gas_limit: U256::from(0x989680),
+        gas_used: 0x22f96,
+        timestamp: 0x6ab06c78,
+        extra_data: bytes("d30191564554495645522d643430323166636532"),
+        paid_fees: U256::from(0x3656c63bb76u64),
+        minimum_gas_price: U256::from(0x1699280),
+        uncle_count: 2,
+        umm_root: Some(Bytes::new()),
+        version_fields: None,
+        bitcoin_merged_mining_header: Some(bytes("00e0f327307a19d17c1e20f51c1190b40d9fc53e7f056272a91d02000000000000000000cd81b87bdc182ac40f11daa46886c0b93b7e6497ca0e541ab5775f9c8fdd3d98936cb06ac51e02172a5c3c6e")),
+        bitcoin_merged_mining_merkle_proof: Some(bytes("c91bd5fe20d82da439eba4770fb50b6792cc06f083eb88b6795f0c89fc8ca427df7cc40dc64602e3fb3cf5c267664be19d148552f01cc28b6d3907d472008d15ba45ca54695cb6cbceac33003f9582450081de9ac6de608f0d49a78f2cae66c5c65cc0e8ac0674edfad8b00027c9d26b64ebe2476b5e91a95800b6786d91df004aa35390a8e996bf2cf9cc57555a12fcb76abcc376b20ebb5a441b1f94839653472ac163740f33c5e88a33003c73726de57da577d9e57d305937269421c1b0be94af8aa6a13a431fb5425ad871e9675edff825e8b49dc016ab6903bf63d376386dbb6c55d84d449f6147763855259dc20a09f72adfb25195c692bd8da719d1d8e9b227b874cbec4f58fb88dc6b21d810e995b4531346f37b0a3a7e54b3327d79450fa01b5a3420bd772f4f0605c829facdb88bc9f2945aa897aef9e6585c80fa62d683e84d1b8bd228f8c985a8269e312e7d0b135cf5aeb50132e1f2592a112db15c3e521d92fb7184af28a0adc8008fa3eb839d1b6d9e5d5c802160ffa7522649c18aa20502e09c50804448465889141227a0a82c85a0ce6876163ae60cc3ac")),
+        bitcoin_merged_mining_coinbase_transaction: Some(bytes("000000000000014013a11ba36836286d0115b1c5c58a42ad692d3aeeaedae25686175928146d440f8931d770ea29b3d5f1dd2eabaf3724518831d656f447230000000000000000002b6a2952534b424c4f434b3afe829f5c494b038c03268d18d0e338bb162f06b69ebc2a5e8f871a1d008d425000000000")),
+        cached_hash: None,
+        cached_hash_for_merged_mining: None,
+        kept: None,
+    }
+}
+
+/// A block prints each property rskj's `BlockResultDTO` has, as `fromBlock`
+/// fills them (task 284). Mainnet #9,257,552 against what
+/// public-node.rsk.co answered for it: the merged-mining fields as held,
+/// the merged-mining hash with the fork-detection data its coinbase
+/// commits to in its last 12 bytes (RSKIP110), the paid fees, and the
+/// cumulative difficulty of it and its two uncles, each of difficulty
+/// 0x177af6546a47de99bb3 (`Block.getCumulativeDifficulty`).
+#[test]
+fn a_block_prints_each_property_rskj_prints() {
+    let header = mainnet_block_9257552();
+    assert_eq!(
+        header.hash(),
+        alloy_primitives::b256!("0e7f9744b001ec59e68f0d60e8bde08ae6e9b9b57113e9a372b2058cc144c9fa")
+    );
+    let uncle = Header {
+        difficulty: U256::from(0x177af6546a47de99bb3u128),
+        ..test_header(9_257_550)
+    };
+    let body = (vec![], vec![uncle.clone(), uncle]);
+    let block = crate::helpers::BlockResultDto::from_header_with_body(
+        &header,
+        header.hash(),
+        U256::from(7),
+        Some(&body),
+        false,
+        30,
+    );
+    let block = serde_json::to_value(block).unwrap();
+    let printed = |key: &str| block[key].clone();
+    assert_eq!(printed("mixHash"), json!(format!("{:#x}", B256::ZERO)));
+    assert_eq!(printed("nonce"), json!("0x0000000000000000"));
+    assert_eq!(printed("totalDifficulty"), json!("0x7"));
+    assert_eq!(
+        printed("hashForMergedMining"),
+        json!("0xfe829f5c494b038c03268d18d0e338bb162f06b69ebc2a5e8f871a1d008d4250")
+    );
+    assert_eq!(printed("paidFees"), json!("0x3656c63bb76"));
+    assert_eq!(
+        printed("cumulativeDifficulty"),
+        json!("0x4652de933bc89240cd0")
+    );
+    assert_eq!(printed("bitcoinMergedMiningHeader"), json!("0x00e0f327307a19d17c1e20f51c1190b40d9fc53e7f056272a91d02000000000000000000cd81b87bdc182ac40f11daa46886c0b93b7e6497ca0e541ab5775f9c8fdd3d98936cb06ac51e02172a5c3c6e"));
+    assert_eq!(printed("bitcoinMergedMiningCoinbaseTransaction"), json!("0x000000000000014013a11ba36836286d0115b1c5c58a42ad692d3aeeaedae25686175928146d440f8931d770ea29b3d5f1dd2eabaf3724518831d656f447230000000000000000002b6a2952534b424c4f434b3afe829f5c494b038c03268d18d0e338bb162f06b69ebc2a5e8f871a1d008d425000000000"));
+    assert_eq!(printed("bitcoinMergedMiningMerkleProof"), json!("0xc91bd5fe20d82da439eba4770fb50b6792cc06f083eb88b6795f0c89fc8ca427df7cc40dc64602e3fb3cf5c267664be19d148552f01cc28b6d3907d472008d15ba45ca54695cb6cbceac33003f9582450081de9ac6de608f0d49a78f2cae66c5c65cc0e8ac0674edfad8b00027c9d26b64ebe2476b5e91a95800b6786d91df004aa35390a8e996bf2cf9cc57555a12fcb76abcc376b20ebb5a441b1f94839653472ac163740f33c5e88a33003c73726de57da577d9e57d305937269421c1b0be94af8aa6a13a431fb5425ad871e9675edff825e8b49dc016ab6903bf63d376386dbb6c55d84d449f6147763855259dc20a09f72adfb25195c692bd8da719d1d8e9b227b874cbec4f58fb88dc6b21d810e995b4531346f37b0a3a7e54b3327d79450fa01b5a3420bd772f4f0605c829facdb88bc9f2945aa897aef9e6585c80fa62d683e84d1b8bd228f8c985a8269e312e7d0b135cf5aeb50132e1f2592a112db15c3e521d92fb7184af28a0adc8008fa3eb839d1b6d9e5d5c802160ffa7522649c18aa20502e09c50804448465889141227a0a82c85a0ce6876163ae60cc3ac"));
+    assert_eq!(printed("rskPteEdges"), Value::Null);
+    assert_eq!(printed("baseEvent"), Value::Null);
+    let mut keys: Vec<&str> = block
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    let mut rskj = vec![
+        "number",
+        "hash",
+        "parentHash",
+        "mixHash",
+        "nonce",
+        "sha3Uncles",
+        "logsBloom",
+        "transactionsRoot",
+        "stateRoot",
+        "receiptsRoot",
+        "miner",
+        "difficulty",
+        "totalDifficulty",
+        "extraData",
+        "size",
+        "gasLimit",
+        "gasUsed",
+        "timestamp",
+        "transactions",
+        "uncles",
+        "minimumGasPrice",
+        "bitcoinMergedMiningHeader",
+        "bitcoinMergedMiningCoinbaseTransaction",
+        "bitcoinMergedMiningMerkleProof",
+        "hashForMergedMining",
+        "paidFees",
+        "cumulativeDifficulty",
+        "rskPteEdges",
+        "baseEvent",
+    ];
+    rskj.sort_unstable();
+    assert_eq!(keys, rskj, "the getters of rskj's BlockResultDTO");
+
+    // A coinbase that commits to `RSKBLOCK:`, the hash's first 20 bytes and
+    // twelve of 0xfd: those are the data from wasabi100 (mainnet's
+    // #1,591,000) on, and below it the coinbase commits to the whole hash.
+    let committing = |number: u64| {
+        let header = Header {
+            number,
+            ..header.clone()
+        };
+        let mut coinbase = vec![0; 40];
+        coinbase.extend_from_slice(b"RSKBLOCK:");
+        coinbase.extend_from_slice(&header.hash_for_merged_mining()[..20]);
+        coinbase.extend_from_slice(&[0xfd; 12]);
+        Header {
+            bitcoin_merged_mining_coinbase_transaction: Some(coinbase.into()),
+            ..header
+        }
+    };
+    let printed = |header: &Header| {
+        crate::helpers::BlockResultDto::from_header(header, B256::ZERO, U256::ZERO)
+            .hash_for_merged_mining
+    };
+    let mut with_data = committing(1_591_000).hash_for_merged_mining();
+    with_data[20..].copy_from_slice(&[0xfd; 12]);
+    assert_eq!(printed(&committing(1_591_000)), format!("{with_data:#x}"));
+    let below = committing(1_590_999);
+    assert_eq!(
+        printed(&below),
+        format!("{:#x}", below.hash_for_merged_mining())
+    );
+    // Where RSKIP110 is from genesis, as on testnet and regtest, the data
+    // still start at block 449 (`MiningConfig.REQUIRED_NUMBER_OF_BLOCKS_FOR_
+    // FORK_DETECTION_CALCULATION`).
+    let from_genesis = |number: u64| {
+        let header = committing(number);
+        let hash = crate::helpers::hash_for_merged_mining_from(&header, 0);
+        (
+            hash[20..] == [0xfd; 12],
+            hash[..20] == header.hash_for_merged_mining()[..20],
+        )
+    };
+    assert_eq!(from_genesis(448), (false, true));
+    assert_eq!(from_genesis(449), (true, true));
+    // Nor are there data to read without a coinbase.
+    let without = Header {
+        bitcoin_merged_mining_coinbase_transaction: None,
+        ..header.clone()
+    };
+    assert_eq!(
+        printed(&without),
+        format!("{:#x}", without.hash_for_merged_mining())
+    );
+    // Without a body, the cumulative difficulty is the block's own.
+    let block = crate::helpers::BlockResultDto::from_header(&header, B256::ZERO, U256::ZERO);
+    assert_eq!(block.cumulative_difficulty, "0x175cf1ea6738d50d56a");
+    assert_eq!(block.bitcoin_merged_mining_header.len(), 2 + 160);
+}
+
+/// An uncle's hash, roots or bloom kept at another length print as the
+/// bytes rskj holds (`toUnformattedJsonHex`), where rustock's typed field
+/// holds zero, and its paid fees past 256 bits as the quantity of the bytes
+/// kept. A versioned header's sublist edges print as rskj's `short[]`, its
+/// base event as hex, or null where empty; a header without merged-mining
+/// fields prints `0x` for each.
+#[test]
+fn an_uncles_kept_fields_print_as_rskj_holds_them() {
+    use rustock_core::types::header::{HeaderVersionFields, KeptFields};
+    let mut uncle = test_header(5);
+    uncle.kept = Some(Box::new(KeptFields {
+        ommers_hash: Some(Bytes::from_static(&[0xaa; 3])),
+        state_root: Some(Bytes::from_static(&[0xbb; 31])),
+        transactions_root: Some(Bytes::new()),
+        receipts_root: Some(Bytes::from_static(&[0xcc; 33])),
+        logs_bloom: Some(Bytes::from_static(&[0xdd; 2])),
+        paid_fees: Some(Bytes::from(vec![0x01; 33])),
+        ..Default::default()
+    }));
+    uncle.version_fields = Some(HeaderVersionFields {
+        version: 2,
+        edges: Some(vec![2, 5]),
+        base_event: Some(Bytes::from_static(&[0xee])),
+    });
+    let block = crate::helpers::BlockResultDto::from_header(&uncle, B256::ZERO, U256::ZERO);
+    let block = serde_json::to_value(block).unwrap();
+    assert_eq!(block["sha3Uncles"], json!("0xaaaaaa"));
+    assert_eq!(block["stateRoot"], json!(format!("0x{}", "bb".repeat(31))));
+    assert_eq!(block["transactionsRoot"], json!("0x"));
+    assert_eq!(
+        block["receiptsRoot"],
+        json!(format!("0x{}", "cc".repeat(33)))
+    );
+    assert_eq!(block["logsBloom"], json!("0xdddd"));
+    assert_eq!(block["paidFees"], json!(format!("0x1{}", "01".repeat(32))));
+    assert_eq!(block["rskPteEdges"], json!([2, 5]));
+    assert_eq!(block["baseEvent"], json!("0xee"));
+    for field in [
+        "bitcoinMergedMiningHeader",
+        "bitcoinMergedMiningCoinbaseTransaction",
+        "bitcoinMergedMiningMerkleProof",
+    ] {
+        assert_eq!(block[field], json!("0x"), "{field}");
+    }
+
+    uncle.version_fields = Some(HeaderVersionFields {
+        version: 2,
+        edges: None,
+        base_event: Some(Bytes::new()),
+    });
+    let block = crate::helpers::BlockResultDto::from_header(&uncle, B256::ZERO, U256::ZERO);
+    assert_eq!((block.rsk_pte_edges, block.base_event), (None, None));
+}
+
 fn setup_state() -> (RpcState, tempfile::TempDir) {
     setup_state_with(|store| store)
 }

@@ -265,30 +265,55 @@ pub fn parse_hex_u32(s: &str) -> Option<u32> {
     u32::from_str_radix(s, 16).ok()
 }
 
-/// Block result DTO matching rskj's `BlockResultDTO` JSON format.
+/// Block result DTO matching rskj's `BlockResultDTO` JSON format: a property
+/// for each of its getters (`BlockResultDTO.java` L218-333), filled as
+/// `fromBlock` fills them (L137-197), for a block and for an uncle
+/// (`Web3Impl.getUncleResultDTO`). rskj's `ObjectMapper` writes a null
+/// property as `null`, as serde writes a `None` here.
+///
+/// Not ported: `fromBlock` prints `number`, `hash`, `logsBloom` and `miner`
+/// as null for a block other than genesis without a merged-mining header,
+/// the pending block rskj builds. A block a node stores has one, merged
+/// mining's rule sees to it, and rustock answers `pending` with its best
+/// block.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BlockResultDto {
     pub number: String,
     pub hash: String,
     pub parent_hash: String,
+    /// `Keccak256.ZERO_HASH`, there for compatibility with Ethereum.
+    pub mix_hash: String,
+    /// `0x0000000000000000`, hardcoded for compatibility with Ethereum.
+    pub nonce: String,
     #[serde(rename = "sha3Uncles")]
     pub sha3_uncles: String,
-    pub miner: String,
-    pub state_root: String,
-    pub transactions_root: String,
-    pub receipts_root: String,
     pub logs_bloom: String,
+    pub transactions_root: String,
+    pub state_root: String,
+    pub receipts_root: String,
+    pub miner: String,
     pub difficulty: String,
     pub total_difficulty: String,
+    pub extra_data: String,
+    pub size: String,
     pub gas_limit: String,
     pub gas_used: String,
     pub timestamp: String,
-    pub extra_data: String,
-    pub minimum_gas_price: String,
     pub transactions: Vec<serde_json::Value>,
     pub uncles: Vec<serde_json::Value>,
-    pub size: String,
+    pub minimum_gas_price: String,
+    pub bitcoin_merged_mining_header: String,
+    pub bitcoin_merged_mining_coinbase_transaction: String,
+    pub bitcoin_merged_mining_merkle_proof: String,
+    pub hash_for_merged_mining: String,
+    pub paid_fees: String,
+    /// The block's difficulty and its uncles' (`Block.getCumulativeDifficulty`).
+    pub cumulative_difficulty: String,
+    /// RSKIP-144's sublist edges, a `short[]`, or null.
+    pub rsk_pte_edges: Option<Vec<i16>>,
+    /// RSKIP-535's base event, or null where it is empty.
+    pub base_event: Option<String>,
 }
 
 impl BlockResultDto {
@@ -332,32 +357,126 @@ impl BlockResultDto {
             vec![]
         };
 
+        // rskj prints a hash or root from the bytes it holds
+        // (`toUnformattedJsonHex`): an uncle's of another length as it kept
+        // them, where the typed field holds zero.
+        let kept = header.kept();
+        let held = |bytes: Option<&alloy_primitives::Bytes>, typed: &B256| {
+            bytes.map_or_else(|| to_hex_b256(typed), |bytes| to_hex_bytes(bytes))
+        };
+        // `toUnformattedJsonHex` of a merged-mining field: `0x` for none.
+        let merged_mining = |field: &Option<alloy_primitives::Bytes>| {
+            to_hex_bytes(field.as_ref().map_or(&[][..], |bytes| bytes.as_ref()))
+        };
+        let version_fields = header.version_fields.as_ref();
+
         Self {
             number: to_hex_u64(header.number),
             hash: to_hex_b256(&hash),
             parent_hash: to_hex_b256(&header.parent_hash),
-            sha3_uncles: to_hex_b256(&header.ommers_hash),
+            mix_hash: to_hex_b256(&B256::ZERO),
+            nonce: "0x0000000000000000".to_owned(),
+            sha3_uncles: held(
+                kept.and_then(|kept| kept.ommers_hash.as_ref()),
+                &header.ommers_hash,
+            ),
+            logs_bloom: match kept.and_then(|kept| kept.logs_bloom.as_ref()) {
+                Some(bloom) => to_hex_bytes(bloom),
+                None => to_hex_bytes(header.logs_bloom.as_ref()),
+            },
+            transactions_root: held(
+                kept.and_then(|kept| kept.transactions_root.as_ref()),
+                &header.transactions_root,
+            ),
+            state_root: held(
+                kept.and_then(|kept| kept.state_root.as_ref()),
+                &header.state_root,
+            ),
+            receipts_root: held(
+                kept.and_then(|kept| kept.receipts_root.as_ref()),
+                &header.receipts_root,
+            ),
             // `toUnformattedJsonHex(getCoinbase().getBytes())`: `0x` for the
             // null address an empty coinbase reads as.
             miner: header
                 .coinbase()
                 .map_or_else(|| "0x".to_owned(), |coinbase| format!("{coinbase:#x}")),
-            state_root: to_hex_b256(&header.state_root),
-            transactions_root: to_hex_b256(&header.transactions_root),
-            receipts_root: to_hex_b256(&header.receipts_root),
-            logs_bloom: to_hex_bytes(header.logs_bloom.as_ref()),
             difficulty: to_hex_u256(&header.difficulty),
             total_difficulty: to_hex_u256(&total_difficulty),
+            extra_data: to_hex_bytes(&header.extra_data),
+            size: to_hex_u64(size),
             gas_limit: to_hex_quantity_bytes(&header.gas_limit_bytes()),
             gas_used: to_hex_u64(header.gas_used),
             timestamp: to_hex_u64(header.timestamp),
-            extra_data: to_hex_bytes(&header.extra_data),
-            minimum_gas_price: to_hex_quantity_bytes(&header.minimum_gas_price_bytes()),
             transactions,
             uncles,
-            size: to_hex_u64(size),
+            minimum_gas_price: to_hex_quantity_bytes(&header.minimum_gas_price_bytes()),
+            bitcoin_merged_mining_header: merged_mining(&header.bitcoin_merged_mining_header),
+            bitcoin_merged_mining_coinbase_transaction: merged_mining(
+                &header.bitcoin_merged_mining_coinbase_transaction,
+            ),
+            bitcoin_merged_mining_merkle_proof: merged_mining(
+                &header.bitcoin_merged_mining_merkle_proof,
+            ),
+            hash_for_merged_mining: to_hex_b256(&hash_for_merged_mining(header)),
+            // `toQuantityJsonHex(Coin.getBytes())`; an uncle's past 256 bits
+            // from the bytes it kept.
+            paid_fees: match kept.and_then(|kept| kept.paid_fees.as_ref()) {
+                Some(fees) => to_hex_quantity_bytes(fees),
+                None => to_hex_u256(&header.paid_fees),
+            },
+            cumulative_difficulty: format!("{:#x}", cumulative_difficulty(header, body)),
+            rsk_pte_edges: version_fields.and_then(|fields| fields.edges.clone()),
+            // `baseEvent != null && baseEvent.length > 0 ? ... : null`.
+            base_event: version_fields
+                .and_then(|fields| fields.base_event.as_ref())
+                .filter(|event| !event.is_empty())
+                .map(|event| to_hex_bytes(event)),
         }
     }
+}
+
+/// rskj `BlockHeader.getHashForMergedMining` (L537-554): the merged-mining
+/// hash, its last 12 bytes the fork-detection data the coinbase commits to
+/// where the header includes it -- from RSKIP110 (wasabi100), never below
+/// block 449 (`BlockFactory` L257-258) -- as `getMiningForkDetectionData`
+/// reads it out of the coinbase (L578-616). The heights are this process's,
+/// which its headers hash under.
+///
+/// Where rskj throws, finding no data in a header that should carry it,
+/// this is the hash without it: merged mining's rule refuses such a header,
+/// so no block or uncle the node stores is one.
+fn hash_for_merged_mining(header: &Header) -> B256 {
+    let wasabi100 = rustock_core::config::ActivationHeights::current().wasabi100;
+    hash_for_merged_mining_from(header, wasabi100)
+}
+
+/// [`hash_for_merged_mining`] on a chain whose RSKIP110 is at `wasabi100`.
+pub(crate) fn hash_for_merged_mining_from(header: &Header, wasabi100: u64) -> B256 {
+    use rustock_core::validation::{fork_detection, merged_mining};
+    let mut hash = header.hash_for_merged_mining();
+    let includes = header.number >= wasabi100 && header.number >= fork_detection::REQUIRED_BLOCKS;
+    let data = includes.then(|| merged_mining::extract_fork_detection_data(header));
+    if let Some(data) = data.flatten() {
+        // `arraycopy(data, 0, hash, HASH_FOR_MERGED_MINING_PREFIX_LENGTH, 12)`.
+        hash[20..].copy_from_slice(&data);
+    }
+    hash
+}
+
+/// rskj `Block.getCumulativeDifficulty` (Block.java L165-171): the block's
+/// difficulty and each of its uncles'. It reads nothing the store keeps;
+/// what the store keeps for a block is its total difficulty, which
+/// `totalDifficulty` prints.
+fn cumulative_difficulty(
+    header: &Header,
+    body: Option<&(Vec<rustock_core::Transaction>, Vec<Header>)>,
+) -> alloy_primitives::U512 {
+    let uncles = body.map_or(&[][..], |(_, uncles)| uncles.as_slice());
+    uncles.iter().fold(
+        alloy_primitives::U512::from(header.difficulty),
+        |sum, uncle| sum + alloy_primitives::U512::from(uncle.difficulty),
+    )
 }
 
 /// Length of the block's RLP encoding, which is what `size` reports.
