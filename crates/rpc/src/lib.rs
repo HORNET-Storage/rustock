@@ -3,6 +3,7 @@ pub mod debug;
 pub mod dto;
 pub mod eth;
 pub mod helpers;
+pub mod java;
 pub mod evm;
 pub mod logs;
 pub mod mnr;

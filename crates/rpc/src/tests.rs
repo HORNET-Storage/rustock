@@ -3725,9 +3725,8 @@ async fn test_eth_gas_price_ignores_the_tracker_without_a_fee_market() {
 /// walked down to 587 wei; rskj answered 645 and this node answered the
 /// tracker's 26,065,600. 587 x 1.1 is 645.7, and rskj truncates it through
 /// `BigDecimal.toBigInteger()`, so 645 is the answer and 646 would be wrong.
-/// The exact ratio this node uses truncates identically here -- see
-/// `GAS_PRICE_MULTIPLIER_NUM` for where the two forms part company, which is
-/// nowhere a real chain reaches.
+/// The exact ratio this node used to compute truncates identically here; see
+/// `eth::head_minimum_times_multiplier` for where the two part company.
 #[tokio::test]
 async fn test_eth_gas_price_truncates_the_multiplier_like_rskj() {
     let (mut state, tmp) = setup_state();
@@ -3752,6 +3751,70 @@ async fn test_eth_gas_price_falls_back_to_the_block_minimum() {
     let (state, _tmp) = setup_state();
     let r = dispatch_for_test(&state, make_request("eth_gasPrice", json!([]))).await;
     assert_eq!(r.result.unwrap(), json!("0x3e252e0"), "59,240,000 x 1.1");
+}
+
+/// rskj's arithmetic, not an exact 1.1 (task 280): the minimum as a double,
+/// times 1.1 in doubles, read back through Java 17's `Double.toString`; and
+/// either answer printed as its low 64 bits (`Long.toHexString(longValue())`).
+#[tokio::test]
+async fn test_eth_gas_price_multiplies_in_doubles_like_rskj() {
+    let (mut state, _tmp) = setup_state();
+    let mut header = state
+        .store
+        .header(state.store.head().unwrap().unwrap())
+        .unwrap()
+        .unwrap();
+    let huge = U256::from(1u8) << 80;
+    let huge_price = crate::java::big_decimal_value_of_to_big_integer(
+        crate::java::big_integer_double_value(&huge) * 1.1,
+    )
+    .unwrap();
+    for (minimum, price) in [
+        // x * 11 / 10 is ...315; the double product rounds up to ...316.
+        (U256::from(511_772_684_928_469u64), 562_949_953_421_316u64),
+        // An integer double under 2^58 prints whole on Java 17 (...090 on 19).
+        (
+            U256::from(130_176_850_055_317_349u64),
+            143_194_535_060_849_088,
+        ),
+        // From 2^61 Java 17 drops two digits, rounding half up.
+        (
+            U256::from(7_471_491_572_244_865_272u64),
+            8_218_640_729_469_351_900,
+        ),
+        // Past a long, the low 64 bits.
+        (huge, huge_price.as_limbs()[0]),
+    ] {
+        header.minimum_gas_price = minimum;
+        header.cached_hash = None;
+        let hash = header.hash();
+        state.store.put_header(&header).unwrap();
+        state.store.put_canonical_hash(header.number, hash).unwrap();
+        state.store.set_head(hash).unwrap();
+        let r = dispatch_for_test(&state, make_request("eth_gasPrice", json!([]))).await;
+        assert_eq!(r.result.unwrap(), json!(format!("{price:#x}")), "{minimum}");
+    }
+    assert!(
+        huge_price > alloy_primitives::U512::from(u64::MAX),
+        "{huge_price}"
+    );
+
+    struct HugeGasPrice;
+    impl crate::server::GasPriceSource for HugeGasPrice {
+        fn gas_price(&self) -> U256 {
+            (U256::from(1u8) << 64) + U256::from(5u8)
+        }
+        fn is_fee_market_working(&self) -> bool {
+            true
+        }
+    }
+    state.gas_price = Some(Arc::new(HugeGasPrice));
+    let r = dispatch_for_test(&state, make_request("eth_gasPrice", json!([]))).await;
+    assert_eq!(
+        r.result.unwrap(),
+        json!("0x5"),
+        "2^64 + 5 prints as its low 64 bits"
+    );
 }
 
 // ========== trace_* namespace ==========

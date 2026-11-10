@@ -1,5 +1,5 @@
 use crate::helpers::{
-    parse_b256, parse_block_number, parse_hex_u32, to_hex_b256, to_hex_u256, to_hex_u64,
+    parse_b256, parse_block_number, parse_hex_u32, to_hex_b256, to_hex_u64,
     BlockResultDto,
 };
 use crate::server::TxSubmitter;
@@ -96,57 +96,52 @@ pub async fn eth_syncing(
 /// 26,065,600 wei against a minimum of 587, a factor of 44,000. Wallets that
 /// trust it do not merely overpay -- they price themselves over RSKIP252's
 /// 100x cap, and the transactions they produce cannot legally be mined.
+///
+/// rskj prints either answer as `Long.toHexString(price.longValue())`
+/// (`Web3Impl.eth_gasPrice`): its low 64 bits, unsigned.
 pub fn eth_gas_price(id: Value, state: &crate::server::RpcState) -> JsonRpcResponse {
     if let Some(tracker) = &state.gas_price {
         if tracker.is_fee_market_working() {
-            return JsonRpcResponse::success(
-                id,
-                json!(to_hex_u256(&alloy_primitives::U256::from(tracker.gas_price()))),
-            );
+            let price = tracker.gas_price();
+            return JsonRpcResponse::success(id, json!(format!("{:#x}", price.as_limbs()[0])));
         }
     }
-    let price = head_header(&state.store)
-        .map(|h| to_hex_u256(&head_minimum_times_multiplier(&h.minimum_gas_price)))
-        .unwrap_or_else(|| "0x0".to_string());
-    JsonRpcResponse::success(id, json!(price))
+    let Some(header) = head_header(&state.store) else {
+        return JsonRpcResponse::success(id, json!("0x0"));
+    };
+    match head_minimum_times_multiplier(&header.minimum_gas_price) {
+        Some(price) => JsonRpcResponse::success(id, json!(format!("{:#x}", price.as_limbs()[0]))),
+        // Where rskj's `BigDecimal` would throw, which no 256-bit minimum reaches.
+        None => JsonRpcResponse::error(id, INTERNAL_ERROR, "Internal server error"),
+    }
 }
 
 /// The head's `minimumGasPrice` times 1.1, which is what rskj answers when the
-/// fee market is not working.
-fn head_minimum_times_multiplier(minimum: &alloy_primitives::U256) -> alloy_primitives::U256 {
-    minimum.saturating_mul(alloy_primitives::U256::from(GAS_PRICE_MULTIPLIER_NUM))
-        / alloy_primitives::U256::from(GAS_PRICE_MULTIPLIER_DEN)
+/// fee market is not working -- in doubles, as `EthereumImpl.getGasPrice`
+/// computes it:
+///
+/// ```java
+/// double estimatedGasPrice = minimumGasPrice.asBigInteger().doubleValue() * minGasPriceMultiplier;
+/// return new Coin(BigDecimal.valueOf(estimatedGasPrice).toBigInteger());
+/// ```
+///
+/// That is `x * 11 / 10` only while the double holds the product to well
+/// under a unit: from about 2^49 wei the rounding of the multiplication
+/// shows (511,772,684,928,469 gives ...316, not ...315), and from 2^54 the
+/// digits `Double.toString` keeps do (see [`crate::java`]). `None` where
+/// `BigDecimal` would throw.
+fn head_minimum_times_multiplier(
+    minimum: &alloy_primitives::U256,
+) -> Option<alloy_primitives::U512> {
+    let estimated = crate::java::big_integer_double_value(minimum) * MIN_GAS_PRICE_MULTIPLIER;
+    crate::java::big_decimal_value_of_to_big_integer(estimated)
 }
 
-/// 1.1 as an exact ratio, so `x * 11 / 10` with truncation rather than a
-/// float.
-///
-/// Two constants in rskj hold this value and both are 1.1, which is why one
-/// pair serves here. They are not the same setting:
-///
-/// * `GasPriceTracker.DEFAULT_GAS_PRICE_MULTIPLIER` floors the percentile.
-/// * `EthereumImpl.minGasPriceMultiplier` scales the head's minimum on the
-///   branch below. It comes from the `gasPriceMultiplier` config key, whose
-///   default in `reference.conf` is 1.1 -- so an rskj operator can retune it
-///   and this node cannot. A divergence only reachable by changing that
-///   setting, and recorded here rather than discovered later.
-///
-/// Duplicated from `rustock_sync::gas_price`, which has the same pair, and
-/// deliberately: `rpc` does not depend on `sync` -- that is what
-/// `GasPriceSource` exists to avoid -- so sharing them would mean adding the
-/// dependency this trait was written to prevent.
-///
-/// **rskj does this in floating point** -- `BigDecimal.valueOf(minimum
-/// .doubleValue() * minGasPriceMultiplier).toBigInteger()` -- and an exact
-/// ratio is not the same function. Checked rather than assumed: the two
-/// agree on every minimum below 2^53, including all 2,061,855 values under
-/// 2e8 that were compared one by one, and part company only above it, where
-/// the double runs out of mantissa. A minimum gas price up there is 1 RBTC
-/// per gas, so the divergence is unreachable; the integer form is kept for
-/// being exact and float-free, and the boundary is written down so the next
-/// reader does not have to rediscover where it lies.
-const GAS_PRICE_MULTIPLIER_NUM: u64 = 11;
-const GAS_PRICE_MULTIPLIER_DEN: u64 = 10;
+/// rskj's `minGasPriceMultiplier`: `rpc.minGasPriceMultiplier`, 1.1 when the
+/// configuration doesn't set it (`SystemProperties.getMinGasPriceMultiplier`;
+/// `reference.conf` doesn't). An rskj operator can retune it and this node
+/// can't. Not `rpc.gasPriceMultiplier`, which is the gas price tracker's.
+const MIN_GAS_PRICE_MULTIPLIER: f64 = 1.1;
 
 pub fn eth_mining(id: Value) -> JsonRpcResponse {
     JsonRpcResponse::success(id, json!(false))
