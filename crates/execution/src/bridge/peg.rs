@@ -528,13 +528,40 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
                 || retiring_std_hash160.is_some_and(|t| input_matches_fed(&r, t))
         })
     });
-    // (3) isMigrationTx: an input spends the retired or retiring federation AND
-    //     an output funds the active federation (moveFromRetiringOrRetired &&
-    //     moveToActive).
+    // (3) isMigrationTx: an input spends the retired or retiring federation
+    //     (moveFromRetiringOrRetired) and the transaction moves to the active
+    //     one (moveToActive: isValidPegInTx against the active federation
+    //     alone, whose minimum from RSKIP293 asks only that no UTXO to it be
+    //     below it, so paying it nothing qualifies).
     let spends_retired_or_retiring = btc_tx.input.iter().any(|i| {
         input_redeem(i).is_some_and(|r| {
             retired_hash160.is_some_and(|t| input_matches_fed(&r, t))
                 || retiring_std_hash160.is_some_and(|t| input_matches_fed(&r, t))
+        })
+    });
+    // (2) isValidPegInTx refuses a spend of the last retired federation as it
+    //     refuses a live one's: by an input that spends its script
+    //     (`scriptCorrectlySpendsTx`), or from RSKIP201 by one whose standard
+    //     redeem script's legacy P2SH is it. bitcoinj runs the scriptSig, then
+    //     the script: the scriptSig's last push must hash to it and, run as a
+    //     redeem script, accept the signatures pushed before it, as a
+    //     federation's own spends do. A P2SH-P2WSH input's last push is its
+    //     witness program, which bitcoinj runs without the witness. A
+    //     transaction refused that is neither a migration nor a pegout is left
+    //     alone.
+    let rskip201 = hardfork_cfg.has_rskip201(rsk_height);
+    let spends_last_retired = retired_hash160.is_some_and(|retired| {
+        btc_tx.input.iter().any(|i| {
+            let last_push = super::release_tx::extract_redeem_script(i.script_sig.as_bytes());
+            last_push.is_some_and(|script| redeem_script_hash160(&script) == retired)
+                || (rskip201
+                    && input_redeem(i).is_some_and(|r| {
+                        let standard = build_federation_redeem_script(
+                            &super::release_tx::spending_redeem_keys(&r),
+                            super::release_tx::redeem_script_threshold(&r),
+                        );
+                        redeem_script_hash160(&standard) == retired
+                    }))
         })
     });
     let active_output_values: Vec<u64> = btc_tx
@@ -544,7 +571,7 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
         .map(|o| o.value.to_sat())
         .collect();
     let move_to_active = if hardfork_cfg.has_rskip293(rsk_height) {
-        !active_output_values.is_empty() && active_output_values.iter().all(|v| *v >= min_pegin)
+        active_output_values.iter().all(|v| *v >= min_pegin)
     } else {
         active_output_values.iter().sum::<u64>() >= min_pegin
     };
@@ -562,6 +589,28 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
         .map(|o| o.value.to_sat())
         .collect();
     let total_value: u64 = live_output_values.iter().sum();
+    // rskj PegUtilsLegacy.isValidPegInTx minimum gate: under RSKIP293 it checks
+    // EACH UTXO (isAnyUTXOAmountBelowMinimum), otherwise the total amount sent
+    // (valueSentToMe.isLessThan). Crucially, an EMPTY live-output set is not
+    // "below minimum" under RSKIP293 (anyMatch over an empty stream is false),
+    // so a tx that pays no live federation (e.g. only a now-retired one, once
+    // the retiring federation has been cleared earlier in the block) is still a
+    // valid peg-in — processed with amount 0 (pegin_btc amount=0, destination
+    // account created). Pre-RSKIP293 a 0 total is below minimum → not a peg-in.
+    // Below the index's height this gate decides whether the transaction is a
+    // peg-in at all, before RSKIP379 and after: one it turns down is neither a
+    // migration nor a pegout here, so rskj leaves it alone.
+    let not_a_peg_in = !pegout_index
+        && pegin_below_minimum(
+            &live_output_values,
+            min_pegin,
+            hardfork_cfg.has_rskip293(rsk_height),
+        );
+    // rskj asks isMigrationTx only of a transaction isValidPegInTx refused, for
+    // an input or for this minimum. A spend of a retired segwit federation,
+    // stored by its P2SH-P2WSH script, matches neither input check, so it's a
+    // peg-in even where it moves to the active federation.
+    let refused_as_peg_in = spends_live_fed || spends_last_retired || not_a_peg_in;
 
     // rskj `PegUtils.getTransactionTypeUsingPegoutIndex`: a transaction whose
     // first input's sighash the index holds is a pegout or a migration, else one
@@ -583,10 +632,13 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
         }
     } else if tx_from_old_fed {
         Some("FROM_OLD_FEDERATION")
-    } else if is_migration {
+    } else if is_migration && refused_as_peg_in {
         Some("MIGRATION")
     } else if spends_live_fed {
         Some("PEGOUT")
+    } else if spends_last_retired {
+        tracing::debug!("registerBtcTransaction: spends the last retired federation and isn't a migration; not registered");
+        return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
     } else {
         None
     };
@@ -614,14 +666,6 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
         return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
     }
 
-    // rskj PegUtilsLegacy.isValidPegInTx minimum gate: under RSKIP293 it checks
-    // EACH UTXO (isAnyUTXOAmountBelowMinimum), otherwise the total amount sent
-    // (valueSentToMe.isLessThan). Crucially, an EMPTY live-output set is not
-    // "below minimum" under RSKIP293 (anyMatch over an empty stream is false),
-    // so a tx that pays no live federation (e.g. only a now-retired one, once
-    // the retiring federation has been cleared earlier in the block) is still a
-    // valid peg-in — processed with amount 0 (pegin_btc amount=0, destination
-    // account created). Pre-RSKIP293 a 0 total is below minimum → not a peg-in.
     let rskip379 = hardfork_cfg.has_rskip379(rsk_height);
     // RSKIP379 (Arrowhead600) moves the minimum-value gate to
     // `PegUtils.allUTXOsToFedAreAboveMinimumPeginValue`, which EXPLICITLY rejects
@@ -629,15 +673,16 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
     // empty (or any-below-minimum) set is below minimum — the OPPOSITE of the
     // pre-379 legacy rule where `anyMatch`/`!isAnyUTXOAmountBelowMinimum` is
     // vacuously satisfied by an empty set (a valid amount-0 peg-in, #5,171,600).
-    let below_min = if rskip379 {
-        live_output_values.is_empty() || live_output_values.iter().any(|&v| v < min_pegin)
-    } else {
-        pegin_below_minimum(&live_output_values, min_pegin, hardfork_cfg.has_rskip293(rsk_height))
-    };
+    // It applies to every peg-in, whichever rules classified it.
+    let evaluated = rskip379 && !not_a_peg_in;
+    let below_min = not_a_peg_in
+        || (evaluated
+            && (live_output_values.is_empty()
+                || live_output_values.iter().any(|&v| v < min_pegin)));
     if below_min {
-        // Pre-RSKIP379: rskj getTransactionType returns UNKNOWN (neither a
+        // Not a peg-in: rskj getTransactionType returns UNKNOWN (neither a
         // migration nor a peg-out), so registerBtcTransaction ignores it silently.
-        // Post-RSKIP379: evaluatePegin returns (NO_REFUND, INVALID_AMOUNT), and
+        // A peg-in from RSKIP379: evaluatePegin returns (NO_REFUND, INVALID_AMOUNT), and
         // BridgeSupport.handleNonRefundablePegin logs rejected_pegin(INVALID_AMOUNT=5)
         // then unrefundable_pegin(NonRefundablePeginReason.INVALID_AMOUNT=3); it
         // marks the tx processed only when shouldMarkRejectedPeginAsProcessed
@@ -651,17 +696,17 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
             vec![
                 ("minimumSat", FieldValue::U64(min_pegin)),
                 ("fedOutputs", FieldValue::U64(live_output_values.len() as u64)),
-                // Whether the chain also logged this. Before RSKIP379 it did
-                // not, which is the gap these records exist to fill.
-                ("logged", FieldValue::Flag(rskip379)),
+                // Whether the chain also logged this. Where it isn't a peg-in it
+                // did not, which is the gap these records exist to fill.
+                ("logged", FieldValue::Flag(evaluated)),
             ],
         );
-        if rskip379 {
+        if evaluated {
             let hash = btc_txid_event_bytes(&btc_tx);
             super::events::log_rejected_pegin(ctx, &hash, 5);
             super::events::log_unrefundable_pegin(ctx, &hash, 3);
         }
-        if should_mark_rejected_pegin_as_processed(hardfork_cfg, rsk_height) {
+        if evaluated && should_mark_rejected_pegin_as_processed(hardfork_cfg, rsk_height) {
             set_btc_tx_processed(ctx, &legacy_txid, rsk_height, hardfork_cfg.has_rskip134(rsk_height));
         }
         return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
@@ -8844,17 +8889,13 @@ mod tests {
 
     /// `registerBtcTransaction` of `tx` at Bitcoin `height` on RSKj's regtest,
     /// with `pegout_sig_hash` in the pegout index and `svp_fund_hash` as the
-    /// unsigned SVP fund transaction's hash. Answers whether the call
-    /// succeeded, whether it marked the transaction processed, how many events
-    /// it logged, and how many UTXOs the active federation then holds.
+    /// unsigned SVP fund transaction's hash. Answers as [`outcome`].
     fn registered(
         tx: &BtcTransaction,
         height: i64,
         pegout_sig_hash: Option<[u8; 32]>,
         svp_fund_hash: Option<[u8; 32]>,
     ) -> (bool, bool, usize, usize) {
-        let config = BridgeConstants::rskj_regtest();
-        let cfg = RskHardforkConfig::rskj_regtest();
         let mut ctx = regtest_bridge_with(tx);
         if let Some(sig_hash) = pegout_sig_hash {
             save_pegout_tx_sig_hash(&mut ctx, &sig_hash);
@@ -8866,6 +8907,19 @@ mod tests {
                 &rlp_encode_element(&hash),
             );
         }
+        outcome(&mut ctx, tx, height, &RskHardforkConfig::rskj_regtest())
+    }
+
+    /// `registerBtcTransaction` of `tx` at Bitcoin `height` in `ctx`, with RSKj's
+    /// regtest constants and `cfg`. Answers whether the call succeeded, whether
+    /// it marked the transaction processed, how many events it logged, and how
+    /// many UTXOs the active federation then holds.
+    fn outcome<CTX: crate::RskContextTr>(
+        ctx: &mut CTX,
+        tx: &BtcTransaction,
+        height: i64,
+        cfg: &RskHardforkConfig,
+    ) -> (bool, bool, usize, usize) {
         let raw = btc_serialize(tx);
         let tree = one_leaf_tree(&raw);
         let args = encode::args(&[
@@ -8874,17 +8928,17 @@ mod tests {
             Arg::Bytes(&tree),
         ]);
         let ok = register_btc_transaction(
-            &mut ctx,
+            ctx,
             &args,
             0,
-            &config,
-            &cfg,
+            &BridgeConstants::rskj_regtest(),
+            cfg,
             &BridgeTxContext::default(),
         )
         .is_ok();
         let logs = ctx.journal_mut().take_logs().len();
-        let processed = is_btc_tx_processed(&mut ctx, &legacy_btc_txid(tx));
-        let utxos = super::super::storage::load_federation_utxos(&mut ctx, &cfg, 10).len();
+        let processed = is_btc_tx_processed(ctx, &legacy_btc_txid(tx));
+        let utxos = super::super::storage::load_federation_utxos(ctx, cfg, 10).len();
         (ok, processed, logs, utxos)
     }
 
@@ -8999,5 +9053,96 @@ mod tests {
             segwit += usize::from(tx.input.iter().any(|input| !input.witness.is_empty()));
         }
         assert_eq!((read, segwit), (8, 4));
+    }
+
+    /// Below the index's height, `isValidPegInTx` refuses a spend of the last
+    /// retired federation as it refuses a live one's, and `isMigrationTx`,
+    /// asked next, knows the retired federation by its standard redeem script.
+    /// Stored by its whole ERP redeem script, as before RSKIP377, the retired
+    /// federation's spend is neither, and is left alone. Stored by its standard
+    /// redeem script, the spend is a migration, from RSKIP293 even when it pays
+    /// the active federation nothing. A segwit one, stored by the P2SH-P2WSH
+    /// script of its standard redeem script, isn't refused, so its spend is a
+    /// peg-in; stored by its whole redeem script's, it's refused, as bitcoinj
+    /// matches the scriptSig's witness program to it, and its spend is left alone.
+    #[test]
+    fn below_the_index_a_spend_of_the_last_retired_federation_is_no_peg_in() {
+        let keys = test_keys(0x10);
+        let standard = build_federation_redeem_script(&keys, 2);
+        let erp = build_erp_redeem_script(&keys, 2, &test_keys(0x40), 2, 52_560, true);
+        let with_retired = |retired: &[u8; 20], tx: &BtcTransaction| {
+            let mut ctx = regtest_bridge_with(tx);
+            let script = p2sh_output_script(retired).into_bytes();
+            bridge_store_bytes_named(
+                &mut ctx,
+                super::super::storage::LAST_RETIRED_FEDERATION_P2SH_SCRIPT_KEY,
+                &rlp_encode_list(&[rlp_encode_element(&script)]),
+            );
+            outcome(&mut ctx, tx, 349, &RskHardforkConfig::rskj_regtest())
+        };
+        let to_federation = (1_000_000_000, regtest_federation_script());
+        let paying_nothing = spend(
+            vec![signed_multisig(&erp)],
+            &[(40_000, p2sh_output_script(&[0x77; 20]))],
+        );
+        let migrating = spend(
+            vec![signed_multisig(&erp)],
+            std::slice::from_ref(&to_federation),
+        );
+        // With no federation retired, both are peg-ins.
+        assert_eq!(
+            registered(&paying_nothing, 349, None, None),
+            (true, false, 2, 0)
+        );
+        assert_eq!(registered(&migrating, 349, None, None), (true, true, 2, 0));
+        let whole = redeem_script_hash160(&erp);
+        assert_eq!(with_retired(&whole, &paying_nothing), (true, false, 0, 0));
+        assert_eq!(with_retired(&whole, &migrating), (true, false, 0, 0));
+        let members = redeem_script_hash160(&standard);
+        assert_eq!(with_retired(&members, &paying_nothing), (true, true, 0, 0));
+        assert_eq!(with_retired(&members, &migrating), (true, true, 0, 1));
+        let (script_sig, _) = super::super::release_tx::segwit_base_input(&erp, 2);
+        let witness = bitcoin::Witness::from_slice(&[
+            vec![],
+            vec![0x30; 71],
+            vec![0x31; 72],
+            vec![],
+            erp.clone(),
+        ]);
+        let segwit = spend(vec![(script_sig, witness)], &[to_federation]);
+        let peg_in = registered(&segwit, 349, None, None);
+        assert!(peg_in.0);
+        assert_eq!(
+            with_retired(&federation_output_hash160(&erp, 4000), &segwit),
+            (true, false, 0, 0)
+        );
+        assert_eq!(
+            with_retired(&federation_output_hash160(&standard, 4000), &segwit),
+            peg_in
+        );
+    }
+
+    /// Below the index's height `isValidPegInTx`'s own minimum decides whether a
+    /// transaction is a peg-in: from RSKIP293 one UTXO to a live federation
+    /// below it makes it none, and it's left alone. From the index's height
+    /// every transaction paying a live federation is a peg-in, and
+    /// `evaluatePegin` turns a small one down with its two events. Where rskj
+    /// marks a rejected peg-in processed (RSKIP459 without RSKIP551), it marks
+    /// only that one.
+    #[test]
+    fn below_the_index_a_small_utxo_makes_no_peg_in() {
+        let redeem = build_federation_redeem_script(&test_keys(0x10), 2);
+        let tx = spend(
+            vec![signed_multisig(&redeem)],
+            &[(1, regtest_federation_script())],
+        );
+        assert_eq!(registered(&tx, 349, None, None), (true, false, 0, 0));
+        assert_eq!(registered(&tx, 350, None, None), (true, false, 2, 0));
+        let marking = RskHardforkConfig::rskj_regtest()
+            .with_hardfork(crate::hardfork::RskNetworkUpgrade::Vetiver900, None);
+        assert!(should_mark_rejected_pegin_as_processed(&marking, 10));
+        let marked = |height| outcome(&mut regtest_bridge_with(&tx), &tx, height, &marking);
+        assert_eq!(marked(349), (true, false, 0, 0));
+        assert_eq!(marked(350), (true, true, 2, 0));
     }
 }
