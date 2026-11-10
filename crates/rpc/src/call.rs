@@ -14,12 +14,16 @@ pub fn eth_call(id: Value, params: &Value, state: &RpcState) -> JsonRpcResponse 
         return JsonRpcResponse::error(id, INVALID_PARAMS, "Missing or invalid call request");
     };
     let block_param = params.get(1).and_then(|v| v.as_str()).unwrap_or("latest");
+    let block_param = match crate::helpers::execution_block(block_param, false) {
+        Ok(block) => block,
+        Err((code, message)) => return JsonRpcResponse::error(id, code, message),
+    };
 
     let Some((trie_store, hardfork_cfg)) = state.trie_store.clone().zip(state.hardfork_cfg.clone()) else {
         return JsonRpcResponse::error(id, INTERNAL_ERROR, "Execution engine not available");
     };
 
-    let Some((root, header)) = resolve_state_root(block_param, state) else {
+    let Some((root, header)) = resolve_state_root(&block_param, state) else {
         return JsonRpcResponse::error(id, INTERNAL_ERROR, "Cannot resolve block");
     };
 
@@ -44,12 +48,16 @@ pub fn eth_estimate_gas(id: Value, params: &Value, state: &RpcState) -> JsonRpcR
         return JsonRpcResponse::error(id, INVALID_PARAMS, "Missing or invalid call request");
     };
     let block_param = params.get(1).and_then(|v| v.as_str()).unwrap_or("latest");
+    let block_param = match crate::helpers::execution_block(block_param, true) {
+        Ok(block) => block,
+        Err((code, message)) => return JsonRpcResponse::error(id, code, message),
+    };
 
     let Some((trie_store, hardfork_cfg)) = state.trie_store.clone().zip(state.hardfork_cfg.clone()) else {
         return JsonRpcResponse::error(id, INTERNAL_ERROR, "Execution engine not available");
     };
 
-    let Some((root, header)) = resolve_state_root(block_param, state) else {
+    let Some((root, header)) = resolve_state_root(&block_param, state) else {
         return JsonRpcResponse::error(id, INTERNAL_ERROR, "Cannot resolve block");
     };
 

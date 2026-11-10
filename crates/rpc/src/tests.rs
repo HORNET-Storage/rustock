@@ -1368,7 +1368,8 @@ fn answered_within_a_minute(state: &RpcState, request: JsonRpcRequest) -> JsonRp
 
 /// **A log range is walked no further than the head.**
 ///
-/// A client may name any block up to 2^64 - 1. `eth_getLogs` measures its span
+/// A client may name any block up to 2^63 - 1, the most rskj reads in a log
+/// filter (`jsonHexToLong`; past it is `-32603`). `eth_getLogs` measures its span
 /// against the cap, and that measurement must not overflow; an installed
 /// filter's range is never measured at all. Either way nothing above the head
 /// holds a block, and walking those numbers one by one would be a request
@@ -1376,7 +1377,7 @@ fn answered_within_a_minute(state: &RpcState, request: JsonRpcRequest) -> JsonRp
 #[tokio::test]
 async fn a_log_range_reaching_the_top_of_the_number_space_stops_at_the_head() {
     let (state, _tmp) = setup_state_with_logs();
-    let top = "0xffffffffffffffff";
+    let top = "0x7fffffffffffffff";
 
     let at_the_top = answered_within_a_minute(
         &state,
@@ -4023,6 +4024,94 @@ async fn eth_call_answers_where_a_transaction_would_be_refused() {
             resp.error
         );
     }
+}
+
+/// Block tags as rskj reads them (upstream #178): as written by every method
+/// but a log filter, which reads them in any case. `LATEST` is `-32602` to
+/// the rest, as is `finalized` -- rskj's `BlockIdentifierParam` lets both
+/// through, but nothing it hands them to resolves them. In a log filter,
+/// `finalized`, `safe` and a decimal reach `jsonHexToLong` and throw,
+/// `-32603`, and what isn't a tag or a number is `-32602`. `eth_call` and
+/// `eth_estimateGas` read a decimal block (`ExecutionBlockRetriever`).
+#[tokio::test]
+async fn block_tags_are_read_as_rskj_reads_them() {
+    let (state, _tmp) = setup_state_with_logs();
+    let ask = |method: &str, params: Value| {
+        let request = make_request(method, params);
+        let state = &state;
+        async move { dispatch_for_test(state, request).await }
+    };
+    let code = |resp: &JsonRpcResponse| resp.error.as_ref().map(|error| error.code);
+    let address = "0x1111111111111111111111111111111111111111";
+
+    let resp = ask("eth_getBlockByNumber", json!(["latest", false])).await;
+    assert_eq!(resp.result.unwrap()["number"], json!("0x3"));
+    for tag in ["LATEST", "Earliest", "finalized", "safe"] {
+        let resp = ask("eth_getBlockByNumber", json!([tag, false])).await;
+        assert_eq!(code(&resp), Some(-32602), "eth_getBlockByNumber {tag}");
+        for method in ["eth_getBalance", "eth_getCode", "eth_getTransactionCount"] {
+            let resp = ask(method, json!([address, tag])).await;
+            assert_eq!(
+                resp.error.map(|error| (error.code, error.message)),
+                Some((-32602, format!("Invalid block identifier '{tag}'"))),
+                "{method} {tag}"
+            );
+        }
+        let resp = ask("eth_call", json!([{"to": address}, tag])).await;
+        assert_eq!(
+            resp.error.map(|error| (error.code, error.message)),
+            Some((-32602, format!("Invalid block identifier '{tag}'"))),
+            "eth_call {tag}"
+        );
+        let resp = ask("eth_estimateGas", json!([{"to": address}, tag])).await;
+        let error = resp.error.expect("eth_estimateGas refuses it");
+        assert_eq!(error.code, -32602, "eth_estimateGas {tag}");
+        assert!(
+            error
+                .message
+                .starts_with(&format!("Unsupported block specifier '{tag}'.")),
+            "eth_estimateGas {tag}: {}",
+            error.message
+        );
+    }
+    let resp = ask("eth_getStorageAt", json!([address, "0x0", "PENDING"])).await;
+    assert_eq!(code(&resp), Some(-32602));
+    let resp = ask("rsk_getStorageBytesAt", json!([address, "0x0", "Latest"])).await;
+    assert_eq!(code(&resp), Some(-32602));
+    let resp = ask("eth_getBalance", json!([address, "3"])).await;
+    assert_eq!(
+        resp.error.map(|error| (error.code, error.message)),
+        Some((-32602, "invalid blocknumber 3".to_string()))
+    );
+
+    let logs = |filter: Value| ask("eth_getLogs", json!([filter]));
+    let resp = logs(json!({"fromBlock": "EARLIEST", "toBlock": "Latest"})).await;
+    assert_eq!(resp.result.unwrap().as_array().unwrap().len(), 3);
+    let resp = ask("eth_newFilter", json!([{"fromBlock": "LATEST"}])).await;
+    assert!(resp.result.is_some(), "{:?}", resp.error);
+    for block in [json!("finalized"), json!("SAFE"), json!("2"), json!(2)] {
+        for key in ["fromBlock", "toBlock"] {
+            let resp = logs(json!({ key: block })).await;
+            assert_eq!(code(&resp), Some(-32603), "eth_getLogs {key} {block}");
+        }
+        let resp = ask("eth_newFilter", json!([{"fromBlock": block}])).await;
+        assert_eq!(code(&resp), Some(-32603), "eth_newFilter {block}");
+    }
+    for block in [json!("foo"), json!(null), json!("0x")] {
+        let resp = logs(json!({"toBlock": block})).await;
+        assert_eq!(code(&resp), Some(-32602), "eth_getLogs {block}");
+    }
+
+    // A decimal block for a call, at the tracing fixture's #41.
+    let (state, _tmp, _, _, _, callee) = setup_state_for_tracing();
+    let call = json!({"to": format!("{callee:#x}")});
+    let resp = dispatch_for_test(&state, make_request("eth_call", json!([call, "41"]))).await;
+    assert_eq!(
+        resp.result,
+        Some(json!(format!("0x{:064x}", 0x2a))),
+        "{:?}",
+        resp.error
+    );
 }
 
 /// `eth_getBlockBy*` with full transactions must name the real sender.

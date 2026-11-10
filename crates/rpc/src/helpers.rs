@@ -81,7 +81,8 @@ pub fn parse_storage_slot(s: &str) -> Option<B256> {
     Some(B256::from(out))
 }
 
-/// Resolves a block parameter: a tag, or a `0x`-prefixed hex height.
+/// Resolves a block parameter: `latest`, `pending` or `earliest` as written,
+/// or a `0x`-prefixed hex height.
 ///
 /// # The `0x` prefix is required, and that is the whole point
 ///
@@ -92,39 +93,168 @@ pub fn parse_storage_slot(s: &str) -> Option<B256> {
 ///
 /// rskj rejects an unprefixed height for every method that reaches
 /// `Web3InformationRetriever` -- `HexUtils.stringHexToBigInteger` demands the
-/// prefix and answers `-32602 invalid blocknumber` -- so rejecting matches it
-/// for the large majority of the namespace, and errs in the safe direction
-/// everywhere else: a client gets an error rather than a wrong block.
+/// prefix and answers `-32602 invalid blocknumber`. `eth_call` and
+/// `eth_estimateGas` read a decimal height too, through
+/// `ExecutionBlockRetriever` ([`execution_block`]), and so does
+/// `eth_getBlocksByNumber`, which parses its own parameter (see
+/// `eth::eth_get_blocks_by_number`).
 ///
-/// Two deliberate differences from rskj remain, both of them rskj accepting
-/// what this rejects:
+/// # Tags are matched as written
 ///
-/// - `eth_call` and `eth_estimateGas` resolve through `ExecutionBlockRetriever`
-///   there, which parses a decimal height too. Whether a method takes decimal
-///   is therefore a property of its retrieval path rather than of the
-///   parameter, which is an upstream accident this does not reproduce.
-/// - `eth_getBlocksByNumber` takes a decimal height, and does so here as well
-///   -- it parses its own parameter (see `eth::eth_get_blocks_by_number`).
-///
-/// Tags are matched case-insensitively. rskj is inconsistent about this --
-/// `BlockTag.fromString` uses `equalsIgnoreCase` while `BlockRefParam` matches
-/// exactly -- so `"LATEST"` works for half its methods. Accepting it
-/// everywhere is the permissive half of that split and cannot break a caller
-/// that works against either.
+/// As every path of rskj's matches them but a log filter's: `getBlock`
+/// switches on the string, `BlockRefParam` lists the three tags,
+/// `ExecutionBlockRetriever` compares with `BlockTag.tagEquals`
+/// (`contentEquals`) and `Web3Impl.getBlockByNumberOrStr` with `equals`.
+/// `BlockIdentifierParam` lets `LATEST`, `finalized` and `safe` through
+/// (`BlockTag.fromString` ignores case), but nothing it hands them to resolves
+/// them but a log filter (upstream #178), which reads its blocks with
+/// [`parse_filter_block`].
 pub fn parse_block_number(s: &str, head_number: u64) -> Option<u64> {
-    let trimmed = s.trim();
-    if trimmed.eq_ignore_ascii_case("latest") || trimmed.eq_ignore_ascii_case("pending") {
-        return Some(head_number);
+    match s {
+        "latest" | "pending" => Some(head_number),
+        "earliest" => Some(0),
+        // No prefix, no answer. Guessing the base is what produced #177.
+        _ if is_hex_number(s) => u64::from_str_radix(&s[2..], 16).ok(),
+        _ => None,
     }
-    if trimmed.eq_ignore_ascii_case("earliest") {
-        return Some(0);
+}
+
+/// rskj's decimal number in a block parameter, `^\d+$`
+/// (`Utils.isDecimalString`).
+fn is_decimal(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// rskj's hex number in a block parameter, `^0x[\da-fA-F]+$`
+/// (`Utils.isHexadecimalString`).
+fn is_hex_number(s: &str) -> bool {
+    s.strip_prefix("0x")
+        .is_some_and(|hex| !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// rskj's block tags, in any case (`BlockTag.fromString`).
+fn is_block_tag(s: &str) -> bool {
+    ["pending", "latest", "earliest", "finalized", "safe"]
+        .iter()
+        .any(|tag| tag.eq_ignore_ascii_case(s))
+}
+
+/// What rskj answers a block reference it refuses before it looks a block up,
+/// for `eth_getBalance`, `eth_getCode`, `eth_getStorageAt`,
+/// `eth_getTransactionCount` and `rsk_getStorageBytesAt`. `BlockRefParam`
+/// passes `earliest`, `latest` and `pending` as written, a decimal and a `0x`
+/// hex number, and refuses the rest -- `LATEST` among them -- with `-32602
+/// Invalid block identifier`. A decimal goes on to
+/// `Web3InformationRetriever.getBlock`, which reads only hex: `-32602 invalid
+/// blocknumber`.
+pub fn refused_block_ref(id: &serde_json::Value, s: &str) -> Option<crate::types::JsonRpcResponse> {
+    let message =
+        if !(matches!(s, "earliest" | "latest" | "pending") || is_decimal(s) || is_hex_number(s)) {
+            format!("Invalid block identifier '{s}'")
+        } else if is_decimal(s) {
+            format!("invalid blocknumber {s}")
+        } else {
+            return None;
+        };
+    Some(crate::types::JsonRpcResponse::error(
+        id.clone(),
+        crate::types::INVALID_PARAMS,
+        message,
+    ))
+}
+
+/// The block `eth_call` (`estimate` false) or `eth_estimateGas` (true) runs
+/// on, as rskj reads it: in a form `state::resolve_state_root` reads, or the
+/// error code and message rskj answers.
+///
+/// The parameter is checked first: `eth_call`'s is a `BlockRefParam`
+/// (`earliest`, `latest` and `pending` as written), `eth_estimateGas`'s a
+/// `BlockIdentifierParam` (rskj's tags in any case); either passes a decimal and
+/// a `0x` hex number and refuses the rest, `-32602 Invalid block identifier`.
+/// Then `ExecutionBlockRetriever.retrieveExecutionBlock` matches the tags as
+/// written and reads a number in hex or decimal as a long, throwing past one
+/// (`Utils.hexadecimalStringToLong`, `decimalStringToLong`), which nothing
+/// catches: `-32603 Internal server error`. A tag in another case, or
+/// `finalized` or `safe`, it refuses: `-32602 Unsupported block specifier`.
+pub fn execution_block(s: &str, estimate: bool) -> Result<String, (i64, String)> {
+    use crate::types::{INTERNAL_ERROR, INVALID_PARAMS};
+    let tag = if estimate {
+        is_block_tag(s)
+    } else {
+        matches!(s, "earliest" | "latest" | "pending")
+    };
+    if estimate && s.is_empty() {
+        return Err((
+            INVALID_PARAMS,
+            "Invalid block identifier: empty or null.".into(),
+        ));
     }
-    // No prefix, no answer. Guessing the base is what produced #177.
-    let hex = trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X"))?;
-    if hex.is_empty() {
-        return None;
+    if !(tag || is_decimal(s) || is_hex_number(s)) {
+        return Err((INVALID_PARAMS, format!("Invalid block identifier '{s}'")));
     }
-    u64::from_str_radix(hex, 16).ok()
+    let number = if is_hex_number(s) {
+        i64::from_str_radix(&s[2..], 16)
+    } else if is_decimal(s) {
+        s.parse::<i64>()
+    } else if matches!(s, "earliest" | "latest" | "pending") {
+        return Ok(s.to_string());
+    } else {
+        return Err((
+            INVALID_PARAMS,
+            format!(
+                "Unsupported block specifier '{s}'. Can only be either 'earliest', 'latest', \
+                 'pending' or a specific block number (either hex - prepending '0x' or decimal)."
+            ),
+        ));
+    };
+    number
+        .map(|number| format!("{number:#x}"))
+        .map_err(|_| (INTERNAL_ERROR, "Internal server error".into()))
+}
+
+/// A log filter's `fromBlock` or `toBlock`, as rskj reads it: the height, or
+/// the error code and message rskj answers.
+///
+/// `FilterRequestParam` takes the value's text (Jackson's `asText`) into a
+/// `BlockIdentifierParam`, which refuses all but rskj's tags in any case, a
+/// decimal and a `0x` hex number: `-32602 Invalid block identifier`. Then
+/// `LogFilter` matches `latest`, `pending` and `earliest` ignoring case
+/// (`isBlockWord`), and reads the rest with `Web3Impl.getBlockByNumberOrStr`,
+/// whose `jsonHexToLong` throws on anything not hex that fits a long --
+/// `finalized`, `safe`, a decimal -- which nothing catches: `-32603 Internal
+/// server error`.
+pub fn parse_filter_block(
+    value: &serde_json::Value,
+    head_number: u64,
+) -> Result<u64, (i64, String)> {
+    use crate::types::{INTERNAL_ERROR, INVALID_PARAMS};
+    use serde_json::Value;
+    let text = match value {
+        Value::String(s) => s.clone(),
+        Value::Number(n) => n.to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::Null => "null".to_string(),
+        Value::Array(_) | Value::Object(_) => String::new(),
+    };
+    if text.is_empty() {
+        return Err((
+            INVALID_PARAMS,
+            "Invalid block identifier: empty or null.".into(),
+        ));
+    }
+    if !(is_block_tag(&text) || is_decimal(&text) || is_hex_number(&text)) {
+        return Err((INVALID_PARAMS, format!("Invalid block identifier '{text}'")));
+    }
+    if text.eq_ignore_ascii_case("latest") || text.eq_ignore_ascii_case("pending") {
+        return Ok(head_number);
+    }
+    if text.eq_ignore_ascii_case("earliest") {
+        return Ok(0);
+    }
+    text.strip_prefix("0x")
+        .and_then(|hex| i64::from_str_radix(hex, 16).ok())
+        .and_then(|number| u64::try_from(number).ok())
+        .ok_or((INTERNAL_ERROR, "Internal server error".into()))
 }
 
 /// Parses a 0x-prefixed hex index. Returns None on anything malformed, which
@@ -388,14 +518,16 @@ mod tests {
         assert_eq!(parse_block_number("0x64", 999), Some(100));
     }
 
-    /// rskj matches tags case-insensitively for half its methods and exactly
-    /// for the other half. Accepting either is the half that cannot break a
-    /// caller written against the other. See #178.
+    /// Tags are matched as written, as rskj matches them everywhere but in a
+    /// log filter: `LATEST` resolves to nothing, nor does a tag with space
+    /// around it or an upper-case prefix (upstream #178).
     #[test]
-    fn block_tags_are_case_insensitive() {
-        assert_eq!(parse_block_number("LATEST", 100), Some(100));
-        assert_eq!(parse_block_number("Earliest", 100), Some(0));
-        assert_eq!(parse_block_number("PENDING", 100), Some(100));
+    fn block_tags_are_matched_as_written() {
+        assert_eq!(parse_block_number("LATEST", 100), None);
+        assert_eq!(parse_block_number("Earliest", 100), None);
+        assert_eq!(parse_block_number("PENDING", 100), None);
+        assert_eq!(parse_block_number(" latest", 100), None);
+        assert_eq!(parse_block_number("0X10", 100), None);
     }
 
     /// Neither a bare prefix nor rubbish resolves to a block.
@@ -405,6 +537,109 @@ mod tests {
         assert_eq!(parse_block_number("", 100), None);
         assert_eq!(parse_block_number("finalized", 100), None);
         assert_eq!(parse_block_number("0xzz", 100), None);
+        assert_eq!(parse_block_number("0x+5", 100), None);
+    }
+
+    /// A block reference rskj refuses before it looks anything up: anything
+    /// but the three tags as written, a decimal and a hex number, and then a
+    /// decimal, which `getBlock` can't read.
+    #[test]
+    fn a_block_reference_is_refused_as_rskj_refuses_it() {
+        let refused = |s: &str| {
+            refused_block_ref(&serde_json::json!(1), s)
+                .and_then(|resp| resp.error)
+                .map(|error| (error.code, error.message))
+        };
+        for fine in ["latest", "pending", "earliest", "0x0", "0x1F"] {
+            assert_eq!(refused(fine), None, "{fine}");
+        }
+        for (s, message) in [
+            ("LATEST", "Invalid block identifier 'LATEST'"),
+            ("finalized", "Invalid block identifier 'finalized'"),
+            ("0x", "Invalid block identifier '0x'"),
+            ("12", "invalid blocknumber 12"),
+        ] {
+            assert_eq!(refused(s), Some((-32602, message.to_string())), "{s}");
+        }
+    }
+
+    /// The block a call or an estimate runs on: rskj's tags as written, a hex
+    /// or decimal long; `eth_call` refuses another tag's spelling as an
+    /// identifier and `eth_estimateGas` as a specifier, both `-32602`, and a
+    /// number past a long is `-32603`.
+    #[test]
+    fn a_calls_block_is_read_as_rskj_reads_it() {
+        for estimate in [false, true] {
+            assert_eq!(execution_block("latest", estimate), Ok("latest".into()));
+            assert_eq!(execution_block("pending", estimate), Ok("pending".into()));
+            assert_eq!(execution_block("0x1F", estimate), Ok("0x1f".into()));
+            assert_eq!(execution_block("100", estimate), Ok("0x64".into()));
+            assert_eq!(
+                execution_block("0x8000000000000000", estimate),
+                Err((-32603, "Internal server error".into()))
+            );
+            assert_eq!(
+                execution_block("9223372036854775808", estimate),
+                Err((-32603, "Internal server error".into()))
+            );
+            assert_eq!(
+                execution_block("foo", estimate),
+                Err((-32602, "Invalid block identifier 'foo'".into()))
+            );
+        }
+        assert_eq!(
+            execution_block("", false),
+            Err((-32602, "Invalid block identifier ''".into()))
+        );
+        assert_eq!(
+            execution_block("", true),
+            Err((-32602, "Invalid block identifier: empty or null.".into()))
+        );
+        assert_eq!(
+            execution_block("LATEST", false),
+            Err((-32602, "Invalid block identifier 'LATEST'".into()))
+        );
+        let (code, message) = execution_block("safe", true).unwrap_err();
+        assert_eq!(code, -32602);
+        assert!(
+            message.starts_with("Unsupported block specifier 'safe'."),
+            "{message}"
+        );
+    }
+
+    /// A log filter's block: rskj's three tags in any case, a hex long; a
+    /// value that isn't one of rskj's tags or numbers is `-32602`, and
+    /// `finalized`, `safe`, a decimal or a number past a long `-32603`.
+    #[test]
+    fn a_log_filters_block_is_read_as_rskj_reads_it() {
+        use serde_json::json;
+        assert_eq!(parse_filter_block(&json!("LATEST"), 100), Ok(100));
+        assert_eq!(parse_filter_block(&json!("Pending"), 100), Ok(100));
+        assert_eq!(parse_filter_block(&json!("EARLIEST"), 100), Ok(0));
+        assert_eq!(parse_filter_block(&json!("0x1F"), 100), Ok(31));
+        let internal = Err((-32603, "Internal server error".to_string()));
+        for value in [
+            json!("finalized"),
+            json!("SAFE"),
+            json!("12"),
+            json!(12),
+            json!("0x8000000000000000"),
+        ] {
+            assert_eq!(parse_filter_block(&value, 100), internal, "{value}");
+        }
+        for (value, message) in [
+            (json!("foo"), "Invalid block identifier 'foo'"),
+            (json!(null), "Invalid block identifier 'null'"),
+            (json!(true), "Invalid block identifier 'true'"),
+            (json!(""), "Invalid block identifier: empty or null."),
+            (json!({}), "Invalid block identifier: empty or null."),
+        ] {
+            assert_eq!(
+                parse_filter_block(&value, 100),
+                Err((-32602, message.to_string())),
+                "{value}"
+            );
+        }
     }
 
     /// **A slot is a quantity.** Clients send `0x0`, not 64 zeros, and

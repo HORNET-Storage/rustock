@@ -12,6 +12,9 @@ pub fn eth_get_balance(id: Value, params: &Value, state: &RpcState) -> JsonRpcRe
         return JsonRpcResponse::error(id, INVALID_PARAMS, "Missing or invalid address");
     };
     let block_param = params.get(1).and_then(|v| v.as_str()).unwrap_or("latest");
+    if let Some(refused) = crate::helpers::refused_block_ref(&id, block_param) {
+        return refused;
+    }
 
     let Some((root, _header)) = resolve_state_root(block_param, state) else {
         return JsonRpcResponse::error(id, INTERNAL_ERROR, "Cannot resolve block");
@@ -29,6 +32,9 @@ pub fn eth_get_transaction_count(id: Value, params: &Value, state: &RpcState) ->
         return JsonRpcResponse::error(id, INVALID_PARAMS, "Missing or invalid address");
     };
     let block_param = params.get(1).and_then(|v| v.as_str()).unwrap_or("latest");
+    if let Some(refused) = crate::helpers::refused_block_ref(&id, block_param) {
+        return refused;
+    }
 
     // For "pending", return the pool's pending nonce if available
     if block_param == "pending" {
@@ -58,6 +64,9 @@ pub fn eth_get_code(id: Value, params: &Value, state: &RpcState) -> JsonRpcRespo
         return JsonRpcResponse::error(id, INVALID_PARAMS, "Missing or invalid address");
     };
     let block_param = params.get(1).and_then(|v| v.as_str()).unwrap_or("latest");
+    if let Some(refused) = crate::helpers::refused_block_ref(&id, block_param) {
+        return refused;
+    }
 
     let Some((root, _header)) = resolve_state_root(block_param, state) else {
         return JsonRpcResponse::error(id, INTERNAL_ERROR, "Cannot resolve block");
@@ -88,6 +97,9 @@ pub fn eth_get_storage_at(id: Value, params: &Value, state: &RpcState) -> JsonRp
         return JsonRpcResponse::error(id, INVALID_PARAMS, "Missing or invalid storage slot");
     };
     let block_param = params.get(2).and_then(|v| v.as_str()).unwrap_or("latest");
+    if let Some(refused) = crate::helpers::refused_block_ref(&id, block_param) {
+        return refused;
+    }
 
     let Some((root, _header)) = resolve_state_root(block_param, state) else {
         return JsonRpcResponse::error(id, INTERNAL_ERROR, "Cannot resolve block");

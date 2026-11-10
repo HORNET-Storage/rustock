@@ -1,5 +1,5 @@
 use crate::dto::LogDto;
-use crate::helpers::{parse_b256, parse_block_number, to_hex_b256, to_hex_u64};
+use crate::helpers::{parse_b256, to_hex_b256, to_hex_u64};
 use crate::server::RpcState;
 use crate::types::*;
 use alloy_primitives::{Address, B256};
@@ -126,7 +126,10 @@ pub fn eth_get_logs(id: Value, params: &Value, state: &RpcState) -> JsonRpcRespo
     };
 
     let head_num = head_number(&state.store).unwrap_or(0);
-    let filter = parse_log_filter(filter_obj, head_num);
+    let filter = match parse_log_filter(filter_obj, head_num) {
+        Ok(filter) => filter,
+        Err((code, message)) => return JsonRpcResponse::error(id, code, message),
+    };
 
     let from = filter.from_block.unwrap_or(head_num);
     let to = filter.to_block.unwrap_or(head_num);
@@ -152,7 +155,10 @@ pub fn eth_new_filter(id: Value, params: &Value, state: &RpcState) -> JsonRpcRes
     };
 
     let head_num = head_number(&state.store).unwrap_or(0);
-    let log_filter = parse_log_filter(filter_obj, head_num);
+    let log_filter = match parse_log_filter(filter_obj, head_num) {
+        Ok(filter) => filter,
+        Err((code, message)) => return JsonRpcResponse::error(id, code, message),
+    };
 
     let filter = Filter {
         kind: FilterKind::Log(log_filter),
@@ -410,14 +416,17 @@ fn matches_filter(log: &rustock_core::Log, filter: &LogFilter) -> bool {
     true
 }
 
-fn parse_log_filter(obj: &Value, head_num: u64) -> LogFilter {
-    let from_block = obj.get("fromBlock")
-        .and_then(|v| v.as_str())
-        .and_then(|s| parse_block_number(s, head_num));
-
-    let to_block = obj.get("toBlock")
-        .and_then(|v| v.as_str())
-        .and_then(|s| parse_block_number(s, head_num));
+/// A log filter as rskj reads it. Its blocks are read as
+/// `crate::helpers::parse_filter_block` says, and one rskj can't read is an
+/// error, not the head.
+fn parse_log_filter(obj: &Value, head_num: u64) -> Result<LogFilter, (i64, String)> {
+    let block = |key: &str| {
+        obj.get(key)
+            .map(|value| crate::helpers::parse_filter_block(value, head_num))
+            .transpose()
+    };
+    let from_block = block("fromBlock")?;
+    let to_block = block("toBlock")?;
 
     let addresses = parse_address_filter(obj.get("address"));
 
@@ -441,7 +450,12 @@ fn parse_log_filter(obj: &Value, head_num: u64) -> LogFilter {
         })
         .unwrap_or_default();
 
-    LogFilter { from_block, to_block, addresses, topics }
+    Ok(LogFilter {
+        from_block,
+        to_block,
+        addresses,
+        topics,
+    })
 }
 
 fn parse_address_filter(v: Option<&Value>) -> Vec<Address> {
