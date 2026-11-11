@@ -175,7 +175,7 @@ fn visit(node: &TrieNode, bits: &[u8], c: &mut Census) {
     c.valued += 1;
     // A key is a whole number of bits only at a byte boundary; a valued node
     // elsewhere is not one, and the unitrie does not make them.
-    if bits.len() % 8 != 0 {
+    if !bits.len().is_multiple_of(8) {
         c.unknown += 1;
         return;
     }

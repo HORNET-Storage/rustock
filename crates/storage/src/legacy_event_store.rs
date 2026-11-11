@@ -315,7 +315,7 @@ mod tests {
         let d = tmp();
         let s = LegacyEventStore::open(d.path().to_str().unwrap()).unwrap();
         let r = row(0xAA, 100, 0);
-        s.put_events(&[r.clone()]).unwrap();
+        s.put_events(std::slice::from_ref(&r)).unwrap();
 
         let got = s.scan(r.topic0, 0, u64::MAX).unwrap();
         assert_eq!(got.len(), 1);

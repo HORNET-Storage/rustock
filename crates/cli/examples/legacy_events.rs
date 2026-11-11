@@ -159,7 +159,7 @@ fn main() -> Result<()> {
 
     println!("{spec}");
     println!("  topic0 0x{}", hexs(topic.as_slice()));
-    if !store.covers(from, to.min(u64::MAX))? {
+    if !store.covers(from, to)? {
         println!(
             "  NOTE: #{from}..{} is not wholly covered by this store -- an absent \
              event here may mean the range was never reconstructed, not that \

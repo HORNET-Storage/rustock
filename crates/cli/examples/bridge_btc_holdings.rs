@@ -79,7 +79,7 @@ fn report(label: &str, utxos: &[BridgeUtxo], known: &BTreeMap<String, String>) {
     rows.sort_by_key(|(_, (v, _))| std::cmp::Reverse(*v));
 
     let (mut fed_sat, mut fed_n, mut der_sat, mut der_n, mut der_scripts) = (0u64, 0usize, 0u64, 0usize, 0usize);
-    println!("  {:<44} {:>18} {:>7}  {}", "scriptPubKey (hash160 if P2SH)", "BTC", "UTXOs", "what");
+    println!("  {:<44} {:>18} {:>7}  what", "scriptPubKey (hash160 if P2SH)", "BTC", "UTXOs");
     for (script, (sat, n)) in &rows {
         let raw = (0..script.len() / 2)
             .map(|i| u8::from_str_radix(&script[i * 2..i * 2 + 2], 16).unwrap_or(0))
