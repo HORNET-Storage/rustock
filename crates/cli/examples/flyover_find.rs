@@ -58,7 +58,7 @@ const FLYOVER_ACTIVATION: u64 = 3_614_800;
 const B58: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
 fn b58_hash160(s: &str) -> Option<[u8; 20]> {
-    let mut n = vec![0u8; 25];
+    let mut n = [0u8; 25];
     for ch in s.bytes() {
         let d = B58.iter().position(|&c| c == ch)? as u32;
         let mut carry = d;

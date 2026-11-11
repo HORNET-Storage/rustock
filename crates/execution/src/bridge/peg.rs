@@ -1928,6 +1928,18 @@ pub fn register_fast_bridge_btc_transaction<CTX: crate::RskContextTr>(
         vec![
             ("peginPath", FieldValue::Text("flyover".into())),
             ("destination", FieldValue::Addr(lbc_address)),
+            // FALSE AT EVERY HEIGHT, today: registerFlyoverBtcTransaction
+            // calls no eventLogger in rskj or here, so a Flyover peg-in is in
+            // no receipt and so in no event index.
+            //
+            // WHEN A FUTURE UPGRADE MAKES THE BRIDGE LOG IT, change this to
+            // the activation predicate for that RSKIP -- e.g.
+            // `hardfork_cfg.has_rskipNNN(rsk_height)` -- at the same time as
+            // adding the log call above. The reconstruction gate reads this
+            // flag per topic, so setting it correctly is what stops the
+            // synthesised event and the real one from both existing across
+            // the activation. Leaving it hardcoded false would duplicate
+            // every Flyover peg-in from that block onward.
             ("logged", FieldValue::Flag(false)),
         ],
     );

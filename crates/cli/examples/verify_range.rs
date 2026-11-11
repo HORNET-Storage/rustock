@@ -995,7 +995,7 @@ fn main() -> Result<()> {
                 // hours, and a span written only on a clean exit is a span
                 // lost to any interruption -- leaving events on disk that
                 // nothing claims, which reads as "never built".
-                if legacy_blocks % LEGACY_COVERAGE_EVERY == 0 {
+                if legacy_blocks.is_multiple_of(LEGACY_COVERAGE_EVERY) {
                     if let Some(first) = legacy_run {
                         lstore.add_coverage(
                             &rustock_storage::legacy_event_store::Coverage {

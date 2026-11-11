@@ -220,7 +220,7 @@ fn rbtc(wei: U256) -> String {
     let w = whole.to_string();
     let mut grouped = String::new();
     for (i, c) in w.chars().enumerate() {
-        if i > 0 && (w.len() - i) % 3 == 0 {
+        if i > 0 && (w.len() - i).is_multiple_of(3) {
             grouped.push(',');
         }
         grouped.push(c);
@@ -581,7 +581,7 @@ fn visit(node: &TrieNode, bits: &[u8], tally: &mut Tally, top_n: usize) {
     // A key is a whole number of bytes. A valued node on a bit boundary that
     // is not a byte boundary cannot be one, and the unitrie does not make
     // them; counting it as unrecognised would be a lie, so skip it.
-    if bits.len() % 8 != 0 {
+    if !bits.len().is_multiple_of(8) {
         tally.unknown += 1;
         return;
     }

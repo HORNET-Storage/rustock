@@ -484,6 +484,29 @@ struct Args {
     #[arg(long, default_value_t = false)]
     no_rpc: bool,
 
+    /// Stop recording the peg events the Bridge does not emit.
+    ///
+    /// On by default. `registerFlyoverBtcTransaction` emits no event at any
+    /// height, so every Flyover peg-in is invisible in the receipts and in
+    /// `bridge_events`, which is built from them. Recording keeps a store of
+    /// the complement current as blocks arrive, in the same layout as the
+    /// real index.
+    ///
+    /// This is a bridge until the event exists. When a future network upgrade
+    /// makes the Bridge log it, synthesis stops on its own -- the gate is the
+    /// per-topic `logged` flag the recording site sets -- so the two can
+    /// never double-count across the activation.
+    #[arg(long, default_value_t = false)]
+    no_peg_event_recording: bool,
+
+    /// Where those records go. Defaults to `<data-dir>/peg-events`.
+    ///
+    /// A database of its own, not a column family of the node's: these events
+    /// are derived rather than observed, and an index that claimed otherwise
+    /// would assert something about the chain that is not true of it.
+    #[arg(long)]
+    peg_events_dir: Option<String>,
+
     /// External IP address to advertise to peers (e.g., 203.0.113.42).
     /// If not set, 127.0.0.1 is used.
     #[arg(long)]
@@ -1507,6 +1530,8 @@ fn apply_file_config(
 
     apply(matches, "read_threads", f.trie.read_threads.as_ref(), &mut a.read_threads);
 
+    apply(matches, "no_peg_event_recording", f.peg_events.disabled.as_ref(), &mut a.no_peg_event_recording);
+    apply_opt(matches, "peg_events_dir", f.peg_events.dir.as_ref(), &mut a.peg_events_dir);
     apply(matches, "prune_keep_depth", f.prune.keep_depth.as_ref(), &mut a.prune_keep_depth);
     apply(matches, "prune_max_batch", f.prune.max_batch.as_ref(), &mut a.prune_max_batch);
     apply(matches, "prune_blocks", f.prune.blocks.as_ref(), &mut a.prune_blocks);
@@ -2592,6 +2617,23 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         block_processor = block_processor.with_sender_cache(cache.clone());
     }
     block_processor = block_processor.with_execution_threads(args.execution_threads);
+    if !args.no_peg_event_recording {
+        let dir = args
+            .peg_events_dir
+            .clone()
+            .unwrap_or_else(|| format!("{}/peg-events", args.data_dir));
+        match rustock_storage::legacy_event_store::LegacyEventStore::open(&dir) {
+            Ok(st) => {
+                info!("Recording unlogged peg events to {dir}");
+                block_processor = block_processor.with_legacy_event_store(std::sync::Arc::new(st));
+            }
+            // A diagnostic store failing to open must not stop the node from
+            // following the chain. Say so loudly and carry on without it.
+            Err(e) => tracing::warn!(
+                "peg event recording disabled: cannot open {dir}: {e}"
+            ),
+        }
+    }
     if config.genesis_spec.is_some() {
         // A chain from an rskj genesis file is rskj's regtest, Bridge
         // federation included.
