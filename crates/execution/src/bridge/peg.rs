@@ -801,6 +801,7 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
                         total_value,
                         "PEGIN_V1_INVALID_PAYLOAD",
                         vec![
+                            ("logged", FieldValue::Flag(hardfork_cfg.has_rskip181(rsk_height))),
                             ("senderType", FieldValue::Text("UNDETERMINED".into())),
                             ("peginVersion", FieldValue::U64(1)),
                         ],
@@ -868,6 +869,7 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
                     total_value,
                     "PEGIN_CAP_SURPASSED",
                     vec![
+                        ("logged", FieldValue::Flag(hardfork_cfg.has_rskip181(rsk_height))),
                         ("senderType", FieldValue::Text("UNDETERMINED".into())),
                         ("peginVersion", FieldValue::U64(1)),
                     ],
@@ -937,6 +939,9 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
             total_value,
             "LEGACY_PEGIN_UNDETERMINED_SENDER",
             vec![
+                // Post-RSKIP379 this path logs rejected_pegin then
+                // unrefundable_pegin; pre-379 it aborts silently.
+                ("logged", FieldValue::Flag(hardfork_cfg.has_rskip379(rsk_height))),
                 ("senderType", FieldValue::Text("UNDETERMINED".into())),
                 ("inputShape", FieldValue::Text(undetermined_input_shape(&btc_tx).into())),
                 (
@@ -1131,9 +1136,19 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
                     FieldValue::Text(sender_base58_address(&sender_hash160, sender_is_p2sh, config)),
                 ),
                 ("peginVersion", FieldValue::U64(0)),
-                // lock_btc arrives with RSKIP146 and pegin_btc with RSKIP170;
-                // before either, a credited peg-in left no trace but the balance.
-                ("logged", FieldValue::Flag(hardfork_cfg.has_rskip146(rsk_height))),
+                // `logged` is PER TOPIC, and the topic reconstructed for an
+                // accepted peg-in is `pegin_btc` -- so the test is RSKIP170,
+                // not RSKIP146.
+                //
+                // Between papyrus200 and iris300 the Bridge logs `lock_btc`
+                // instead. That peg-in is therefore visible in the real index
+                // under a different topic, and reconstructing `pegin_btc` for
+                // it duplicates nothing: a scan of either topic over the union
+                // of the two stores returns each peg-in exactly once, and a
+                // scan of `pegin_btc` alone spans all of history, which is the
+                // point of reconstructing the modern event rather than the
+                // contemporaneous one.
+                ("logged", FieldValue::Flag(hardfork_cfg.has_rskip170(rsk_height))),
             ],
         );
         if hardfork_cfg.has_rskip170(rsk_height) {
@@ -1162,6 +1177,38 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
     set_btc_tx_processed(ctx, &legacy_txid, rsk_height, hardfork_cfg.has_rskip134(rsk_height));
 
     Ok(PrecompileOutput::new(gas_cost, Bytes::new()))
+}
+
+/// Emits `release_requested`, or records it when the Bridge of the day did
+/// not.
+///
+/// The event arrives with RSKIP146 (papyrus200). Before it the peg-out was
+/// queued exactly the same way and nothing was written to the receipts, which
+/// is why a receipts-derived index has no peg-outs for that era. Recording
+/// the same three fields here is what lets the legacy-event store rebuild the
+/// event rather than approximate it.
+///
+/// A no-op on the recording side unless a replay tool turned recording on, so
+/// production pays one thread-local read per peg-out.
+fn release_requested_or_record<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    logged: bool,
+    rsk_tx_hash: &[u8; 32],
+    btc_tx_hash: &[u8; 32],
+    amount_satoshis: u64,
+) {
+    if logged {
+        super::events::log_release_requested(ctx, rsk_tx_hash, btc_tx_hash, amount_satoshis);
+        return;
+    }
+    crate::silent::record_here(
+        SilentKind::PegoutRequested,
+        vec![
+            ("rskTxHash", FieldValue::Bytes(rsk_tx_hash.to_vec())),
+            ("btcTxHash", FieldValue::Bytes(btc_tx_hash.to_vec())),
+            ("amountSat", FieldValue::U64(amount_satoshis)),
+        ],
+    );
 }
 
 /// Describes a peg-in decision for the silent-decision store.
@@ -1350,14 +1397,13 @@ fn emit_pegin_rejection_release<CTX: crate::RskContextTr>(
             rsk_block_height: rsk_height,
             rsk_tx_hash: use_tx_hash.then_some(tx_ctx.rsk_tx_hash),
         });
-        if use_tx_hash {
-            super::events::log_release_requested(
-                ctx,
-                &tx_ctx.rsk_tx_hash,
-                &btc_txid_event_bytes(&built.tx),
-                total_value,
-            );
-        }
+        release_requested_or_record(
+            ctx,
+            use_tx_hash,
+            &tx_ctx.rsk_tx_hash,
+            &btc_txid_event_bytes(&built.tx),
+            total_value,
+        );
         store_pegout_confirmation_set(ctx, &waiting, use_tx_hash);
     } else {
         // The refund was due and could not be built -- in practice the inputs
@@ -2020,6 +2066,18 @@ pub fn register_fast_bridge_btc_transaction<CTX: crate::RskContextTr>(
         vec![
             ("peginPath", FieldValue::Text("flyover".into())),
             ("destination", FieldValue::Addr(lbc_address)),
+            // FALSE AT EVERY HEIGHT, today: registerFlyoverBtcTransaction
+            // calls no eventLogger in rskj or here, so a Flyover peg-in is in
+            // no receipt and so in no event index.
+            //
+            // WHEN A FUTURE UPGRADE MAKES THE BRIDGE LOG IT, change this to
+            // the activation predicate for that RSKIP -- e.g.
+            // `hardfork_cfg.has_rskipNNN(rsk_height)` -- at the same time as
+            // adding the log call above. The reconstruction gate reads this
+            // flag per topic, so setting it correctly is what stops the
+            // synthesised event and the real one from both existing across
+            // the activation. Leaving it hardcoded false would duplicate
+            // every Flyover peg-in from that block onward.
             ("logged", FieldValue::Flag(false)),
         ],
     );
@@ -2417,14 +2475,13 @@ fn emit_flyover_rejection_release<CTX: crate::RskContextTr>(
             rsk_block_height: rsk_height,
             rsk_tx_hash: use_tx_hash.then_some(tx_ctx.rsk_tx_hash),
         });
-        if use_tx_hash {
-            super::events::log_release_requested(
-                ctx,
-                &tx_ctx.rsk_tx_hash,
-                &btc_txid_event_bytes(&built.tx),
-                total_satoshis,
-            );
-        }
+        release_requested_or_record(
+            ctx,
+            use_tx_hash,
+            &tx_ctx.rsk_tx_hash,
+            &btc_txid_event_bytes(&built.tx),
+            total_satoshis,
+        );
         store_pegout_confirmation_set(ctx, &waiting, use_tx_hash);
     }
 }
@@ -2933,15 +2990,14 @@ pub fn update_collections<CTX: crate::RskContextTr>(
                         rsk_block_height: block_number,
                         rsk_tx_hash: if use_tx_hash { rsk_tx_hash } else { None },
                     });
-                    if use_tx_hash {
-                        if let Some(hash) = rsk_tx_hash {
-                            super::events::log_release_requested(
-                                ctx,
-                                &hash,
-                                &btc_txid_event_bytes(&built.tx),
-                                amount,
-                            );
-                        }
+                    if let Some(hash) = rsk_tx_hash {
+                        release_requested_or_record(
+                            ctx,
+                            use_tx_hash,
+                            &hash,
+                            &btc_txid_event_bytes(&built.tx),
+                            amount,
+                        );
                     }
                     // RSKIP428 (lovell700): processReleaseTransactionInfo emits
                     // pegout_transaction_created right after release_requested,
@@ -4115,11 +4171,12 @@ fn process_funds_migration<CTX: crate::RskContextTr>(
                 rsk_block_height: block_number,
                 rsk_tx_hash: use_tx_hash.then_some(tx_ctx.rsk_tx_hash),
             });
-            if use_tx_hash {
+            {
                 let amount_migrated: u64 =
                     built.used_utxos.iter().map(|u| u.value_satoshis).sum();
-                super::events::log_release_requested(
+                release_requested_or_record(
                     ctx,
+                    use_tx_hash,
                     &tx_ctx.rsk_tx_hash,
                     &btc_txid_event_bytes(&built.tx),
                     amount_migrated,

@@ -203,6 +203,16 @@ backend = "epoch"                   # light: bounds state size. This setting ALO
 # Sweeps never run until the node has settled into ordinary sync, so a
 # snapshot sync's blocks are never swept while it is still fetching them.
 # `rsk_pruneBlocks` (needs rpc.admin) forces one sweep with the same clamps.
+# Peg events the Bridge does not emit. A Flyover peg-in reaches no receipt --
+# `registerFlyoverBtcTransaction` calls no event logger -- and is an internal
+# call, so it is invisible in block bodies too. Recording keeps a store of
+# those missing events current as blocks arrive. Kept on a light node: it is
+# small, and it is the only record of a Flyover peg-in there will ever be
+# until a network upgrade makes the Bridge log one.
+[peg_events]
+# disabled = false                 # default — recording is on
+# dir = "..."                       # default: unset — <data-dir>/peg-events
+
 [prune]
 blocks = true                       # light: run sweeps. Default false -- pruning discards
 

@@ -20,6 +20,7 @@ pub mod constants;
 pub mod events;
 pub mod federation;
 pub mod getters;
+pub mod legacy_events;
 pub mod governance;
 pub mod peg;
 pub mod pegin_instructions;

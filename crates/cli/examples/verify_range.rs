@@ -55,7 +55,20 @@
 //!                      also record the Bridge decisions that emit no event
 //!                      into a silent-decision store at DIR (created if
 //!                      absent, appended to otherwise)
+//!   --record-legacy-events DIR
+//!                      also reconstruct, into a legacy-event store at DIR,
+//!                      the peg events the Bridge of that height did not log
+//!                      -- `pegin_btc`, `release_requested`, `rejected_pegin`,
+//!                      `unrefundable_pegin` -- in the same key and value
+//!                      layout as the node's own `bridge_events` index, so
+//!                      one reader spans both. Nothing is written for a
+//!                      height where the Bridge really logged, so the union
+//!                      of the two never double-counts. Read it back with
+//!                      the `legacy_events` tool.
 //! ```
+//!
+//! Both recording options ride on the same drained decisions, so asking for
+//! both costs one replay rather than two.
 //!
 //! `--record-silent` makes the pass pay for itself twice. Verifying a range
 //! already executes every block against rskj's own state; recording while it
@@ -86,9 +99,64 @@ use rustock_storage::BlockStore;
 use rustock_trie::{OverlayTrieStore, TrieNode, TrieStore};
 use std::sync::Arc;
 
+/// Closes an open reconstructed-event coverage span at the last good block.
+///
+/// Mirrors `close_run` for the silent store, and for the same reason. A span
+/// is a claim that every block in it was examined; a block whose decisions
+/// were dropped -- an execution error, an unresolvable parent, an orchid
+/// comparison that yielded no verdict -- breaks that claim. Without this the
+/// span would run straight over the hole, and a later `covers()` would answer
+/// "yes, examined" for a block whose peg-ins are missing. That is worse than
+/// an admitted gap: it reads as authoritative.
+#[allow(clippy::too_many_arguments)]
+/// Renders the labelled skip counts as a JSON object for the coverage record.
+fn render_skips(m: &std::collections::BTreeMap<String, u64>) -> String {
+    if m.is_empty() {
+        return "{}".to_string();
+    }
+    let body: Vec<String> = m.iter().map(|(k, v)| format!("\"{k}\":{v}")).collect();
+    format!("{{{}}}", body.join(","))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn close_legacy_run(
+    legacy: &Option<rustock_storage::legacy_event_store::LegacyEventStore>,
+    start: &mut Option<u64>,
+    last_good: u64,
+    build: &str,
+    blocks: u64,
+    verified: u64,
+    events: u64,
+    skipped: u64,
+    skip_detail: &std::collections::BTreeMap<String, u64>,
+) -> anyhow::Result<()> {
+    let (Some(store), Some(from)) = (legacy, *start) else {
+        *start = None;
+        return Ok(());
+    };
+    if last_good >= from {
+        store.add_coverage(&rustock_storage::legacy_event_store::Coverage {
+            from,
+            to: last_good,
+            build: build.to_string(),
+            blocks,
+            verified,
+            events,
+            skipped,
+            skip_detail: render_skips(skip_detail),
+        })?;
+    }
+    *start = None;
+    Ok(())
+}
+
+/// How often the reconstructed-event coverage span is rewritten. Keyed on
+/// the span start, so each write replaces the last rather than accumulating.
+const LEGACY_COVERAGE_EVERY: u64 = 50_000;
+
 const USAGE: &str = "usage: verify_range <data-dir> <rskj-unitrie-dir> <from> <to> \
 [--network-id N] [--scratch DIR] [--max-failures N] [--cache-mb N] \
-[--blocks FILE] [--record-silent DIR]";
+[--blocks FILE] [--record-silent DIR] [--record-legacy-events DIR]";
 
 /// Splits `--key value` and `--key=value` options out of the command line,
 /// leaving the positional arguments.
@@ -98,7 +166,8 @@ const USAGE: &str = "usage: verify_range <data-dir> <rskj-unitrie-dir> <from> <t
 /// read as a positional -- a mistyped `--max-failures` that became a block
 /// number would be worse than no option at all.
 fn split_options(argv: Vec<String>) -> Result<(Vec<String>, Vec<(String, String)>)> {
-    const WITH_VALUE: [&str; 10] = [
+    const WITH_VALUE: [&str; 11] = [
+        "--record-legacy-events",
         "--network-id",
         "--scratch",
         "--max-failures",
@@ -111,7 +180,7 @@ fn split_options(argv: Vec<String>) -> Result<(Vec<String>, Vec<(String, String)
         "--execution-threads",
     ];
     const SEED: [&str; 2] = ["--seed-genesis", "--sequential"];
-    const FLAGS: [&str; 1] = ["--explain"];
+    const FLAGS: [&str; 2] = ["--explain", "--read-only"];
     let mut positional = Vec::new();
     let mut options = Vec::new();
     let mut it = argv.into_iter();
@@ -356,6 +425,16 @@ fn main() -> Result<()> {
     let contiguous = blocks_file.is_none();
     let record_silent: Option<String> =
         options.iter().rev().find(|(k, _)| k == "--record-silent").map(|(_, v)| v.clone());
+    // Purely reads: no scratch database, writes held in memory and dropped
+    // after each block. Only sound when every block resolves its own parent
+    // from the source -- i.e. NOT with --sequential, where the last block's
+    // writes are the next one's parent state.
+    let read_only = options.iter().any(|(k, _)| k == "--read-only");
+    let record_legacy: Option<String> = options
+        .iter()
+        .rev()
+        .find(|(k, _)| k == "--record-legacy-events")
+        .map(|(_, v)| v.clone());
     let store = Arc::new(
         BlockStore::open_read_only(&data_dir)
             .with_context(|| format!("opening block store at {data_dir} read-only"))?,
@@ -383,7 +462,20 @@ fn main() -> Result<()> {
             rustock_storage::RocksDbTrieStore::open_read_only(&unitrie_dir)
                 .with_context(|| format!("opening rustock trie store at {unitrie_dir}"))?,
         ),
-        other => anyhow::bail!("--state-format must be rskj or rustock, not {other:?}"),
+        // The live node's own backend. Useful for the recent chain, where it
+        // is the only store that has the state at all -- an archival import
+        // stops at whatever height it was taken.
+        "epoch" => Arc::new(
+            rustock_storage::epoch_store::EpochTrieStore::open_read_only_with(
+                &unitrie_dir,
+                rustock_storage::epoch_store::EpochConfig::default(),
+                Arc::new(rustock_storage::epoch_backend::FlatFactory::new(0)),
+            )
+            .with_context(|| format!("opening epoch trie store at {unitrie_dir}"))?,
+        ),
+        other => {
+            anyhow::bail!("--state-format must be rskj, rustock or epoch, not {other:?}")
+        }
     };
 
     // Somewhere for the replay's own writes that is neither database. Kept on
@@ -402,22 +494,57 @@ fn main() -> Result<()> {
     // scratch directory on whatever filesystem had room, and a full disk
     // makes a trie store answer "absent" for nodes it was asked to keep --
     // which yields wrong roots, not errors.
-    let scratch_store = Arc::new(
-        rustock_storage::RocksDbTrieStore::open(&scratch_path)
-            .with_context(|| format!("opening scratch trie at {}", scratch_path.display()))?,
+    anyhow::ensure!(
+        !(read_only && sequential),
+        "--read-only cannot be combined with --sequential: a sequential replay's \
+         parent state IS the previous block's writes, which --read-only discards"
     );
-    let spill: Arc<dyn TrieStore> = scratch_store.clone();
-    let trie: Arc<dyn TrieStore> = Arc::new(OverlayTrieStore::with_spill(source, spill));
+    // `overlay` is kept alongside the trait object so the per-block clear can
+    // be called; in read-only mode that is what keeps memory flat.
+    let (scratch_store, overlay, trie): (
+        Option<Arc<rustock_storage::RocksDbTrieStore>>,
+        Option<Arc<OverlayTrieStore>>,
+        Arc<dyn TrieStore>,
+    ) = if read_only {
+        let o = Arc::new(OverlayTrieStore::new(source));
+        eprintln!("  scratch (none: --read-only, writes held in memory per block)");
+        (None, Some(o.clone()), o)
+    } else {
+        let sc = Arc::new(
+            rustock_storage::RocksDbTrieStore::open(&scratch_path)
+                .with_context(|| format!("opening scratch trie at {}", scratch_path.display()))?,
+        );
+        let spill: Arc<dyn TrieStore> = sc.clone();
+        let t: Arc<dyn TrieStore> = Arc::new(OverlayTrieStore::with_spill(source, spill));
+        (Some(sc), None, t)
+    };
 
-    // The earliest chain has no state source on this machine: the rskj
-    // snapshot and the full trie both start above #1.5M, and a segbuild chunk
-    // captures its producer's read set rather than roots addressable by hash.
-    // None of that is needed, because genesis state is not read from anywhere
-    // -- it is constructed from the chain config. Build it into the scratch
-    // store and a contiguous replay from #1 carries its own state forward,
-    // each block's parent root having been written by the one before.
-    // In sequential mode the state is carried here rather than resolved per
-    // block from the source.
+    // Genesis state is not read from anywhere -- it is constructed from the
+    // chain config. Build it into the scratch store and a contiguous replay
+    // from #1 carries its own state forward, each block's parent root having
+    // been written by the one before. In sequential mode the state is carried
+    // here rather than resolved per block from the source, which is why the
+    // source goes unread in that mode (zero open descriptors on it, measured).
+    //
+    // A previous version of this comment also claimed a segbuild chunk
+    // "captures its producer's read set rather than roots addressable by
+    // hash", and gave that as a reason the early chain had no usable state
+    // source. **That is false**, and it is worth saying so plainly because it
+    // stopped at least one investigation. It came from probing a chunk with
+    // `rskj_root_probe`, which opens the DEFAULT column family; our own trie
+    // stores key nodes in `trie_nodes`, so that tool reports ABSENT for every
+    // hash in a segbuild chunk whatever it holds. Probed through the right
+    // column family (`trie_probe`), chunk `000-1-1591000` does hold
+    // pre-wasabi100 unitrie roots with resolvable children -- verified
+    // against block #6,916's root, taken from rskj's own `stateRoots` table.
+    //
+    // So a segbuild chunk is a plausible state source for this era. What
+    // stops it being used here is not its contents but the composition
+    // below: `OverlayTrieStore` reads the spill before the base, and
+    // `--seed-genesis` puts every computed node in the spill, so the base is
+    // never consulted. Serving reads from a sealed chunk instead would mean
+    // reading base-first -- safe, since the trie is content-addressed and a
+    // hash cannot map to two different values -- and has not been measured.
     let mut carried: Option<TrieNode> = None;
     anyhow::ensure!(
         !sequential || blocks_file.is_none(),
@@ -484,11 +611,38 @@ fn main() -> Result<()> {
             let s = rustock_storage::silent_store::SilentStore::open(dir)
                 .with_context(|| format!("opening the silent-decision store at {dir}"))?;
             eprintln!("  silent  {dir} (recording Bridge decisions that emit no event)");
-            rustock_execution::silent::start();
             Some(s)
         }
         None => None,
     };
+    // The reconstructed-event store rides on the same decisions as the
+    // silent store, so either option turns recording on, and both together
+    // cost one replay rather than two.
+    let legacy = match &record_legacy {
+        Some(dir) => {
+            let s = rustock_storage::legacy_event_store::LegacyEventStore::open(dir)
+                .with_context(|| format!("opening the legacy event store at {dir}"))?;
+            eprintln!("  legacy  {dir} (reconstructing peg events the Bridge never logged)");
+            Some(s)
+        }
+        None => None,
+    };
+    if silent.is_some() || legacy.is_some() {
+        rustock_execution::silent::start();
+    }
+    // Totals for the coverage record, which is what tells a later reader
+    // that an empty scan means "none here" rather than "never built".
+    let mut legacy_first: Option<u64> = None;
+    let mut legacy_last: u64 = 0;
+    let mut legacy_blocks: u64 = 0;
+    let mut legacy_verified: u64 = 0;
+    // The open span, and the last block whose decisions were actually kept.
+    let mut legacy_run: Option<u64> = None;
+    let mut legacy_good: u64 = 0;
+    let mut legacy_events: u64 = 0;
+    let mut legacy_skipped: u64 = 0;
+    let mut legacy_skip_kinds: std::collections::BTreeMap<String, u64> =
+        std::collections::BTreeMap::new();
     // The build that produced the records. A replay is only as good as the
     // code that ran it, and this is the only way to tell later which rows
     // came from which rules.
@@ -613,6 +767,8 @@ fn main() -> Result<()> {
                 &build,
                 "parent state root not in the source unitrie",
             )?;
+            close_legacy_run(&legacy, &mut legacy_run, legacy_good, &build,
+                legacy_blocks, legacy_verified, legacy_events, legacy_skipped, &legacy_skip_kinds)?;
             unverifiable += 1;
             continue;
         };
@@ -628,6 +784,8 @@ fn main() -> Result<()> {
                 // dropped, not kept and not left to be blamed on the next one.
                 rustock_execution::silent::drain();
                 close_run(&silent, &mut run_start, n, &build, "execution error")?;
+                close_legacy_run(&legacy, &mut legacy_run, legacy_good, &build,
+                    legacy_blocks, legacy_verified, legacy_events, legacy_skipped, &legacy_skip_kinds)?;
                 diverged += 1;
                 first_bad.get_or_insert(n);
                 continue;
@@ -637,7 +795,7 @@ fn main() -> Result<()> {
         // Before the verdict is believed: if the scratch could not keep what
         // this block computed, the comparison below is meaningless, and so is
         // every block after it. Stop rather than record a plausible lie.
-        if scratch_store.write_failed() {
+        if scratch_store.as_ref().is_some_and(|sc| sc.write_failed()) {
             if let Some(store) = &silent {
                 rustock_execution::silent::drain();
                 if let Some(start) = run_start.take() {
@@ -660,8 +818,11 @@ fn main() -> Result<()> {
         // blocks as a tripwire. Elsewhere state is carried forward unchecked,
         // and the coverage records say so by omitting those blocks.
         let unitrie_root = hardfork_cfg.has_unitrie_state_root(n);
-        let decisions_here =
-            if silent.is_some() { rustock_execution::silent::drain() } else { Vec::new() };
+        let decisions_here = if silent.is_some() || legacy.is_some() {
+            rustock_execution::silent::drain()
+        } else {
+            Vec::new()
+        };
 
         // Below wasabi100 the header's root is an Orchid one and cannot be
         // compared with what we compute. There are two ways to get a verdict,
@@ -723,6 +884,8 @@ fn main() -> Result<()> {
                 "pre-wasabi100: orchid comparison inconclusive",
             )?;
             rustock_execution::silent::drain();
+            close_legacy_run(&legacy, &mut legacy_run, legacy_good, &build,
+                legacy_blocks, legacy_verified, legacy_events, legacy_skipped, &legacy_skip_kinds)?;
             unverifiable += 1;
             continue;
         }
@@ -731,9 +894,130 @@ fn main() -> Result<()> {
         } else {
             unchecked += 1;
         }
+        // Nothing this block wrote is needed again: the next block resolves
+        // its own parent from the source. Dropping it here is what keeps a
+        // read-only run at constant memory over millions of blocks.
+        if let Some(o) = &overlay {
+            o.clear_overlay();
+        }
         // Drained above, before the verdict, because the orchid check needs
         // to know whether this block decided anything.
         let decisions = decisions_here;
+        // Reconstructed events, written only for blocks that verified: a
+        // block whose state root disagrees was executed by this code and not
+        // by the network, so its decisions are ours, not the chain's.
+        if let Some(lstore) = &legacy {
+            if verdict.ok() {
+                legacy_first.get_or_insert(n);
+                legacy_last = n;
+                legacy_run.get_or_insert(n);
+                legacy_good = n;
+                legacy_blocks += 1;
+                if checked_here {
+                    legacy_verified += 1;
+                }
+                let mut rows = Vec::new();
+                // One log_index sequence per block, as a receipt would have.
+                let mut log_index: u32 = 0;
+                for d in &decisions {
+                    // Never reconstruct what the Bridge really logged: the
+                    // node's own index already has it, and a duplicate would
+                    // double-count in the union of the two. A record that
+                    // does not say is REFUSED, not assumed -- see
+                    // `legacy_events::reconstructable`.
+                    match rustock_execution::bridge::legacy_events::reconstructable(d) {
+                        Ok(true) => {}
+                        Ok(false) => continue,
+                        Err(why) => {
+                            legacy_skipped += 1;
+                            *legacy_skip_kinds
+                                .entry(format!("{}/UNGATED({why})", d.kind.name()))
+                                .or_insert(0) += 1;
+                            continue;
+                        }
+                    }
+                    // A flyover peg-in is the case this whole exercise is
+                    // about, and it is rare enough to name individually.
+                    if matches!(
+                        d.fields.iter().find(|(k, _)| *k == "peginPath").map(|(_, v)| v),
+                        Some(rustock_execution::silent::FieldValue::Text(p)) if p == "flyover"
+                    ) {
+                        let f = |name: &str| {
+                            d.fields
+                                .iter()
+                                .find(|(k, _)| *k == name)
+                                .map(|(_, v)| v.to_json())
+                                .unwrap_or_else(|| "null".into())
+                        };
+                        eprintln!(
+                            "FLYOVER  #{} tx[{}]  lbc={} amountSat={} btcTx={}",
+                            d.block,
+                            d.tx_index,
+                            f("destination"),
+                            f("amountSat"),
+                            f("btcTxHash"),
+                        );
+                    }
+                    let evs = rustock_execution::bridge::legacy_events::events_for(d);
+                    if evs.is_empty() {
+                        legacy_skipped += 1;
+                        *legacy_skip_kinds
+                            .entry(rustock_execution::bridge::legacy_events::skip_label(d))
+                            .or_insert(0) += 1;
+                        continue;
+                    }
+                    // The real index keys each event to its transaction, so
+                    // this does too, taken from the body by position -- the
+                    // ordering the receipts root commits to.
+                    let tx_hash = block
+                        .transactions
+                        .get(d.tx_index as usize)
+                        .map(|t| t.tx_hash())
+                        .unwrap_or_default();
+                    for e in evs {
+                        rows.push(rustock_storage::legacy_event_store::EventRow {
+                            topic0: e.topic0,
+                            block: d.block,
+                            tx_index: d.tx_index,
+                            log_index,
+                            tx_hash,
+                            topics: e.topics,
+                            data: e.data,
+                        });
+                        log_index += 1;
+                    }
+                }
+                if !rows.is_empty() {
+                    legacy_events += rows.len() as u64;
+                    lstore.put_events(&rows)?;
+                }
+                // Coverage every so often, not only at the end: this runs for
+                // hours, and a span written only on a clean exit is a span
+                // lost to any interruption -- leaving events on disk that
+                // nothing claims, which reads as "never built".
+                if legacy_blocks.is_multiple_of(LEGACY_COVERAGE_EVERY) {
+                    if let Some(first) = legacy_run {
+                        lstore.add_coverage(
+                            &rustock_storage::legacy_event_store::Coverage {
+                                from: first,
+                                to: n,
+                                build: build.clone(),
+                                blocks: legacy_blocks,
+                                verified: legacy_verified,
+                                events: legacy_events,
+                                skipped: legacy_skipped,
+                                skip_detail: render_skips(&legacy_skip_kinds),
+                            },
+                        )?;
+                    }
+                }
+            } else {
+                // Executed by us and not by the network: its decisions are
+                // ours, not the chain's, so the span cannot span it.
+                close_legacy_run(&legacy, &mut legacy_run, legacy_good, &build,
+                    legacy_blocks, legacy_verified, legacy_events, legacy_skipped, &legacy_skip_kinds)?;
+            }
+        }
         if let Some(store) = &silent {
             if verdict.ok() {
                 if !decisions.is_empty() {
@@ -912,13 +1196,32 @@ fn main() -> Result<()> {
         let last = stopped_at.unwrap_or(to);
         write_coverage(&silent, start, last, &build)?;
     }
+    if legacy.is_some() {
+        close_legacy_run(&legacy, &mut legacy_run, legacy_good, &build,
+            legacy_blocks, legacy_verified, legacy_events, legacy_skipped, &legacy_skip_kinds)?;
+    }
+    if legacy.is_some() {
+        let _ = legacy_first;
+        let _ = legacy_last;
+        eprintln!(
+            "\n  legacy: {legacy_events} event(s) reconstructed over {legacy_blocks} executed \
+             block(s), {legacy_verified} of them with the state root checked{}",
+            if legacy_skipped > 0 {
+                format!(", {legacy_skipped} decision(s) not encodable -- see the coverage record")
+            } else {
+                String::new()
+            }
+        );
+    }
     if let Some(store) = &silent {
-        rustock_execution::silent::finish();
         eprintln!(
             "\n  silent: {silent_rows} decision(s) recorded; coverage now {} span(s), {} gap(s)",
             store.coverage()?.len(),
             store.gaps()?.len()
         );
+    }
+    if silent.is_some() || legacy.is_some() {
+        rustock_execution::silent::finish();
     }
 
     let reached = stopped_at.unwrap_or(to);

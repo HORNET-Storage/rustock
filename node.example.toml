@@ -175,6 +175,36 @@
 # rotate_mb = 1024                  # default
 # burial = 4000                     # default
 # check_secs = 60                   # default
+# ---------------------------------------------------------------------------
+# Peg events the Bridge does not emit
+# ---------------------------------------------------------------------------
+#
+# `registerFlyoverBtcTransaction` calls no event logger at any height, so a
+# Flyover peg-in reaches no receipt -- and `bridge_events` is built from
+# receipts, so it is absent there too. It is also an internal call, invisible
+# in block bodies. Only execution sees it.
+#
+# Recording keeps a store of those missing events current as blocks arrive,
+# in the same key and value layout as the node's own event index, so one
+# reader handles both and the union never double-counts. Read it back with
+# the `legacy_events` tool.
+#
+# This is a bridge until the event exists. When a future network upgrade
+# makes the Bridge log Flyover peg-ins, synthesis stops on its own: the gate
+# is a per-topic flag set where the decision is recorded, so the synthesised
+# event and the real one can never both exist.
+#
+# A separate database, not a column family of the node's own: these events
+# are derived rather than observed, and folding them into the receipts-built
+# index would make it assert something about the chain that is not true.
+[peg_events]
+# Turn recording off. On by default -- the cost on an ordinary block is one
+# thread-local read per Bridge decision, and most blocks make none.
+# disabled = false                 # default — recording is on
+# Where the records go.
+# dir = "..."                       # default: unset — <data-dir>/peg-events
+
+
 
 # Block-history pruning: bodies, receipts, the transaction index, headers and
 # the canonical mapping, for blocks far enough behind.

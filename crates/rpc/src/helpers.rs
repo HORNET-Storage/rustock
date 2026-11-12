@@ -307,6 +307,16 @@ pub struct BlockResultDto {
     pub bitcoin_merged_mining_coinbase_transaction: String,
     pub bitcoin_merged_mining_merkle_proof: String,
     pub hash_for_merged_mining: String,
+    /// Total fees paid by this block's transactions, in wei.
+    ///
+    /// An RSK header field (number 14, where Ethereum has `mixHash`), so this
+    /// is the chain's own figure rather than one recomputed here: it is
+    /// committed to by the block hash. Summing `gasUsed * gasPrice` over the
+    /// block's receipts reproduces it exactly, which is what `block_fees
+    /// --verify` checks.
+    ///
+    /// rskj's `BlockResultDTO` also carries it, so serving it is parity, not
+    /// an extension.
     pub paid_fees: String,
     /// The block's difficulty and its uncles' (`Block.getCumulativeDifficulty`).
     pub cumulative_difficulty: String,

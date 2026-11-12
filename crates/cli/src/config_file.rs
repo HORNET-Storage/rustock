@@ -57,6 +57,8 @@ pub struct FileConfig {
     #[serde(default)]
     pub snapshot: SnapshotSection,
     #[serde(default)]
+    pub peg_events: PegEventsSection,
+    #[serde(default)]
     pub checkpoint: CheckpointSection,
     #[serde(default)]
     pub metrics: MetricsSection,
@@ -256,6 +258,21 @@ pub struct CheckpointSection {
     pub bound_work: Option<bool>,
 }
 
+/// Recording the peg events the Bridge does not emit.
+///
+/// `registerFlyoverBtcTransaction` calls no event logger at any height, so
+/// every Flyover peg-in is absent from the receipts and therefore from
+/// `bridge_events`, which is built from them. Recording keeps a store of the
+/// complement current as blocks arrive.
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PegEventsSection {
+    /// Turn recording off. On by default.
+    pub disabled: Option<bool>,
+    /// Where the records go. Defaults to `<data-dir>/peg-events`.
+    pub dir: Option<String>,
+}
+
 #[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PruneSection {
@@ -441,6 +458,8 @@ pub const CONFIGURABLE: &[&str] = &[
     "rpc_admin",
     "wallet_file",
     "no_rpc",
+    "no_peg_event_recording",
+    "peg_events_dir",
     "ws",
     "ws_port",
     "max_peers",

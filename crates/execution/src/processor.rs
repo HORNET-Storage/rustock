@@ -142,6 +142,12 @@ pub struct BlockProcessor {
     /// proof of work, timestamps, difficulty and gas limit against its own
     /// parent.
     chain_config: Arc<rustock_core::config::ChainConfig>,
+    /// Where to record the peg events the Bridge does not emit.
+    ///
+    /// `None` disables recording entirely, and the cost of that is one
+    /// thread-local read per Bridge decision -- `silent::record_here` is a
+    /// no-op when no sink is open.
+    legacy_events: Option<Arc<rustock_storage::legacy_event_store::LegacyEventStore>>,
 }
 
 /// Ancestry lookups backed by the block store, for the uncle and
@@ -199,6 +205,7 @@ impl BlockProcessor {
             validate_fork_detection_data: false,
             sender_cache: None,
             chain_config,
+            legacy_events: None,
         }
     }
 
@@ -218,6 +225,21 @@ impl BlockProcessor {
     /// above all. Handing the same `Arc` to both is the point: a transaction
     /// the pool admitted should not be recovered a second time when the
     /// block carrying it executes.
+    /// Records peg events the Bridge does not emit, into `store`.
+    ///
+    /// Opens the thread-local sink here, because recording is a property of
+    /// the thread that executes and this is the thread that will. Sublists
+    /// running in parallel open their own and the coordinator absorbs them
+    /// (`silent::absorb`), so a parallel block is captured whole.
+    pub fn with_legacy_event_store(
+        mut self,
+        store: Arc<rustock_storage::legacy_event_store::LegacyEventStore>,
+    ) -> Self {
+        crate::silent::start();
+        self.legacy_events = Some(store);
+        self
+    }
+
     pub fn with_sender_cache(
         mut self,
         cache: Arc<crate::sender_cache::SenderCache>,
@@ -321,6 +343,14 @@ impl BlockProcessor {
         trie_store: Arc<dyn TrieStore>,
         save_out: Option<&mut std::time::Duration>,
     ) -> Result<ProcessedBlock, ProcessError> {
+        // Recording is thread-local, and the thread that built this processor
+        // need not be the one executing. Opening the sink lazily here makes
+        // that irrelevant: whichever thread arrives, it records. Without it a
+        // node whose import loop runs off the main thread would record
+        // nothing and look exactly like a chain with no Flyover peg-ins.
+        if self.legacy_events.is_some() && !crate::silent::is_recording() {
+            crate::silent::start();
+        }
         let started = std::time::Instant::now();
         let out = self.execute_block_inner(block, state_root, trie_store, save_out);
         // Timed whether or not it succeeded: a block that fails still spent
@@ -1066,6 +1096,62 @@ impl BlockProcessor {
     /// The commit half of [`BlockProcessor::process_and_commit`]: store the
     /// receipts of a processed block and index its transactions and Bridge
     /// events.
+    /// Records this block's peg events that the Bridge did not emit.
+    ///
+    /// Runs beside `index_bridge_events` deliberately: that keeps the index
+    /// of what the Bridge *did* log current as blocks arrive, and this keeps
+    /// the complement current. An index only ever rebuilt offline is stale
+    /// the moment the node advances.
+    ///
+    /// **This is a bridge until the event exists.** Flyover peg-ins are the
+    /// live case -- `registerFlyoverBtcTransaction` emits nothing at any
+    /// height, so every one is invisible in the receipts. When a future
+    /// network upgrade makes the Bridge log it, nothing here needs changing:
+    /// the gate is the per-topic `logged` flag the recording site sets, so
+    /// the moment that site starts logging it will set `logged` true and
+    /// synthesis stops on its own. The flag is what keeps the two from ever
+    /// double-counting across an activation.
+    /// Public so it can be driven without `commit_receipts`, which also
+    /// writes receipts and so cannot run against a read-only store. The node
+    /// reaches it through `commit_receipts`; a test reaches it directly.
+    pub fn record_unlogged_peg_events(&self, block: &Block) -> Result<(), ProcessError> {
+        let Some(store) = &self.legacy_events else { return Ok(()) };
+        let decisions = crate::silent::drain();
+        if decisions.is_empty() {
+            return Ok(());
+        }
+        let mut rows = Vec::new();
+        let mut log_index: u32 = 0;
+        for d in &decisions {
+            // A record that does not say whether the Bridge logged it is
+            // refused, not guessed at -- see `legacy_events::reconstructable`.
+            if !matches!(crate::bridge::legacy_events::reconstructable(d), Ok(true)) {
+                continue;
+            }
+            let tx_hash = block
+                .transactions
+                .get(d.tx_index as usize)
+                .map(|t| t.tx_hash())
+                .unwrap_or_default();
+            for e in crate::bridge::legacy_events::events_for(d) {
+                rows.push(rustock_storage::legacy_event_store::EventRow {
+                    topic0: e.topic0,
+                    block: d.block,
+                    tx_index: d.tx_index,
+                    log_index,
+                    tx_hash,
+                    topics: e.topics,
+                    data: e.data,
+                });
+                log_index += 1;
+            }
+        }
+        if !rows.is_empty() {
+            store.put_events(&rows).map_err(ProcessError::Storage)?;
+        }
+        Ok(())
+    }
+
     pub fn commit_receipts(
         &self,
         block: &Block,
@@ -1097,6 +1183,7 @@ impl BlockProcessor {
                 crate::precompiles::BRIDGE_ADDR,
             )
             .map_err(ProcessError::Storage)?;
+        self.record_unlogged_peg_events(block)?;
         Ok(())
     }
 
