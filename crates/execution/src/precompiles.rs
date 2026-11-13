@@ -561,8 +561,15 @@ pub fn rsk_precompiles(hardfork_cfg: &RskHardforkConfig, block_number: u64) -> P
 /// read by the Bridge precompile inside `run_bridge`.
 #[derive(Debug, Clone, Default)]
 pub struct BridgeTxContext {
-    /// Keccak256 of the RLP-encoded transaction.
+    /// rskj's `rskTx.getHash()`: the Keccak256 of the RLP-encoded
+    /// transaction, and for a contract's call to the Bridge the hash of the
+    /// internal transaction rskj makes of the call, which is the `rskTx` the
+    /// Bridge is then handed (`crate::internal_tx`).
     pub rsk_tx_hash: [u8; 32],
+    /// The hash of the transaction in the block, whoever calls the Bridge:
+    /// rskj's `InternalTransaction.getOriginHash()`, by which the flyover
+    /// method names a refund.
+    pub origin_tx_hash: [u8; 32],
     /// BTC P2PKH destination: RIPEMD160(SHA256(compressed_pubkey)).
     /// Derived from the RSK transaction's secp256k1 signature.
     /// Zero bytes if the pubkey cannot be recovered (system/REMASC transactions).
@@ -898,6 +905,11 @@ impl RskPrecompileProvider {
                 }
                 _ => (inputs.caller, inputs.call_value()),
             };
+            // That internal transaction's hash is what the Bridge names a
+            // refund by. It goes to the call's context address, as the
+            // endowment does.
+            let internal_tx_hash =
+                self.bridge_internal_tx(context, owner, inputs.target_address, value);
             self.run_bridge(
                 context,
                 &input_bytes,
@@ -905,8 +917,12 @@ impl RskPrecompileProvider {
                 owner,
                 inputs.scheme,
                 value,
+                internal_tx_hash,
             )
         } else {
+            // REMASC is handed one too, which counts among those the calling
+            // program has made.
+            context.chain_mut().internal_txs.count();
             self.run_remasc(context, &input_bytes, inputs.gas_limit)
         };
 
@@ -1039,8 +1055,39 @@ impl RskPrecompileProvider {
         Ok(Some(result))
     }
 
+    /// The hash of the internal transaction rskj hands the Bridge when a
+    /// contract calls it as `owner`, for `receiver` and with `value`
+    /// (`crate::internal_tx`). None when the transaction calls the Bridge
+    /// itself.
+    fn bridge_internal_tx<CTX: crate::RskContextTr>(
+        &self,
+        context: &mut CTX,
+        owner: Address,
+        receiver: Address,
+        value: revm::primitives::U256,
+    ) -> Option<[u8; 32]> {
+        use revm::context_interface::JournalTr;
+        let tx_hash = self
+            .bridge_tx_context
+            .lock()
+            .map(|tx| tx.origin_tx_hash)
+            .unwrap_or_default();
+        // The program that calls is running, so its account is loaded.
+        let nonce = context
+            .journal_mut()
+            .load_account(owner)
+            .map(|account| account.info.nonce)
+            .unwrap_or_default();
+        context
+            .chain_mut()
+            .internal_txs
+            .reach_bridge(tx_hash.into(), owner, nonce, receiver, value)
+            .map(|hash| hash.0)
+    }
+
     /// Bridge precompile (0x01000006).
     /// BTC–RSK two-way peg with 69 ABI methods.
+    #[allow(clippy::too_many_arguments)]
     fn run_bridge<CTX: crate::RskContextTr>(
         &self,
         context: &mut CTX,
@@ -1049,6 +1096,7 @@ impl RskPrecompileProvider {
         caller: Address,
         scheme: revm::interpreter::CallScheme,
         call_value: revm::primitives::U256,
+        internal_tx_hash: Option<[u8; 32]>,
     ) -> Result<PrecompileOutput, PrecompileError> {
         use revm::context_interface::JournalTr;
         use revm::interpreter::CallScheme;
@@ -1065,9 +1113,14 @@ impl RskPrecompileProvider {
         // reached via a contract CALL (rskj `isContractTx`). revm's depth here
         // already counts the precompile's own frame.
         let call_depth = context.journal().depth();
-        let tx_ctx = self.bridge_tx_context.lock()
+        let mut tx_ctx = self
+            .bridge_tx_context
+            .lock()
             .map(|g| g.clone())
             .unwrap_or_default();
+        if let Some(hash) = internal_tx_hash {
+            tx_ctx.rsk_tx_hash = hash;
+        }
         crate::bridge::execute_bridge(
             context,
             input,
@@ -1310,6 +1363,13 @@ impl<CTX: crate::RskContextTr> PrecompileProvider<CTX> for RskPrecompileProvider
         let Some(precompile) = self.precompiles.get(&addr) else {
             return Ok(None);
         };
+
+        // rskj makes an internal transaction of a contract's call to one of
+        // its native contracts, as of one to the Bridge or to REMASC, and of
+        // a call to no other precompile (`crate::internal_tx`).
+        if NATIVE_CONTRACTS.contains(&addr) {
+            context.chain_mut().internal_txs.count();
+        }
 
         // rskj creates the account of the call's context address on first
         // call: the precompile's, or for CALLCODE and DELEGATECALL the

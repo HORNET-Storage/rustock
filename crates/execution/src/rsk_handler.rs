@@ -31,7 +31,9 @@
 //!   and the auction proceeds. Top-level deploy transactions are NOT
 //!   affected (rskj TransactionExecutor.createContract throws, like EIP-2).
 
+use crate::internal_tx::InternalTx;
 use revm::context::result::HaltReason;
+use revm::context::JournalEntry;
 use revm::context_interface::journaled_state::account::JournaledAccountTr;
 use revm::context_interface::{Cfg, ContextTr, JournalTr};
 use revm::handler::instructions::InstructionProvider;
@@ -560,6 +562,17 @@ where
             }
             _ => true,
         };
+        // Every internal transaction rskj makes under this one carries its
+        // gas price and the block's gas limit (`crate::internal_tx`).
+        {
+            use revm::context_interface::{Block, Transaction};
+            let ctx = evm.ctx();
+            let gas_price = ctx.tx().effective_gas_price(ctx.block().basefee() as u128);
+            let block_gas_limit = ctx.block().gas_limit();
+            ctx.chain_mut()
+                .internal_txs
+                .begin(U256::from(gas_price), U256::from(block_gas_limit));
+        }
         if let ItemOrResult::Result(frame_result) = D::init(evm, first_frame_input)? {
             return Ok(frame_result);
         }
@@ -574,6 +587,7 @@ where
         // bumps the nonce (even post-RSKIP125), so it stays 0.
         set_created_contract_nonce(evm, 0);
         self.open_frame(evm);
+        evm.ctx().chain_mut().internal_txs.enter(None);
         // A local call whose gas limit can't pay its intrinsic cost (see
         // `validate`): rskj's `go()` throws as it charges the cost, before the
         // program runs, and takes back what opening it did.
@@ -656,6 +670,10 @@ where
                         }
                         continue;
                     }
+                    // What rskj's internal transaction for this frame is, if it
+                    // comes to make one: read before the frame opens, while a
+                    // creator's nonce is still the one the creation carries.
+                    let made = internal_tx_of(evm, &init.frame_input);
                     match D::init(evm, init)? {
                         ItemOrResult::Item(()) => {
                             // Internal CREATE/CREATE2 opcode: post-RSKIP125
@@ -664,6 +682,18 @@ where
                             let nonce = u64::from(self.rskip125_active);
                             set_created_contract_nonce(evm, nonce);
                             self.open_frame(evm);
+                            // The program runs as that internal transaction,
+                            // which carries the code it runs.
+                            let code = evm
+                                .frame_stack()
+                                .get()
+                                .interpreter
+                                .bytecode
+                                .original_bytes();
+                            evm.ctx()
+                                .chain_mut()
+                                .internal_txs
+                                .enter(made.map(|tx| InternalTx { code, ..tx }));
                             continue;
                         }
                         // Do not pop the frame since no new frame was created:
@@ -671,6 +701,24 @@ where
                         // account, or a failed pre-check (depth/endowment)
                         // resolves.
                         ItemOrResult::Result(result) => {
+                            // A call that ran no code and reached no
+                            // precompile went to an account without code, and
+                            // rskj makes an internal transaction of that one
+                            // too (`Program.callToAddress`). A call or a
+                            // creation it refuses, for depth, balance or an
+                            // address in use, comes back with another result
+                            // and makes none; a precompile counts its own.
+                            if matches!(
+                                &result,
+                                FrameResult::Call(outcome)
+                                    if !outcome.was_precompile_called
+                                        && matches!(
+                                            outcome.instruction_result(),
+                                            InstructionResult::Stop
+                                        )
+                            ) {
+                                evm.ctx().chain_mut().internal_txs.count();
+                            }
                             // A precompile's failed call has had its
                             // checkpoint reverted by now; the logs rskj leaves
                             // with the caller go back in as the caller's.
@@ -734,6 +782,24 @@ where
                 // when its result is ok (`rsk_frame_return`).
                 ItemOrResult::Result(result) => {
                     self.close_frame(evm, result.instruction_result().is_ok());
+                    // The program's internal transactions (`crate::internal_tx`).
+                    // rskj `Program.suicide` makes one of the balance it
+                    // moves, where the account has one: the journal's last
+                    // entry is that SELFDESTRUCT's. And a call's program
+                    // hands what it made to its caller, where a creation's
+                    // doesn't.
+                    let moved_a_balance =
+                        matches!(result.instruction_result(), InstructionResult::SelfDestruct)
+                            && matches!(
+                                evm.ctx().journal().journal().last(),
+                                Some(JournalEntry::AccountDestroyed { had_balance, .. })
+                                    if !had_balance.is_zero()
+                            );
+                    let internal_txs = &mut evm.ctx().chain_mut().internal_txs;
+                    if moved_a_balance {
+                        internal_txs.count();
+                    }
+                    internal_txs.leave(matches!(result, FrameResult::Call(_)));
                     result
                 }
             };
@@ -942,6 +1008,55 @@ where
             evm.ctx().journal_mut().log(log);
         }
     }
+}
+
+/// The internal transaction rskj makes of the call or the creation a frame
+/// is about to start (`Program.callToAddress`, `Program.createContract`),
+/// less the code its program runs, which the frame holds once it is open.
+fn internal_tx_of<EVM>(
+    evm: &mut EVM,
+    input: &revm::interpreter::interpreter_action::FrameInput,
+) -> Option<InternalTx>
+where
+    EVM: EvmTr<Context: ContextTr<Journal: JournalTr<State = EvmState> + JournalExt>>,
+{
+    use revm::interpreter::interpreter_action::FrameInput;
+    let (sender, receiver, value, creates) = match input {
+        FrameInput::Call(inputs) => {
+            // rskj's sender is the program that calls, and its value what the
+            // opcode took off the stack. For a DELEGATECALL revm's caller and
+            // value are those of the frame that delegates, where rskj's are
+            // that frame's own address and nothing.
+            let delegates = inputs.scheme == revm::interpreter::CallScheme::DelegateCall;
+            let sender = if delegates {
+                inputs.target_address
+            } else {
+                inputs.caller
+            };
+            let value = if delegates {
+                U256::ZERO
+            } else {
+                inputs.call_value()
+            };
+            (sender, Some(inputs.target_address), value, false)
+        }
+        FrameInput::Create(inputs) => (inputs.caller(), None, inputs.value(), true),
+        _ => return None,
+    };
+    let nonce = evm
+        .ctx()
+        .journal()
+        .evm_state()
+        .get(&sender)
+        .map_or(0, |account| account.info.nonce);
+    Some(InternalTx {
+        sender,
+        nonce,
+        receiver,
+        value,
+        code: Bytes::new(),
+        creates,
+    })
 }
 
 /// Hands the journal's entries to the RSKIP-144 collision tracker.

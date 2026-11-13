@@ -1237,7 +1237,8 @@ fn record_pegin(
     }
     let mut fields = vec![
         ("btcTxHash", FieldValue::Bytes(btc_txid_event_bytes(btc_tx).to_vec())),
-        ("rskTxHash", FieldValue::Bytes(tx_ctx.rsk_tx_hash.to_vec())),
+        // The transaction in the block, by which a record is found again.
+        ("rskTxHash", FieldValue::Bytes(tx_ctx.origin_tx_hash.to_vec())),
         ("amountSat", FieldValue::U64(amount_sat)),
         ("reason", FieldValue::Text(reason.to_string())),
     ];
@@ -2627,17 +2628,20 @@ fn emit_flyover_rejection_release<CTX: crate::RskContextTr>(
         )
     };
     if let Some(built) = built {
+        // rskj names a flyover refund by `internalTx.getOriginHash()`, the
+        // hash of the transaction in the block, where every other release is
+        // named by `rskTx.getHash()`.
         let use_tx_hash = hardfork_cfg.has_rskip146(rsk_height);
         let mut waiting = load_pegout_confirmation_set(ctx, use_tx_hash);
         waiting.push(PegoutWaitingForConfirmations {
             btc_tx_raw: btc_serialize(&built.tx),
             rsk_block_height: rsk_height,
-            rsk_tx_hash: use_tx_hash.then_some(tx_ctx.rsk_tx_hash),
+            rsk_tx_hash: use_tx_hash.then_some(tx_ctx.origin_tx_hash),
         });
         release_requested_or_record(
             ctx,
             use_tx_hash,
-            &tx_ctx.rsk_tx_hash,
+            &tx_ctx.origin_tx_hash,
             &btc_txid_event_bytes(&built.tx),
             total_satoshis,
         );

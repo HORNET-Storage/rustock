@@ -71,6 +71,11 @@ pub struct RskChainExt {
     /// the caller. revm drops them with the call's checkpoint; they wait here
     /// for `RskHandler` to write them again once that checkpoint is gone.
     pub kept_logs: Vec<revm::primitives::Log>,
+    /// The programs of the transaction that is running and the internal
+    /// transactions each has made, for the hash of the one rskj hands the
+    /// Bridge when a contract calls it. `RskHandler` follows the programs,
+    /// and the precompiles tell it of the calls that reach them.
+    pub internal_txs: crate::internal_tx::InternalTxs,
 }
 
 /// Raw-bytes storage overlay for the block being executed.

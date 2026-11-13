@@ -1803,7 +1803,10 @@ impl RskExecutor {
 
             // Update per-transaction Bridge context before execution.
             // This provides the Bridge precompile with:
-            //   - rsk_tx_hash: used for RSKIP146 release queue entries
+            //   - rsk_tx_hash: used for RSKIP146 release queue entries. A
+            //     contract's call to the Bridge is handed another, the hash of
+            //     the internal transaction rskj makes of it, which
+            //     `RskPrecompileProvider` works out from this one.
             //   - btc_sender_hash160: used as BTC peg-out destination (matches rskj's
             //     BridgeUtils.recoverBtcAddressFromEthTransaction)
             {
@@ -1817,6 +1820,7 @@ impl RskExecutor {
                 if let Ok(mut guard) = bridge_ctx_slot.lock() {
                     *guard = BridgeTxContext {
                         rsk_tx_hash,
+                        origin_tx_hash: rsk_tx_hash,
                         btc_sender_hash160,
                         rsk_sender: *sender,
                         // A transaction in a block is never a local call.
@@ -14986,6 +14990,13 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
         );
     }
 
+    /// The run of that name among a file's.
+    fn run_named<'a>(runs: &'a [RskjRun], name: &str) -> &'a RskjRun {
+        runs.iter()
+            .find(|run| run.name == name)
+            .unwrap_or_else(|| panic!("no run {name}"))
+    }
+
     /// What rskj's release does with a peg-in it refunds, read from its own
     /// `TransactionExecutor` (the testdata's header says how). A member of the
     /// federation hands the Bridge six Bitcoin headers, and then a transaction
@@ -14997,38 +15008,60 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
     /// regtest's is and mainnet's since its first change after RSKIP305, with
     /// the witness program in each input's scriptSig, the unsigned witness, and
     /// the fee taken over the virtual size. The fee is no less than bitcoinj's
-    /// minimum, which the second run's fee per kilobyte takes it down to
+    /// minimum, which the fee per kilobyte of `low-fee` takes it down to
     /// (`Wallet.adjustOutputDownwardsForFee`). And rskj ends the refund's
     /// settling as it ends every release's (`settleReleaseRejection`,
     /// `processReleaseTransactionInfo`): it logs `pegout_transaction_created`
     /// after `release_requested` (RSKIP428) and stores the values of what the
     /// refund spends (RSKIP305).
     ///
-    /// The last run registers a flyover payment over the locking cap, through
-    /// the contract that stands for the liquidity bridge. rskj refunds that one
+    /// `flyover` registers a flyover payment over the locking cap, through the
+    /// contract that stands for the liquidity bridge. rskj refunds that one
     /// the same way, spending the output that pays the federation's flyover
     /// address, which for a P2SH-P2WSH federation is the P2SH of the flyover
     /// script's witness program. It names that refund by the hash of the
     /// block's transaction, not of the contract's call (`getOriginHash`).
+    ///
+    /// In `many-outputs` the payment is in 330 outputs. rskj builds its
+    /// refund, which is over bitcoinj's 100,000 bytes once its inputs are
+    /// filled in and under them while bitcoinj checks
+    /// (`release_tx::fill_inputs`).
     #[test]
     fn a_refunded_peg_in_is_registered_as_rskj_registers_it() {
         let runs = rskj_runs(include_str!("bridge/testdata/rskj_refunded_pegins.txt"));
-        let names: Vec<&str> = runs.iter().map(|run| run.name.as_str()).collect();
-        assert_eq!(
-            names,
-            [
-                "direct",
-                "relay",
-                "nested",
-                "delegate",
-                "low-fee",
-                "flyover",
-                "many-outputs"
-            ]
-        );
-        replays_as_rskj_ran_it(&runs[0]);
-        replays_as_rskj_ran_it(&runs[4]);
-        replays_as_rskj_ran_it(&runs[5]);
-        replays_as_rskj_ran_it(&runs[6]);
+        for name in ["direct", "low-fee", "flyover", "many-outputs"] {
+            replays_as_rskj_ran_it(run_named(&runs, name));
+        }
+    }
+
+    /// A contract registers the payment, and rskj hands the Bridge the
+    /// internal transaction it makes of the contract's call. The refund is
+    /// named by that transaction's hash, in `release_requested` and with the
+    /// release where it waits for its confirmations
+    /// (`BridgeSupport.registerBtcTransaction`, `rskTx.getHash()`), not by the
+    /// hash of the transaction in the block.
+    ///
+    /// That hash is over where the call stands among the internal
+    /// transactions of the transaction (`crate::internal_tx`). In `relay` the
+    /// contract the transaction calls hands its call data to the Bridge. In
+    /// `nested` it first calls an account without code, creates a contract
+    /// whose constructor calls one too, makes a STATICCALL to the identity
+    /// precompile, calls a contract that destroys itself and one that calls
+    /// and reverts, makes a call it has no balance for, calls the BlockHeader
+    /// contract and REMASC, makes a CALLCODE, and then a DELEGATECALL to the
+    /// code that reaches the Bridge. In `delegate` it delegates at once.
+    ///
+    /// In `constructor` the contract calls one that destroys itself with no
+    /// balance, which makes no internal transaction, and the Bridge with no
+    /// data, which makes one though the Bridge turns the call down. Then it
+    /// creates a contract whose constructor registers the payment, under the
+    /// creation's internal transaction. In `deploy` the transaction itself
+    /// creates the contract whose constructor registers.
+    #[test]
+    fn a_contract_registers_a_refunded_peg_in_as_rskj_registers_it() {
+        let runs = rskj_runs(include_str!("bridge/testdata/rskj_refunded_pegins.txt"));
+        for name in ["relay", "nested", "delegate", "constructor", "deploy"] {
+            replays_as_rskj_ran_it(run_named(&runs, name));
+        }
     }
 }
