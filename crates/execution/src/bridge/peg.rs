@@ -4508,10 +4508,11 @@ pub(crate) fn federation_redeem_for_format_pub(
 /// rskj `BridgeUtils.isFromFederateMember(rskTx, federation)`: true when the
 /// call's sender RSK address matches the RSK public-key address of any member
 /// of the ACTIVE or RETIRING federation. This is the authorization enforced by
-/// `Bridge.activeAndRetiringFederationOnly` for `updateCollections` (always)
-/// and `receiveHeaders` (post-RSKIP200). `sender` is the immediate caller of
-/// the Bridge precompile (= rskj's internalTx sender = `getOwnerRskAddress`),
-/// so a relay contract forwarding the call is checked, not the original EOA.
+/// `Bridge.activeAndRetiringFederationOnly` for `updateCollections` (always),
+/// `receiveHeaders` (post-RSKIP200) and `registerBtcTransaction` (until
+/// RSKIP199). `sender` is the immediate caller of the Bridge precompile (=
+/// rskj's internalTx sender = `getOwnerRskAddress`), so a relay contract
+/// forwarding the call is checked, not the original EOA.
 pub(crate) fn is_sender_active_or_retiring_fed_member<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     config: &BridgeConstants,
@@ -4562,6 +4563,28 @@ pub(crate) fn is_sender_active_or_retiring_fed_member<CTX: crate::RskContextTr>(
             .any(|k| rsk_address_from_public_key(k) == Some(sender));
     }
     false
+}
+
+/// Whether `sender` is a member of the proposed federation, whom
+/// `Bridge.activeRetiringAndProposedFederationOnly` admits to `addSignature`
+/// beside the active and retiring federations' members. Before RSKIP419
+/// `getProposedFederation` answers that there is none.
+pub(crate) fn is_sender_proposed_fed_member<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    hardfork_cfg: &RskHardforkConfig,
+    block_number: u64,
+    sender: alloy_primitives::Address,
+) -> bool {
+    use super::federation::rsk_address_from_public_key;
+    hardfork_cfg.has_rskip419(block_number)
+        && super::federation::load_stored_federation(ctx, PROPOSED_FEDERATION_KEY).is_some_and(
+            |proposed| {
+                proposed
+                    .members
+                    .iter()
+                    .any(|m| rsk_address_from_public_key(&m.rsk) == Some(sender))
+            },
+        )
 }
 
 pub(crate) fn genesis_federation_keys(config: &BridgeConstants) -> Vec<[u8; 33]> {

@@ -823,32 +823,46 @@ fn execute_method<CTX: crate::RskContextTr>(
     call_value: U256,
 ) -> Result<PrecompileOutput, PrecompileError> {
 
-    // rskj `Bridge.activeAndRetiringFederationOnly` authorization. The executor
-    // for `updateCollections` (always) and `receiveHeaders` (when not public,
-    // i.e. post-RSKIP200) throws a `VMException` when the call's sender is not a
-    // member of the active or retiring federation. Bridge.execute wraps that in
-    // a VMException which `executePrecompiledAndHandleError` turns into a
-    // rollback + stackPushZero (the call returns 0 / empty data) while still
-    // charging the full `requiredGas`. A relay contract forwarding the call is
-    // checked by its own address, so a non-federation caller is rejected with no
-    // state change and no event (mainnet #6,223,774 tx[1]: updateCollections via
-    // relay 0x82494fb1 must NOT emit the update_collections log).
-    let federation_only = match method_name {
-        "updateCollections" => true,
+    // rskj wraps four methods' executors in a check of the caller against the
+    // federations (BridgeMethods.java). `activeAndRetiringFederationOnly`
+    // guards `updateCollections` always, `receiveHeaders` when it isn't public
+    // and `registerBtcTransaction` until RSKIP199 makes it public.
+    // `activeRetiringAndProposedFederationOnly` guards `addSignature` at every
+    // height. Each throws a plain `VMException` for anyone else, which nothing
+    // answers with null before RSKIP88: `executePrecompiledAndHandleError`
+    // turns it into a rollback + stackPushZero (the call returns 0 / empty
+    // data) while still charging the full `requiredGas`. A relay contract
+    // forwarding the call is checked by its own address, so a non-federation
+    // caller is rejected with no state change and no event (mainnet #6,223,774
+    // tx[1]: updateCollections via relay 0x82494fb1 must NOT emit the
+    // update_collections log).
+    let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
+    let (federation_only, proposed_too) = match method_name {
+        "updateCollections" => (true, false),
         // receiveHeadersIsPublic() = RSKIP124 && !RSKIP200; restricted otherwise.
         #[allow(clippy::nonminimal_bool)] // mirrors the rskj formula above
-        "receiveHeaders" => {
-            let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
-            !(hardfork_cfg.has_rskip124(block_number) && !hardfork_cfg.has_rskip200(block_number))
-        }
-        _ => false,
+        "receiveHeaders" => (
+            !(hardfork_cfg.has_rskip124(block_number) && !hardfork_cfg.has_rskip200(block_number)),
+            false,
+        ),
+        // registerBtcTransactionIsPublic() = RSKIP199.
+        "registerBtcTransaction" => (!hardfork_cfg.has_rskip199(block_number), false),
+        "addSignature" => (true, true),
+        _ => (false, false),
     };
     if federation_only {
-        let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
-        if !peg::is_sender_active_or_retiring_fed_member(ctx, config, hardfork_cfg, block_number, caller) {
-            // BridgeIllegalArgumentException-equivalent: a non-OOG throw the
-            // execute_bridge wrapper maps to the depth-aware bridge-throw marker
-            // (rollback + only requiredGas spent).
+        let member = peg::is_sender_active_or_retiring_fed_member(
+            ctx,
+            config,
+            hardfork_cfg,
+            block_number,
+            caller,
+        ) || (proposed_too
+            && peg::is_sender_proposed_fed_member(ctx, hardfork_cfg, block_number, caller));
+        if !member {
+            // A non-OOG throw the execute_bridge wrapper maps to the
+            // depth-aware bridge-throw marker (rollback + only requiredGas
+            // spent).
             return Err(PrecompileError::other("Bridge: sender is not a federation member"));
         }
     }
@@ -1387,6 +1401,144 @@ mod tests {
         let sel = compute_selector("releaseBtc()");
         let m = find_bridge_method(&sel).unwrap();
         assert_eq!(m.name, "releaseBtc");
+    }
+
+    fn mainnet_at(
+        block_number: u64,
+    ) -> revm::Context<
+        revm::context::BlockEnv,
+        revm::context::TxEnv,
+        revm::context::CfgEnv,
+        revm::database::EmptyDB,
+        revm::Journal<revm::database::EmptyDB>,
+        crate::raw_storage::RskChainExt,
+    > {
+        use revm::MainContext;
+        let mut ctx =
+            revm::Context::mainnet().with_chain(crate::raw_storage::RskChainExt::default());
+        ctx.block.number = U256::from(block_number);
+        ctx
+    }
+
+    /// Whether `method`, called by `caller` with no arguments, is turned down
+    /// as rskj's federation-only executors turn down a caller who is in none
+    /// of the federations they name.
+    fn turned_down_as_a_stranger<CTX: crate::RskContextTr>(
+        ctx: &mut CTX,
+        method: &str,
+        caller: alloy_primitives::Address,
+    ) -> bool {
+        let (config, cfg) = (BridgeConstants::mainnet(), RskHardforkConfig::mainnet());
+        let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
+        let tx_ctx = BridgeTxContext {
+            rsk_sender: caller,
+            ..Default::default()
+        };
+        let result = execute_method(
+            ctx,
+            method,
+            &[],
+            0,
+            &config,
+            None,
+            cfg.has_stored_block_v2(block_number),
+            &cfg,
+            &tx_ctx,
+            caller,
+            0,
+            U256::ZERO,
+        );
+        result.is_err_and(|e| format!("{e:?}").contains("not a federation member"))
+    }
+
+    /// rskj gives four methods an executor that throws a `VMException` for a
+    /// caller outside the federations (BridgeMethods.java): `addSignature` at
+    /// every height, `registerBtcTransaction` until RSKIP199 makes it public,
+    /// `receiveHeaders` while it isn't public, and `updateCollections`.
+    #[test]
+    fn the_federations_methods_turn_a_stranger_down() {
+        let config = BridgeConstants::mainnet();
+        // With no federation stored yet the genesis federation is the active one.
+        let member =
+            federation::rsk_address_from_public_key(&peg::genesis_federation_keys(&config)[0])
+                .unwrap();
+        let stranger = alloy_primitives::Address::repeat_byte(0x99);
+
+        for block_number in [1, 3_000_000, 8_000_000] {
+            let mut ctx = mainnet_at(block_number);
+            assert!(turned_down_as_a_stranger(
+                &mut ctx,
+                "addSignature",
+                stranger
+            ));
+            assert!(!turned_down_as_a_stranger(&mut ctx, "addSignature", member));
+            assert!(turned_down_as_a_stranger(
+                &mut ctx,
+                "updateCollections",
+                stranger
+            ));
+        }
+
+        // RSKIP199 is iris300's, at 3,614,800.
+        let mut before = mainnet_at(3_614_799);
+        assert!(turned_down_as_a_stranger(
+            &mut before,
+            "registerBtcTransaction",
+            stranger
+        ));
+        assert!(!turned_down_as_a_stranger(
+            &mut before,
+            "registerBtcTransaction",
+            member
+        ));
+        let mut from = mainnet_at(3_614_800);
+        assert!(!turned_down_as_a_stranger(
+            &mut from,
+            "registerBtcTransaction",
+            stranger
+        ));
+    }
+
+    /// `activeRetiringAndProposedFederationOnly` also admits a member of the
+    /// proposed federation, which exists from RSKIP419 (lovell700, 7,338,024).
+    /// `activeAndRetiringFederationOnly` doesn't.
+    #[test]
+    fn add_signature_admits_a_member_of_the_proposed_federation() {
+        let key = |hex: &str| -> [u8; 33] {
+            alloy_primitives::hex::decode(hex)
+                .unwrap()
+                .try_into()
+                .unwrap()
+        };
+        // The curve's generator and its double.
+        let g = key("0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798");
+        let two_g = key("02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5");
+        let proposed = federation::StoredMember {
+            btc: g,
+            rsk: two_g,
+            mst: g,
+        };
+        let caller = federation::rsk_address_from_public_key(&two_g).unwrap();
+
+        for (block_number, admitted) in [(7_338_023, false), (7_338_024, true)] {
+            let mut ctx = mainnet_at(block_number);
+            let stored = federation::serialize_federation_multikey(
+                std::slice::from_ref(&proposed),
+                1_700_000_000_000,
+                7_000_000,
+            );
+            storage::bridge_store_bytes_named(&mut ctx, storage::PROPOSED_FEDERATION_KEY, &stored);
+            assert_eq!(
+                !turned_down_as_a_stranger(&mut ctx, "addSignature", caller),
+                admitted,
+                "at {block_number}"
+            );
+            assert!(turned_down_as_a_stranger(
+                &mut ctx,
+                "updateCollections",
+                caller
+            ));
+        }
     }
 
     /// rskj Bridge.receiveHeadersGetCost groundtruth: 22_000 pre-RSKIP124;
