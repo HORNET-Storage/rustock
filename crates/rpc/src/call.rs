@@ -1,4 +1,5 @@
-use crate::dto::CallRequest;
+use crate::dto::{CallArguments, CallRequest};
+use crate::params::{uncaught, Refusal};
 use crate::server::RpcState;
 
 use crate::types::*;
@@ -25,22 +26,52 @@ pub const CALL_GAS_CAP: u64 = 10_000_000;
 /// `internalEstimateGas` caps the answer at it).
 pub const GAS_ESTIMATION_CAP: u64 = 6_800_000;
 
+/// A call's arguments, checked as rskj's `CallArgumentsParam` checks them
+/// before the method runs. `None` for `null`, which reaches the method as no
+/// arguments at all: it throws when it comes to read them, and nothing
+/// catches that.
+fn call_arguments(params: &Value) -> Result<Option<CallArguments>, Refusal> {
+    match params.get(0) {
+        None => Err((
+            INVALID_PARAMS,
+            "Missing or invalid call request".to_string(),
+        )),
+        Some(Value::Null) => Ok(None),
+        Some(arguments) => CallArguments::read(arguments).map(Some),
+    }
+}
+
 pub fn eth_call(id: Value, params: &Value, state: &RpcState) -> JsonRpcResponse {
-    let Some(call_req) = params.get(0).and_then(CallRequest::from_json) else {
-        return JsonRpcResponse::error(id, INVALID_PARAMS, "Missing or invalid call request");
+    let refuse = |id: Value, (code, message): Refusal| JsonRpcResponse::error(id, code, message);
+    let arguments = match call_arguments(params) {
+        Ok(arguments) => arguments,
+        Err(refusal) => return refuse(id, refusal),
     };
     let block_param = match crate::helpers::call_block(params.get(1), &state.store) {
         Ok(block) => block,
-        Err((code, message)) => return JsonRpcResponse::error(id, code, message),
+        Err(refusal) => return refuse(id, refusal),
     };
 
     let Some((trie_store, hardfork_cfg)) = state.trie_store.clone().zip(state.hardfork_cfg.clone()) else {
         return JsonRpcResponse::error(id, INTERNAL_ERROR, "Execution engine not available");
     };
 
-    let (root, header) = match crate::state::execution_state(&id, &block_param, state) {
+    // rskj has the block in hand before it reads the call's numbers, and
+    // looks for the block's state only as it runs the call (`EthModule.call`).
+    let found = crate::state::state_at(&block_param, state);
+    if let Err(none @ crate::state::NoState::Block) = found {
+        return crate::state::no_execution_state(&id, &block_param, none);
+    }
+    let call_req = match arguments
+        .ok_or_else(uncaught)
+        .and_then(CallArguments::request)
+    {
+        Ok(request) => request,
+        Err(refusal) => return refuse(id, refusal),
+    };
+    let (root, header) = match found {
         Ok(found) => found,
-        Err(refused) => return refused,
+        Err(none) => return crate::state::no_execution_state(&id, &block_param, none),
     };
 
     let sender = call_req.from.unwrap_or(Address::ZERO);
@@ -60,12 +91,14 @@ pub fn eth_call(id: Value, params: &Value, state: &RpcState) -> JsonRpcResponse 
 }
 
 pub fn eth_estimate_gas(id: Value, params: &Value, state: &RpcState) -> JsonRpcResponse {
-    let Some(call_req) = params.get(0).and_then(CallRequest::from_json) else {
-        return JsonRpcResponse::error(id, INVALID_PARAMS, "Missing or invalid call request");
+    let refuse = |id: Value, (code, message): Refusal| JsonRpcResponse::error(id, code, message);
+    let arguments = match call_arguments(params) {
+        Ok(arguments) => arguments,
+        Err(refusal) => return refuse(id, refusal),
     };
     let block_param = match crate::helpers::estimate_block(params.get(1)) {
         Ok(block) => block,
-        Err((code, message)) => return JsonRpcResponse::error(id, code, message),
+        Err(refusal) => return refuse(id, refusal),
     };
 
     let Some((trie_store, hardfork_cfg)) = state.trie_store.clone().zip(state.hardfork_cfg.clone()) else {
@@ -75,6 +108,15 @@ pub fn eth_estimate_gas(id: Value, params: &Value, state: &RpcState) -> JsonRpcR
     let (root, header) = match crate::state::execution_state(&id, &block_param, state) {
         Ok(found) => found,
         Err(refused) => return refused,
+    };
+    // An estimate has its state in hand before it reads the call's numbers
+    // (`EthModule.estimateGas`).
+    let call_req = match arguments
+        .ok_or_else(uncaught)
+        .and_then(CallArguments::estimate_request)
+    {
+        Ok(request) => request,
+        Err(refusal) => return refuse(id, refusal),
     };
 
     let sender = call_req.from.unwrap_or(Address::ZERO);

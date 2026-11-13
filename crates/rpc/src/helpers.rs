@@ -156,15 +156,25 @@ pub(crate) fn abbreviated(s: &str) -> String {
 }
 
 /// The bytes rskj's `HexUtils.stringHexToByteArray` reads: a `0x` taken off,
-/// and an odd count of digits padded with a zero in front. `None` where its
-/// decoder throws.
-fn hex_to_bytes(s: &str) -> Option<Vec<u8>> {
-    let digits = s.strip_prefix("0x").unwrap_or(s);
-    if digits.len().is_multiple_of(2) {
-        hex::decode(digits).ok()
-    } else {
-        hex::decode(format!("0{digits}")).ok()
+/// and an odd count of characters padded with a zero in front. `None` where
+/// its decoder throws.
+///
+/// The decoder is bouncycastle's `Hex.decode`, which passes over a space, a
+/// tab, a line feed and a carriage return wherever they stand. The zero goes
+/// in front by the count of characters, those four counted: `12 34 ` is two
+/// bytes, and `12 34` is padded to five digits and refused.
+pub(crate) fn hex_to_bytes(s: &str) -> Option<Vec<u8>> {
+    let written = s.strip_prefix("0x").unwrap_or(s);
+    let mut digits = Vec::with_capacity(written.len() + 1);
+    if !written.len().is_multiple_of(2) {
+        digits.push(b'0');
     }
+    digits.extend(
+        written
+            .bytes()
+            .filter(|byte| !matches!(byte, b' ' | b'\t' | b'\n' | b'\r')),
+    );
+    hex::decode(digits).ok()
 }
 
 /// A block parameter as rskj's `BlockRefParam` reads it, for `eth_call`,
@@ -350,14 +360,8 @@ pub fn call_block(
 /// its opening brace, refused. Left out or `null`, it is the latest block
 /// (`Web3Impl.eth_estimateGas`).
 pub fn estimate_block(value: Option<&serde_json::Value>) -> Result<String, (i64, String)> {
-    use serde_json::Value;
-    let text = match value {
-        None | Some(Value::Null) => return Ok("latest".to_string()),
-        Some(Value::String(s)) => s.clone(),
-        Some(Value::Number(n)) => n.to_string(),
-        Some(Value::Bool(b)) => b.to_string(),
-        Some(Value::Array(_)) => "[".to_string(),
-        Some(Value::Object(_)) => "{".to_string(),
+    let Some(text) = value.and_then(crate::params::text) else {
+        return Ok("latest".to_string());
     };
     execution_block(&text, true)
 }
@@ -427,14 +431,7 @@ pub fn parse_filter_block(
     head_number: u64,
 ) -> Result<u64, (i64, String)> {
     use crate::types::{INTERNAL_ERROR, INVALID_PARAMS};
-    use serde_json::Value;
-    let text = match value {
-        Value::String(s) => s.clone(),
-        Value::Number(n) => n.to_string(),
-        Value::Bool(b) => b.to_string(),
-        Value::Null => "null".to_string(),
-        Value::Array(_) | Value::Object(_) => String::new(),
-    };
+    let text = crate::params::field_text(value).unwrap_or_else(|| "null".to_string());
     if text.is_empty() {
         return Err((
             INVALID_PARAMS,

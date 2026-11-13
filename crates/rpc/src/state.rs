@@ -145,28 +145,32 @@ pub(crate) fn queried_state(
 }
 
 /// The state a local call runs on, at the block `helpers::call_block` or
-/// `estimate_block` gave, or the answer rskj gives where there is none.
-/// `ExecutionBlockRetriever` refuses a number that has no block, `-32602`;
-/// a state the node doesn't hold is an exception nobody catches
-/// (`RepositoryLocator.snapshotAt`), `-32603`.
+/// `estimate_block` gave, or the answer rskj gives where there is none
+/// ([`no_execution_state`]).
 pub(crate) fn execution_state(
     id: &Value,
     block: &str,
     state: &RpcState,
 ) -> Result<(TrieNode, Header), JsonRpcResponse> {
-    state_at(block, state).map_err(|none| {
-        let number = block
-            .strip_prefix("0x")
-            .and_then(|hex| u64::from_str_radix(hex, 16).ok());
-        let (code, message) = match (none, number) {
-            (NoState::Block, Some(number)) => {
-                (INVALID_PARAMS, format!("Invalid block number {number}"))
-            }
-            (NoState::Block, None) => (INTERNAL_ERROR, "Internal server error".to_string()),
-            (NoState::State(hash), _) => (INTERNAL_ERROR, stateless(hash)),
-        };
-        JsonRpcResponse::error(id.clone(), code, message)
-    })
+    state_at(block, state).map_err(|none| no_execution_state(id, block, none))
+}
+
+/// What rskj answers a local call that has no state to run on.
+/// `ExecutionBlockRetriever` refuses a number that has no block, `-32602`;
+/// a state the node doesn't hold is an exception nobody catches
+/// (`RepositoryLocator.snapshotAt`), `-32603`.
+pub(crate) fn no_execution_state(id: &Value, block: &str, none: NoState) -> JsonRpcResponse {
+    let number = block
+        .strip_prefix("0x")
+        .and_then(|hex| u64::from_str_radix(hex, 16).ok());
+    let (code, message) = match (none, number) {
+        (NoState::Block, Some(number)) => {
+            (INVALID_PARAMS, format!("Invalid block number {number}"))
+        }
+        (NoState::Block, None) => (INTERNAL_ERROR, "Internal server error".to_string()),
+        (NoState::State(hash), _) => (INTERNAL_ERROR, stateless(hash)),
+    };
+    JsonRpcResponse::error(id.clone(), code, message)
 }
 
 /// rskj's words for a block whose state the node doesn't hold. It prints the

@@ -180,6 +180,108 @@ impl LogDto {
     }
 }
 
+/// A call's arguments as rskj's `CallArgumentsParam` holds them: each field
+/// checked, and the numbers still as they were written.
+///
+/// rskj reads a call's arguments in two steps. Its deserializer checks every
+/// field it knows, in its own order whatever the order written, and what a
+/// field's type refuses is `-32602`: an address that isn't one, a number that
+/// isn't hex or a decimal, data that isn't hex. A field that is absent or
+/// `null` is not there, and what isn't an object has no fields. Then, with the
+/// block in hand, `CallArgumentsToByteArray` reads the numbers
+/// ([`CallArguments::request`]).
+#[derive(Debug)]
+pub struct CallArguments {
+    from: Option<Address>,
+    to: Option<Address>,
+    gas: Option<String>,
+    gas_price: Option<String>,
+    value: Option<String>,
+    data: Option<Vec<u8>>,
+}
+
+impl CallArguments {
+    /// `CallArgumentsParam.Deserializer`. `arguments` is not `null`: that
+    /// reaches the method as no arguments at all, and what the method makes of
+    /// that is its own.
+    pub fn read(arguments: &serde_json::Value) -> Result<Self, crate::params::Refusal> {
+        use crate::params::{field_text, hex_address, hex_data, hex_number};
+        let field = |name: &str| arguments.get(name).and_then(field_text);
+        let number = |name: &str| match field(name) {
+            Some(text) => hex_number(&text).map(|()| Some(text)),
+            None => Ok(None),
+        };
+        let from = field("from").map(|text| hex_address(&text)).transpose()?;
+        let to = field("to").map(|text| hex_address(&text)).transpose()?;
+        let gas = number("gas")?;
+        let gas_price = number("gasPrice")?;
+        // Checked, and read by no call.
+        number("gasLimit")?;
+        number("nonce")?;
+        number("chainId")?;
+        let value = number("value")?;
+        let data = field("data").map(|text| hex_data(&text)).transpose()?;
+        let input = field("input").map(|text| hex_data(&text)).transpose()?;
+        Ok(Self {
+            from,
+            to,
+            gas,
+            gas_price,
+            value,
+            // `CallArguments.setInput` writes over what `setData` wrote.
+            data: input.or(data),
+        })
+    }
+
+    /// `CallArgumentsToByteArray`: the gas price, the gas and the value read
+    /// as numbers, in that order ([`crate::params::number_bytes`]). One
+    /// written as nothing is not there.
+    ///
+    /// A call's gas is held to `rpc.callGasCap` whatever it names, and one
+    /// written in more than eight bytes is an error nobody catches
+    /// (`ByteUtil.byteArrayToLong`). A gas of 2^63 or more in eight bytes
+    /// gets past rskj's own cap, which compares it as a `long`
+    /// (`gasLimitForCall`): a contract then runs on 2^63 - 1 gas, and a call
+    /// to anything else is an error. That isn't followed. It is held to the
+    /// cap like any other.
+    pub fn request(self) -> Result<CallRequest, crate::params::Refusal> {
+        use crate::params::{number, number_bytes, uncaught};
+        let written = |text: Option<String>| text.filter(|text| !text.is_empty());
+        let gas_price = written(self.gas_price)
+            .map(|text| number(&text))
+            .transpose()?;
+        let gas = match written(self.gas)
+            .map(|text| number_bytes(&text))
+            .transpose()?
+        {
+            Some(bytes) if bytes.len() > 8 => return Err(uncaught()),
+            Some(bytes) => Some(
+                bytes
+                    .iter()
+                    .fold(0u64, |gas, byte| gas << 8 | u64::from(*byte)),
+            ),
+            None => None,
+        };
+        let value = written(self.value).map(|text| number(&text)).transpose()?;
+        Ok(CallRequest {
+            from: self.from,
+            to: self.to,
+            gas,
+            gas_price,
+            value,
+            data: self.data,
+        })
+    }
+
+    /// [`CallArguments::request`] for an estimate, which reads the gas price
+    /// and the value and not the gas (`EthModule.estimateGas` runs every
+    /// estimate at its cap).
+    pub fn estimate_request(mut self) -> Result<CallRequest, crate::params::Refusal> {
+        self.gas = None;
+        self.request()
+    }
+}
+
 /// Call request object for eth_call / eth_estimateGas.
 #[derive(Debug)]
 pub struct CallRequest {
@@ -189,52 +291,6 @@ pub struct CallRequest {
     pub gas_price: Option<U256>,
     pub value: Option<U256>,
     pub data: Option<Vec<u8>>,
-}
-
-impl CallRequest {
-    pub fn from_json(v: &serde_json::Value) -> Option<Self> {
-        let obj = v.as_object()?;
-
-        let from = obj.get("from")
-            .and_then(|v| v.as_str())
-            .and_then(|s| s.parse::<Address>().ok());
-
-        let to = obj.get("to")
-            .and_then(|v| v.as_str())
-            .and_then(|s| s.parse::<Address>().ok());
-
-        let gas = obj.get("gas")
-            .and_then(|v| v.as_str())
-            .and_then(parse_hex_u64);
-
-        let gas_price = obj.get("gasPrice")
-            .and_then(|v| v.as_str())
-            .and_then(parse_hex_u256);
-
-        let value = obj.get("value")
-            .and_then(|v| v.as_str())
-            .and_then(parse_hex_u256);
-
-        let data = obj.get("data")
-            .or_else(|| obj.get("input"))
-            .and_then(|v| v.as_str())
-            .and_then(|s| {
-                let s = s.strip_prefix("0x").unwrap_or(s);
-                hex::decode(s).ok()
-            });
-
-        Some(Self { from, to, gas, gas_price, value, data })
-    }
-}
-
-fn parse_hex_u64(s: &str) -> Option<u64> {
-    let s = s.strip_prefix("0x").unwrap_or(s);
-    u64::from_str_radix(s, 16).ok()
-}
-
-fn parse_hex_u256(s: &str) -> Option<U256> {
-    let s = s.strip_prefix("0x").unwrap_or(s);
-    U256::from_str_radix(s, 16).ok()
 }
 
 fn compute_contract_address(sender: &[u8], nonce: u64) -> Address {

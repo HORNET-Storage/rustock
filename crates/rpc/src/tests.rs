@@ -5013,6 +5013,248 @@ async fn a_calls_defaults_are_rskjs() {
     assert_eq!(resp.result, Some(json!("0x")), "{:?}", resp.error);
 }
 
+/// A call's arguments as rskj reads them: `CallArgumentsParam` checks each
+/// field, and `CallArgumentsToByteArray` then reads the numbers. An address
+/// that isn't one, a number or data that isn't hex is refused, `-32602`,
+/// where each used to be left out without a word -- a mistyped `to` made the
+/// call a creation. A number without its `0x` is a decimal, where it used to
+/// be read as hex, and so is a JSON number, which used to be left out.
+/// rskj's release answers each so: its `CallArgumentsParam` and its
+/// `CallArgumentsToByteArray` were run on these.
+#[tokio::test]
+async fn a_calls_arguments_are_read_as_rskj_reads_them() {
+    let (state, _tmp, reader, _burner) = setup_defaults_state(1);
+    let ask = |method: &str, params: Value| {
+        let request = make_request(method, params);
+        let state = &state;
+        async move { dispatch_for_test(state, request).await }
+    };
+    let call = |call: Value| ask("eth_call", json!([call, "latest"]));
+    let words = |resp: JsonRpcResponse| {
+        let out = resp.result.unwrap_or_else(|| panic!("{:?}", resp.error));
+        let out = hex::decode(out.as_str().unwrap().trim_start_matches("0x")).unwrap();
+        (
+            U256::from_be_slice(&out[..32]),
+            U256::from_be_slice(&out[32..]),
+        )
+    };
+    let error = |resp: JsonRpcResponse| resp.error.map(|error| (error.code, error.message));
+    let to = format!("{reader:#x}");
+    // A number as the request writes it, which `json!` would write its own way.
+    let written = |field: &str, number: &str| -> Value {
+        serde_json::from_str(&format!(r#"{{"to":"{to}","{field}":{number}}}"#)).unwrap()
+    };
+
+    // The reader answers the gas price and the gas it sees: the call's gas
+    // less the 21,000, what its data costs -- 68 a byte, and 4 a byte of
+    // zero -- and the 13 spent before it.
+    let all = 10_000_000 - 21_013u64;
+    let some = 200_000 - 21_013u64;
+    for (arguments, gas_price, gas) in [
+        (
+            json!({"to": to, "gasPrice": "0x10", "gas": "0x30d40"}),
+            16u64,
+            some,
+        ),
+        (
+            json!({"to": to, "gasPrice": "0x000a", "gas": "0x00030d40"}),
+            10,
+            some,
+        ),
+        // Without the prefix a number is a decimal, and so is a JSON number.
+        (
+            json!({"to": to, "gasPrice": "10", "gas": "200000"}),
+            10,
+            some,
+        ),
+        (json!({"to": to, "gasPrice": 7, "gas": 200000}), 7, some),
+        (json!({"to": to, "gasPrice": "+7"}), 7, all),
+        // `BigInteger.toByteArray` writes -1 as the one byte 0xff.
+        (json!({"to": to, "gasPrice": "-1"}), 255, all),
+        (json!({"to": to, "gasPrice": -1}), 255, all),
+        // Nothing written, an object or an array is no number, and a bare
+        // prefix is zero.
+        (json!({"to": to, "gasPrice": "", "gas": {}}), 0, all),
+        (json!({"to": to, "gasPrice": "0x", "gas": null}), 0, all),
+        // A JSON number of any length is its digits.
+        (written("value", "20000000000000000000"), 0, all),
+        // More gas than the cap is the cap, and so is 2^63, which gets past
+        // rskj's own cap: that isn't followed.
+        (json!({"to": to, "gas": "0x989681"}), 0, all),
+        (json!({"to": to, "gas": "0x8000000000000000"}), 0, all),
+        // An address with no prefix, one in upper case, and one of 40
+        // digits and two spaces, which the decoder passes over.
+        (
+            json!({"to": to[2..], "from": to.to_uppercase().replace('X', "x")}),
+            0,
+            all,
+        ),
+        (json!({"to": format!("{}  ", &to[2..])}), 0, all),
+        // Data of an odd count of digits, with no prefix: 0x0abc.
+        (json!({"to": to, "data": "abc"}), 0, all - 2 * 68),
+        // `input` is read over `data`, written as nothing too.
+        (json!({"to": to, "data": "abc", "input": 5}), 0, all - 68),
+        (json!({"to": to, "data": "0x1234", "input": ""}), 0, all),
+        (
+            json!({"to": to, "input": "0x1234", "data": {}}),
+            0,
+            all - 2 * 68,
+        ),
+        // A space and a line feed in data are passed over: 0x1200.
+        (json!({"to": to, "data": "0x12 00\n"}), 0, all - 68 - 4),
+    ] {
+        let resp = call(arguments.clone()).await;
+        assert_eq!(
+            words(resp),
+            (U256::from(gas_price), U256::from(gas)),
+            "{arguments}"
+        );
+    }
+
+    let address = "Invalid address: null, empty or invalid hex value.";
+    let malformed = "Invalid address format: invalid hex value.";
+    let number = "value must be a valid hex or string number.";
+    let data = "Invalid data format: invalid hex value.";
+    let letters = "Number values should not contain letters or hex values should start with 0x.";
+    let long = "1".repeat(68);
+    for (arguments, message) in [
+        (json!({"to": "0x123"}), address.to_string()),
+        (json!({"to": 5}), address.to_string()),
+        (json!({"to": to, "from": {}}), address.to_string()),
+        (
+            json!({"to": format!("0x{}", "zz".repeat(20))}),
+            malformed.to_string(),
+        ),
+        (
+            json!({"to": format!("0x{}", "11".repeat(19))}),
+            malformed.to_string(),
+        ),
+        (json!({"to": to.replace("0x", "0X")}), malformed.to_string()),
+        // 40 digits and one space are padded to 41 digits.
+        (
+            json!({"to": format!("{} ", &to[2..])}),
+            malformed.to_string(),
+        ),
+        (
+            json!({"to": to, "gas": "zz"}),
+            format!("Invalid param zz: {number}"),
+        ),
+        (
+            json!({"to": to, "gas": "0X10"}),
+            format!("Invalid param 0X10: {number}"),
+        ),
+        (
+            json!({"to": to, "gas": " 5"}),
+            format!("Invalid param  5: {number}"),
+        ),
+        (
+            json!({"to": to, "gas": true}),
+            format!("Invalid param true: {number}"),
+        ),
+        // A JSON number with a fraction or an exponent is the double it
+        // reads as, printed as Java prints one.
+        (
+            written("gas", "5.5"),
+            format!("Invalid param 5.5: {number}"),
+        ),
+        (
+            written("gas", "1e5"),
+            format!("Invalid param 100000.0: {number}"),
+        ),
+        (
+            written("gas", "0.0001"),
+            format!("Invalid param 1.0E-4: {number}"),
+        ),
+        // Checked, though a call reads none of the three.
+        (
+            json!({"to": to, "nonce": "zz"}),
+            format!("Invalid param zz: {number}"),
+        ),
+        (
+            json!({"to": to, "chainId": "zz"}),
+            format!("Invalid param zz: {number}"),
+        ),
+        (
+            json!({"to": to, "gasLimit": "zz"}),
+            format!("Invalid param zz: {number}"),
+        ),
+        (
+            written("nonce", "1e5"),
+            format!("Invalid param 100000.0: {number}"),
+        ),
+        (
+            json!({"to": to, "value": long}),
+            format!("Invalid param: {}...", &long[..66]),
+        ),
+        (json!({"to": to, "data": "0xzz"}), data.to_string()),
+        (json!({"to": to, "input": "zz"}), data.to_string()),
+        // Five characters are padded to six, and five digits are left.
+        (json!({"to": to, "data": "0x12 34"}), data.to_string()),
+        // The sender is checked first, wherever it is written.
+        (json!({"gas": "zz", "from": "0x1"}), address.to_string()),
+        // Hex without its prefix passes the check and is then no decimal.
+        (json!({"to": to, "gas": "ff"}), letters.to_string()),
+        (json!({"to": to, "gasPrice": "ff"}), letters.to_string()),
+        (json!({"to": to, "value": "ff"}), letters.to_string()),
+    ] {
+        assert_eq!(
+            error(call(arguments.clone()).await),
+            Some((-32602, message)),
+            "{arguments}"
+        );
+    }
+    // A gas written in more than eight bytes, and no arguments at all, which
+    // the method reads and finds nothing to read: what rskj throws there
+    // nothing catches.
+    let uncaught = Some((-32603, "Internal server error".to_string()));
+    for arguments in [
+        json!({"to": to, "gas": "0x000000000000989680"}),
+        json!({"to": to, "gas": "18446744073709551616"}),
+        written("gas", "18446744073709551616"),
+        json!(null),
+    ] {
+        assert_eq!(
+            error(call(arguments.clone()).await),
+            uncaught,
+            "{arguments}"
+        );
+    }
+    // What isn't an object has no fields: a creation with no code.
+    let resp = call(json!("x")).await;
+    assert_eq!(resp.result, Some(json!("0x")), "{:?}", resp.error);
+
+    // The fields are checked before the block is looked for, and the
+    // arguments read after it.
+    let nowhere = Some((-32602, "Invalid block number 99".to_string()));
+    let resp = ask("eth_call", json!([{"to": "0x123"}, "0x63"])).await;
+    assert_eq!(error(resp), Some((-32602, address.to_string())));
+    let resp = ask("eth_call", json!([{"to": to, "gas": "ff"}, "0x63"])).await;
+    assert_eq!(error(resp), nowhere);
+    let resp = ask("eth_call", json!([null, "0x63"])).await;
+    assert_eq!(error(resp), nowhere);
+
+    // An estimate reads the same arguments, but for the gas, which it
+    // checks and then doesn't read.
+    let estimate = |call: Value| ask("eth_estimateGas", json!([call, "latest"]));
+    assert_eq!(
+        error(estimate(json!({"to": "0x123"})).await),
+        Some((-32602, address.to_string()))
+    );
+    assert_eq!(
+        error(estimate(json!({"to": to, "value": "ff"})).await),
+        Some((-32602, letters.to_string()))
+    );
+    assert_eq!(
+        error(estimate(json!({"to": to, "gas": "zz"})).await),
+        Some((-32602, format!("Invalid param zz: {number}")))
+    );
+    assert_eq!(error(estimate(json!(null)).await), uncaught);
+    for gas in ["ff", "18446744073709551616"] {
+        let resp = estimate(json!({"to": to, "gas": gas})).await;
+        assert!(resp.result.is_some(), "{gas}: {:?}", resp.error);
+    }
+}
+
 /// A sent transaction's defaults are rskj's
 /// (`TransactionArgumentsUtil.processArguments`): a gas price of 0, not the
 /// node's price, and the gas named as `gas`, else as `gasLimit`, else 90,000,

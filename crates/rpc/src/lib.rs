@@ -10,6 +10,7 @@ pub mod mnr;
 pub mod metrics_server;
 pub mod admin;
 pub mod net;
+pub mod params;
 pub mod proof;
 pub mod rsk;
 pub mod sco;

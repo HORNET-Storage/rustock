@@ -16,6 +16,10 @@
 //! JDK 17's: a port of `jdk.internal.math.FloatingDecimal` as OpenJDK 17 has
 //! it (`getBinaryToASCIIConverter(double, true)`, `BinaryToASCIIBuffer.dtoa`,
 //! `developLongDigits`, `roundup`, `estimateDecExp`).
+//!
+//! A parameter written as a JSON number with a fraction or an exponent goes
+//! through `Double.toString` as well: Jackson holds it as a double and gives
+//! the parameter's reader that double's text (`params::text`).
 
 use alloy_primitives::{U256, U512};
 
@@ -84,6 +88,47 @@ pub fn big_decimal_value_of_to_big_integer(d: f64) -> Option<U512> {
         value = value * U512::from(10u8) + U512::from(digit);
     }
     Some(value)
+}
+
+/// Java 17's `Double.toString(d)` (`BinaryToASCIIBuffer.getChars`): from
+/// 10^-3 to below 10^7 the digits around a point, and outside that one digit,
+/// a point, the rest and an `E` with the exponent. A digit always follows the
+/// point.
+pub fn double_to_string(d: f64) -> String {
+    if d.is_nan() {
+        return "NaN".to_string();
+    }
+    let sign = if d.is_sign_negative() { "-" } else { "" };
+    if d.is_infinite() {
+        return format!("{sign}Infinity");
+    }
+    if d == 0.0 {
+        return format!("{sign}0.0");
+    }
+    let (digits, dec_exponent) = double_to_string_digits(d.abs());
+    let digits: String = digits
+        .iter()
+        .map(|digit| char::from(b'0' + digit))
+        .collect();
+    let count = digits.len() as i32;
+    if (1..8).contains(&dec_exponent) {
+        let whole = count.min(dec_exponent) as usize;
+        let zeros = "0".repeat((dec_exponent - count).max(0) as usize);
+        let fraction = match &digits[whole..] {
+            "" => "0",
+            fraction => fraction,
+        };
+        format!("{sign}{}{zeros}.{fraction}", &digits[..whole])
+    } else if (-2..=0).contains(&dec_exponent) {
+        let zeros = "0".repeat(-dec_exponent as usize);
+        format!("{sign}0.{zeros}{digits}")
+    } else {
+        let fraction = match &digits[1..] {
+            "" => "0",
+            fraction => fraction,
+        };
+        format!("{sign}{}.{fraction}E{}", &digits[..1], dec_exponent - 1)
+    }
 }
 
 /// The digits of Java 17's `Double.toString(d)` for a positive finite `d`,
@@ -247,12 +292,16 @@ fn dtoa(bin_exp: i32, mut fract_bits: i64, n_significant_bits: i32) -> (Vec<u8>,
         // FDBigInteger, exactly. Its normalizing shift scales B, S, M and 10S
         // alike, which no quotient or comparison below can see; and here the
         // test for reaching 10S is `>=`, where the int and long paths use `>`.
-        let pow52 = |p5: i32, p2: i32| U512::from(5u8).pow(U512::from(p5)) << (p2 as usize);
+        //
+        // 1024 bits hold it for every double: the least and the greatest keep
+        // B, S, M and 10S below 2^830.
+        type Wide = alloy_primitives::Uint<1024, 16>;
+        let pow52 = |p5: i32, p2: i32| Wide::from(5u8).pow(Wide::from(p5)) << (p2 as usize);
         let s = pow52(s5, s2);
-        let mut b = U512::from(fract_bits as u64) * pow52(b5, b2);
+        let mut b = Wide::from(fract_bits as u64) * pow52(b5, b2);
         let mut m = pow52(m5 + 1, m2 + 1);
         let ten_s = pow52(s5 + 1, s2 + 1);
-        let ten = U512::from(10u8);
+        let ten = Wide::from(10u8);
         // `quoRemIteration`: the quotient, and B becomes 10 * (B mod S).
         let mut q = (b / s).to::<u8>();
         b = (b % s) * ten;
@@ -487,6 +536,54 @@ mod tests {
         assert_eq!(printed(2.0e23), "1.9999999999999998E23");
         assert_eq!(printed(1.0e23), "9.999999999999999E22");
         assert_eq!(to_big_integer(8.41e21), 8_409_999_999_999_999_000_000);
+    }
+
+    /// `Double.toString` as Java 17 lays a double out, whatever its size.
+    /// Each line is Java's own output: Java 11, which prints a double as 17
+    /// does, printed these. The three past 10^21 are ones JDK 19 prints
+    /// shorter.
+    #[test]
+    fn a_double_prints_as_java_17_prints_it() {
+        for (d, printed) in [
+            (0.0, "0.0"),
+            (0.1, "0.1"),
+            (5.5, "5.5"),
+            (5.0, "5.0"),
+            (123.456, "123.456"),
+            (100000.0, "100000.0"),
+            (9999999.999, "9999999.999"),
+            (1.0e7, "1.0E7"),
+            (12345678.9, "1.23456789E7"),
+            (0.001, "0.001"),
+            (0.00123, "0.00123"),
+            (0.0001, "1.0E-4"),
+            (1.5e-7, "1.5E-7"),
+            (1.0e30, "1.0E30"),
+            (8.41e21, "8.409999999999999E21"),
+            (1.0e23, "9.999999999999999E22"),
+            (2.0e23, "1.9999999999999998E23"),
+            (f64::MAX, "1.7976931348623157E308"),
+            (f64::MIN_POSITIVE, "2.2250738585072014E-308"),
+            (5e-324, "4.9E-324"),
+            (f64::INFINITY, "Infinity"),
+        ] {
+            assert_eq!(double_to_string(d), printed);
+            assert_eq!(double_to_string(-d), format!("-{printed}"));
+        }
+        assert_eq!(double_to_string(f64::NAN), "NaN");
+        // And whatever the double, the least of them included, what is
+        // printed reads back as it.
+        let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+        for _ in 0..20_000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            for d in [f64::from_bits(x), f64::from_bits(x >> 12)] {
+                if d.is_finite() {
+                    assert_eq!(double_to_string(d).parse(), Ok(d), "{d:e}");
+                }
+            }
+        }
     }
 
     /// A fraction is dropped, and the digits round-trip: what Java 17 prints
