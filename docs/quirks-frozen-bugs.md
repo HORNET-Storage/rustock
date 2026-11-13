@@ -676,3 +676,61 @@ data in it. Test
 with). Verified: testnet #5,214,732 replays to the header's state and
 receipts roots.
 
+---
+
+## §94 Before RSKIP284 a Flyover BTC address's version is read as a signed byte (testnet #2,122,593)
+
+`registerFastBridgeBtcTransaction` takes the user's refund address and the
+liquidity provider's BTC address as `[version || hash160]` byte arrays.
+rskj's `Bridge.registerFlyoverBtcTransaction` reads both with
+`BridgeUtils.deserializeBtcAddressWithVersion` before anything else, inside a
+`try` whose `catch` answers GENERIC_ERROR (-900). Before RSKIP284 that is
+`BridgeUtilsLegacy.deserializeBtcAddressWithVersionLegacy`:
+
+```java
+int version = addressBytes[0];
+byte[] hashBytes = new byte[20];
+System.arraycopy(addressBytes, 1, hashBytes, 0, 20);
+return new Address(networkParameters, version, hashBytes);
+```
+
+`addressBytes[0]` is a signed Java byte, so testnet's P2SH version 196
+(`0xc4`) reads -60, and bitcoinj's `VersionedChecksummedBytes` refuses a
+version below 0 (`IllegalArgumentException`). `Address` then refuses a
+version its network doesn't accept (`WrongNetworkException`): mainnet 0 and
+5, testnet and regtest 111 and 196. So before RSKIP284 a testnet P2SH address
+is always refused and a mainnet one never is, and the bytes after the 21st are
+ignored. From RSKIP284 the array must be exactly 21 bytes and the version is
+read unsigned. Testnet moves RSKIP284 to #2,581,800; mainnet has it at hop400.
+
+The derivation hash is built from `serializeBtcAddressWithVersion` of the
+address read, not from the argument: one version byte and the hash160 in both
+eras, so a 22nd byte before RSKIP284 doesn't enter it.
+
+**Trigger**: testnet #2,122,593 tx[0] calls the LBC at `0x2ff74f84…`, which
+calls the Bridge with a testnet P2SH address (`c4…`) as both addresses. rskj
+answers GENERIC_ERROR, and that LBC carries on, logs twice and succeeds
+(161,566 gas). rustock checked only the length, looked for the payment, and
+answered UNPROCESSABLE_VALUE_ZERO (-304), on which the LBC reverted: 121,745
+gas, and the block's gasUsed 434,600 against the header's 474,421. (The
+Bitcoin transaction pays the Flyover address built from `00 c4` and the
+hash160, the two bytes `BigInteger.valueOf(196).toByteArray()` writes: its
+maker expected the address to be read.)
+
+**Ground truth**: RSKj's release VETIVER-9.0.4, run as the jar on testnet's
+activations. At #2,122,593 `deserializeBtcAddressWithVersion` throws
+`IllegalArgumentException` for `c4…` and `WrongNetworkException` for `00…`
+and `05…`, reads `6f…`, and reads a 22-byte `6f…` as its first 21 bytes. At
+#3,103,000 it reads `c4…` and `6f…`, and refuses anything but 21 bytes.
+
+**rustock**: `flyover_btc_address` (crates/execution/src/bridge/peg.rs) reads
+each address as rskj does and returns the 21 bytes the derivation hash and
+the refund use, or `None`, which `register_fast_bridge_btc_transaction`
+answers with GENERIC_ERROR. Tests
+`bridge::peg::tests::a_flyover_address_bitcoinj_refuses_is_a_generic_error`
+(without the fix a testnet P2SH address before RSKIP284 gets the validations
+code) and `a_flyover_derivation_hash_reads_the_address_bitcoinj_read`
+(without the fix a 22-byte address misses a registration made under its 21
+bytes). Verified: testnet #2,122,593 replays to the header's state and
+receipts roots.
+

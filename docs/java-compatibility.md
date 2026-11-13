@@ -96,6 +96,7 @@ implementation quirk, it is cross-referenced below.
 | 76 | Rejected peg-out refund: full wei vs satoshi-truncated (RSKIP427) | [`consensus-port-log.md`](./consensus-port-log.md) |
 | 88 | Empty Bridge `byte[]` return ABI-encodes to 96 bytes | [`consensus-port-log.md`](./consensus-port-log.md) |
 | 93 | A reverted CREATE/CREATE2 leaves its creator's return data empty | [`quirks-frozen-bugs.md`](./quirks-frozen-bugs.md) |
+| 94 | Before RSKIP284 a Flyover BTC address's version is read as a signed byte | [`quirks-frozen-bugs.md`](./quirks-frozen-bugs.md) |
 | — | Discovery NodeTable eviction (liveness, non-consensus) | [`wire-protocol.md`](./wire-protocol.md) |
 
 ## Quirks logged with their feature (cross-reference to `consensus-port-log.md`)

@@ -1826,14 +1826,41 @@ fn flyover_code_output(code: i64) -> Bytes {
     Bytes::copy_from_slice(&value.to_be_bytes::<32>())
 }
 
+/// rskj `BridgeUtils.deserializeBtcAddressWithVersion`, for a Flyover BTC
+/// address argument, and `serializeBtcAddressWithVersion` of the address it
+/// builds: the 21 bytes, `[version || hash160]`, that the derivation hash and
+/// the refund read. `None` where rskj throws, which
+/// `Bridge.registerFlyoverBtcTransaction` answers with GENERIC_ERROR.
+///
+/// Before RSKIP284 (`BridgeUtilsLegacy.deserializeBtcAddressWithVersionLegacy`)
+/// the version is `addressBytes[0]`, a signed Java byte, and the bytes after
+/// the 21st are ignored; an array shorter than 21 throws in its `arraycopy`.
+/// From RSKIP284 the array must be exactly 21 bytes, and the version is read
+/// unsigned. Either way bitcoinj's `Address(params, version, hash160)` then
+/// refuses a negative version (`VersionedChecksummedBytes`) and one its
+/// network doesn't accept (`WrongNetworkException`): mainnet 0 and 5, testnet
+/// and regtest 111 and 196. So before RSKIP284 a testnet P2SH address, version
+/// 196 or `0xc4`, which is -60 as a signed byte, is refused (testnet
+/// #2,122,593). That also makes the written version one byte in both eras:
+/// `BigInteger.valueOf(version).toByteArray()` is one byte for the versions
+/// that get through before RSKIP284 (0 to 127), and `intToBytesNoLeadZeroes`
+/// is from it.
+fn flyover_btc_address(bytes: &[u8], config: &BridgeConstants, rskip284: bool) -> Option<[u8; 21]> {
+    if rskip284 && bytes.len() != 21 {
+        return None;
+    }
+    let address: [u8; 21] = bytes.get(..21)?.try_into().ok()?;
+    let version = if rskip284 { i32::from(address[0]) } else { i32::from(address[0] as i8) };
+    let accepted = [super::getters::p2pkh_version(config), super::getters::p2sh_version(config)];
+    accepted.iter().any(|&v| i32::from(v) == version).then_some(address)
+}
+
 /// rskj `PegUtils.getFlyoverDerivationHash`:
 /// `keccak256(derivationArgumentsHash(32) || userRefundAddrBytes ||
 /// lbcAddress(20) || lpBtcAddrBytes)`. Note the array-copy order puts the LBC
 /// address BEFORE the LP address (NOT the parameter order). The BTC-address
-/// bytes are `serializeBtcAddressWithVersion`; pre-RSKIP284 (iris) that
-/// round-trips the input `[version || hash160]` arg unchanged (a single version
-/// byte for every mainnet address version), so the raw 21-byte ABI args are
-/// used verbatim.
+/// bytes are `serializeBtcAddressWithVersion`'s, as [`flyover_btc_address`]
+/// returns them.
 fn flyover_derivation_hash(
     derivation_arguments_hash: &[u8; 32],
     user_refund_addr_bytes: &[u8],
@@ -1930,23 +1957,20 @@ pub fn register_fast_bridge_btc_transaction<CTX: crate::RskContextTr>(
     };
 
     // rskj parses BOTH BTC addresses in the ABI layer (`Bridge.registerFlyover-
-    // BtcTransaction`) via `BridgeUtils.deserializeBtcAddressWithVersion`, wrapped
-    // in a try/catch that returns GENERIC_ERROR on ANY exception — and this runs
-    // BEFORE `bridgeSupport.registerFlyoverBtcTransaction`'s isContractTx/sender
-    // checks. Post-RSKIP284 (hop400) the deserializer REQUIRES exactly 21 bytes
-    // (`[version || 20-byte hash160]`), throwing `BridgeIllegalArgumentException`
-    // otherwise; pre-RSKIP284 the legacy path only needs ≥21 bytes (a shorter
-    // array throws `ArrayIndexOutOfBoundsException` in its `arraycopy`). Either
-    // way a bad-length address yields GENERIC_ERROR. The userRefund address is
-    // parsed first, the LP address second (mainnet #5,967,453: a 33-byte
-    // userRefund address makes rskj return GENERIC_ERROR, not a validations code).
+    // BtcTransaction`) via `BridgeUtils.deserializeBtcAddressWithVersion`, the
+    // userRefund address first, wrapped in a try/catch that returns
+    // GENERIC_ERROR on ANY exception -- and this runs BEFORE
+    // `bridgeSupport.registerFlyoverBtcTransaction`'s isContractTx/sender
+    // checks. [`flyover_btc_address`] says what it refuses: mainnet #5,967,453
+    // has a 33-byte userRefund address, refused from RSKIP284, and testnet
+    // #2,122,593 a testnet P2SH address, refused before it.
     let rskip284 = hardfork_cfg.has_rskip284(rsk_height_of(ctx));
-    let address_len_ok = |bytes: &[u8]| -> bool {
-        if rskip284 { bytes.len() == 21 } else { bytes.len() >= 21 }
-    };
-    if !address_len_ok(&user_refund_addr) || !address_len_ok(&lp_btc_addr) {
+    let (Some(user_refund_addr), Some(lp_btc_addr)) = (
+        flyover_btc_address(&user_refund_addr, config, rskip284),
+        flyover_btc_address(&lp_btc_addr, config, rskip284),
+    ) else {
         return ok(flyover_code_output(flyover_codes::GENERIC_ERROR));
-    }
+    };
 
     // rskj `isContractTx`: the rskTx must be an InternalTransaction (the Bridge
     // was reached via a contract CALL), i.e. call depth > 1.
@@ -9189,6 +9213,113 @@ mod tests {
             code(&ONE_INPUT, -1, &[0xFF; 3]),
             validations,
             "a negative height"
+        );
+    }
+
+    /// A Flyover call with the given BTC addresses at `height`, as the LBC
+    /// 0x4242..42 makes it, for a transaction whose confirmations rskj's
+    /// validations refuse: what the method answers, by name.
+    fn flyover_answer(
+        config: &BridgeConstants,
+        cfg: &RskHardforkConfig,
+        height: u64,
+        user: &[u8],
+        lp: &[u8],
+        registered: Option<[u8; 32]>,
+    ) -> &'static str {
+        use revm::MainContext;
+        let lbc = RskAddress::repeat_byte(0x42);
+        let mut lbc_word = [0u8; 32];
+        lbc_word[12..].copy_from_slice(lbc.as_slice());
+        let args = encode::args(&[
+            Arg::Bytes(&ONE_INPUT),
+            Arg::Word(encode::int(i64::from(i32::MAX))),
+            Arg::Bytes(&[0xFF; 3]),
+            Arg::Word([0x11; 32]),
+            Arg::Bytes(user),
+            Arg::Word(lbc_word),
+            Arg::Bytes(lp),
+            Arg::Word([0; 32]),
+        ]);
+        let mut ctx = revm::Context::mainnet().with_chain(crate::raw_storage::RskChainExt::default());
+        ctx.block.number = U256::from(height);
+        if let Some(hash) = registered {
+            mark_flyover_derivation_hash_used(&mut ctx, &calculate_btc_tx_hash(&ONE_INPUT), &hash);
+        }
+        let out = register_fast_bridge_btc_transaction(
+            &mut ctx,
+            &args,
+            0,
+            config,
+            cfg,
+            &BridgeTxContext::default(),
+            lbc,
+            2,
+        )
+        .unwrap()
+        .bytes;
+        [
+            (flyover_codes::GENERIC_ERROR, "generic"),
+            (flyover_codes::UNPROCESSABLE_VALIDATIONS, "validations"),
+            (flyover_codes::UNPROCESSABLE_ALREADY_PROCESSED, "already processed"),
+        ]
+        .into_iter()
+        .find(|(code, _)| flyover_code_output(*code) == out)
+        .map_or("other", |(_, name)| name)
+    }
+
+    /// rskj reads both Flyover BTC addresses with bitcoinj before anything
+    /// else (`BridgeUtils.deserializeBtcAddressWithVersion`) and answers
+    /// GENERIC_ERROR where that throws: in both eras for a version the network
+    /// doesn't accept, and before RSKIP284 for a version that is negative as a
+    /// signed byte, which testnet's P2SH version 196 (`0xc4`) is. Testnet
+    /// #2,122,593 makes such a call: rskj answers GENERIC_ERROR and the LBC
+    /// carries on, where rustock answered UNPROCESSABLE_VALUE_ZERO and the LBC
+    /// reverted.
+    #[test]
+    fn a_flyover_address_bitcoinj_refuses_is_a_generic_error() {
+        let with = |version: u8| [&[version][..], &[0x51; 20][..]].concat();
+        let (p2pkh, p2sh) = (with(0x6F), with(0xC4));
+        let longer = [&p2pkh[..], &[0xEE]].concat();
+
+        // Testnet past iris300, before its RSKIP284 (#2,581,800).
+        let (testnet, testnet_cfg) = (BridgeConstants::testnet(), RskHardforkConfig::testnet());
+        let before = |user: &[u8], lp: &[u8]| flyover_answer(&testnet, &testnet_cfg, 2_122_593, user, lp, None);
+        assert_eq!(before(&p2pkh, &p2pkh), "validations");
+        assert_eq!(before(&p2sh, &p2pkh), "generic", "a P2SH address, -60 as a signed byte");
+        assert_eq!(before(&p2pkh, &p2sh), "generic", "the liquidity provider's");
+        assert_eq!(before(&with(0x00), &p2pkh), "generic", "a mainnet version");
+        assert_eq!(before(&longer, &p2pkh), "validations", "a 22nd byte, ignored");
+
+        // From testnet's RSKIP284 the version is read unsigned, and the
+        // address is 21 bytes exactly.
+        let from = |user: &[u8], lp: &[u8]| flyover_answer(&testnet, &testnet_cfg, 2_581_800, user, lp, None);
+        assert_eq!(from(&p2sh, &p2sh), "validations");
+        assert_eq!(from(&with(0x00), &p2pkh), "generic", "a mainnet version");
+        assert_eq!(from(&longer, &p2pkh), "generic", "a 22nd byte");
+
+        // Mainnet before its RSKIP284 (hop400, #4,598,500): both its versions,
+        // 0 and 5, are positive bytes.
+        let (mainnet, mainnet_cfg) = (BridgeConstants::mainnet(), RskHardforkConfig::mainnet());
+        let on_mainnet = |user: &[u8], lp: &[u8]| flyover_answer(&mainnet, &mainnet_cfg, 4_000_000, user, lp, None);
+        assert_eq!(on_mainnet(&with(0x05), &with(0x00)), "validations");
+        assert_eq!(on_mainnet(&p2pkh, &with(0x00)), "generic", "a testnet version");
+    }
+
+    /// The derivation hash is built from the address bitcoinj read and wrote
+    /// back (`serializeBtcAddressWithVersion`), not from the argument: before
+    /// RSKIP284 a 22nd byte is dropped, so a payment registered under the 21
+    /// bytes is found registered when the argument has 22.
+    #[test]
+    fn a_flyover_derivation_hash_reads_the_address_bitcoinj_read() {
+        let (config, cfg) = (BridgeConstants::testnet(), RskHardforkConfig::testnet());
+        let address = [0x6F; 21];
+        let longer = [&address[..], &[0xEE]].concat();
+        let lbc = RskAddress::repeat_byte(0x42);
+        let hash = flyover_derivation_hash(&[0x11; 32], &address, &lbc, &address);
+        assert_eq!(
+            flyover_answer(&config, &cfg, 2_122_593, &longer, &address, Some(hash)),
+            "already processed"
         );
     }
 

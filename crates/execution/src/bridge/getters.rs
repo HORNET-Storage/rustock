@@ -414,14 +414,18 @@ fn p2pkh_base58_address(hash160: &[u8; 20], config: &BridgeConstants) -> String 
     bitcoin::base58::encode_check(&payload)
 }
 
-fn p2pkh_version(config: &BridgeConstants) -> u8 {
+/// bitcoinj `NetworkParameters.getAddressHeader`: the version of a P2PKH
+/// address on the Bridge's network.
+pub(super) fn p2pkh_version(config: &BridgeConstants) -> u8 {
     match config.btc_network {
         super::constants::BtcNetwork::Mainnet => 0,
         _ => 111,
     }
 }
 
-fn p2sh_version(config: &BridgeConstants) -> u8 {
+/// bitcoinj `NetworkParameters.getP2SHHeader`: the version of a P2SH address
+/// on the Bridge's network.
+pub(super) fn p2sh_version(config: &BridgeConstants) -> u8 {
     match config.btc_network {
         super::constants::BtcNetwork::Mainnet => 5,
         _ => 196,
