@@ -40,6 +40,8 @@ pub enum RskNetworkUpgrade {
 
 pub const RSK_MAINNET_CHAIN_ID: u64 = 30;
 pub const RSK_TESTNET_CHAIN_ID: u64 = 31;
+/// rskj `Constants.REGTEST_CHAIN_ID`: its regtest's, and rustock's own.
+pub const RSK_REGTEST_CHAIN_ID: u64 = 33;
 
 /// Mainnet activation heights.
 pub const MAINNET_ACTIVATIONS: &[(u64, RskNetworkUpgrade)] = &[
@@ -173,9 +175,9 @@ impl RskHardforkConfig {
     pub fn regtest() -> Self {
         Self {
             activations: vec![(0, RskNetworkUpgrade::Vetiver900)],
-            chain_id: 33,
+            chain_id: RSK_REGTEST_CHAIN_ID,
             rule_overrides: Vec::new(),
-            after_bridge_sync: Self::after_bridge_sync_for(33),
+            after_bridge_sync: Self::after_bridge_sync_for(RSK_REGTEST_CHAIN_ID),
         }
     }
 
@@ -192,7 +194,7 @@ impl RskHardforkConfig {
                 (0, RskNetworkUpgrade::Reed810),
                 (0, RskNetworkUpgrade::Vetiver900),
             ],
-            chain_id: 33,
+            chain_id: RSK_REGTEST_CHAIN_ID,
             rule_overrides: vec![
                 (ConsensusRule::Rskip144, Some(1)),
                 (ConsensusRule::Rskip351, Some(1)),

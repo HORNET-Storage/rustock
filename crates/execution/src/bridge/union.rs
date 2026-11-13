@@ -23,7 +23,9 @@ use alloy_primitives::{Address, Bytes, U256};
 use revm::precompile::{PrecompileError, PrecompileOutput};
 
 use super::storage::{bridge_load_bytes, bridge_storage_key_long, bridge_store_bytes};
-use crate::hardfork::{RskHardforkConfig, RSK_MAINNET_CHAIN_ID, RSK_TESTNET_CHAIN_ID};
+use crate::hardfork::{
+    RskHardforkConfig, RSK_MAINNET_CHAIN_ID, RSK_REGTEST_CHAIN_ID, RSK_TESTNET_CHAIN_ID,
+};
 
 /// rskj `UnionResponseCode`. Returned as an int256 by every mutating method.
 ///
@@ -64,8 +66,8 @@ pub const MAX_EVENT_DATA_LENGTH: usize = 128;
 /// rskj `UnionBridgeConstants`, per network.
 ///
 /// Mainnet's address and all three authorizers are the zero address: the
-/// union bridge is configured on testnet and not yet on mainnet, so every
-/// authorized method there rejects.
+/// union bridge is configured on testnet and regtest and not yet on mainnet,
+/// so every authorized method there rejects.
 pub struct UnionConstants {
     pub address: Address,
     pub initial_locking_cap: U256,
@@ -89,8 +91,20 @@ pub fn union_constants(hardfork_cfg: &RskHardforkConfig) -> UnionConstants {
             change_locking_cap_authorizer: addr("1a8109af0f019ed3045fbcdf45e5e90d6b6aafaf"),
             change_transfer_permissions_authorizer: addr("8db1f83e8119e4dce5bc708ec2f4390ffd910b19"),
         },
-        // Mainnet and regtest alike: zero address throughout, so nothing is
-        // authorized and the contract address falls back to zero.
+        // rskj `UnionBridgeRegTestConstants`: an account sets the contract's
+        // address, and one contract holds the other two permissions.
+        RSK_REGTEST_CHAIN_ID => UnionConstants {
+            address: Address::ZERO,
+            initial_locking_cap: one_rbtc(),
+            locking_cap_increments_multiplier: 2,
+            change_address_authorizer: addr("6c9dfd950bf748bb26f893f7e5f693c7f60a8f85"),
+            change_locking_cap_authorizer: addr("ff6f4ff09c54561e1476203e56fcfc834911aa64"),
+            change_transfer_permissions_authorizer: addr(
+                "ff6f4ff09c54561e1476203e56fcfc834911aa64",
+            ),
+        },
+        // Mainnet: the zero address throughout, so nothing is authorized and
+        // the contract address is zero.
         _ => UnionConstants {
             address: Address::ZERO,
             initial_locking_cap: one_rbtc(),
@@ -723,6 +737,38 @@ mod tests {
         ] {
             assert!(set_contract_address_for_testnet(&mut c, &[0u8; 32], 0, &cfg, caller).is_err());
         }
+    }
+
+    /// rskj's regtest names its own authorizers (`UnionBridgeRegTestConstants`):
+    /// an account for the contract's address, and one contract for both the
+    /// locking cap and the transfer permissions.
+    #[test]
+    fn regtest_has_the_authorizers_rskj_gives_it() {
+        let cfg = RskHardforkConfig::rskj_regtest();
+        let for_the_address = addr("6c9dfd950bf748bb26f893f7e5f693c7f60a8f85");
+        let for_the_rest = addr("ff6f4ff09c54561e1476203e56fcfc834911aa64");
+
+        let mut c = ctx();
+        let doubled = one_rbtc() * U256::from(2u64);
+        let cap = doubled.to_be_bytes::<32>();
+        assert!(increase_locking_cap(&mut c, &cap, 0, &cfg, for_the_address).is_err());
+        let out = increase_locking_cap(&mut c, &cap, 0, &cfg, for_the_rest).unwrap();
+        assert_eq!(code(out), UnionResponse::Success.code());
+        assert_eq!(locking_cap(&mut c, &cfg), doubled);
+
+        let both_off = [0u8; 64];
+        assert!(set_transfer_permissions(&mut c, &both_off, 0, &cfg, for_the_address).is_err());
+        let out = set_transfer_permissions(&mut c, &both_off, 0, &cfg, for_the_rest).unwrap();
+        assert_eq!(code(out), UnionResponse::Success.code());
+        assert!(!request_enabled(&mut c) && !release_enabled(&mut c));
+
+        let mut address = [0u8; 32];
+        address[12..].copy_from_slice(union_bridge().as_slice());
+        assert!(set_contract_address_for_testnet(&mut c, &address, 0, &cfg, for_the_rest).is_err());
+        let out =
+            set_contract_address_for_testnet(&mut c, &address, 0, &cfg, for_the_address).unwrap();
+        assert_eq!(code(out), UnionResponse::Success.code());
+        assert_eq!(contract_address(&mut c, &cfg), union_bridge());
     }
 
     // -- RSKIP529: the super and base events ------------------------------
