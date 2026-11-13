@@ -14607,4 +14607,222 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
             assert_subtree_deleted(&new_root, store.as_ref(), &victim);
         }
     }
+
+    /// One of rskj's runs in `bridge/testdata/rskj_refunded_pegins.txt`.
+    #[derive(Default)]
+    struct RskjRun {
+        name: String,
+        /// Each account's address, nonce, balance and code.
+        accounts: Vec<(Address, u64, U256, Vec<u8>)>,
+        /// The storage cells it starts with: address, key, value.
+        stored: Vec<(Address, U256, Vec<u8>)>,
+        preroot: B256,
+        transactions: Vec<(rustock_core::Transaction, Address)>,
+        /// For each transaction: whether it succeeded, the gas it used, its logs.
+        results: Vec<(bool, u64, Vec<revm::primitives::Log>)>,
+        /// The Bridge's storage after the transactions.
+        cells: std::collections::BTreeMap<U256, Vec<u8>>,
+        root: B256,
+    }
+
+    /// The runs a file of rskj's holds, whose header says what each line is.
+    fn rskj_runs(vectors: &str) -> Vec<RskjRun> {
+        let bytes = |field: &str| {
+            if field == "-" {
+                Vec::new()
+            } else {
+                hex::decode(field).unwrap()
+            }
+        };
+        let mut runs: Vec<RskjRun> = Vec::new();
+        for line in vectors.lines().filter(|line| !line.starts_with('#')) {
+            let fields: Vec<&str> = line.split(' ').collect();
+            if fields[0] == "scenario" {
+                runs.push(RskjRun {
+                    name: fields[1].into(),
+                    ..RskjRun::default()
+                });
+                continue;
+            }
+            let Some(run) = runs.last_mut() else {
+                continue;
+            };
+            match fields[0] {
+                "account" => run.accounts.push((
+                    Address::from_slice(&bytes(fields[1])),
+                    fields[2].parse().unwrap(),
+                    U256::from_str_radix(fields[3], 16).unwrap(),
+                    bytes(fields[4]),
+                )),
+                "store" => run.stored.push((
+                    Address::from_slice(&bytes(fields[1])),
+                    U256::from_be_slice(&bytes(fields[2])),
+                    bytes(fields[3]),
+                )),
+                "preroot" => run.preroot = B256::from_slice(&bytes(fields[1])),
+                "tx" => {
+                    let tx = rustock_core::Transaction::from_rskj(&bytes(fields[1])).unwrap();
+                    assert_eq!(
+                        alloy_primitives::keccak256(tx.rlp_for_trie()),
+                        B256::from_slice(&bytes(fields[3])),
+                        "{}: the transaction's hash",
+                        run.name
+                    );
+                    run.transactions
+                        .push((tx, Address::from_slice(&bytes(fields[2]))));
+                }
+                "result" => {
+                    assert_eq!(fields[1], "1", "{}: executed", run.name);
+                    run.results
+                        .push((fields[2] == "1", fields[3].parse().unwrap(), Vec::new()));
+                }
+                "log" => {
+                    let topics = fields[2]
+                        .split(',')
+                        .filter(|topic| *topic != "-")
+                        .map(|topic| B256::from_slice(&bytes(topic)))
+                        .collect();
+                    let log = revm::primitives::Log::new_unchecked(
+                        Address::from_slice(&bytes(fields[1])),
+                        topics,
+                        Bytes::from(bytes(fields[3])),
+                    );
+                    run.results.last_mut().unwrap().2.push(log);
+                }
+                "cell" => {
+                    run.cells
+                        .insert(U256::from_be_slice(&bytes(fields[1])), bytes(fields[2]));
+                }
+                "root" => run.root = B256::from_slice(&bytes(fields[1])),
+                "itx" | "end" | "enc" => {}
+                other => panic!("an unknown line: {other}"),
+            }
+        }
+        runs
+    }
+
+    /// Runs one of rskj's runs here and holds what comes of it to what came of
+    /// it in rskj: each transaction's outcome, logs and gas, the Bridge's
+    /// storage, and the state root.
+    fn replays_as_rskj_ran_it(run: &RskjRun) {
+        let store = Arc::new(MemoryTrieStore::new());
+        let mut root = TrieNode::empty();
+        for (address, nonce, balance, code) in &run.accounts {
+            root = put_account(&root, store.as_ref(), address, *nonce, *balance);
+            if !code.is_empty() {
+                let key = rustock_trie::code_key(address);
+                root = root.put(&TrieKeySlice::from_key(&key), code, store.as_ref());
+            }
+        }
+        for (address, key, value) in &run.stored {
+            let key = rustock_trie::storage_key(address, &B256::from(*key));
+            root = root.put(&TrieKeySlice::from_key(&key), value, store.as_ref());
+        }
+        assert_eq!(
+            root.compute_hash(store.as_ref()),
+            run.preroot,
+            "{}: the state before",
+            run.name
+        );
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let executor = RskExecutor::new(RskHardforkConfig::rskj_regtest(), block_store)
+            .with_bridge_constants(crate::bridge::constants::BridgeConstants::rskj_regtest());
+        let header = Header {
+            difficulty: U256::from(1),
+            ..dummy_header(10)
+        };
+        let result = executor
+            .execute_block(&header, &run.transactions, &root, store.clone())
+            .expect("block");
+        assert_eq!(result.tx_results.len(), run.results.len(), "{}", run.name);
+        for (index, (outcome, (success, gas_used, logs))) in
+            result.tx_results.iter().zip(&run.results).enumerate()
+        {
+            let what = format!("{}: transaction {index}", run.name);
+            assert_eq!(outcome.success, *success, "{what}");
+            assert_eq!(outcome.logs.len(), logs.len(), "{what}: how many logs");
+            for (at, (log, rskjs)) in outcome.logs.iter().zip(logs).enumerate() {
+                assert_eq!(log, rskjs, "{what}: log {at}");
+            }
+            assert_eq!(outcome.gas_used, *gas_used, "{what}: gas");
+        }
+        // The Bridge's storage: what it started with, and over it what the
+        // transactions wrote, in order.
+        let bridge = crate::precompiles::BRIDGE_ADDR;
+        let started_with = run
+            .stored
+            .iter()
+            .cloned()
+            .map(|(address, key, value)| (address, key, Some(value)));
+        let wrote = result.markers.raw_storage.iter().cloned();
+        let mut cells = std::collections::BTreeMap::new();
+        for (_, key, value) in started_with
+            .chain(wrote)
+            .filter(|(address, _, _)| *address == bridge)
+        {
+            match value {
+                Some(value) if !value.is_empty() => cells.insert(key, value),
+                _ => cells.remove(&key),
+            };
+        }
+        let keys: std::collections::BTreeSet<&U256> =
+            cells.keys().chain(run.cells.keys()).collect();
+        for key in keys {
+            assert_eq!(
+                cells.get(key).map(hex::encode),
+                run.cells.get(key).map(hex::encode),
+                "{}: the Bridge's cell {key:#066x}",
+                run.name
+            );
+        }
+        let after = crate::state::apply_state_changes(
+            &root,
+            store.as_ref(),
+            &result.state_changes,
+            &result.markers,
+        );
+        assert_eq!(
+            after.compute_hash(store.as_ref()),
+            run.root,
+            "{}: the state after",
+            run.name
+        );
+    }
+
+    /// What rskj's release does with a peg-in it refunds, read from its own
+    /// `TransactionExecutor` (the testdata's header says how). A member of the
+    /// federation hands the Bridge six Bitcoin headers, and then a transaction
+    /// registers a payment to the federation from a multisig, in the second of
+    /// them.
+    ///
+    /// rskj refunds the payment, with a release it builds as it builds every
+    /// other (`ReleaseTransactionBuilder`): for a P2SH-P2WSH federation, as
+    /// regtest's is and mainnet's since its first change after RSKIP305, with
+    /// the witness program in each input's scriptSig, the unsigned witness, and
+    /// the fee taken over the virtual size. The fee is no less than bitcoinj's
+    /// minimum, which the second run's fee per kilobyte takes it down to
+    /// (`Wallet.adjustOutputDownwardsForFee`). And rskj ends the refund's
+    /// settling as it ends every release's (`settleReleaseRejection`,
+    /// `processReleaseTransactionInfo`): it logs `pegout_transaction_created`
+    /// after `release_requested` (RSKIP428) and stores the values of what the
+    /// refund spends (RSKIP305).
+    ///
+    /// The last run registers a flyover payment over the locking cap, through
+    /// the contract that stands for the liquidity bridge. rskj refunds that one
+    /// the same way, spending the output that pays the federation's flyover
+    /// address, which for a P2SH-P2WSH federation is the P2SH of the flyover
+    /// script's witness program. It names that refund by the hash of the
+    /// block's transaction, not of the contract's call (`getOriginHash`).
+    #[test]
+    fn a_refunded_peg_in_is_registered_as_rskj_registers_it() {
+        let runs = rskj_runs(include_str!("bridge/testdata/rskj_refunded_pegins.txt"));
+        let names: Vec<&str> = runs.iter().map(|run| run.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["direct", "relay", "nested", "delegate", "low-fee", "flyover"]
+        );
+        replays_as_rskj_ran_it(&runs[0]);
+        replays_as_rskj_ran_it(&runs[4]);
+        replays_as_rskj_ran_it(&runs[5]);
+    }
 }

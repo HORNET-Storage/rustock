@@ -1367,13 +1367,28 @@ fn emit_pegin_rejection_release<CTX: crate::RskContextTr>(
             coinbase: btc_tx.is_coinbase(),
         })
         .collect();
-    let refund_redeem = if pegin_utxos
-        .iter()
-        .all(|u| retiring.as_ref().is_some_and(|(_, rs)| u.script == rs.to_bytes()))
-    {
-        &retiring.as_ref().expect("checked above").0
-    } else {
-        fed_redeem
+    // rskj `getFederationFromTxOutputs`: the refund is built for the active
+    // federation where the payment pays it, and for the retiring one where it
+    // pays that one alone. That federation's format decides where what spends
+    // an input goes: the scriptSig, or for a P2SH-P2WSH federation the
+    // witness (`ReleaseTransactionBuilder.setSrConfiguration`).
+    let retiring_redeem = retiring
+        .as_ref()
+        .filter(|(_, script)| {
+            pegin_utxos
+                .iter()
+                .all(|utxo| utxo.script == script.to_bytes())
+        })
+        .map(|(redeem, _)| redeem.as_slice());
+    let (refund_redeem, format) = match retiring_redeem {
+        Some(redeem) => (
+            redeem,
+            federation_format_version(ctx, super::storage::OLD_FEDERATION_FORMAT_VERSION_KEY),
+        ),
+        None => (
+            fed_redeem,
+            active_federation_format(ctx, config, hardfork_cfg, rsk_height),
+        ),
     };
     let fee_per_kb = get_effective_fee_per_kb(ctx, config);
     let tx_version = if hardfork_cfg.has_rskip201(rsk_height) { 2 } else { 1 };
@@ -1388,6 +1403,7 @@ fn emit_pegin_rejection_release<CTX: crate::RskContextTr>(
         refund_redeem,
         fee_per_kb,
         tx_version,
+        format >= 4000,
     );
     tracing::debug!(
         "pegin rejection release: utxos {} fee_per_kb {} built {:?}",
@@ -1412,6 +1428,7 @@ fn emit_pegin_rejection_release<CTX: crate::RskContextTr>(
             &btc_txid_event_bytes(&built.tx),
             total_value,
         );
+        process_release_transaction_info(ctx, &built, hardfork_cfg, rsk_height);
         store_pegout_confirmation_set(ctx, &waiting, use_tx_hash);
     } else {
         // The refund was due and could not be built -- in practice the inputs
@@ -2023,8 +2040,8 @@ pub fn register_fast_bridge_btc_transaction<CTX: crate::RskContextTr>(
     // one has activated; its redeem follows the OLD federation's STORED format
     // version (`federation.getRedeemScript()`), so an ERP retiring federation
     // gets its ERP flyover redeem. The flyover output script is a plain P2SH for
-    // every federation format except P2SH-P2WSH-ERP (`getFlyoverFederationOutputScript`),
-    // which rustock does not yet support — feds at hop400 are P2SH-ERP.
+    // every federation format except P2SH-P2WSH-ERP, whose is the P2SH of the
+    // flyover script's witness program (`getFlyoverFederationOutputScript`).
     let retiring_format =
         federation_format_version(ctx, super::storage::OLD_FEDERATION_FORMAT_VERSION_KEY);
     let retiring_flyover = if hardfork_cfg.has_rskip293(block_number) {
@@ -2123,9 +2140,17 @@ pub fn register_fast_bridge_btc_transaction<CTX: crate::RskContextTr>(
         // flyover UTXOs of BOTH the active and (RSKIP293) retiring feds, resolving
         // each input's redeem from its flyover P2SH (FlyoverCompatibleBtcWallet-
         // WithMultipleScripts).
-        let mut flyover_redeems: Vec<Vec<u8>> = vec![flyover_redeem.clone()];
+        let mut flyover_feds = vec![(
+            flyover_redeem.clone(),
+            flyover_script.clone(),
+            active_format,
+        )];
         if let Some(r) = &retiring_flyover {
-            flyover_redeems.push(r.flyover_redeem.clone());
+            flyover_feds.push((
+                r.flyover_redeem.clone(),
+                r.flyover_script.clone(),
+                retiring_format,
+            ));
         }
         let mut extra = refund_fields(&refund_hash160, refund_is_p2sh, config);
         extra.push(("peginPath", FieldValue::Text("flyover".into())));
@@ -2143,7 +2168,7 @@ pub fn register_fast_bridge_btc_transaction<CTX: crate::RskContextTr>(
         );
         emit_flyover_rejection_release(
             ctx, &btc_tx, &refund_hash160, refund_is_p2sh, total_satoshis,
-            &flyover_redeems, rsk_height, config, hardfork_cfg, tx_ctx,
+            &flyover_feds, rsk_height, config, hardfork_cfg, tx_ctx,
         );
         return ok(flyover_code_output(if is_lp {
             flyover_codes::REFUNDED_LP
@@ -2359,6 +2384,31 @@ fn save_release_outpoints_values<CTX: crate::RskContextTr>(
     super::storage::bridge_store_raw(ctx, key, Some(serialized));
 }
 
+/// rskj `processReleaseTransactionInfo`, which ends the settling of every
+/// release the Bridge builds: a pegout's, a migration's, and the refund of a
+/// peg-in it turns down (`settleReleaseRejection`). From RSKIP428 it logs
+/// `pegout_transaction_created` with the value of each output the release
+/// spends, in the order of its inputs, and from RSKIP305 it stores those
+/// values under the release's hash.
+fn process_release_transaction_info<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    built: &super::release_tx::BuiltPegout,
+    hardfork_cfg: &RskHardforkConfig,
+    block_number: u64,
+) {
+    if !hardfork_cfg.has_rskip428(block_number) {
+        return;
+    }
+    let outpoint_values: Vec<u64> = built
+        .used_utxos
+        .iter()
+        .map(|utxo| utxo.value_satoshis)
+        .collect();
+    let txid = btc_txid_event_bytes(&built.tx);
+    super::events::log_pegout_transaction_created(ctx, &txid, &outpoint_values);
+    save_release_outpoints_values(ctx, &txid, &outpoint_values, hardfork_cfg, block_number);
+}
+
 /// rskj `BridgeStorageProvider.getReleaseOutpointsValues`: the per-input spent
 /// values stored when a release tx is created, keyed by its witness-stripped
 /// hash. Decodes the bitcoinj `VarInt` concatenation (`UtxoUtils`).
@@ -2503,10 +2553,11 @@ fn resolve_flyover_input_redeems<CTX: crate::RskContextTr>(
 /// empty-wallet refund of the flyover-federation outputs to `refund_hash160`
 /// using the FLYOVER redeem script(s), enqueue it, and log release_requested.
 ///
-/// `flyover_redeems` is the list of candidate flyover redeem scripts (the active
-/// fed's, plus the retiring fed's under RSKIP293). The refund spends every output
-/// paying any of their flyover P2SH addresses; each input is resolved to its own
-/// redeem (rskj `FlyoverCompatibleBtcWalletWithMultipleScripts`).
+/// `flyover_feds` holds, for the active federation and then (under RSKIP293) the
+/// retiring one, its flyover redeem script, the output script that pays it,
+/// and the federation's format. The refund spends every output paying one of
+/// them; each input is resolved to its own redeem (rskj
+/// `FlyoverCompatibleBtcWalletWithMultipleScripts`).
 #[allow(clippy::too_many_arguments)]
 fn emit_flyover_rejection_release<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
@@ -2514,22 +2565,21 @@ fn emit_flyover_rejection_release<CTX: crate::RskContextTr>(
     refund_hash160: &[u8; 20],
     refund_is_p2sh: bool,
     total_satoshis: u64,
-    flyover_redeems: &[Vec<u8>],
+    flyover_feds: &[(Vec<u8>, bitcoin::ScriptBuf, u64)],
     rsk_height: u64,
     config: &BridgeConstants,
     hardfork_cfg: &RskHardforkConfig,
     tx_ctx: &BridgeTxContext,
 ) {
-    // Map each flyover P2SH output script → its redeem, then gather the spending
-    // UTXOs in output order with their resolved redeem.
-    let scripts: Vec<(bitcoin::ScriptBuf, &[u8])> = flyover_redeems
-        .iter()
-        .map(|r| (p2sh_output_script(&redeem_script_hash160(r)), r.as_slice()))
-        .collect();
+    // Gather the spending UTXOs in output order, each with the redeem of the
+    // flyover address it pays.
     let mut utxos: Vec<BridgeUtxo> = Vec::new();
     let mut input_redeems: Vec<&[u8]> = Vec::new();
     for (index, o) in btc_tx.output.iter().enumerate() {
-        if let Some((_, redeem)) = scripts.iter().find(|(s, _)| *s == o.script_pubkey) {
+        if let Some((redeem, _, _)) = flyover_feds
+            .iter()
+            .find(|(_, script, _)| *script == o.script_pubkey)
+        {
             utxos.push(BridgeUtxo {
                 tx_hash: btc_txid_event_bytes(btc_tx),
                 vout: index as u32,
@@ -2541,6 +2591,15 @@ fn emit_flyover_rejection_release<CTX: crate::RskContextTr>(
             input_redeems.push(redeem);
         }
     }
+    // rskj `getFlyoverFederationFromTxOutputs`: the refund is built for the
+    // active federation where the payment pays its flyover address, and for
+    // the retiring one where it pays that one's alone, and in that federation's
+    // format: with the witness for a P2SH-P2WSH one
+    // (`ReleaseTransactionBuilder.setSrConfiguration`).
+    let is_segwit = flyover_feds
+        .iter()
+        .find(|(_, script, _)| btc_tx.output.iter().any(|o| o.script_pubkey == *script))
+        .is_some_and(|(_, _, format)| *format >= 4000);
     let fee_per_kb = get_effective_fee_per_kb(ctx, config);
     let tx_version = if hardfork_cfg.has_rskip201(rsk_height) { 2 } else { 1 };
     let refund_script = if refund_is_p2sh {
@@ -2555,11 +2614,16 @@ fn emit_flyover_rejection_release<CTX: crate::RskContextTr>(
     let built = if input_redeems.iter().all(|r| *r == input_redeems.first().copied().unwrap_or(&[])) {
         let single = input_redeems.first().copied().unwrap_or(&[]);
         super::release_tx::build_empty_wallet_to(
-            &utxos, &refund_script, single, fee_per_kb, tx_version,
+            &utxos, &refund_script, single, fee_per_kb, tx_version, is_segwit,
         )
     } else {
         build_flyover_empty_wallet_multi(
-            &utxos, &input_redeems, &refund_script, fee_per_kb, tx_version,
+            &utxos,
+            &input_redeems,
+            &refund_script,
+            fee_per_kb,
+            tx_version,
+            is_segwit,
         )
     };
     if let Some(built) = built {
@@ -2577,6 +2641,7 @@ fn emit_flyover_rejection_release<CTX: crate::RskContextTr>(
             &btc_txid_event_bytes(&built.tx),
             total_satoshis,
         );
+        process_release_transaction_info(ctx, &built, hardfork_cfg, rsk_height);
         store_pegout_confirmation_set(ctx, &waiting, use_tx_hash);
     }
 }
@@ -2588,15 +2653,18 @@ fn emit_flyover_rejection_release<CTX: crate::RskContextTr>(
 /// single flyover tx funds BOTH the active and retiring flyover feds.
 ///
 /// The fee sizing mirrors bitcoinj exactly: a single downward fee adjustment of
-/// `feePerKb * size / 1000`, where `size` is the empty-scriptSig serialized
-/// length plus, per input, `threshold * SIG_SIZE + redeemScript.len()`. The
-/// final placeholder-filled tx must not exceed MAX_STANDARD_TX_SIZE.
+/// `feePerKb * size / 1000`, no less than the reference minimum, where `size`
+/// is the empty-scriptSig serialized length plus, per input, `threshold *
+/// SIG_SIZE + redeemScript.len()`, segwit-weighted for a P2SH-P2WSH federation
+/// (`is_segwit`), whose inputs carry their witnesses. The final
+/// placeholder-filled tx must not exceed MAX_STANDARD_TX_SIZE.
 fn build_flyover_empty_wallet_multi(
     utxos: &[BridgeUtxo],
     input_redeems: &[&[u8]],
     refund_script: &bitcoin::ScriptBuf,
     fee_per_kb: u64,
     version: i32,
+    is_segwit: bool,
 ) -> Option<super::release_tx::BuiltPegout> {
     use bitcoin::{
         absolute::LockTime, transaction::Version, Amount, OutPoint, Sequence, TxIn, TxOut, Witness,
@@ -2649,15 +2717,21 @@ fn build_flyover_empty_wallet_multi(
         }],
     };
 
-    let base_size = bitcoin::consensus::serialize(&tx).len();
+    // As `release_tx::build_empty_wallet_to` sizes and fills its inputs, with
+    // each input's own redeem script.
+    let base_size =
+        bitcoin::consensus::serialize(&tx).len() + if is_segwit { utxos.len() * 36 } else { 0 };
     let sig_estimate: usize = input_redeems
         .iter()
         .zip(&thresholds)
         .map(|(r, t)| t * SIG_SIZE + r.len())
         .sum();
-    let size = base_size + sig_estimate;
-    let fee_rate = fee_per_kb.max(REFERENCE_DEFAULT_MIN_TX_FEE);
-    let fee = fee_rate * size as u64 / 1000;
+    let size = if is_segwit {
+        (base_size + sig_estimate + 3 * base_size) / 4
+    } else {
+        base_size + sig_estimate
+    };
+    let fee = (fee_per_kb * size as u64 / 1000).max(REFERENCE_DEFAULT_MIN_TX_FEE);
     if fee >= gathered {
         return None;
     }
@@ -2668,8 +2742,15 @@ fn build_flyover_empty_wallet_multi(
     tx.output[0].value = Amount::from_sat(value);
 
     for (input, (redeem, threshold)) in tx.input.iter_mut().zip(input_redeems.iter().zip(&thresholds)) {
-        input.script_sig =
-            bitcoin::ScriptBuf::from_bytes(super::release_tx::placeholder_scriptsig(redeem, *threshold));
+        if is_segwit {
+            let (script_sig, witness) = super::release_tx::segwit_base_input(redeem, *threshold);
+            input.script_sig = script_sig;
+            input.witness = witness;
+        } else {
+            input.script_sig = bitcoin::ScriptBuf::from_bytes(
+                super::release_tx::placeholder_scriptsig(redeem, *threshold),
+            );
+        }
     }
     if bitcoin::consensus::serialize(&tx).len() > MAX_STANDARD_TX_SIZE {
         return None;
@@ -3097,23 +3178,7 @@ pub fn update_collections<CTX: crate::RskContextTr>(
                     // RSKIP428 (lovell700): processReleaseTransactionInfo emits
                     // pegout_transaction_created right after release_requested,
                     // listing each spent input's value (in input order).
-                    if hardfork_cfg.has_rskip428(block_number) {
-                        let outpoint_values: Vec<u64> =
-                            built.used_utxos.iter().map(|u| u.value_satoshis).collect();
-                        let txid = btc_txid_event_bytes(&built.tx);
-                        super::events::log_pegout_transaction_created(
-                            ctx,
-                            &txid,
-                            &outpoint_values,
-                        );
-                        save_release_outpoints_values(
-                            ctx,
-                            &txid,
-                            &outpoint_values,
-                            hardfork_cfg,
-                            block_number,
-                        );
-                    }
+                    process_release_transaction_info(ctx, &built, hardfork_cfg, block_number);
                     // rskj BridgeSupport.adjustBalancesIfChangeOutputWasDust
                     // (unconditional since genesis): when a dusty change
                     // output was raised to the non-dust minimum (paid by the
@@ -4279,19 +4344,7 @@ fn process_funds_migration<CTX: crate::RskContextTr>(
             }
             // RSKIP428 (lovell700): pegout_transaction_created for the migration
             // tx too (settleReleaseRequest -> processReleaseTransactionInfo).
-            if hardfork_cfg.has_rskip428(block_number) {
-                let outpoint_values: Vec<u64> =
-                    built.used_utxos.iter().map(|u| u.value_satoshis).collect();
-                let txid = btc_txid_event_bytes(&built.tx);
-                super::events::log_pegout_transaction_created(ctx, &txid, &outpoint_values);
-                save_release_outpoints_values(
-                    ctx,
-                    &txid,
-                    &outpoint_values,
-                    hardfork_cfg,
-                    block_number,
-                );
-            }
+            process_release_transaction_info(ctx, &built, hardfork_cfg, block_number);
             store_pegout_confirmation_set(ctx, &waiting, use_tx_hash);
 
             old_utxos.retain(|u| {
@@ -8847,11 +8900,13 @@ mod tests {
         // Uniform case: both inputs use fly_a → must equal the single-redeem build.
         let utxos = [mk_utxo(1, 5_000_000), mk_utxo(2, 6_000_000)];
         let redeems_uniform: Vec<&[u8]> = vec![fly_a.as_slice(), fly_a.as_slice()];
-        let multi = build_flyover_empty_wallet_multi(&utxos, &redeems_uniform, &refund, 1000, 2)
-            .expect("multi build");
-        let single =
-            crate::bridge::release_tx::build_empty_wallet_to(&utxos, &refund, &fly_a, 1000, 2)
-                .expect("single build");
+        let multi =
+            build_flyover_empty_wallet_multi(&utxos, &redeems_uniform, &refund, 1000, 2, false)
+                .expect("multi build");
+        let single = crate::bridge::release_tx::build_empty_wallet_to(
+            &utxos, &refund, &fly_a, 1000, 2, false,
+        )
+        .expect("single build");
         assert_eq!(
             bitcoin::consensus::serialize(&multi.tx),
             bitcoin::consensus::serialize(&single.tx),
@@ -8863,8 +8918,9 @@ mod tests {
         // only if the redeems differ in length; here they are equal length but
         // distinct content).
         let redeems_mixed: Vec<&[u8]> = vec![fly_a.as_slice(), fly_b.as_slice()];
-        let mixed = build_flyover_empty_wallet_multi(&utxos, &redeems_mixed, &refund, 1000, 2)
-            .expect("mixed build");
+        let mixed =
+            build_flyover_empty_wallet_multi(&utxos, &redeems_mixed, &refund, 1000, 2, false)
+                .expect("mixed build");
         assert_eq!(mixed.tx.input.len(), 2);
         assert_eq!(mixed.used_utxos.len(), 2);
         // Each input's scriptSig is the placeholder built from its own redeem.
@@ -9688,9 +9744,10 @@ mod tests {
         let sig_hash = sig_hash_for_pegout_index(&tx).unwrap();
         // Its change is registered as the federation's, and nothing is logged.
         assert_eq!(registered(&tx, 350, sig_hash, None), (true, true, 0, 1));
-        // As a peg-in it's turned down: marked processed, two events, and
+        // As a peg-in it's turned down and refunded: marked processed, three
+        // events (the refusal, the refund's request and its creation), and
         // nothing kept for the federation.
-        let peg_in = (true, true, 2, 0);
+        let peg_in = (true, true, 3, 0);
         assert_eq!(registered(&tx, 350, None, None), peg_in);
         assert_eq!(registered(&tx, 349, sig_hash, None), peg_in);
     }
@@ -9804,12 +9861,13 @@ mod tests {
             vec![signed_multisig(&erp)],
             std::slice::from_ref(&to_federation),
         );
-        // With no federation retired, both are peg-ins.
+        // With no federation retired, both are peg-ins, and the one that pays
+        // the federation is refunded, which leaves a third event.
         assert_eq!(
             registered(&paying_nothing, 349, None, None),
             (true, false, 2, 0)
         );
-        assert_eq!(registered(&migrating, 349, None, None), (true, true, 2, 0));
+        assert_eq!(registered(&migrating, 349, None, None), (true, true, 3, 0));
         let whole = redeem_script_hash160(&erp);
         assert_eq!(with_retired(&whole, &paying_nothing), (true, false, 0, 0));
         assert_eq!(with_retired(&whole, &migrating), (true, false, 0, 0));

@@ -476,12 +476,19 @@ where
 /// rejection refunds: spend ALL the given UTXOs (in provider order — the
 /// MAX_MONEY selection skips sorting) into a single output to `refund_script`
 /// worth the gathered total minus the size-based fee.
+///
+/// `is_segwit` is `SendRequest.isSegwitCompatible`, which
+/// `ReleaseTransactionBuilder.setSrConfiguration` sets for a P2SH-P2WSH
+/// federation whatever it builds: the fee is then taken over the virtual size,
+/// and each input carries the witness program in its scriptSig and the
+/// unsigned witness (`signSegwitTxInputs`), as a pegout's does.
 pub fn build_empty_wallet_to(
     utxos: &[BridgeUtxo],
     refund_script: &ScriptBuf,
     redeem_script: &[u8],
     fee_per_kb: u64,
     version: i32,
+    is_segwit: bool,
 ) -> Option<BuiltPegout> {
     if utxos.is_empty() {
         return None;
@@ -515,12 +522,21 @@ pub fn build_empty_wallet_to(
         }],
     };
 
-    // adjustOutputDownwardsForFee: single pass, fee from the empty-scriptSig
-    // size plus the signing estimate; the output must stay above dust.
-    let base_size = bitcoin::consensus::serialize(&tx).len();
-    let size = base_size + utxos.len() * (threshold * SIG_SIZE + redeem_script.len());
-    let fee_rate = fee_per_kb.max(REFERENCE_DEFAULT_MIN_TX_FEE);
-    let fee = fee_rate * size as u64 / 1000;
+    // adjustOutputDownwardsForFee: a single pass, over the size
+    // `calculateTxSize` gives the transaction while its scriptSigs are empty,
+    // segwit-weighted exactly as in `complete_pegout_tx`. The fee is no less
+    // than the reference minimum (`ensureMinRequiredFee`): a floor under the
+    // fee itself here, where `calculateFee` puts one under the rate. The
+    // output must stay above dust.
+    let base_size =
+        bitcoin::consensus::serialize(&tx).len() + if is_segwit { utxos.len() * 36 } else { 0 };
+    let signing = utxos.len() * (threshold * SIG_SIZE + redeem_script.len());
+    let size = if is_segwit {
+        (base_size + signing + 3 * base_size) / 4
+    } else {
+        base_size + signing
+    };
+    let fee = (fee_per_kb * size as u64 / 1000).max(REFERENCE_DEFAULT_MIN_TX_FEE);
     if fee >= gathered {
         return None;
     }
@@ -530,9 +546,15 @@ pub fn build_empty_wallet_to(
     }
     tx.output[0].value = Amount::from_sat(value);
 
-    let scriptsig = placeholder_scriptsig(redeem_script, threshold);
     for input in &mut tx.input {
-        input.script_sig = ScriptBuf::from_bytes(scriptsig.clone());
+        if is_segwit {
+            let (script_sig, witness) = segwit_base_input(redeem_script, threshold);
+            input.script_sig = script_sig;
+            input.witness = witness;
+        } else {
+            input.script_sig =
+                ScriptBuf::from_bytes(placeholder_scriptsig(redeem_script, threshold));
+        }
     }
     if bitcoin::consensus::serialize(&tx).len() > MAX_STANDARD_TX_SIZE {
         return None;
@@ -1584,6 +1606,7 @@ mod tests {
             &redeem,
             500_000,
             1,
+            false,
         )
         .expect("rejection release builds");
         let mut rid = *built.tx.compute_txid().to_raw_hash().as_byte_array();
@@ -1665,6 +1688,7 @@ mod tests {
             &redeem,
             500_000, // mainnet genesis feePerKb
             1,       // pre-RSKIP201
+            false,
         )
         .expect("rejection release builds");
 
