@@ -207,9 +207,19 @@ else {
 ```
 
 That hard-coded `0L` is what `action.gas` reports for a plain rBTC transfer
-to a codeless account, and for a call straight to a precompile. The tracer
-reproduces it by watching `initialize_interp`, which revm fires exactly when
-it builds an interpreter for a frame — rskj's `program != null`.
+to a codeless account, for a call straight to a precompile, and for a
+creation with no init code (`create()` builds a `Program` only for data that
+is not empty). The tracer reproduces it by watching `initialize_interp`,
+which revm fires when it builds an interpreter for a frame — rskj's
+`program != null`, but for that creation, where revm builds one and rskj
+does not.
+
+The second branch sets no error and no revert flag either, so such a trace
+never has an `error`, whatever became of the transaction. A call straight to
+a precompile with too little gas for it fails, its receipt says so, and its
+trace still carries a `result`. A transaction the Bridge runs before RSKIP136,
+or free of charge for the federation, never enters the EVM here; its trace is
+made the same way, as REMASC's is.
 
 **Every RSK block ends with REMASC, and it gets a trace.** It takes the
 `program == null` branch above, so `trace_block` on any mainnet block returns

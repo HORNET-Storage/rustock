@@ -108,6 +108,13 @@ pub struct ProgramTrace {
     /// `invoke.getGas()`, which is the transaction gas limit less the
     /// intrinsic cost, and what the top-level trace reports as `action.gas`.
     pub root_gas: u64,
+    /// Whether a program ran for the transaction itself -- rskj's
+    /// `program != null`. Where none did (a plain transfer, a call straight to
+    /// a precompile, a creation with no init code), rskj's trace is a bare
+    /// `SummarizedProgramTrace`, which `TransactionExecutor.extractTrace`
+    /// gives no gas, no error and no revert, whatever became of the
+    /// transaction.
+    pub ran_program: bool,
     /// The transaction's call tree: rskj's `SummarizedProgramTrace.subtraces`.
     ///
     /// The transaction's own frame is **not** here. rskj renders the top-level
@@ -380,6 +387,7 @@ impl RskTracer {
             // reporting the real figure here would disagree with every rskj
             // node.
             root_gas: if self.root_has_program { self.root_gas } else { 0 },
+            ran_program: self.root_has_program,
             ..Default::default()
         };
         self.pending_storage = None;
@@ -490,10 +498,13 @@ where
     INTR: InterpreterTypes,
 {
     fn initialize_interp(&mut self, _interp: &mut Interpreter<INTR>, _context: &mut CTX) {
-        // Fires exactly when revm builds an interpreter for a frame, which is
-        // rskj's `program != null`. See `take_trace` for why that matters.
-        if self.open_frames.len() == 1 {
-            self.root_has_program = true;
+        // Fires when revm builds an interpreter for a frame, which is rskj's
+        // `program != null` but for one case: revm builds one for a creation
+        // with no init code as well, where rskj's `create()` builds no
+        // `Program` (`isEmpty(tx.getData())`). See `take_trace` for why that
+        // matters.
+        if let [root] = self.open_frames.as_slice() {
+            self.root_has_program = root.kind != SubtraceKind::Create || !root.input.is_empty();
         }
     }
 

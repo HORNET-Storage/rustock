@@ -1974,6 +1974,32 @@ impl RskExecutor {
                     (false, Vec::new(), Vec::new())
                 };
 
+                // Every transaction's, traced or not, so that one's can't reach
+                // the next transaction's trace.
+                let transfers = std::mem::take(&mut evm.ctx.chain_mut().precompile_transfers);
+                if traced.includes(i) {
+                    // The Bridge never enters the EVM here, so the tracer
+                    // records nothing, but rskj traces the transaction all
+                    // the same (`TransactionExecutor.extractTrace`'s
+                    // `program == null` branch, as for REMASC above): its own
+                    // call with no gas, and a CALL subtrace for each transfer
+                    // the Bridge made. Left out, every later transaction of
+                    // the block would be answered with the trace of the one
+                    // after it.
+                    let subtraces = crate::tracer::precompile_subtraces(
+                        Some(crate::precompiles::BRIDGE_ADDR),
+                        success,
+                        transfers,
+                    );
+                    traces.insert(
+                        i,
+                        crate::tracer::ProgramTrace {
+                            subtraces: subtraces.unwrap_or_default(),
+                            ..Default::default()
+                        },
+                    );
+                }
+
                 // Fees go to REMASC like the revm path (block beneficiary).
                 // An invisible exception charges the full gas limit
                 // (rskj TransactionExecutionSummary.getFee when failed).
@@ -2454,8 +2480,14 @@ impl TracedOutcome {
     fn apply_to(self, trace: &mut crate::tracer::ProgramTrace) {
         trace.contract_address = self.contract_address;
         trace.result = self.result;
-        trace.error = self.error;
-        trace.reverted = self.reverted;
+        // rskj sets these two on the program's trace (`extractTrace`:
+        // `program.getTrace().result(..).error(..).revert(..)`). Where no
+        // program ran it makes a new trace and sets neither, so a call
+        // straight to a precompile that fails is traced with no error.
+        if trace.ran_program {
+            trace.error = self.error;
+            trace.reverted = self.reverted;
+        }
     }
 }
 
@@ -14410,6 +14442,88 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
             Some((U256::ZERO, U256::ZERO)),
             "the call after the destruction makes it"
         );
+    }
+
+    /// rskj traces a transaction sent straight to the Bridge though no
+    /// program runs for it (`TransactionExecutor.extractTrace`), so a block's
+    /// traces are one to a transaction, in the transactions' order. Before
+    /// RSKIP136, and for the federation's free transactions, the Bridge is
+    /// called outside the EVM, where no tracer hears of it.
+    #[test]
+    fn a_bridge_transaction_run_outside_the_evm_has_its_trace() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let sender = Address::repeat_byte(0xAA);
+        let payee = Address::repeat_byte(0xEE);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&TrieNode::empty(), store.as_ref(), &sender, 0, one_rbtc);
+
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+        // Mainnet's block 3,000 is below bahamas, where RSKIP136 starts.
+        let txs = vec![
+            (
+                plain_tx(0, &crate::precompiles::BRIDGE_ADDR, U256::ZERO),
+                sender,
+            ),
+            (plain_tx(1, &payee, U256::from(1_000)), sender),
+        ];
+        let (result, traces) = executor
+            .execute_block_call_traced(&dummy_header(3_000), &txs, &root, store.clone())
+            .expect("block");
+        assert!(result.tx_results[1].success);
+        assert_eq!(traces.len(), 2, "one trace to a transaction");
+        // The Bridge's is the one rskj makes where no program ran, and the
+        // transfer's is its own.
+        assert_eq!(traces[0].contract_address, "");
+        assert_eq!(traces[1].contract_address, hex::encode(payee));
+    }
+
+    /// Where no program runs for a transaction, rskj's trace of it is a bare
+    /// `SummarizedProgramTrace` (`TransactionExecutor.extractTrace`): no gas,
+    /// no error and no revert, whatever became of the transaction. That is a
+    /// call straight to a precompile, also one that fails for want of gas
+    /// (`call()` returns before any program), and a creation with no init
+    /// code (`create()` builds a `Program` only for data that isn't empty).
+    #[test]
+    fn a_transaction_that_runs_no_program_is_traced_without_gas_or_error() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let sender = Address::repeat_byte(0xAA);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&TrieNode::empty(), store.as_ref(), &sender, 0, one_rbtc);
+
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+        // ECRECOVER asks 3,000 gas, and this leaves it 100.
+        let starved = rustock_core::Transaction {
+            gas_limit: U256::from(21_100),
+            ..plain_tx(0, &Address::with_last_byte(1), U256::ZERO)
+        };
+        let codeless = rustock_core::Transaction {
+            to: Bytes::new(),
+            ..plain_tx(1, &Address::ZERO, U256::ZERO)
+        };
+        let txs = vec![(starved, sender), (codeless, sender)];
+        let (result, traces) = executor
+            .execute_block_call_traced(&dummy_header(3_173_807), &txs, &root, store.clone())
+            .expect("block");
+        assert!(
+            !result.tx_results[0].success,
+            "the precompile had too little gas"
+        );
+        assert!(
+            result.tx_results[1].success,
+            "a creation with no code succeeds"
+        );
+        assert_eq!(traces.len(), 2);
+        for (trace, what) in traces
+            .iter()
+            .zip(["the starved call", "the codeless creation"])
+        {
+            assert_eq!(trace.root_gas, 0, "{what}");
+            assert_eq!(trace.error, "", "{what}");
+            assert!(!trace.reverted, "{what}");
+            assert!(trace.subtraces.is_empty(), "{what}");
+        }
     }
 
     /// RSKIP-131: from RSKIP125 rskj's `Program.createContract` refuses a
