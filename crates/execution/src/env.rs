@@ -79,14 +79,40 @@ pub fn tx_env_from_rsk_tx(
     sender: Address,
     _hardfork_cfg: &RskHardforkConfig,
 ) -> Result<TxEnv, ExecutionError> {
+    let gas_price = u128::try_from(tx.gas_price)
+        .map_err(|_| ExecutionError::Evm(format!("gas price {} is 2^128 or more", tx.gas_price)))?;
+    tx_env(tx, sender, gas_price)
+}
+
+/// A local call's `TxEnv`, and its gas price where that is 2^128 or more.
+///
+/// rskj runs a call at whatever price it names: a local call is charged no
+/// gas, so no balance has to cover it (`TransactionExecutor.execute`), and
+/// GASPRICE pushes the price whole. revm's `TxEnv` can't hold such a price, so
+/// its own is 0 then and the whole one goes beside it, in
+/// `RskChainExt::whole_gas_price`, where GASPRICE finds it.
+pub fn local_call_env(
+    tx: &rustock_core::Transaction,
+    sender: Address,
+) -> Result<(TxEnv, Option<U256>), ExecutionError> {
+    match u128::try_from(tx.gas_price) {
+        Ok(gas_price) => Ok((tx_env(tx, sender, gas_price)?, None)),
+        Err(_) => Ok((tx_env(tx, sender, 0)?, Some(tx.gas_price))),
+    }
+}
+
+/// The `TxEnv` of `tx` at `gas_price`. See [`tx_env_from_rsk_tx`].
+fn tx_env(
+    tx: &rustock_core::Transaction,
+    sender: Address,
+    gas_price: u128,
+) -> Result<TxEnv, ExecutionError> {
     let gas_limit = tx.gas().ok_or_else(|| {
         ExecutionError::Evm(format!(
             "gas limit {} is not gas: eight bytes with the top bit set",
             tx.gas_limit
         ))
     })?;
-    let gas_price = u128::try_from(tx.gas_price)
-        .map_err(|_| ExecutionError::Evm(format!("gas price {} is 2^128 or more", tx.gas_price)))?;
     let kind = if tx.to.is_empty() {
         TxKind::Create
     } else {
@@ -326,5 +352,34 @@ mod tests {
                 .gas_price,
             u128::MAX
         );
+    }
+
+    /// A local call runs at any price, as rskj's does: one revm's `TxEnv`
+    /// can't hold goes beside it, whole, and the `TxEnv`'s own is 0. The gas
+    /// limit is read as a transaction's is.
+    #[test]
+    fn a_local_call_carries_any_gas_price() {
+        let tx = |gas_limit: U256, gas_price: U256| rustock_core::Transaction {
+            nonce: 0,
+            gas_price,
+            gas_limit,
+            to: AlBytes::from(vec![0xAA; 20]),
+            value: U256::ZERO,
+            input: AlBytes::new(),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
+        };
+        let env = |gas_limit, gas_price| local_call_env(&tx(gas_limit, gas_price), Address::ZERO);
+        let (one, gas) = (U256::from(1u64), U256::from(21_000));
+
+        let (held, whole) = env(gas, U256::from(u128::MAX)).unwrap();
+        assert_eq!((held.gas_price, whole), (u128::MAX, None));
+        for price in [one << 128, (one << 255) - one, U256::MAX] {
+            let (held, whole) = env(gas, price).unwrap();
+            assert_eq!((held.gas_price, whole), (0, Some(price)));
+        }
+        assert!(env(one << 63, one).is_err(), "eight bytes, top bit set");
     }
 }

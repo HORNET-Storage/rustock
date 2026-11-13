@@ -370,6 +370,7 @@ fn setup_state_with(store: impl FnOnce(BlockStore) -> BlockStore) -> (RpcState, 
         tx_submitter: None,
         trie_store: None,
         hardfork_cfg: None,
+        bridge_constants: None,
         filter_store: Arc::new(crate::logs::FilterStore::new()),
         tx_pool: None,
         wire_queue_depth: None,
@@ -1014,6 +1015,7 @@ async fn test_eth_send_raw_transaction_with_submitter() {
         tx_submitter: Some(Arc::new(MockSubmitter)),
         trie_store: None,
         hardfork_cfg: None,
+        bridge_constants: None,
         filter_store: Arc::new(crate::logs::FilterStore::new()),
         tx_pool: None,
         wire_queue_depth: None,
@@ -1075,6 +1077,7 @@ async fn test_eth_send_raw_transaction_invalid_hex() {
         tx_submitter: Some(Arc::new(MockSubmitter)),
         trie_store: None,
         hardfork_cfg: None,
+        bridge_constants: None,
         filter_store: Arc::new(crate::logs::FilterStore::new()),
         tx_pool: None,
         wire_queue_depth: None,
@@ -1269,6 +1272,7 @@ fn setup_state_with_trie() -> (RpcState, tempfile::TempDir) {
         tx_submitter: None,
         trie_store: Some(trie_store),
         hardfork_cfg: Some(rustock_execution::RskHardforkConfig::mainnet()),
+        bridge_constants: None,
         filter_store: Arc::new(crate::logs::FilterStore::new()),
         tx_pool: None,
         wire_queue_depth: None,
@@ -1409,6 +1413,7 @@ fn setup_state_with_tx() -> (RpcState, tempfile::TempDir, B256) {
         tx_submitter: None,
         trie_store: None,
         hardfork_cfg: None,
+        bridge_constants: None,
         filter_store: Arc::new(crate::logs::FilterStore::new()),
         tx_pool: None,
         wire_queue_depth: None,
@@ -1504,6 +1509,7 @@ async fn reported_tx_hash_is_the_one_that_can_be_looked_up() {
         tx_submitter: None,
         trie_store: None,
         hardfork_cfg: None,
+        bridge_constants: None,
         filter_store: Arc::new(crate::logs::FilterStore::new()),
         tx_pool: None,
         wire_queue_depth: None,
@@ -1697,6 +1703,7 @@ fn setup_state_with_logs() -> (RpcState, tempfile::TempDir) {
         tx_submitter: None,
         trie_store: None,
         hardfork_cfg: None,
+        bridge_constants: None,
         filter_store: Arc::new(crate::logs::FilterStore::new()),
         tx_pool: None,
         wire_queue_depth: None,
@@ -2143,6 +2150,7 @@ async fn test_receipt_dto_failed_status() {
         tx_submitter: None,
         trie_store: None,
         hardfork_cfg: None,
+        bridge_constants: None,
         filter_store: Arc::new(crate::logs::FilterStore::new()),
         tx_pool: None,
         wire_queue_depth: None,
@@ -3104,6 +3112,7 @@ fn setup_state_with_receipts(
         tx_submitter: None,
         trie_store: None,
         hardfork_cfg: None,
+        bridge_constants: None,
         filter_store: Arc::new(crate::logs::FilterStore::new()),
         tx_pool: None,
         wire_queue_depth: None,
@@ -3378,6 +3387,7 @@ async fn test_eth_bridge_state_hashes_have_no_0x_prefix() {
         tx_submitter: None,
         trie_store: Some(trie_store),
         hardfork_cfg: Some(rustock_execution::RskHardforkConfig::mainnet()),
+        bridge_constants: None,
         filter_store: Arc::new(crate::logs::FilterStore::new()),
         tx_pool: None,
         wire_queue_depth: None,
@@ -4444,6 +4454,7 @@ fn setup_state_for_tracing() -> (RpcState, tempfile::TempDir, B256, Address, Add
         tx_submitter: None,
         trie_store: Some(trie_store),
         hardfork_cfg: Some(rustock_execution::RskHardforkConfig::mainnet()),
+        bridge_constants: None,
         filter_store: Arc::new(crate::logs::FilterStore::new()),
         tx_pool: None,
         wire_queue_depth: None,
@@ -5117,10 +5128,11 @@ async fn a_calls_defaults_are_rskjs() {
     let resp = ask("eth_estimateGas", json!({"to": to, "gas": "0x5208"})).await;
     assert!(resp.result.is_some(), "{:?}", resp.error);
     // The burner needs 21,003 + 26 * 2^18 = 6,836,747, over the estimate's cap
-    // whatever the call names.
+    // whatever the call names: it runs out of gas there, and a program that
+    // fails is estimated at all it was given, the cap.
     let burn = format!("{burner:#x}");
     let resp = ask("eth_estimateGas", json!({"to": burn, "gas": "0x7a1200"})).await;
-    assert!(resp.error.is_some(), "{:?}", resp.result);
+    assert_eq!(resp.result, Some(json!("0x67c280")), "{:?}", resp.error);
     let resp = ask("eth_call", json!({"to": burn})).await;
     assert_eq!(resp.result, Some(json!("0x")), "{:?}", resp.error);
 }
@@ -5365,6 +5377,166 @@ async fn a_calls_arguments_are_read_as_rskj_reads_them() {
         let resp = estimate(json!({"to": to, "gas": gas})).await;
         assert!(resp.result.is_some(), "{gas}: {:?}", resp.error);
     }
+}
+
+/// The state of one scenario of `testdata/rskj_local_calls.txt`: the accounts
+/// its `account` lines list, under the head its `head` line describes, on
+/// rskj's regtest. An account listed as `none` is one rskj's state didn't
+/// hold, and this one doesn't either. The head stands on a block with the
+/// coinbase of regtest's genesis, as rskj's did. The scenario named
+/// `...-before-rskip136` was run under a schedule without RSKIP136, and is
+/// here too.
+fn setup_state_of_scenario(
+    name: &str,
+    head: &str,
+    accounts: &[&str],
+) -> (RpcState, tempfile::TempDir) {
+    use rustock_execution::hardfork::{ConsensusRule, RskHardforkConfig};
+    use rustock_trie::{account_key, code_key, MemoryTrieStore, TrieKeySlice, TrieNode};
+
+    let (mut state, tmp) = setup_state();
+    let trie_store = Arc::new(MemoryTrieStore::new());
+    let mut root = TrieNode::empty();
+    for account in accounts {
+        // name, address, nonce, balance and, where it has some, code.
+        let words: Vec<&str> = account.split(' ').collect();
+        if words[2] == "none" {
+            continue;
+        }
+        let address = Address::from_slice(&hex::decode(words[1]).unwrap());
+        let held = rustock_trie::AccountState::new(
+            U256::from(words[2].parse::<u64>().unwrap()),
+            words[3].parse().unwrap(),
+        );
+        let key = account_key(&address);
+        root = root.put(&TrieKeySlice::from_key(&key), &held.encode(), &*trie_store);
+        if let Some(code) = words.get(4) {
+            let code = hex::decode(code).unwrap();
+            root = root.put(
+                &TrieKeySlice::from_key(&code_key(&address)),
+                &code,
+                &*trie_store,
+            );
+        }
+    }
+    root.save(&*trie_store, true);
+    let state_root = root.compute_hash(&*trie_store);
+    rustock_trie::TrieStore::put(
+        &*trie_store,
+        state_root.as_slice(),
+        &root.to_message(&*trie_store),
+    );
+
+    // number, gas limit, minimum gas price.
+    let words: Vec<&str> = head.split(' ').collect();
+    let number: u64 = words[0].parse().unwrap();
+    // The block before the head, which the BlockHeader contract reads as the
+    // one at depth 0. rskj's is regtest's genesis, and its coinbase is all
+    // that is asked for.
+    let parent = Header {
+        beneficiary: Address::repeat_byte(0x33),
+        ..test_header(number - 1)
+    };
+    state.store.put_header(&parent).unwrap();
+    let header = Header {
+        parent_hash: parent.hash(),
+        state_root,
+        gas_limit: words[1].parse().unwrap(),
+        minimum_gas_price: words[2].parse().unwrap(),
+        ..test_header(number)
+    };
+    let hash = header.hash();
+    state.store.put_header(&header).unwrap();
+    state.store.put_canonical_hash(header.number, hash).unwrap();
+    state.store.set_head(hash).unwrap();
+    state
+        .store
+        .put_total_difficulty(hash, U256::from(1))
+        .unwrap();
+
+    let mut config = RskHardforkConfig::rskj_regtest();
+    if name.ends_with("-before-rskip136") {
+        config = config.with_consensus_rule(ConsensusRule::Rskip136, None);
+    }
+    state.trie_store = Some(trie_store);
+    state.hardfork_cfg = Some(config);
+    // rskj's regtest has a federation of its own, which the Bridge answers
+    // with.
+    state.bridge_constants =
+        Some(rustock_execution::bridge::constants::BridgeConstants::rskj_regtest());
+    (state, tmp)
+}
+
+/// `eth_call` and `eth_estimateGas` answer as rskj's release answers them,
+/// request by request: `testdata/rskj_local_calls.txt` is that release's own
+/// server answering over a state it was given, and each scenario's state is
+/// rebuilt here.
+///
+/// Where rskj answers `-32603`, an exception nothing caught, the code is
+/// compared and the message is not: rskj's says "Internal server error" of
+/// every one of them, and this node's says what went wrong.
+///
+/// What used to differ, in more than half of these: a program that reverted
+/// was answered with its data as if it had returned it, where rskj answers
+/// an error of its own, with the reason; an estimate of a call that fails
+/// was refused, where rskj answers its cap; a sender short of the value it
+/// sends read as holding nothing, where rskj's holds less than nothing, and
+/// one that sends itself the value was left holding it; a call that names
+/// no sender ran from the zero address in every respect, where rskj's runs
+/// from an account of its own; a gas price of 2^128 or more was refused, and
+/// a value of 2^255 or more ran a program rskj can't start; and before
+/// RSKIP136 a precompile was held to gas rskj doesn't hold it to.
+///
+/// And of the estimates: the most a program had held was counted without the
+/// transaction's own cost, so a call that hands gas back was estimated at
+/// less than rskj estimates it; a refund was added to gas it had not been
+/// taken off; a creation inside a program, a DELEGATECALL of a program that
+/// was sent value, and a call inside a program that then failed each counted
+/// for what rskj doesn't count them for (the scenario `spend`).
+#[tokio::test]
+async fn a_local_call_answers_as_rskj_answers_it() {
+    let text = include_str!("testdata/rskj_local_calls.txt");
+    let mut differing = Vec::new();
+    let mut asked = 0;
+    for scenario in text.split("\nscenario ").skip(1) {
+        let mut lines = scenario.lines();
+        let name = lines.next().unwrap();
+        let lines: Vec<&str> = lines.collect();
+        let head = lines
+            .iter()
+            .find_map(|line| line.strip_prefix("head "))
+            .unwrap();
+        let accounts: Vec<&str> = lines
+            .iter()
+            .filter_map(|line| line.strip_prefix("account "))
+            .collect();
+        let (state, _tmp) = setup_state_of_scenario(name, head, &accounts);
+        for call in lines.iter().filter_map(|line| line.strip_prefix("call ")) {
+            asked += 1;
+            let (request, answer) = call.split_once(" => ").unwrap();
+            let mut words = request.splitn(3, ' ');
+            let label = words.next().unwrap();
+            let method = words.next().unwrap();
+            let params: Value = serde_json::from_str(words.next().unwrap()).unwrap();
+            let theirs: Value = serde_json::from_str(answer).unwrap();
+            let ours = dispatch_for_test(&state, make_request(method, params)).await;
+            let mut ours = serde_json::to_value(&ours).unwrap();
+            let uncaught = json!(INTERNAL_ERROR);
+            if theirs["error"]["code"] == uncaught && ours["error"]["code"] == uncaught {
+                ours["error"]["message"] = theirs["error"]["message"].clone();
+            }
+            if ours != theirs {
+                differing.push(format!("{name} {label}:\n  rskj {theirs}\n  here {ours}"));
+            }
+        }
+    }
+    assert!(
+        differing.is_empty(),
+        "{} of {asked} answers differ:\n{}",
+        differing.len(),
+        differing.join("\n")
+    );
+    assert_eq!(asked, 305, "every request of the file was asked");
 }
 
 /// A sent transaction's defaults are rskj's
@@ -5978,6 +6150,7 @@ fn setup_state_with_varied_logs() -> (RpcState, tempfile::TempDir, Vec<Address>,
         tx_submitter: None,
         trie_store: None,
         hardfork_cfg: None,
+        bridge_constants: None,
         filter_store: Arc::new(crate::logs::FilterStore::new()),
         tx_pool: None,
         wire_queue_depth: None,
@@ -7620,7 +7793,7 @@ async fn estimate(state: &RpcState, from: Address, to: Address) -> u64 {
 /// - the single-pass estimator reports the limit at which it *behaves as it
 ///   did at the cap*.
 ///
-/// They part company over a CALL with a generous fixed allowance. RSK has no
+/// They part company over a CALL with a fixed allowance. RSK has no
 /// EIP-150 retention and `calleeGas = min(remaining, requested + stipend)`,
 /// so a CALL asking for 100,000 with 11,000 left does not fail -- the callee
 /// simply gets 11,000. The transaction therefore still succeeds at a limit
@@ -7630,14 +7803,22 @@ async fn estimate(state: &RpcState, from: Address, to: Address) -> u64 {
 /// else. The peak is the limit that preserves the observed behaviour.
 ///
 /// So what is required here is that the single-pass answer is *sufficient*
-/// and never below the search's, and that the two agree wherever no such
-/// allowance is in play.
+/// and never below the search's, and that it is above it by what the callee
+/// was handed and had no use for, and no more: the allowance, and for a call
+/// with value the 2,300 rskj adds on top of the stipend the peak already
+/// holds. (The callee here is a bare STOP.) rskj's release answers calls of
+/// this shape the same way: `testdata/rskj_local_calls.txt`, the scenario
+/// `spend`, `calls-fixed-plain-estimate` and `forwards-poor-5-estimate`.
 #[tokio::test]
 async fn the_exactimator_never_undercuts_binary_search() {
-    for (stipend, value, agree, what) in [
-        (100_000u64, 0u64, false, "a callee handed far more than it spends"),
-        (3_000, 0, true, "a callee handed roughly what it needs"),
-        (3_000, 1, true, "a value-bearing call, which carries the 2300 stipend"),
+    for (stipend, value, what) in [
+        (100_000u64, 0u64, "a callee handed far more than it spends"),
+        (3_000, 0, "a callee handed roughly what it needs"),
+        (
+            3_000,
+            1,
+            "a value-bearing call, which carries the 2300 stipend",
+        ),
     ] {
         let (fast_state, _t1, from, to) = setup_estimation_state(stipend, value, false);
         let (slow_state, _t2, _, _) = setup_estimation_state(stipend, value, true);
@@ -7650,9 +7831,12 @@ async fn the_exactimator_never_undercuts_binary_search() {
             "{what}: single pass said {fast}, below binary search's {slow} -- \
              an estimate that does not execute"
         );
-        if agree {
-            assert_eq!(fast, slow, "{what}: the two should agree here");
-        }
+        let unused = stipend + if value > 0 { 2_300 } else { 0 };
+        assert_eq!(
+            fast - slow,
+            unused,
+            "{what}: the gap is what the callee was handed and didn't use"
+        );
     }
 }
 
@@ -7665,8 +7849,8 @@ async fn the_exactimator_never_undercuts_binary_search() {
 /// had assumed the answer away and returned 21,001. Found by comparing it
 /// against the single-pass estimator, which answered 21,000.
 ///
-/// Unrelated to the refund overshoot in #334: that one is inherited from
-/// rskj's formula, this one was ours alone and is simply wrong.
+/// Unrelated to the refund overshoot in #334, which was the single pass's
+/// (`the_refund_is_not_added_to_what_was_spent`).
 #[tokio::test]
 async fn binary_search_finds_the_intrinsic_cost_exactly() {
     let (state, _tmp, from, _) = setup_estimation_state(0, 0, true);
@@ -7711,8 +7895,8 @@ async fn the_estimate_covers_the_allowance_a_call_asks_for() {
 /// A contract that clears a storage slot (earning a refund) and then calls
 /// out with `GAS` (handing over everything it has left). That lands on the
 /// `movedRemainingGasToChild` branch *and* has a refund, which is the
-/// combination where the two branches of rskj's formula disagree with each
-/// other about whether a refund belongs in an estimate.
+/// combination where a refund can be counted into an estimate that doesn't
+/// need it.
 fn setup_refund_state(binary_search: bool) -> (RpcState, tempfile::TempDir, Address, Address) {
     use rustock_trie::{account_key, code_key, storage_key, MemoryTrieStore, TrieKeySlice, TrieNode};
 
@@ -7770,38 +7954,28 @@ fn setup_refund_state(binary_search: bool) -> (RpcState, tempfile::TempDir, Addr
     (state, tmp, sender, caller)
 }
 
-/// rskj's formula adds the refund back on the `movedRemainingGasToChild`
-/// branch and not on the other, and this test pins the consequence: the
-/// estimate comes out `deductedRefund` higher than the limit the transaction
-/// actually needs -- here 40,089 against a demonstrated 26,726, which is the
-/// `gasUsed/2` refund cap, so 50% high.
+/// On the `movedRemainingGasToChild` branch rskj answers
+/// `gasUsed + deductedRefund`, and by the time it does, `gasUsed` is less the
+/// refund: `TransactionExecutor.localCallFinalization` sets it to what the
+/// transaction is charged. So the sum is what was spent before the refund,
+/// which is the limit the transaction needs, and binary search finds the
+/// same by executing there.
 ///
-/// Kept as an assertion rather than fixed, because it is rskj's behaviour and
-/// this estimator is meant to agree with rskj. See `docs/gas-estimation.md`
-/// §2 -- if the rskj side ever drops the `+ deductedRefund`, this test is the
-/// thing to update alongside.
-///
-/// Note the contrast with `the_estimate_covers_the_allowance_a_call_asks_for`:
-/// *that* divergence from binary search is a deliberate, minimal answer to a
-/// stricter question. This one buys nothing.
+/// rskj's release answers so: in `testdata/rskj_local_calls.txt`, the
+/// scenario `spend`, `sstores-calls-estimate` is 46,731, what its run spends,
+/// with a refund of 15,000 in it. This node took `gasUsed` for what was spent
+/// before the refund and added the refund to it, and came out half as high
+/// again here: 40,089. See `docs/gas-estimation.md` §2.
 #[tokio::test]
-async fn the_refund_branch_overshoots_by_the_refund() {
+async fn the_refund_is_not_added_to_what_was_spent() {
     let (fast_state, _t1, from, to) = setup_refund_state(false);
     let (slow_state, _t2, _, _) = setup_refund_state(true);
 
     let fast = estimate(&fast_state, from, to).await;
     let slow = estimate(&slow_state, from, to).await;
 
-    assert!(
-        fast > slow,
-        "fixture no longer reaches the refund branch: {fast} vs {slow}"
-    );
-    // The gap is exactly the refund, capped at half the gas used.
-    assert_eq!(
-        fast - slow,
-        slow / 2,
-        "the overshoot should be the capped refund and nothing else"
-    );
+    assert_eq!(fast, slow, "what was spent before the refund, and no more");
+    assert_eq!(fast, 26_726);
 }
 
 // ===== eth_getProof =====

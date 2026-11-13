@@ -33,6 +33,51 @@ pub struct TxExecutionResult {
     /// (`SEQUENTIAL_ONLY_PRECOMPILES`). True whatever the call returned --
     /// reaching the precompile is what counts.
     pub reached_sequential_only: bool,
+    /// rskj's `ProgramResult.isRevert`: the transaction's own program ended
+    /// with REVERT, and `output` is what it reverted with. `eth_call` and
+    /// `eth_estimateGas` answer a revert as an error of its own. A precompile
+    /// the transaction calls itself has no program and never ends so: what
+    /// one throws, `RskHandler` settles as rskj does.
+    pub reverted: bool,
+}
+
+/// What one execution says of the gas a transaction needs
+/// ([`RskExecutor::estimate_gas_exact`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GasEstimate {
+    /// The gas to give it.
+    Gas(u64),
+    /// Its program ended with REVERT, with this output.
+    Reverted(Vec<u8>),
+}
+
+/// Who a local call is from: the sender it names, or nobody. rskj runs a call
+/// that names no sender from its null address, which is not the zero address
+/// (`RskHandler`'s `no_sender`). An `Address` is a sender named.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocalSender(Option<Address>);
+
+impl LocalSender {
+    /// The address the call runs from here: the sender's, or the zero address.
+    fn address(self) -> Address {
+        self.0.unwrap_or(Address::ZERO)
+    }
+
+    fn is_nobody(self) -> bool {
+        self.0.is_none()
+    }
+}
+
+impl From<Address> for LocalSender {
+    fn from(sender: Address) -> Self {
+        Self(Some(sender))
+    }
+}
+
+impl From<Option<Address>> for LocalSender {
+    fn from(sender: Option<Address>) -> Self {
+        Self(sender)
+    }
 }
 
 /// What the miner's execution mode left out of the block, by index into the
@@ -342,7 +387,7 @@ impl RskExecutor {
         state_root: &TrieNode,
         trie_store: Arc<dyn TrieStore>,
     ) -> Result<TxExecutionResult, ExecutionError> {
-        self.execute_tx_inner(header, tx, sender, state_root, trie_store, false)
+        self.execute_tx_inner(header, tx, sender.into(), state_root, trie_store, false)
     }
 
     /// Execute a transaction as a **local call** -- rskj's
@@ -360,29 +405,54 @@ impl RskExecutor {
     ///   getters -- the federation address, the BTC blockchain head, the
     ///   peg-out queue sizes -- which rskj deliberately refuses to answer
     ///   on-chain so that no contract can depend on them.
+    ///
+    /// `sender` is the sender the call names, or `None` where it names none
+    /// ([`LocalSender`]).
     pub fn execute_local_call(
         &self,
         header: &Header,
         tx: &rustock_core::Transaction,
-        sender: Address,
+        sender: impl Into<LocalSender>,
         state_root: &TrieNode,
         trie_store: Arc<dyn TrieStore>,
     ) -> Result<TxExecutionResult, ExecutionError> {
-        self.execute_tx_inner(header, tx, sender, state_root, trie_store, true)
+        self.execute_tx_inner(header, tx, sender.into(), state_root, trie_store, true)
+    }
+
+    /// A transaction's `TxEnv`, and a local call's gas price where revm's
+    /// can't hold it (`env::local_call_env`).
+    fn tx_env_for(
+        &self,
+        tx: &rustock_core::Transaction,
+        sender: Address,
+        local_call: bool,
+    ) -> Result<(revm::context::TxEnv, Option<U256>), ExecutionError> {
+        if local_call {
+            return crate::env::local_call_env(tx, sender);
+        }
+        Ok((tx_env_from_rsk_tx(tx, sender, &self.hardfork_cfg)?, None))
+    }
+
+    /// rskj's `ProgramResult.isRevert` for a transaction's result: its own
+    /// program ended with REVERT.
+    fn program_reverted<H>(exec: &revm::context::result::ExecutionResult<H>) -> bool {
+        matches!(exec, revm::context::result::ExecutionResult::Revert { .. })
     }
 
     fn execute_tx_inner(
         &self,
         header: &Header,
         tx: &rustock_core::Transaction,
-        sender: Address,
+        sender: LocalSender,
         state_root: &TrieNode,
         trie_store: Arc<dyn TrieStore>,
         local_call: bool,
     ) -> Result<TxExecutionResult, ExecutionError> {
+        let no_sender = local_call && sender.is_nobody();
+        let sender = sender.address();
         let spec_id = self.hardfork_cfg.spec_id(header.number);
         let block_env = block_env_from_header(header, &self.hardfork_cfg);
-        let tx_env = tx_env_from_rsk_tx(tx, sender, &self.hardfork_cfg)?;
+        let (tx_env, whole_gas_price) = self.tx_env_for(tx, sender, local_call)?;
         let db = RskDatabase::new(state_root.clone(), trie_store.clone(), self.block_store.clone());
 
         let cfg = make_cfg_env(spec_id, self.hardfork_cfg.chain_id, self.hardfork_cfg.has_rskip544(header.number));
@@ -390,6 +460,7 @@ impl RskExecutor {
         let mut chain_ext = crate::raw_storage::RskChainExt::default();
         chain_ext.raw_storage.set_reader(trie_store, state_root.clone());
         chain_ext.btc_block_cache = self.btc_block_cache.clone();
+        chain_ext.whole_gas_price = whole_gas_price;
         let ctx = revm::Context::mainnet()
             .with_db(WrapDatabaseRef(db))
             .with_block(block_env)
@@ -462,7 +533,8 @@ impl RskExecutor {
                 self.hardfork_cfg.has_rskip171(header.number),
             )
             .failing_programs(!header_fits_program_invoke(header))
-            .as_local_call(local_call, self.hardfork_cfg.has_rskip136(header.number));
+            .as_local_call(local_call, self.hardfork_cfg.has_rskip136(header.number))
+            .from_nobody(no_sender);
             let out = handler
                 .run(&mut evm)
                 .map_err(|e: revm::context::result::EVMError<_>| {
@@ -478,6 +550,7 @@ impl RskExecutor {
 
         let exec = result.result;
         let success = exec.is_success();
+        let reverted = Self::program_reverted(&exec);
         let gas_used = exec.gas_used();
         let output = exec.output().map(|o| o.to_vec()).unwrap_or_default();
         let logs = exec.into_logs();
@@ -492,6 +565,7 @@ impl RskExecutor {
             output,
             logs,
             created_address,
+            reverted,
         })
     }
 
@@ -520,7 +594,7 @@ impl RskExecutor {
     ) -> Result<(TxExecutionResult, crate::tracer::ProgramTrace), ExecutionError> {
         let spec_id = self.hardfork_cfg.spec_id(header.number);
         let block_env = block_env_from_header(header, &self.hardfork_cfg);
-        let tx_env = tx_env_from_rsk_tx(tx, sender, &self.hardfork_cfg)?;
+        let (tx_env, whole_gas_price) = self.tx_env_for(tx, sender, local_call)?;
         let db = RskDatabase::new(state_root.clone(), trie_store.clone(), self.block_store.clone());
 
         let cfg = make_cfg_env(spec_id, self.hardfork_cfg.chain_id, self.hardfork_cfg.has_rskip544(header.number));
@@ -528,6 +602,7 @@ impl RskExecutor {
         let mut chain_ext = crate::raw_storage::RskChainExt::default();
         chain_ext.raw_storage.set_reader(trie_store, state_root.clone());
         chain_ext.btc_block_cache = self.btc_block_cache.clone();
+        chain_ext.whole_gas_price = whole_gas_price;
         let ctx = revm::Context::mainnet()
             .with_db(WrapDatabaseRef(db))
             .with_block(block_env)
@@ -618,6 +693,7 @@ impl RskExecutor {
 
         let exec = result.result;
         let success = exec.is_success();
+        let reverted = Self::program_reverted(&exec);
         let gas_used = exec.gas_used();
         let output = exec.output().map(|o| o.to_vec()).unwrap_or_default();
         let outcome = TracedOutcome::of(tx, sender, &exec, &output);
@@ -646,6 +722,7 @@ impl RskExecutor {
                 output,
                 logs,
                 created_address,
+                reverted,
                 reached_sequential_only: reached_sequential_only
                     .load(std::sync::atomic::Ordering::Relaxed),
             },
@@ -656,9 +733,14 @@ impl RskExecutor {
 
     /// Estimate a transaction's gas in one execution.
     ///
-    /// Returns `(estimate, success, output)`. On failure the estimate is zero
-    /// and the output is the revert data, so the caller can report the reason
-    /// rather than a number.
+    /// A program that ends with REVERT has no estimate: rskj answers with what
+    /// it reverted with (`EthModule.estimateGas`), and so does
+    /// [`GasEstimate::Reverted`]. A run that fails any other way is estimated
+    /// as one that doesn't fail is, from the gas it used
+    /// (`EthModule.internalEstimateGas`): where a program failed, all it was
+    /// given, which is the cap. And a creation without data is estimated at
+    /// 0: rskj's `create()` works out what is left of its gas and spends none
+    /// in the result the estimate is read from (TransactionExecutor.java:406).
     ///
     /// The floor matters: a plain value transfer never enters the
     /// interpreter, so the inspector sees no opcodes and reports no peak. Its
@@ -667,18 +749,23 @@ impl RskExecutor {
         &self,
         header: &Header,
         tx: &rustock_core::Transaction,
-        sender: Address,
+        sender: impl Into<LocalSender>,
         state_root: &TrieNode,
         trie_store: Arc<dyn TrieStore>,
         cap: u64,
-    ) -> Result<(u64, bool, Vec<u8>), ExecutionError> {
+    ) -> Result<GasEstimate, ExecutionError> {
         let (result, telemetry) =
             self.execute_tx_for_estimate(header, tx, sender, state_root, trie_store, true)?;
-        if !result.success {
-            return Ok((0, false, result.output));
+        if result.reverted {
+            return Ok(GasEstimate::Reverted(result.output));
         }
-        let estimate = telemetry.estimate(cap);
-        Ok((estimate, true, result.output))
+        if tx.to.is_empty() && tx.input.is_empty() {
+            return Ok(GasEstimate::Gas(0));
+        }
+        if !result.success {
+            return Ok(GasEstimate::Gas(result.gas_used.min(cap)));
+        }
+        Ok(GasEstimate::Gas(telemetry.estimate(cap)))
     }
 
     /// The same execution as `execute_tx_inner`, with the gas-estimation
@@ -695,14 +782,18 @@ impl RskExecutor {
         &self,
         header: &Header,
         tx: &rustock_core::Transaction,
-        sender: Address,
+        sender: impl Into<LocalSender>,
         state_root: &TrieNode,
         trie_store: Arc<dyn TrieStore>,
         local_call: bool,
     ) -> Result<(TxExecutionResult, crate::gas_estimator::EstimateTelemetry), ExecutionError> {
+        let sender = sender.into();
+        let no_sender = local_call && sender.is_nobody();
+        let sender = sender.address();
         let spec_id = self.hardfork_cfg.spec_id(header.number);
         let block_env = block_env_from_header(header, &self.hardfork_cfg);
-        let tx_env = tx_env_from_rsk_tx(tx, sender, &self.hardfork_cfg)?;
+        let (tx_env, whole_gas_price) = self.tx_env_for(tx, sender, local_call)?;
+        let gas_limit = tx_env.gas_limit;
         let db = RskDatabase::new(state_root.clone(), trie_store.clone(), self.block_store.clone());
 
         let cfg = make_cfg_env(spec_id, self.hardfork_cfg.chain_id, self.hardfork_cfg.has_rskip544(header.number));
@@ -710,6 +801,7 @@ impl RskExecutor {
         let mut chain_ext = crate::raw_storage::RskChainExt::default();
         chain_ext.raw_storage.set_reader(trie_store, state_root.clone());
         chain_ext.btc_block_cache = self.btc_block_cache.clone();
+        chain_ext.whole_gas_price = whole_gas_price;
         let ctx = revm::Context::mainnet()
             .with_db(WrapDatabaseRef(db))
             .with_block(block_env)
@@ -783,7 +875,8 @@ impl RskExecutor {
                 self.hardfork_cfg.has_rskip171(header.number),
             )
             .failing_programs(!header_fits_program_invoke(header))
-            .as_local_call(local_call, self.hardfork_cfg.has_rskip136(header.number));
+            .as_local_call(local_call, self.hardfork_cfg.has_rskip136(header.number))
+            .from_nobody(no_sender);
             use revm::inspector::InspectorHandler;
             let out = handler
                 .inspect_run(&mut evm)
@@ -800,20 +893,19 @@ impl RskExecutor {
 
         let exec = result.result;
         let success = exec.is_success();
+        let reverted = Self::program_reverted(&exec);
         let gas_used = exec.gas_used();
         let output = exec.output().map(|o| o.to_vec()).unwrap_or_default();
         // `spent` is revm's pre-refund figure -- limit minus remaining --
-        // which is the same quantity rskj's `getGasUsed()` holds, and what an
-        // estimate has to cover. `used()` is after the refund and would
-        // under-report.
+        // which is what an estimate has to cover, and what rskj's
+        // `getGasUsed() + getDeductedRefund()` comes to. `used()` is after
+        // the refund and would under-report.
         let spent = exec.gas().spent();
-        let refunded = exec.gas().final_refunded();
         let logs = exec.into_logs();
 
         let created_address = Self::extract_created_address(tx, sender, &success);
 
-        let telemetry =
-            std::mem::take(&mut evm.inspector).into_telemetry(spent, refunded);
+        let telemetry = std::mem::take(&mut evm.inspector).into_telemetry(gas_limit, spent);
 
         Ok((
             TxExecutionResult {
@@ -822,6 +914,7 @@ impl RskExecutor {
                 output,
                 logs,
                 created_address,
+                reverted,
                 reached_sequential_only: reached_sequential_only
                     .load(std::sync::atomic::Ordering::Relaxed),
             },
@@ -1773,6 +1866,7 @@ impl RskExecutor {
                     output: Vec::new(),
                     logs,
                     created_address: None,
+                    reverted: false,
                 });
                 if crate::supply::per_transaction_enabled() {
                     use revm::context_interface::ContextTr;
@@ -2030,6 +2124,7 @@ impl RskExecutor {
                     output,
                     logs,
                     created_address: None,
+                    reverted: false,
                 });
                 if crate::supply::per_transaction_enabled() {
                     use revm::context_interface::ContextTr;
@@ -2187,6 +2282,7 @@ impl RskExecutor {
             };
 
             let success = result.is_success();
+            let reverted = Self::program_reverted(&result);
             let gas_used = result.gas_used();
             let output = result.output().map(|o| o.to_vec()).unwrap_or_default();
             // Every transaction's, traced or not, so that one's can't reach the
@@ -2256,6 +2352,7 @@ impl RskExecutor {
                 output,
                 logs,
                 created_address,
+                reverted,
             });
 
             if crate::supply::per_transaction_enabled() {

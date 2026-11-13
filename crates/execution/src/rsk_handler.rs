@@ -154,6 +154,17 @@ invisible_exception: Arc<AtomicBool>,
     /// all its gas as it charges that cost (455): the loop halts it as it
     /// opens.
     starved: std::cell::Cell<bool>,
+    /// A local call that names no sender. rskj runs it from its null address,
+    /// which has no bytes (`CallArgumentsToByteArray.getFromAddress`): CALLER
+    /// and ORIGIN push zero, as they do for the zero address the call runs
+    /// from here, but the value comes out of the null address's own account,
+    /// which no program can read, and a contract it creates gets its address
+    /// from a sender of no bytes (`HashUtil.calcNewAddr`).
+    no_sender: bool,
+    /// Set for a local call whose value moves nothing here
+    /// (`validate_against_state_and_deduct_caller`): its first frame carries
+    /// the value and transfers none.
+    moves_nothing: std::cell::Cell<bool>,
     _phantom: core::marker::PhantomData<(CTX, ERROR, FRAME)>,
 }
 
@@ -202,6 +213,83 @@ impl<CTX, ERROR, FRAME> RskHandler<CTX, ERROR, FRAME> {
         self
     }
 
+    /// A local call that names no sender. See the field.
+    pub fn from_nobody(mut self, no_sender: bool) -> Self {
+        self.no_sender = no_sender;
+        self
+    }
+
+    /// Whether a local call to `to` runs whatever gas it has: a precompile,
+    /// before RSKIP136. rskj leaves out the check that the gas covers a
+    /// precompile's cost for every local call (TransactionExecutor.java:350).
+    /// From RSKIP136 it throws as it works out what is left
+    /// (`GasCost.subtract`, 360); before it, that is a plain subtraction,
+    /// which goes below zero and throws nothing, and the precompile runs.
+    fn runs_unmetered(&self, to: &Address) -> bool {
+        self.local_call && !self.rskip136_active && self.active_precompiles.contains(to)
+    }
+
+    /// Makes a local call's first frame what rskj's is, where that isn't what
+    /// a transaction's is. Returns the gas limit of a frame that is lent gas.
+    ///
+    /// - A call whose value moves nothing (`moves_nothing`) carries it and
+    ///   transfers none.
+    /// - A precompile that runs whatever gas the call has (`runs_unmetered`)
+    ///   is lent all it could ask for; [`Self::settle_lent_gas`] puts what it
+    ///   spent back on the limit the call had.
+    /// - A creation that names no sender is made at the address rskj derives
+    ///   from a sender of no bytes and its nonce, 0 (see `no_sender`).
+    fn fit_local_call(
+        &self,
+        input: &mut revm::interpreter::interpreter_action::FrameInput,
+    ) -> Option<u64> {
+        use revm::context_interface::CreateScheme;
+        use revm::interpreter::interpreter_action::FrameInput;
+        use revm::interpreter::{CallValue, CreateInputs};
+        if !self.local_call {
+            return None;
+        }
+        match input {
+            FrameInput::Call(inputs) => {
+                if self.moves_nothing.get() {
+                    inputs.value = CallValue::Apparent(inputs.value.get());
+                }
+                if self.runs_unmetered(&inputs.target_address) {
+                    let limit = inputs.gas_limit;
+                    inputs.gas_limit = i64::MAX as u64;
+                    return Some(limit);
+                }
+            }
+            FrameInput::Create(inputs) if self.no_sender => {
+                // keccak256(rlp(["", 0])), less its first 12 bytes.
+                let hash = revm::primitives::keccak256([0xc2, 0x80, 0x80]);
+                let address = Address::from_slice(&hash[12..]);
+                **inputs = CreateInputs::new(
+                    inputs.caller(),
+                    CreateScheme::Custom { address },
+                    inputs.value(),
+                    inputs.init_code().clone(),
+                    inputs.gas_limit(),
+                );
+            }
+            _ => {}
+        }
+        None
+    }
+
+    /// Puts a precompile's result back on the gas limit its call had, after
+    /// it ran on gas it was lent (`fit_local_call`): what it spent comes off
+    /// that limit, all of it where the limit can't pay it.
+    fn settle_lent_gas(result: &mut FrameResult, limit: u64) {
+        let gas = result.gas_mut();
+        let mut settled = Gas::new(limit);
+        if !settled.record_cost(gas.spent()) {
+            settled.spend_all();
+        }
+        settled.record_refund(gas.refunded());
+        *gas = settled;
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn with_rskip125(
         empty_create_on_unpayable_deposit: bool,
@@ -228,6 +316,8 @@ impl<CTX, ERROR, FRAME> RskHandler<CTX, ERROR, FRAME> {
             local_call: false,
             rskip136_active: true,
             starved: std::cell::Cell::new(false),
+            no_sender: false,
+            moves_nothing: std::cell::Cell::new(false),
             _phantom: core::marker::PhantomData,
         }
     }
@@ -273,7 +363,8 @@ where
     /// (TransactionExecutor.java:360, 384) and in `create()` for a creation
     /// without data (406). If a program runs, `go()` fails it with all its gas
     /// as it charges the cost (455), before it runs anything (`starved`). A
-    /// precompile's account holds no code.
+    /// precompile's account holds no code, and before RSKIP136 one runs all
+    /// the same (`runs_unmetered`).
     fn validate(
         &self,
         evm: &mut Self::Evm,
@@ -303,7 +394,8 @@ where
                     .as_ref()
                     .is_some_and(|code| !code.is_empty()),
             };
-            if !runs_program {
+            let unmetered = matches!(ctx.tx().kind(), TxKind::Call(to) if self.runs_unmetered(&to));
+            if !runs_program && !unmetered {
                 return Err(
                     revm::context_interface::result::InvalidTransaction::CallGasCostMoreThanGasLimit {
                         gas_limit,
@@ -325,8 +417,29 @@ where
     /// `Repository.transfer` (397, 427), which creates the sender's account
     /// and takes its balance below zero rather than fail. One here can't go
     /// below zero, so a sender short of the value is lifted to it, as revm
-    /// lifts one for a simulation (`disable_balance_check`), and holds nothing
-    /// where rskj's holds less than nothing.
+    /// lifts one for a simulation (`disable_balance_check`), and what it was
+    /// lifted by is kept as what it owes (`RskChainExt::owed`): BALANCE and
+    /// SELFBALANCE read the account less that, as rskj reads one below zero.
+    /// It is taken off what the account reads as, not off what it can spend:
+    /// a sender that is a contract, short of the value and paid back within
+    /// the call, can there send on what rskj's, still below zero, could not.
+    ///
+    /// Where the call names no sender (`no_sender`), rskj takes the value out
+    /// of its null address's account, which no program can read, and the zero
+    /// address the call runs from here has no part in it: it is not touched,
+    /// and has no account where it had none. The account called is given the
+    /// value here. A creation's value revm moves as it opens the creation, so
+    /// the zero address is given that first, and `exec_loop` leaves it as it
+    /// was once the creation is open.
+    ///
+    /// So the first frame of such a call carries the value and transfers none
+    /// (`moves_nothing`), and so does that of two more:
+    /// - one a named sender sends itself, which leaves it and comes back
+    ///   whatever the sender holds, where revm's transfer refuses a sender
+    ///   that holds less;
+    /// - one that would take the account it is sent past 2^256. rskj's
+    ///   balances have no top, and revm's transfer fails there. Such a value
+    ///   is 2^255 or more, so no program runs to read what moved (`exec_loop`).
     fn validate_against_state_and_deduct_caller(
         &self,
         evm: &mut Self::Evm,
@@ -337,16 +450,57 @@ where
             );
         }
         use revm::context_interface::Transaction;
+        use revm::primitives::TxKind;
         let ctx = evm.ctx();
         let (caller, value) = (ctx.tx().caller(), ctx.tx().value());
-        let mut sender = ctx
-            .journal_mut()
-            .load_account_mut(caller)
-            .map_err(|e| ERROR::from(e))?;
-        sender.touch();
-        if *sender.balance() < value {
-            sender.set_balance(value);
+        let to = match ctx.tx().kind() {
+            TxKind::Call(to) => Some(to),
+            TxKind::Create => None,
+        };
+        let past_the_top = match to {
+            Some(to) if !value.is_zero() => ctx
+                .journal_mut()
+                .load_account(to)
+                .map_err(|e| ERROR::from(e))?
+                .info
+                .balance
+                .checked_add(value)
+                .is_none(),
+            _ => false,
+        };
+        let mut moves_nothing = (!self.no_sender && to == Some(caller)) || past_the_top;
+        let mut owed = None;
+        {
+            let journal = ctx.journal_mut();
+            if !self.no_sender {
+                let mut sender = journal
+                    .load_account_mut(caller)
+                    .map_err(|e| ERROR::from(e))?;
+                sender.touch();
+                let held = *sender.balance();
+                if !moves_nothing && held < value {
+                    sender.set_balance(value);
+                    owed = Some((caller, value - held));
+                }
+            } else if value.is_zero() || moves_nothing {
+                journal.load_account(caller).map_err(|e| ERROR::from(e))?;
+            } else if let Some(to) = to {
+                journal.load_account(caller).map_err(|e| ERROR::from(e))?;
+                let _ = journal
+                    .load_account_mut(to)
+                    .map_err(|e| ERROR::from(e))?
+                    .incr_balance(value);
+                moves_nothing = true;
+            } else {
+                let mut payer = journal
+                    .load_account_mut(caller)
+                    .map_err(|e| ERROR::from(e))?;
+                let held = *payer.balance();
+                payer.set_balance(held.saturating_add(value));
+            }
         }
+        self.moves_nothing.set(moves_nothing);
+        ctx.chain_mut().owed = owed;
         Ok(())
     }
 
@@ -478,7 +632,7 @@ where
         // (TransactionExecutor.java:350), and from RSKIP136 works out the
         // leftover with `GasCost.subtract` (360), which throws out of
         // `executeTransaction`. Before RSKIP136 rskj runs the precompile all
-        // the same, which isn't done here.
+        // the same, on gas it doesn't have (`runs_unmetered`).
         if self.local_call
             && self.rskip136_active
             && frame_result.interpreter_result().result == InstructionResult::PrecompileOOG
@@ -553,6 +707,9 @@ where
         evm: &mut EVM,
         first_frame_input: FrameInit,
     ) -> Result<FrameResult, ERROR> {
+        // What a local call's first frame is that a transaction's isn't.
+        let mut first_frame_input = first_frame_input;
+        let lent = self.fit_local_call(&mut first_frame_input.frame_input);
         // rskj builds a program's invocation only for a transaction that runs
         // code (`TransactionExecutor.call` and `create`); revm opens a frame
         // for a creation with no data too, which runs nothing.
@@ -562,24 +719,65 @@ where
             }
             _ => true,
         };
+        let creates_locally = self.local_call
+            && matches!(
+                first_frame_input.frame_input,
+                revm::interpreter::interpreter_action::FrameInput::Create(_)
+            );
         // Every internal transaction rskj makes under this one carries its
         // gas price and the block's gas limit (`crate::internal_tx`).
-        {
+        let past_a_word = {
             use revm::context_interface::{Block, Transaction};
             let ctx = evm.ctx();
-            let gas_price = ctx.tx().effective_gas_price(ctx.block().basefee() as u128);
+            let gas_price = ctx.chain().whole_gas_price.unwrap_or_else(|| {
+                U256::from(ctx.tx().effective_gas_price(ctx.block().basefee() as u128))
+            });
             let block_gas_limit = ctx.block().gas_limit();
             ctx.chain_mut()
                 .internal_txs
-                .begin(U256::from(gas_price), U256::from(block_gas_limit));
+                .begin(gas_price, U256::from(block_gas_limit));
+            // The value and the gas price go into a program's invocation as
+            // the header's words do (`fail_programs`), and 2^255 takes a sign
+            // byte, a 33rd. Only a local call can carry either: no balance
+            // pays for one.
+            self.local_call && (gas_price.bit_len() == 256 || ctx.tx().value().bit_len() == 256)
+        };
+        match D::init(evm, first_frame_input)? {
+            ItemOrResult::Result(mut frame_result) => {
+                if let Some(limit) = lent {
+                    Self::settle_lent_gas(&mut frame_result, limit);
+                }
+                return Ok(frame_result);
+            }
+            ItemOrResult::Item(()) => {}
         }
-        if let ItemOrResult::Result(frame_result) = D::init(evm, first_frame_input)? {
-            return Ok(frame_result);
+        // revm bumps a creator's nonce as it opens the creation, which touches
+        // the creator. A local call's sender keeps its nonce
+        // (TransactionExecutor.java:292-301), which a program it holds reads
+        // when it creates in turn. And a creation that names no sender is
+        // from rskj's null address (`no_sender`): the zero address it runs
+        // from here is left as it was, with no account where it had none.
+        if creates_locally {
+            use revm::context_interface::Transaction;
+            let caller = evm.ctx().tx().caller();
+            if let Some(account) = evm.ctx().journal_mut().evm_state_mut().get_mut(&caller) {
+                account.info.nonce = account.info.nonce.saturating_sub(1);
+                if self.no_sender {
+                    account.unmark_touch();
+                }
+            }
         }
         if self.fail_programs && runs_code {
             return Err(ERROR::from_string(
                 "rskj can't build this transaction's program: a field of the \
                  block's header is past 32 bytes"
+                    .into(),
+            ));
+        }
+        if past_a_word && runs_code {
+            return Err(ERROR::from_string(
+                "rskj can't build this call's program: its value or its gas \
+                 price is past 32 bytes"
                     .into(),
             ));
         }

@@ -79,6 +79,11 @@ pub struct RpcState {
     pub tx_submitter: Option<Arc<dyn TxSubmitter>>,
     pub trie_store: Option<Arc<dyn TrieStore>>,
     pub hardfork_cfg: Option<RskHardforkConfig>,
+    /// The Bridge's constants where they aren't the chain's own: a chain from
+    /// an rskj genesis file runs on rskj's regtest ones, as the node's block
+    /// processor does (`BlockProcessor::with_bridge_constants`). A call, an
+    /// estimate and a trace run on the same.
+    pub bridge_constants: Option<rustock_execution::bridge::constants::BridgeConstants>,
     pub filter_store: Arc<logs::FilterStore>,
     pub tx_pool: Option<Arc<dyn TxPoolReader>>,
     /// Live depth of the inbound wire-message queue, for
@@ -138,6 +143,29 @@ pub struct RpcState {
     /// without an event source, and keeps the WebSocket transport testable
     /// without one.
     pub events: Option<crate::subscribe::EventSender>,
+}
+
+impl RpcState {
+    /// The executor a call or an estimate runs on, under `config`.
+    pub(crate) fn executor(&self, config: RskHardforkConfig) -> rustock_execution::RskExecutor {
+        let executor = rustock_execution::RskExecutor::new(config, self.store.clone());
+        match &self.bridge_constants {
+            Some(constants) => executor.with_bridge_constants(constants.clone()),
+            None => executor,
+        }
+    }
+
+    /// The processor a trace runs a block again on, under `config`.
+    pub(crate) fn block_processor(
+        &self,
+        config: RskHardforkConfig,
+    ) -> rustock_execution::BlockProcessor {
+        let processor = rustock_execution::BlockProcessor::new(config, self.store.clone());
+        match &self.bridge_constants {
+            Some(constants) => processor.with_bridge_constants(constants.clone()),
+            None => processor,
+        }
+    }
 }
 
 /// Starts the JSON-RPC HTTP server on the given host and port.

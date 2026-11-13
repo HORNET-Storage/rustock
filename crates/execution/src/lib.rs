@@ -31,7 +31,9 @@ impl<T: revm::context_interface::ContextTr<Chain = raw_storage::RskChainExt>> Rs
 pub use database::RskDatabase;
 pub use bridge::btc_block_cache::{BtcBlockCache, CacheStatsSnapshot};
 pub use raw_storage::{RawStorage, RskChainExt};
-pub use executor::{BlockExecutionResult, ExecutionError, RskExecutor, TxExecutionResult};
+pub use executor::{
+    BlockExecutionResult, ExecutionError, GasEstimate, LocalSender, RskExecutor, TxExecutionResult,
+};
 pub use hardfork::{RskHardforkConfig, RskNetworkUpgrade, RSK_MAINNET_CHAIN_ID};
 pub use precompiles::{
     rsk_precompiles, is_rsk_precompile,

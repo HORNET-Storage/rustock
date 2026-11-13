@@ -1346,8 +1346,8 @@ struct Args {
 
     /// Regtest: override an rskj consensus rule, as `name=height` (`-1`
     /// disables it), like rskj's `blockchain.config.consensusRules`.
-    /// Repeatable. Supported: rskip97, rskip144, rskip351, rskip535,
-    /// rskip536 and rskipUMM.
+    /// Repeatable. Supported: rskip97, rskip136, rskip144, rskip351,
+    /// rskip535, rskip536 and rskipUMM.
     #[arg(long, value_name = "NAME=HEIGHT")]
     consensus_rule: Vec<String>,
 
@@ -3629,6 +3629,12 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
             tx_submitter: Some(Arc::new(TxRelaySubmitter(tx_relay.clone()))),
             trie_store: Some(trie_store),
             hardfork_cfg: Some(hardfork_cfg),
+            // A chain from an rskj genesis file is rskj's regtest, Bridge
+            // federation included, for a call as for a block.
+            bridge_constants: config
+                .genesis_spec
+                .is_some()
+                .then(rustock_execution::bridge::constants::BridgeConstants::rskj_regtest),
             filter_store: Arc::new(rustock_rpc::logs::FilterStore::new()),
             tx_pool: Some(Arc::new(PoolAdapter(pool.clone()))),
 

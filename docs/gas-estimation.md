@@ -1,4 +1,4 @@
-# Single-pass gas estimation, and where it is looser than it needs to be
+# Single-pass gas estimation, and where its answer is not the smallest limit
 
 `eth_estimateGas` is asked for the smallest gas limit at which a transaction
 succeeds. The obvious way to answer is to binary search: execute at the cap,
@@ -16,18 +16,22 @@ if (reversibleExecutionResult.isCallWithValuePerformed()) {
 }
 ```
 
-Rustock now implements the same algorithm (`crates/execution/src/gas_estimator.rs`),
+Rustock implements the same algorithm (`crates/execution/src/gas_estimator.rs`),
 with the previous binary search retained behind
 `--gas-estimator-binary-search` so the two can be compared on the same node.
 
-Comparing them turned up **two** places where the single-pass answer differs
-from the binary search's. They are not the same kind of thing, and conflating
-them is easy, so this note separates them.
+Its answers are meant to be rskj's to the unit.
+`crates/rpc/src/testdata/rskj_local_calls.txt` holds what rskj's release
+(9.0.4) answers to a set of estimates, and the test
+`a_local_call_answers_as_rskj_answers_it` asks Rustock the same and compares.
+
+This note is about how the single-pass answer stands to the binary search's:
 
 - §1 is **not a defect.** The single pass answers a stricter question and its
   answer is exactly minimal for that question.
-- §2 **is** an over-estimate, by up to 50%, with no benefit that we can
-  identify. It is inherited from rskj and is a one-line fix on both sides.
+- §2 is the case with a refund. The two agree there, and rskj's formula
+  reads as if they wouldn't.
+- §3 is a program that creates a contract, which rskj estimates at its cap.
 
 ---
 
@@ -48,9 +52,9 @@ Measured on a regtest fixture (`setup_estimation_state` in
 
 | | |
 |---|---|
-| total consumed | ~30,700 |
-| single-pass estimate | **112,021** |
-| binary search | ~30,700 |
+| total consumed | 21,721 |
+| single-pass estimate | **121,721** |
+| binary search | 21,721 |
 
 ### Why the single pass is right
 
@@ -76,13 +80,19 @@ commitment. That is precisely `gasBeforeCall + 100000` — the smallest limit at
 which the callee still receives the full allowance it asked for. **It is not a
 conservative margin; it is the exact minimum for the stronger property.**
 
+`gasBeforeCall` counts from the transaction's intrinsic cost: rskj charges it
+to the program before the program runs (`TransactionExecutor.go`), so it is in
+`maxGasUsed`. Here that is 21,000, then 21 for what the caller pushes and 700
+for the CALL.
+
 This is the behaviour worth keeping, and `the_estimate_covers_the_allowance_a_call_asks_for`
 pins it, asserting both that the single pass covers the allowance and that
-binary search does not.
+binary search does not. `the_exactimator_never_undercuts_binary_search` pins
+the gap between the two at what the callee was handed and didn't use.
 
 ---
 
-## 2. The refund: a 50% over-estimate, on both clients
+## 2. The refund: what was spent before it, and no more
 
 ### What happens
 
@@ -96,104 +106,90 @@ CALL(gas = GAS, callee, 0, ...)       // hands over all remaining gas
 STOP
 ```
 
-Measured on a regtest fixture (`setup_refund_state`, same file). The telemetry
-from the single execution:
-
-```
-gas_used = 26726      (pre-refund)
-refunded = 13363      (= gas_used / 2, the cap binding)
-moved_all_to_child = true
-```
+Measured on a regtest fixture (`setup_refund_state`, same file):
 
 | | |
 |---|---|
-| single-pass estimate | **40,089**  (26,726 + 13,363) |
+| spent before the refund | 26,726 |
+| refund | 13,363  (half of that: the cap binds) |
+| single-pass estimate | **26,726** |
 | binary search | **26,726** |
 
-26,726 is not a guess: binary search reaches it by executing there and
-observing success. The single-pass answer is **50% higher than necessary**,
-which is the worst case, because the refund is capped at `gasUsed / 2`.
+### Why the sum is what was spent
 
-### Why this one is wrong
-
-The two branches of the formula treat the refund inconsistently:
-
-| branch | expression | refund included? |
-|---|---|---|
-| not moved | `maxGasUsed` | no |
-| moved | `gasUsed + deductedRefund` | **yes** |
-
-Both `maxGasUsed` and `gasUsed` are *pre-refund* figures. That is worth
-establishing carefully, because the field names invite the opposite reading:
-
-- `ProgramResult.refundGas(long)` **does** subtract from `gasUsed` — but it is
-  called only from `Program.refundGas`, which is unused gas coming back from a
-  **child call**. Not the end-of-transaction refund.
-- The end-of-transaction refund is applied in
-  `TransactionExecutor.refundGas()`:
-
-  ```java
-  long gasRefund = Math.min(result.getFutureRefund(), result.getGasUsed() / 2);
-  result.addDeductedRefund(gasRefund);
-  result.setGasUsedBeforeRefunds(result.getGasUsed());
-  gasLeftover = GasCost.add(gasLeftover, gasRefund);
-  ```
-
-  It credits `gasLeftover` and records the amount. **It never touches
-  `result.gasUsed`.**
-
-So `getGasUsed()` is consumption before any refund, and the refund is credited
-at the very end. A caller must be able to cover the consumption; it never has
-to cover the refund, because the refund is money coming back, not going out.
-
-Adding `deductedRefund` therefore inflates the estimate by an amount the
-transaction demonstrably does not need — as the measurement above shows, by
-executing successfully at the smaller figure.
-
-The asymmetry is the tell. If the refund genuinely had to be held, the
-`maxGasUsed` branch would need it too, and it does not have it.
-
-### What we considered and rejected
-
-- **"It compensates for the refund cap moving when the limit changes."** It
-  does not move. The cap is `min(futureRefund, gasUsed / 2)`, and `gasUsed` is
-  a property of the execution, not of the limit.
-- **"It is a safety margin for the behaviour change in this branch."** The
-  `movedRemainingGasToChild` branch has already given up on preserving
-  behaviour — that is why it abandons the peak. But a margin of "half the gas
-  used, but only when a refund happens to be present, and zero otherwise" is
-  not a margin anyone would design. It is proportional to the wrong thing.
-
-### The fix
-
-Drop the term:
+`gasUsed + deductedRefund` reads as consumption with the refund on top, which
+would be 40,089 here. It isn't, because of when it is read. A local call ends
+in `TransactionExecutor.localCallFinalization`:
 
 ```java
-long estimatedGas = reversibleExecutionResult.getMovedRemainingGasToChild() ?
-        reversibleExecutionResult.getGasUsed() :          // was: + getDeductedRefund()
-        reversibleExecutionResult.getMaxGasUsed();
+long gasRefund = refundGas();
+
+result.setGasUsed(getGasConsumed());
 ```
 
-In Rustock the equivalent is one line in `EstimateTelemetry::estimate`
-(`crates/execution/src/gas_estimator.rs`).
+`refundGas()` works out the refund, records it as `deductedRefund` and adds it
+to `gasLeftover`. `getGasConsumed()` is the gas limit less `gasLeftover`. So by
+the time `internalEstimateGas` runs, `getGasUsed()` is what the transaction is
+charged, the refund already off it, and adding `deductedRefund` gives back
+what was spent before the refund.
 
-### Status
+That is the figure a limit has to cover. The refund is credited at the very
+end, so it can't pay for anything before it, and it doesn't have to be held
+either.
 
-Rustock currently **reproduces rskj's behaviour**, including this
-over-estimate, and pins it with `the_refund_branch_overshoots_by_the_refund`
-so that it cannot change silently. The deliberate choice is to agree with rskj
-rather than to be quietly better than it; if the rskj side drops the term, the
-Rustock side and that test should be updated together.
+rskj's release answers accordingly. In `rskj_local_calls.txt`, the scenario
+`spend`, `sstores-calls-estimate` is the estimate of a contract that stores 1
+and then 0 in a cell and calls out with all its gas. Its run spends 46,731
+and earns a refund of 15,000, and rskj answers 46,731.
+
+### What Rustock did before
+
+Rustock took `gasUsed` for the figure before the refund, which is what revm's
+`spent` is, and added the refund to that: 40,089 for the fixture above, half
+as high again as the transaction needs, and not rskj's answer.
+`EstimateTelemetry::estimate` now answers what was spent, and
+`the_refund_is_not_added_to_what_was_spent` pins it.
+
+---
+
+## 3. A program that creates a contract: the cap
+
+rskj's `CREATE` and `CREATE2` spend all the gas their program has left, and
+hand back what the constructor doesn't use (`Program.createContract`). They
+don't set `movedRemainingGasToChild`: only the CALL family does
+(`VM.doCALL`). So for a program that creates, `maxGasUsed` is all it was
+given, and the estimate is the cap the estimate ran at — 6,800,000 by default,
+rskj's `rpc.gasEstimationCap`.
+
+The exception is a program of which a call also took all it had left. That
+sets the flag, and the estimate is what was spent, as in §2.
+
+rskj's release answers so, and so does Rustock: `creates-estimate`,
+`create-creates-estimate` and `creates-then-calls-all-estimate`, in the same
+scenario. Binary search finds the smallest limit instead, which is far below
+the cap.
+
+Two more things are counted as rskj counts them, and each has its answers in
+that scenario:
+
+- The 2,300 is added where a CALL or a CALLCODE names a value, in a program
+  whose result reaches the transaction's own. It is not added for a
+  DELEGATECALL of a program that was itself sent value, for a CREATE with an
+  endowment, or for a call inside a program that then fails or reverts.
+- A call that takes all its program has left switches the estimate to what
+  was spent wherever it happens: in the transaction's own program, or in one
+  that program calls, if that one ends without failing.
 
 ---
 
 ## Reproducing
 
-Both fixtures are regtest-only and live in `crates/rpc/src/tests.rs`:
+The fixtures are regtest-only and live in `crates/rpc/src/tests.rs`:
 
 ```
+cargo test -p rustock-rpc -- a_local_call_answers_as_rskj_answers_it
 cargo test -p rustock-rpc -- the_estimate_covers_the_allowance_a_call_asks_for
-cargo test -p rustock-rpc -- the_refund_branch_overshoots_by_the_refund
+cargo test -p rustock-rpc -- the_refund_is_not_added_to_what_was_spent
 cargo test -p rustock-rpc -- the_exactimator_never_undercuts_binary_search
 ```
 

@@ -354,7 +354,7 @@ fn replay(
     };
     let root = rustock_trie::TrieNode::from_message(&root_bytes, trie_store.as_ref());
     let block = rustock_core::Block { header, transactions, ommers };
-    let processor = rustock_execution::BlockProcessor::new(hardfork_cfg, state.store.clone());
+    let processor = state.block_processor(hardfork_cfg);
     let traces = processor
         .trace_block_calls(&block, &root, trie_store)
         .map_err(|e| format!("Replay failed: {e}"))?;

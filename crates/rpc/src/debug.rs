@@ -206,7 +206,7 @@ fn trace_block_transaction(
         transactions,
         ommers,
     };
-    let processor = rustock_execution::BlockProcessor::new(hardfork_cfg, state.store.clone());
+    let processor = state.block_processor(hardfork_cfg);
 
     match processor.trace_transaction(&block, &root, trie_store, index, MAX_STRUCT_LOGS) {
         Ok(Some(trace)) => Ok(Some(render_trace(&trace))),

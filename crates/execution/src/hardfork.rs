@@ -88,6 +88,7 @@ pub const TESTNET_ACTIVATIONS: &[(u64, RskNetworkUpgrade)] = &[
 /// by name are here; every other rule follows its upgrade.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConsensusRule {
+    Rskip136,
     Rskip144,
     Rskip351,
     Rskip535,
@@ -98,6 +99,7 @@ impl ConsensusRule {
     /// The rule rskj calls `name` in `consensusRules`.
     pub fn from_rskj_name(name: &str) -> Option<Self> {
         Some(match name {
+            "rskip136" => Self::Rskip136,
             "rskip144" => Self::Rskip144,
             "rskip351" => Self::Rskip351,
             "rskip535" => Self::Rskip535,
@@ -405,8 +407,8 @@ impl RskHardforkConfig {
     ///   rskj's upgrade for RSKIP559, which no network schedules and this
     ///   node doesn't implement. Accepted and reported as such. Any other
     ///   name is refused, as rskj's `NetworkUpgrade.named` refuses it.
-    /// - `rskip144`, `rskip351`, `rskip535`, `rskip536`: scheduled apart from
-    ///   their upgrade.
+    /// - `rskip136`, `rskip144`, `rskip351`, `rskip535`, `rskip536`: scheduled
+    ///   apart from their upgrade.
     /// - `rskipUMM`: accepted at any height. Only a header's layout reads it,
     ///   from the chain's activation heights, which the caller moves.
     ///
@@ -443,7 +445,7 @@ impl RskHardforkConfig {
             } else {
                 return Err(format!(
                     "consensus rule {name}: not one this node schedules on its own \
-                     (rskip144, rskip351, rskip535, rskip536, rskipUMM)"
+                     (rskip136, rskip144, rskip351, rskip535, rskip536, rskipUMM)"
                 ));
             }
         }
@@ -882,6 +884,9 @@ impl RskHardforkConfig {
     /// the tx gas limit against the precompile cost alone and recorded
     /// gasUsed = precompileCost + intrinsicCost, which can EXCEED the limit.
     pub fn has_rskip136(&self, block_number: u64) -> bool {
+        if let Some(height) = self.rule_override(ConsensusRule::Rskip136) {
+            return height.is_some_and(|h| block_number >= h);
+        }
         let height = match self.chain_id {
             RSK_MAINNET_CHAIN_ID => 3_397,
             _ => 0,

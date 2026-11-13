@@ -187,7 +187,7 @@ pub fn install<WIRE, HOST>(
     block: BlockWords,
 ) where
     WIRE: InterpreterTypes,
-    HOST: Host + ContractMarker + BeneficiaryTouch,
+    HOST: Host + ContractMarker + BeneficiaryTouch + LocalCallWords,
 {
     // RSKIP446 (lovell700): transient storage TLOAD/TSTORE (0x5c/0x5d,
     // EIP-1153, rskj `GasCost.TLOAD`/`TSTORE` = 100 each). RSKIP445 (lovell700):
@@ -288,9 +288,11 @@ pub fn install<WIRE, HOST>(
     // charge the bumped Istanbul prices. Pin both back to rskj's `GasCost.SLOAD`
     // (200) and `GasCost.BALANCE` (400). Pre-Istanbul specs already use these
     // values, so the override is a no-op there; at SHANGHAI (lovell700+) it also
-    // corrects the same EIP-1884 over-charge. The instruction bodies are revm's
-    // own pre-Berlin SLOAD/BALANCE (RSK never reaches Berlin), which charge
-    // everything via the static gas we set here. (Mainnet #6,223,700.)
+    // corrects the same EIP-1884 over-charge. SLOAD's body is revm's own, which
+    // before Berlin (RSK never reaches it) charges everything via the static
+    // gas we set here. BALANCE's is `rsk_balance`, which reads the account as
+    // revm's does, at the same static gas, and makes the word rskj makes of the
+    // balance. (Mainnet #6,223,700.)
     instructions.insert_instruction(
         opcode::SLOAD,
         Instruction::new(
@@ -300,10 +302,13 @@ pub fn install<WIRE, HOST>(
     );
     instructions.insert_instruction(
         opcode::BALANCE,
-        Instruction::new(
-            revm::interpreter::instructions::host::balance::<WIRE, HOST>,
-            BALANCE_GAS,
-        ),
+        Instruction::new(rsk_balance::<WIRE, HOST>, BALANCE_GAS),
+    );
+    // GASPRICE at rskj's BASE tier, 2, as revm's: `rsk_gasprice` pushes a
+    // local call's price whole.
+    instructions.insert_instruction(
+        opcode::GASPRICE,
+        Instruction::new(rsk_gasprice::<WIRE, HOST>, 2),
     );
 
     // rskj `VM.doSSTORE` keeps Petersburg metering forever (SET=20000,
@@ -659,6 +664,70 @@ where
     }
 }
 
+/// What BALANCE, SELFBALANCE and GASPRICE read of a local call (`eth_call`,
+/// `eth_estimateGas`) that revm's `Host` can't tell them: rskj holds a
+/// balance with its sign and a gas price at any width.
+pub trait LocalCallWords {
+    /// What `address` owes: the part of a local call's value that its sender
+    /// didn't hold (`RskChainExt::owed`), and nothing for any other account.
+    fn owed_by(&self, address: Address) -> U256;
+
+    /// The gas price of a local call, where revm's transaction can't hold it
+    /// (`RskChainExt::whole_gas_price`).
+    fn whole_gas_price(&self) -> Option<U256>;
+}
+
+impl<BLOCK, TX, CFG, LOCAL> LocalCallWords
+    for revm::Context<
+        BLOCK,
+        TX,
+        CFG,
+        RskDb,
+        revm::context::Journal<RskDb>,
+        crate::raw_storage::RskChainExt,
+        LOCAL,
+    >
+where
+    LOCAL: revm::context_interface::LocalContextTr,
+{
+    fn owed_by(&self, address: Address) -> U256 {
+        match self.chain.owed {
+            Some((sender, owed)) if sender == address => owed,
+            _ => U256::ZERO,
+        }
+    }
+
+    fn whole_gas_price(&self) -> Option<U256> {
+        self.chain.whole_gas_price
+    }
+}
+
+/// The word rskj's `Program.getBalance` makes of a balance: `DataWord.valueOf`
+/// of `Coin.getBytes()`, which is `BigInteger.toByteArray`, the two's
+/// complement in the fewest bytes, set at the low end of the word. So a
+/// balance below zero reads as those bytes do without their sign: 255 for -1,
+/// 0xff7f for -129. One of 2^255 or more takes a sign byte, a 33rd, and
+/// `valueOf` throws, as it does below -2^255: `None`, and the program fails.
+///
+/// `held` is what the journal holds for the account and `owed` what the
+/// account owes ([`LocalCallWords::owed_by`]); the balance is the one less the
+/// other. On the chain nothing is owed and no account holds 2^255, so the
+/// word is the balance.
+pub(crate) fn balance_word(held: U256, owed: U256) -> Option<U256> {
+    if held >= owed {
+        let balance = held - owed;
+        return (balance.bit_len() < 256).then_some(balance);
+    }
+    let below = owed - held;
+    // The fewest bytes whose two's complement holds `-below`.
+    let bytes = (below - U256::from(1)).bit_len() / 8 + 1;
+    match bytes {
+        33.. => None,
+        32 => Some(below.wrapping_neg()),
+        _ => Some((U256::from(1) << (8 * bytes)) - below),
+    }
+}
+
 /// CHAINID without revm's ISTANBUL spec check (RSKIP152 activates it at
 /// papyrus200 while the spec stays PETERSBURG).
 fn rsk_chainid<WIRE: InterpreterTypes, H: Host + ?Sized>(
@@ -862,15 +931,61 @@ fn rsk_txindex<WIRE: InterpreterTypes, H: Host + ?Sized>(context: InstructionCon
     }
 }
 
-/// SELFBALANCE without revm's ISTANBUL spec check (RSKIP151, papyrus200).
-fn rsk_selfbalance<WIRE: InterpreterTypes, H: Host + ?Sized>(
+/// SELFBALANCE without revm's ISTANBUL spec check (RSKIP151, papyrus200),
+/// pushing the word rskj makes of the balance ([`balance_word`]).
+fn rsk_selfbalance<WIRE: InterpreterTypes, H: Host + LocalCallWords + ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
 ) {
-    let Some(balance) = context.host.balance(context.interpreter.input.target_address()) else {
+    let address = context.interpreter.input.target_address();
+    let Some(balance) = context.host.balance(address) else {
         context.interpreter.halt_fatal();
         return;
     };
-    if !context.interpreter.stack.push(balance.data) {
+    let Some(word) = balance_word(balance.data, context.host.owed_by(address)) else {
+        context.interpreter.halt(InstructionResult::OutOfGas);
+        return;
+    };
+    if !context.interpreter.stack.push(word) {
+        context.interpreter.halt_overflow();
+    }
+}
+
+/// BALANCE, pushing the word rskj makes of the balance ([`balance_word`]).
+/// The account is read as revm's BALANCE reads one before Berlin, and the
+/// instruction's static gas is all it costs (see `install`).
+fn rsk_balance<WIRE: InterpreterTypes, H: Host + LocalCallWords + ?Sized>(
+    context: InstructionContext<'_, H, WIRE>,
+) {
+    let address = {
+        let Some(([], top)) = context.interpreter.stack.popn_top::<0>() else {
+            context.interpreter.halt_underflow();
+            return;
+        };
+        Address::from_word(B256::from(*top))
+    };
+    let Some(balance) = context.host.balance(address) else {
+        context.interpreter.halt_fatal();
+        return;
+    };
+    let Some(word) = balance_word(balance.data, context.host.owed_by(address)) else {
+        context.interpreter.halt(InstructionResult::OutOfGas);
+        return;
+    };
+    if let Some(([], top)) = context.interpreter.stack.popn_top::<0>() {
+        *top = word;
+    }
+}
+
+/// GASPRICE, pushing a local call's price whole where revm's transaction
+/// can't hold it ([`LocalCallWords`]).
+fn rsk_gasprice<WIRE: InterpreterTypes, H: Host + LocalCallWords + ?Sized>(
+    context: InstructionContext<'_, H, WIRE>,
+) {
+    let price = context
+        .host
+        .whole_gas_price()
+        .unwrap_or_else(|| context.host.effective_gas_price());
+    if !context.interpreter.stack.push(price) {
         context.interpreter.halt_overflow();
     }
 }
@@ -940,7 +1055,10 @@ thread_local! {
 
 /// All-ops tracer: log pc/opcode/gas (post-static-charge), then dispatch to
 /// the real implementation (custom rsk op or default PETERSBURG table).
-fn traced_all<WIRE: InterpreterTypes, HOST: Host + ContractMarker + BeneficiaryTouch>(
+fn traced_all<
+    WIRE: InterpreterTypes,
+    HOST: Host + ContractMarker + BeneficiaryTouch + LocalCallWords,
+>(
     context: InstructionContext<'_, HOST, WIRE>,
 ) {
     use revm::interpreter::interpreter_types::{InputsTr, Jumps, LegacyBytecode};
@@ -963,6 +1081,8 @@ fn traced_all<WIRE: InterpreterTypes, HOST: Host + ContractMarker + BeneficiaryT
     // NOTE: addr= field added for the per-opcode trace oracle (rskj diff).
     match op {
         opcode::EXTCODESIZE => rsk_extcodesize(context),
+        opcode::BALANCE => rsk_balance(context),
+        opcode::GASPRICE => rsk_gasprice(context),
         opcode::CALL => rsk_call(context),
         opcode::CALLCODE => rsk_call_code(context),
         opcode::DELEGATECALL => rsk_delegate_call(context),
@@ -1501,6 +1621,38 @@ mod tests {
             .expect("range");
         assert_eq!(r.start, usize::MAX);
         assert!(r.is_empty());
+    }
+
+    /// The word BALANCE pushes is the one rskj makes of the balance: the
+    /// balance itself, the bytes of one below zero without their sign
+    /// (`BigInteger.toByteArray`), and none for one that takes a 33rd byte.
+    /// rskj's release answered each of those below zero here, down to
+    /// -10^18, through `eth_call` (the rpc crate's
+    /// `testdata/rskj_local_calls.txt`).
+    #[test]
+    fn a_balance_reads_as_the_word_rskj_makes_of_it() {
+        let word = |held: u64, owed: u64| balance_word(U256::from(held), U256::from(owed));
+        assert_eq!(word(7, 0), Some(U256::from(7)));
+        assert_eq!(word(7, 7), Some(U256::ZERO));
+        assert_eq!(word(0, 1), Some(U256::from(0xff)));
+        assert_eq!(word(1, 3), Some(U256::from(0xfe)));
+        assert_eq!(word(0, 127), Some(U256::from(0x81)));
+        assert_eq!(word(0, 128), Some(U256::from(0x80)));
+        assert_eq!(word(0, 129), Some(U256::from(0xff7f)));
+        assert_eq!(
+            word(0, 1_000_000_000_000_000_000),
+            Some(U256::from(0xf21f_494c_589c_0000u64))
+        );
+
+        // 32 bytes hold -2^255 to 2^255 - 1.
+        let (one, top) = (U256::from(1), U256::from(1) << 255);
+        assert_eq!(balance_word(top - one, U256::ZERO), Some(top - one));
+        assert_eq!(balance_word(top, U256::ZERO), None);
+        assert_eq!(balance_word(U256::MAX, U256::ZERO), None);
+        assert_eq!(balance_word(U256::ZERO, top - one), Some(top + one));
+        assert_eq!(balance_word(U256::ZERO, top), Some(top));
+        assert_eq!(balance_word(U256::ZERO, top + one), None);
+        assert_eq!(balance_word(U256::ZERO, U256::MAX), None);
     }
 }
 

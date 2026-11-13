@@ -76,6 +76,18 @@ pub struct RskChainExt {
     /// Bridge when a contract calls it. `RskHandler` follows the programs,
     /// and the precompiles tell it of the calls that reach them.
     pub internal_txs: crate::internal_tx::InternalTxs,
+    /// What a local call's sender owes: the part of the value it sent that it
+    /// didn't hold. rskj's `Repository.transfer` takes a sender below zero
+    /// rather than fail (`TransactionExecutor.call`), which no balance here
+    /// can show, so `RskHandler` lifts the sender by this much before the
+    /// value moves, and BALANCE and SELFBALANCE take it off again as they
+    /// read the account (`rsk_instructions::LocalCallWords`). `None` in a
+    /// block's run.
+    pub owed: Option<(Address, U256)>,
+    /// A local call's gas price where revm's transaction can't hold it, at
+    /// 2^128 or more. rskj carries whatever price a call names, and GASPRICE
+    /// pushes it whole.
+    pub whole_gas_price: Option<U256>,
 }
 
 /// Raw-bytes storage overlay for the block being executed.

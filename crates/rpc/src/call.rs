@@ -3,9 +3,9 @@ use crate::params::{uncaught, Refusal};
 use crate::server::RpcState;
 
 use crate::types::*;
-use alloy_primitives::{Address, Bytes, U256};
+use alloy_primitives::{Bytes, U256};
 use rustock_core::Transaction;
-use rustock_execution::RskExecutor;
+use rustock_execution::{GasEstimate, RskExecutor};
 use serde_json::{json, Value};
 
 use crate::helpers::to_hex_bytes;
@@ -74,18 +74,15 @@ pub fn eth_call(id: Value, params: &Value, state: &RpcState) -> JsonRpcResponse 
         Err(none) => return crate::state::no_execution_state(&id, &block_param, none),
     };
 
-    let sender = call_req.from.unwrap_or(Address::ZERO);
-    let tx = build_call_tx(&call_req, &root, sender, state);
-    let executor = RskExecutor::new(hardfork_cfg, state.store.clone());
+    let tx = build_call_tx(&call_req, &root, state);
+    let executor = state.executor(hardfork_cfg);
 
-    match executor.execute_local_call(&header, &tx, sender, &root, trie_store) {
-        Ok(result) => {
-            if result.output.is_empty() {
-                JsonRpcResponse::success(id, json!("0x"))
-            } else {
-                JsonRpcResponse::success(id, json!(to_hex_bytes(&result.output)))
-            }
-        }
+    // A program that ends with REVERT is an error of its own; one that fails
+    // any other way answers with no data, as a call that runs nothing does
+    // (`EthModule.call`).
+    match executor.execute_local_call(&header, &tx, call_req.from, &root, trie_store) {
+        Ok(result) if result.reverted => crate::revert::answer(id, &result.output),
+        Ok(result) => JsonRpcResponse::success(id, json!(to_hex_bytes(&result.output))),
         Err(e) => JsonRpcResponse::error(id, INTERNAL_ERROR, format!("Execution failed: {e}")),
     }
 }
@@ -119,31 +116,28 @@ pub fn eth_estimate_gas(id: Value, params: &Value, state: &RpcState) -> JsonRpcR
         Err(refusal) => return refuse(id, refusal),
     };
 
-    let sender = call_req.from.unwrap_or(Address::ZERO);
-    let executor = RskExecutor::new(hardfork_cfg, state.store.clone());
+    let executor = state.executor(hardfork_cfg);
 
     // rskj runs every estimate at its cap; the call's own gas isn't read.
     let gas_cap = GAS_ESTIMATION_CAP;
 
-    let mut tx = build_call_tx(&call_req, &root, sender, state);
+    let mut tx = build_call_tx(&call_req, &root, state);
     tx.gas_limit = U256::from(gas_cap);
 
     if state.gas_estimator_binary_search {
         return estimate_by_binary_search(
-            id, &call_req, &header, &root, sender, state, &executor, trie_store, gas_cap,
+            id, &call_req, &header, &root, state, &executor, trie_store, gas_cap,
         );
     }
 
     // One execution, at the cap, with the estimation inspector attached. See
     // `rustock_execution::gas_estimator` for why the three things it records
     // are enough to answer without searching.
-    match executor.estimate_gas_exact(&header, &tx, sender, &root, trie_store, gas_cap) {
-        Ok((estimate, true, _)) => {
+    match executor.estimate_gas_exact(&header, &tx, call_req.from, &root, trie_store, gas_cap) {
+        Ok(GasEstimate::Gas(estimate)) => {
             JsonRpcResponse::success(id, json!(crate::helpers::to_hex_u64(estimate)))
         }
-        Ok((_, false, _)) => {
-            JsonRpcResponse::error(id, INTERNAL_ERROR, "Transaction would revert")
-        }
+        Ok(GasEstimate::Reverted(output)) => crate::revert::answer(id, &output),
         Err(e) => JsonRpcResponse::error(id, INTERNAL_ERROR, format!("Execution failed: {e}")),
     }
 }
@@ -161,7 +155,6 @@ fn estimate_by_binary_search(
     call_req: &CallRequest,
     header: &rustock_core::types::header::Header,
     root: &rustock_trie::TrieNode,
-    sender: Address,
     state: &RpcState,
     executor: &RskExecutor,
     trie_store: std::sync::Arc<dyn rustock_trie::TrieStore>,
@@ -180,13 +173,18 @@ fn estimate_by_binary_search(
     let mut lo = 0u64;
     let mut hi = gas_cap;
 
-    // First check if the transaction even succeeds at the gas cap
-    let mut tx = build_call_tx(call_req, root, sender, state);
+    // First check if the transaction even succeeds at the gas cap. One that
+    // reverts is answered as a revert, and one that fails any other way has
+    // no smaller limit to find: it is estimated at what it used, as rskj
+    // estimates it (`RskExecutor::estimate_gas_exact`).
+    let mut tx = build_call_tx(call_req, root, state);
     tx.gas_limit = U256::from(hi);
-    match executor.execute_local_call(header, &tx, sender, root, trie_store.clone()) {
+    match executor.execute_local_call(header, &tx, call_req.from, root, trie_store.clone()) {
+        Ok(result) if result.reverted => return crate::revert::answer(id, &result.output),
         Ok(result) if result.success => {}
-        Ok(_) => {
-            return JsonRpcResponse::error(id, INTERNAL_ERROR, "Transaction would revert");
+        Ok(result) => {
+            let used = result.gas_used.min(gas_cap);
+            return JsonRpcResponse::success(id, json!(crate::helpers::to_hex_u64(used)));
         }
         Err(e) => {
             return JsonRpcResponse::error(id, INTERNAL_ERROR, format!("Execution failed: {e}"));
@@ -195,10 +193,16 @@ fn estimate_by_binary_search(
 
     while lo + 1 < hi {
         let mid = lo + (hi - lo) / 2;
-        let mut probe_tx = build_call_tx(call_req, root, sender, state);
+        let mut probe_tx = build_call_tx(call_req, root, state);
         probe_tx.gas_limit = U256::from(mid);
 
-        match executor.execute_local_call(header, &probe_tx, sender, root, trie_store.clone()) {
+        match executor.execute_local_call(
+            header,
+            &probe_tx,
+            call_req.from,
+            root,
+            trie_store.clone(),
+        ) {
             Ok(result) if result.success => hi = mid,
             _ => lo = mid,
         }
@@ -212,19 +216,20 @@ fn estimate_by_binary_search(
 /// 0 (`getGasPrice`), [`CALL_GAS_CAP`]'s gas (`gasLimitForCall`; an estimate
 /// sets its own), no value. The nonce is the sender's, as
 /// `ReversibleTransactionExecutor` builds it; a local call doesn't check it.
+/// A call that names no sender is from rskj's null address
+/// (`getFromAddress`), which no transaction is ever from: its nonce is 0.
 fn build_call_tx(
     req: &CallRequest,
     root: &rustock_trie::TrieNode,
-    sender: Address,
     state: &RpcState,
 ) -> Transaction {
-    let sender_nonce = crate::state::trie_get_account(
-        root,
-        &rustock_trie::account_key(&sender),
-        state,
-    )
-    .map(|a| a.nonce.to::<u64>())
-    .unwrap_or(0);
+    let sender_nonce = req
+        .from
+        .and_then(|sender| {
+            crate::state::trie_get_account(root, &rustock_trie::account_key(&sender), state)
+        })
+        .map(|a| a.nonce.to::<u64>())
+        .unwrap_or(0);
     Transaction {
         nonce: sender_nonce,
         gas_price: req.gas_price.unwrap_or(U256::ZERO),

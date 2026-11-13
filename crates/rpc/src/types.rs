@@ -9,6 +9,10 @@ pub const INTERNAL_ERROR: i64 = -32603;
 /// rskj's own, `RskJsonRpcRequestException.transactionError`: a transaction
 /// its pool refuses.
 pub const TRANSACTION_ERROR: i64 = -32010;
+/// rskj's own, `RskJsonRpcRequestException.executionError`: a call or an
+/// estimate whose program ended with REVERT. Its `data` is what the program
+/// reverted with.
+pub const EXECUTION_ERROR: i64 = -32015;
 
 #[derive(Debug, Deserialize)]
 pub struct JsonRpcRequest {
@@ -33,6 +37,11 @@ pub struct JsonRpcResponse {
 pub struct JsonRpcError {
     pub code: i64,
     pub message: String,
+    /// What rskj's `RskJsonRpcRequestException` carries as `revertData`: only
+    /// a revert has it, and every other error is written without the field.
+    /// Boxed, to keep a response the size it was for those.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<Box<serde_json::Value>>,
 }
 
 impl JsonRpcResponse {
@@ -62,8 +71,23 @@ impl JsonRpcResponse {
             error: Some(JsonRpcError {
                 code,
                 message: message.into(),
+                data: None,
             }),
             id,
         }
+    }
+
+    /// An error that carries `data`, as rskj's answer to a revert does.
+    pub fn error_with_data(
+        id: serde_json::Value,
+        code: i64,
+        message: impl Into<String>,
+        data: serde_json::Value,
+    ) -> Self {
+        let mut response = Self::error(id, code, message);
+        if let Some(error) = &mut response.error {
+            error.data = Some(Box::new(data));
+        }
+        response
     }
 }

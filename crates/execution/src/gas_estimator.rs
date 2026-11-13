@@ -38,9 +38,10 @@
 //! When a callee is handed every last unit of the caller's remaining gas, the
 //! peak stops saying anything: it is just the cap we happened to run at.
 //! rskj detects that case (`calleeGas == remainingGas`) and switches to
-//! `gasUsed + deductedRefund`, which is the honest total — what was spent,
-//! plus the refunds that are credited at the end but must be *supplied* up
-//! front.
+//! `gasUsed + deductedRefund`. By then `gasUsed` is what the transaction is
+//! charged, the refund already off it
+//! (`TransactionExecutor.localCallFinalization`), so the sum is what was spent
+//! before the refund: the gas that had to be there.
 //!
 //! Note this is RSK-specific and the reason the rule is this simple here: RSK
 //! never adopted EIP-150's 63/64 retention, so a caller really can hand over
@@ -54,6 +55,28 @@
 //! A CALL that transfers value grants the callee a 2,300-gas stipend it did
 //! not have to pay for. The caller still has to be able to cover it, so the
 //! estimate carries it.
+//!
+//! ## What rskj counts
+//!
+//! The estimate is rskj's to the unit, so what it counts is counted here as
+//! it counts it, each point as its release answers `eth_estimateGas` (the rpc
+//! crate's `testdata/rskj_local_calls.txt`):
+//!
+//! - The peak is that of the transaction's own program, and it starts at the
+//!   intrinsic cost, which rskj charges the program before it runs
+//!   (`TransactionExecutor.go`).
+//! - A CREATE spends all the gas its program has left, and what the
+//!   constructor doesn't use comes back (`Program.createContract`). So the
+//!   peak of a program that creates is all it was given, and the estimate is
+//!   the cap, unless a call of that program took all it had left.
+//! - The two flags belong to a program (`ProgramResult`). A CALL, CALLCODE,
+//!   DELEGATECALL or STATICCALL sets them in the program that runs it
+//!   (`VM.doCALL`), whether or not the call is then made. They pass to the
+//!   program that called it only where it ends without an exception or a
+//!   REVERT (`ProgramResult.merge`), and never from a constructor to the
+//!   program that ran its CREATE, which sets neither.
+//! - A call carries value where its CALL or CALLCODE names one. A
+//!   DELEGATECALL names none, whatever value its program was called with.
 
 use alloy_primitives::Address;
 use revm::context::ContextTr;
@@ -69,17 +92,16 @@ pub const STIPEND_CALL: u64 = 2_300;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct EstimateTelemetry {
     /// Gas consumed before the end-of-transaction refund -- revm's
-    /// `ResultGas::spent`, which is the same quantity rskj's `getGasUsed()`
-    /// holds. Not `used()`, which is after the refund and would under-report.
+    /// `ResultGas::spent`. rskj's `getGasUsed() + getDeductedRefund()` is the
+    /// same quantity: its `getGasUsed()` is less the refund by the time an
+    /// estimate reads it. Not `used()`, which is after the refund and would
+    /// under-report.
     pub gas_used: u64,
-    /// Refunds credited at the end. They reduce what is *charged* and not
-    /// what has to be *available*, so an estimate has to add them back.
-    pub refunded: u64,
-    /// rskj's `maxGasUsed`: the high-water mark of the root frame's
-    /// commitment, counting a callee's whole allowance from the moment it is
-    /// handed over.
-    pub max_committed: u64,
-    /// Some call was given every unit the caller had left, so `max_committed`
+    /// rskj's `maxGasUsed`: the high-water mark of the transaction's own
+    /// program, from the intrinsic cost up, counting a callee's whole
+    /// allowance from the moment it is handed over. 0 where no program ran.
+    pub max_gas_used: u64,
+    /// Some call was given every unit its caller had left, so `max_gas_used`
     /// is an artefact of the cap we ran at rather than a property of the
     /// transaction.
     pub moved_all_to_child: bool,
@@ -97,30 +119,22 @@ impl EstimateTelemetry {
     /// actually supply is not an estimate, it is a refusal in disguise.
     pub fn estimate(&self, cap: u64) -> u64 {
         let mut estimate: u64 = if self.moved_all_to_child {
-            // rskj's branch, and note what `gas_used` is here: the *pre-refund*
-            // figure. rskj's `getGasUsed()` is never reduced by the end-of-
-            // transaction refund -- `TransactionExecutor.refundGas` credits
-            // `gasLeftover` instead -- so this sum is consumption plus the
-            // refund on top, and is deliberately the looser of the two
-            // answers. It is only reached when the peak has stopped meaning
-            // anything.
-            self.gas_used.saturating_add(self.refunded)
+            // rskj's `getGasUsed() + getDeductedRefund()`: what was spent
+            // before the refund. It is only reached when the peak has
+            // stopped meaning anything.
+            self.gas_used
         } else {
-            // The peak, alone. The refund is credited back at the end, so the
-            // caller never has to hold it; the peak is the whole requirement.
-            self.max_committed
+            // The peak. It is never below what was spent, but for two cases
+            // the inspector doesn't see, where what was spent is the whole
+            // answer: a transfer to an account with no code never enters the
+            // interpreter, so there is no peak to report; and the cost of
+            // the code a creation leaves is charged after its last step.
+            //
+            // The floor has to be applied *here*, before the stipend:
+            // flooring afterwards would discard the stipend whenever the
+            // peak came out below the spend.
+            self.max_gas_used.max(self.gas_used)
         };
-        // Whatever the branch, the estimate can never be below what the
-        // transaction actually spent. A transfer to an account with no code
-        // never enters the interpreter, so there is no peak to report and
-        // this floor is the entire answer.
-        //
-        // It has to be applied *here*, before the stipend: flooring
-        // afterwards would discard the stipend whenever the peak came out
-        // below the spend, and the estimate would then be too small to
-        // execute -- which is the one way an estimator can be useless rather
-        // than merely imprecise.
-        estimate = estimate.max(self.gas_used);
         if self.call_with_value {
             estimate = estimate.saturating_add(STIPEND_CALL);
         }
@@ -128,34 +142,44 @@ impl EstimateTelemetry {
     }
 }
 
-/// Records the three signals `EstimateTelemetry` needs, and nothing else.
-///
-/// Scoped to the root frame deliberately. rskj keeps a counter per frame and
-/// takes the maximum across them when a child's result is merged into its
-/// parent's, but a child's peak is bounded by the allowance its parent
-/// committed, and that commitment is already in the parent's own peak. The
-/// root's peak therefore dominates every descendant's, and tracking one frame
-/// avoids carrying a stack of counters that can only ever agree with it.
-/// Frame depth of the transaction's own call. revm announces the root frame
-/// through the `call` hook exactly as it announces a nested one, so the root
-/// is depth 1 and a child of the root is depth 2.
-const ROOT_DEPTH: usize = 1;
+/// What rskj's `ProgramResult` holds of one program for the estimate, beside
+/// its gas.
+#[derive(Debug, Clone, Copy, Default)]
+struct ProgramFlags {
+    /// One of its calls was given every unit it had left.
+    moved_all_to_child: bool,
+    /// One of its calls named a value.
+    call_with_value: bool,
+}
 
+/// Records what `EstimateTelemetry` needs, and nothing else.
+///
+/// The peak is the transaction's own program's alone. rskj keeps a counter
+/// per program and takes the maximum across them when a callee's result is
+/// merged into its caller's, but a callee's peak is bounded by the allowance
+/// its caller committed, and that commitment is already in the caller's own
+/// peak. The flags are kept for every open program, as rskj keeps them, and
+/// passed to the caller as rskj passes them (see the module's last section).
+///
+/// revm announces the transaction's own call through the `call` or `create`
+/// hook exactly as it announces a nested one, so the first program opened is
+/// the transaction's own.
 #[derive(Debug, Default)]
 pub struct EstimationInspector {
-    /// Frames entered so far: 0 before the root is announced, 1 while the
-    /// root runs, 2+ inside a child.
-    depth: usize,
-    /// The root frame's gas limit, learned from the first step.
+    /// The programs that are open, the transaction's own first. That one
+    /// stays when it ends: its flags are the answer.
+    open: Vec<ProgramFlags>,
+    /// The gas limit of the transaction's own program: the transaction's,
+    /// less its intrinsic cost. Learned from its first step.
     root_limit: u64,
-    /// The root frame's remaining gas as of its last completed step.
-    root_remaining: u64,
-    /// Whether the root frame has been stepped at all. A transaction that is
-    /// a plain value transfer never enters the interpreter.
+    /// The gas left to the program that ran the last completed step.
+    remaining: u64,
+    /// Whether the transaction's own program has been stepped at all. A
+    /// transaction that is a plain value transfer never enters the
+    /// interpreter.
     stepped: bool,
+    /// The most the transaction's own program had spent of `root_limit`.
     max_committed: u64,
-    moved_all_to_child: bool,
-    call_with_value: bool,
 }
 
 impl EstimationInspector {
@@ -164,54 +188,45 @@ impl EstimationInspector {
     }
 
     /// Fold the inspector's observations together with the figures only the
-    /// finished execution knows.
-    pub fn into_telemetry(self, gas_used: u64, refunded: u64) -> EstimateTelemetry {
+    /// finished execution knows: the transaction's gas limit, and what it
+    /// spent of it before the refund.
+    pub fn into_telemetry(self, gas_limit: u64, gas_used: u64) -> EstimateTelemetry {
+        let own = self.open.first().copied().unwrap_or_default();
         EstimateTelemetry {
             gas_used,
-            refunded,
             // A transaction that never ran bytecode has no peak to report;
             // its cost is entirely intrinsic, which `gas_used` already holds.
-            max_committed: if self.stepped { self.max_committed } else { 0 },
-            moved_all_to_child: self.moved_all_to_child,
-            call_with_value: self.call_with_value,
+            // One that did was charged the intrinsic cost first: what the
+            // transaction's limit has over its program's.
+            max_gas_used: if self.stepped {
+                gas_limit
+                    .saturating_sub(self.root_limit)
+                    .saturating_add(self.max_committed)
+            } else {
+                0
+            },
+            moved_all_to_child: own.moved_all_to_child,
+            call_with_value: own.call_with_value,
         }
     }
 
-    /// Shared by the call and create hooks: a frame is being entered.
-    fn enter_frame(&mut self, value_is_nonzero: bool) {
-        // Only a CALL *opcode* counts, which is what rskj's `VM.doCALL`
-        // flags. The transaction's own value is already paid for by the
-        // intrinsic cost and grants no stipend, so the root frame's entry
-        // must not set this.
-        if value_is_nonzero && self.depth >= ROOT_DEPTH {
-            self.call_with_value = true;
-        }
-        if self.depth == ROOT_DEPTH && self.stepped && self.root_remaining == 0 {
-            // The opcode has already charged its own cost and the callee's
-            // allowance, and left the root with nothing. That is rskj's
-            // `calleeGas == remainingGas`.
-            self.moved_all_to_child = true;
-        }
-        self.depth += 1;
+    /// A program is being opened: the transaction's own, a callee's or a
+    /// constructor's.
+    fn open_program(&mut self) {
+        self.open.push(ProgramFlags::default());
     }
 
-    fn leave_frame(&mut self) {
-        self.depth = self.depth.saturating_sub(1);
-    }
-
-    fn observe_root(&mut self, limit: u64, remaining: u64) {
-        if self.depth != ROOT_DEPTH {
+    /// The program on top has ended. A callee's flags pass to its caller
+    /// where `merges`; the transaction's own program stays.
+    fn close_program(&mut self, merges: bool) {
+        if self.open.len() < 2 {
             return;
         }
-        self.stepped = true;
-        if self.root_limit == 0 {
-            self.root_limit = limit;
+        let ended = self.open.pop().unwrap_or_default();
+        if let (true, Some(caller)) = (merges, self.open.last_mut()) {
+            caller.moved_all_to_child |= ended.moved_all_to_child;
+            caller.call_with_value |= ended.call_with_value;
         }
-        let committed = self.root_limit.saturating_sub(remaining);
-        if committed > self.max_committed {
-            self.max_committed = committed;
-        }
-        self.root_remaining = remaining;
     }
 }
 
@@ -221,9 +236,9 @@ where
     INTR: InterpreterTypes,
 {
     fn step(&mut self, interp: &mut Interpreter<INTR>, _context: &mut CTX) {
-        // Before the opcode runs, so the limit is known even for a frame
+        // Before the opcode runs, so the limit is known even for a program
         // whose first instruction reverts.
-        if self.depth == ROOT_DEPTH && self.root_limit == 0 {
+        if self.open.len() == 1 && !self.stepped {
             self.root_limit = interp.gas.limit();
             self.stepped = true;
         }
@@ -233,20 +248,34 @@ where
         // After the opcode, which is the point that matters: a CALL has by
         // now charged both its own cost and the whole allowance it is about
         // to hand over, so this is where the commitment peaks.
-        self.observe_root(interp.gas.limit(), interp.gas.remaining());
+        self.remaining = interp.gas.remaining();
+        if self.open.len() == 1 {
+            let committed = self.root_limit.saturating_sub(self.remaining);
+            self.max_committed = self.max_committed.max(committed);
+        }
     }
 
     fn call(&mut self, _context: &mut CTX, inputs: &mut CallInputs) -> Option<CallOutcome> {
-        self.enter_frame(!inputs.value.get().is_zero());
+        // With a program open this is a CALL-family opcode it just ran,
+        // which has charged its own cost and the callee's allowance: one that
+        // left its program with nothing is rskj's `calleeGas == remainingGas`.
+        // The transaction's own call sets nothing: its value is paid for by
+        // the transaction and grants no stipend.
+        let remaining = self.remaining;
+        if let Some(caller) = self.open.last_mut() {
+            caller.moved_all_to_child |= remaining == 0;
+            caller.call_with_value |= inputs.transfers_value();
+        }
+        self.open_program();
         None
     }
 
-    fn call_end(&mut self, _context: &mut CTX, _inputs: &CallInputs, _outcome: &mut CallOutcome) {
-        self.leave_frame();
+    fn call_end(&mut self, _context: &mut CTX, _inputs: &CallInputs, outcome: &mut CallOutcome) {
+        self.close_program(outcome.result.result.is_ok());
     }
 
-    fn create(&mut self, _context: &mut CTX, inputs: &mut CreateInputs) -> Option<CreateOutcome> {
-        self.enter_frame(!inputs.value().is_zero());
+    fn create(&mut self, _context: &mut CTX, _inputs: &mut CreateInputs) -> Option<CreateOutcome> {
+        self.open_program();
         None
     }
 
@@ -256,7 +285,7 @@ where
         _inputs: &CreateInputs,
         _outcome: &mut CreateOutcome,
     ) {
-        self.leave_frame();
+        self.close_program(false);
     }
 }
 
@@ -283,24 +312,11 @@ mod tests {
     fn the_floor_does_not_swallow_the_stipend() {
         let t = EstimateTelemetry {
             gas_used: 30_721,
-            max_committed: 28_000, // below the spend
+            max_gas_used: 28_000, // below the spend
             call_with_value: true,
             ..Default::default()
         };
         assert_eq!(t.estimate(10_000_000), 30_721 + STIPEND_CALL);
-    }
-
-    /// With no call in the picture the peak is the whole story, and the
-    /// refund is credited back rather than held -- so it is not added.
-    #[test]
-    fn a_refund_alone_does_not_raise_the_estimate() {
-        let t = EstimateTelemetry {
-            gas_used: 30_000,
-            refunded: 4_800,
-            max_committed: 30_000,
-            ..Default::default()
-        };
-        assert_eq!(t.estimate(10_000_000), 30_000);
     }
 
     /// The case binary search exists for: a callee handed far more than it
@@ -309,31 +325,31 @@ mod tests {
     fn the_peak_wins_over_the_total() {
         let t = EstimateTelemetry {
             gas_used: 26_000,      // what was actually consumed
-            max_committed: 121_000, // what had to be available at the CALL
+            max_gas_used: 121_000, // what had to be available at the CALL
             ..Default::default()
         };
         assert_eq!(t.estimate(10_000_000), 121_000);
     }
 
     /// When everything was handed over, the peak is just the cap we ran at
-    /// and says nothing; the total is the honest answer.
+    /// and says nothing; the total is the honest answer. It is what was spent
+    /// before the refund, and the refund is not added to it again.
     #[test]
     fn handing_over_everything_falls_back_to_the_total() {
         let t = EstimateTelemetry {
             gas_used: 26_000,
-            refunded: 1_000,
-            max_committed: 9_999_999, // an artefact of the cap
+            max_gas_used: 9_999_999, // an artefact of the cap
             moved_all_to_child: true,
             ..Default::default()
         };
-        assert_eq!(t.estimate(10_000_000), 27_000);
+        assert_eq!(t.estimate(10_000_000), 26_000);
     }
 
     #[test]
     fn a_value_bearing_call_carries_the_stipend() {
         let t = EstimateTelemetry {
             gas_used: 30_000,
-            max_committed: 30_000,
+            max_gas_used: 30_000,
             call_with_value: true,
             ..Default::default()
         };
@@ -344,7 +360,42 @@ mod tests {
     /// supply is not an estimate.
     #[test]
     fn the_estimate_is_clamped_to_the_cap() {
-        let t = EstimateTelemetry { gas_used: 50_000, max_committed: 90_000, ..Default::default() };
+        let t = EstimateTelemetry {
+            gas_used: 50_000,
+            max_gas_used: 90_000,
+            ..Default::default()
+        };
         assert_eq!(t.estimate(60_000), 60_000);
+    }
+
+    /// The flags are a program's own, and pass to its caller as rskj's
+    /// `ProgramResult.merge` passes them: from a callee that ended well, and
+    /// from no constructor. The transaction's own program stays when it ends.
+    #[test]
+    fn a_programs_flags_pass_to_its_caller_as_rskjs_do() {
+        let flagged = ProgramFlags {
+            moved_all_to_child: true,
+            call_with_value: true,
+        };
+        let run = |merges: bool| {
+            let mut inspector = EstimationInspector::new();
+            inspector.open_program();
+            inspector.open_program();
+            inspector.open[1] = flagged;
+            inspector.close_program(merges);
+            inspector.close_program(true);
+            assert_eq!(
+                inspector.open.len(),
+                1,
+                "the transaction's own program stays"
+            );
+            inspector.into_telemetry(100_000, 30_000)
+        };
+        let merged = run(true);
+        assert!(merged.moved_all_to_child && merged.call_with_value);
+        let dropped = run(false);
+        assert!(!dropped.moved_all_to_child && !dropped.call_with_value);
+        // Nothing was stepped, so there is no peak.
+        assert_eq!((merged.gas_used, merged.max_gas_used), (30_000, 0));
     }
 }
