@@ -4820,6 +4820,10 @@ async fn trace_transaction_renders_the_call_tree() {
     // The receipt's gas, not the frame's: rskj builds the top-level result
     // from `txInfo.getReceipt().getGasUsed()`.
     assert_eq!(top["result"]["gasUsed"], "0x9c40");
+    // And nothing else from the call: that result is a fresh, empty
+    // `ProgramResult` (`TraceTransformer.addTrace`), so a transaction's own
+    // trace has no output, whatever its call returned.
+    assert_eq!(top["result"]["output"], "0x");
     // A JSON number, because rskj's `blockNumber` is a Java `long`.
     assert_eq!(top["blockNumber"], json!(42));
     assert!(top["blockNumber"].is_number(), "blockNumber must not be a hex string");
@@ -4835,6 +4839,49 @@ async fn trace_transaction_renders_the_call_tree() {
         inner["result"]["output"].as_str().unwrap(),
         "0x000000000000000000000000000000000000000000000000000000000000002a"
     );
+}
+
+/// rskj builds a transaction's own trace from its receipt and a fresh, empty
+/// `ProgramResult` (`TraceTransformer.addTrace`): the gas the receipt names
+/// and no output, whatever the call returned. A creation's result is the
+/// code it left, which rskj takes from the trace (`trace.getResult()`).
+#[test]
+fn a_transactions_own_trace_carries_no_output() {
+    let call = rustock_core::Transaction {
+        nonce: 0,
+        gas_price: U256::ZERO,
+        gas_limit: U256::from(100_000),
+        to: Bytes::copy_from_slice(&[0xCC; 20]),
+        value: U256::ZERO,
+        input: Bytes::new(),
+        v: 0,
+        r: U256::ZERO,
+        s: U256::ZERO,
+        cached_rlp: None,
+    };
+    let creation = rustock_core::Transaction {
+        to: Bytes::new(),
+        ..call.clone()
+    };
+    let block = rustock_core::Block {
+        header: test_header(42),
+        transactions: vec![call, creation],
+        ommers: vec![],
+    };
+    // What the call returned, and what the creation left.
+    let trace = rustock_execution::tracer::ProgramTrace {
+        result: "2a".into(),
+        ..Default::default()
+    };
+    let mut out = Vec::new();
+    for index in 0..2 {
+        crate::trace::render_transaction(&mut out, &block, B256::ZERO, index, 21_000, &trace, 30);
+    }
+    assert_eq!(
+        out[0]["result"],
+        json!({"gasUsed": "0x5208", "output": "0x"})
+    );
+    assert_eq!(out[1]["result"]["code"], "0x2a");
 }
 
 /// `trace_block` accepts a hash or a block id, and returns the same traces.

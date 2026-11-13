@@ -367,7 +367,7 @@ fn replay(
 
 /// Flatten one transaction's trace into rskj's depth-first `TransactionTrace`
 /// list: the transaction's own frame first, then each subtree in order.
-fn render_transaction(
+pub(crate) fn render_transaction(
     out: &mut Vec<Value>,
     block: &rustock_core::Block,
     block_hash: B256,
@@ -382,7 +382,8 @@ fn render_transaction(
 
     // rskj's top-level trace is built from the receipt, not from a frame: a
     // synthetic `ProgramResult` carrying only `receipt.getGasUsed()` and the
-    // revert flag.
+    // revert flag (`TraceTransformer.addTrace`). So a call's own trace never
+    // shows what the call returned; only its subtraces show their output.
     let error = if trace.reverted {
         Some("Reverted".to_string())
     } else if trace.error.is_empty() {
@@ -420,9 +421,10 @@ fn render_transaction(
             &created,
         )
     } else {
+        // The synthetic result's `getHReturn()` is the empty array.
         json!({
             "gasUsed": quantity(receipt_gas_used),
-            "output": Value::String(format!("0x{}", trace.result)),
+            "output": "0x",
         })
     };
 

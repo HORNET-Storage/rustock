@@ -195,6 +195,13 @@ the intrinsic 21,000 — while every subtrace reports its own frame's spend.
 `action.gas` is the frame's gas (limit less intrinsic), which is why the
 tracer records `root_gas` separately.
 
+Its `result.output` is always `0x`, for the same reason: `addTrace` starts
+from `ProgramResult.empty()` and adds only the gas and the revert flag, so
+what the transaction's call returned is nowhere in its own trace. A caller
+that wants the return data has to replay the call. A creation's `code` is the
+exception, because `addTrace` reads it from the trace (`trace.getResult()`)
+and not from that result.
+
 **…except when no `Program` was built, where `action.gas` is `0x0`.**
 `TransactionExecutor.extractTrace` has two branches:
 
