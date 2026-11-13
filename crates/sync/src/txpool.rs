@@ -590,10 +590,17 @@ impl TransactionPool {
                 if existing.hash == hash {
                     return Err(PoolError::AlreadyKnown);
                 }
-                let bump_threshold = existing.tx.gas_price
-                    * U256::from(100 + self.config.gas_price_bump)
-                    / U256::from(100);
-                if tx.gas_price < bump_threshold {
+                // rskj `isBumpingGasPriceForSameNonceTx`: a higher price, and
+                // no less than the old one raised by the bump, which rskj
+                // reckons in whole numbers (`Coin.multiply`). Where the bump
+                // rounds to nothing, the same price again doesn't replace.
+                let old_price = existing.tx.gas_price;
+                let bumped = alloy_primitives::U512::from(old_price)
+                    * alloy_primitives::U512::from(100 + self.config.gas_price_bump)
+                    / alloy_primitives::U512::from(100);
+                let pays_more = old_price < tx.gas_price
+                    && bumped <= alloy_primitives::U512::from(tx.gas_price);
+                if !pays_more {
                     return Err(PoolError::ReplacementGasPriceTooLow);
                 }
                 old_hash_to_remove = Some(existing.hash);
@@ -606,22 +613,30 @@ impl TransactionPool {
             // rskj `getTxBaseCost`: the value, plus the gas only when the
             // transaction costs anything -- a free Bridge transaction carries
             // its value and nothing else.
-            let base_cost = |t: &Transaction| -> U256 {
+            let base_cost = |t: &Transaction| -> Option<U256> {
                 let free = self
                     .chain_rules
                     .as_ref()
                     .is_some_and(|r| r.is_free_tx(t, &sender, current_block));
-                if free { t.value } else { tx_cost(t) }
+                if free {
+                    Some(t.value)
+                } else {
+                    tx_cost(t)
+                }
             };
             let mut total_cost = base_cost(&tx);
             if let Some(pending_map) = inner.pending.get(&sender) {
                 for (nonce, ptx) in pending_map {
                     if *nonce != tx.nonce {
-                        total_cost += base_cost(&ptx.tx);
+                        total_cost = total_cost
+                            .zip(base_cost(&ptx.tx))
+                            .and_then(|(total, cost)| total.checked_add(cost));
                     }
                 }
             }
-            if total_cost > balance {
+            // rskj adds these up in whole numbers (`Coin`): a sum past 256
+            // bits is more than any balance.
+            if total_cost.is_none_or(|total| total > balance) {
                 return Err(PoolError::InsufficientFundsForPendingAndNew);
             }
         }
@@ -743,10 +758,12 @@ impl TransactionPool {
         }
 
         // 5. Balance >= gas cost (`TxValidatorAccountBalanceValidator`),
-        //    which a free transaction skips.
+        //    which a free transaction skips. rskj multiplies in whole
+        //    numbers (`Coin.multiply`), so a cost past 256 bits is more
+        //    than any balance.
         if !is_free {
-            let gas_cost = tx.gas_price * tx.gas_limit;
-            if balance < gas_cost {
+            let gas_cost = tx.gas_price.checked_mul(tx.gas_limit);
+            if gas_cost.is_none_or(|gas_cost| balance < gas_cost) {
                 return Err(PoolError::InsufficientFunds);
             }
         }
@@ -1086,9 +1103,13 @@ fn tx_facts(tx: &Transaction, encoded_size: usize) -> crate::quota::TxFacts {
     }
 }
 
-/// Compute the cost of a transaction: value + gas_price * gas_limit.
-fn tx_cost(tx: &Transaction) -> U256 {
-    tx.value + tx.gas_price * tx.gas_limit
+/// Compute the cost of a transaction: value + gas_price * gas_limit. `None`
+/// where that is past 256 bits, and so more than any balance: rskj reckons it
+/// in whole numbers (`TransactionPoolImpl.getTxBaseCost`).
+fn tx_cost(tx: &Transaction) -> Option<U256> {
+    tx.gas_price
+        .checked_mul(tx.gas_limit)?
+        .checked_add(tx.value)
 }
 
 /// Compute the intrinsic gas cost of a transaction (matching rskj).
@@ -1180,6 +1201,17 @@ mod tests {
         config: PoolConfig,
         rules: Option<ChainRules>,
     ) -> (TransactionPool, SigningKey, Address) {
+        setup_pool_on(test_header(), balance, nonce, config, rules)
+    }
+
+    /// [`setup_pool_with_rules`] on a head of the test's own choosing.
+    fn setup_pool_on(
+        mut header: Header,
+        balance: U256,
+        nonce: u64,
+        config: PoolConfig,
+        rules: Option<ChainRules>,
+    ) -> (TransactionPool, SigningKey, Address) {
         let dir = tempdir().unwrap();
         let store = Arc::new(BlockStore::open(dir.path()).unwrap());
         let trie_store: Arc<dyn TrieStore> = Arc::new(MemoryTrieStore::new());
@@ -1198,7 +1230,6 @@ mod tests {
         let root_data = root.to_message(&*trie_store);
         rustock_trie::TrieStore::put(&*trie_store, state_root.as_slice(), &root_data);
 
-        let mut header = test_header();
         header.state_root = state_root;
         store.update_head(&header, U256::from(100_000)).unwrap();
 
@@ -1959,6 +1990,82 @@ mod tests {
         sign_tx(&mut tx2, &key, 33);
         let err = pool.add_transaction(&encode_tx(&tx2)).unwrap_err();
         assert!(matches!(err, PoolError::InsufficientFundsForPendingAndNew));
+    }
+
+    /// rskj reckons what a transaction costs in whole numbers (`Coin`, a
+    /// `BigInteger`), so a cost past 256 bits is more than any balance. In
+    /// 256 bits it wraps: 2^240 a gas for 65,536 gas comes to nothing, and so
+    /// do two transactions of 2^255 each.
+    #[test]
+    fn a_cost_past_256_bits_is_more_than_any_balance() {
+        let (pool, key, _addr) = setup_pool_with_account(U256::from(1), 0);
+        let mut tx = make_tx(0, 0);
+        tx.gas_price = U256::from(1) << 240;
+        tx.gas_limit = U256::from(65_536);
+        tx.value = U256::ZERO;
+        sign_tx(&mut tx, &key, 33);
+        let err = pool.add_transaction(&encode_tx(&tx)).unwrap_err();
+        assert!(matches!(err, PoolError::InsufficientFunds), "{err}");
+
+        let half = U256::from(1) << 255;
+        let gas = U256::from(59_240_000u64 * 21_000);
+        let (pool, key, _addr) = setup_pool_with_account(half, 0);
+        let costing_half = |nonce: u64| {
+            let mut tx = make_tx(nonce, 59_240_000);
+            tx.value = half - gas;
+            sign_tx(&mut tx, &key, 33);
+            pool.add_transaction(&encode_tx(&tx))
+        };
+        costing_half(0).expect("the account holds what the first costs");
+        let err = costing_half(1).unwrap_err();
+        assert!(
+            matches!(err, PoolError::InsufficientFundsForPendingAndNew),
+            "{err}"
+        );
+    }
+
+    /// rskj replaces a pending transaction only with one that pays more
+    /// (`isBumpingGasPriceForSameNonceTx`: `oldGasPrice < newGasPrice`, and
+    /// no less than the old price raised by the bump). Where the bump rounds
+    /// to nothing -- a price of 0, 1 or 2 -- the same price again is not
+    /// enough.
+    #[test]
+    fn a_replacement_has_to_pay_more() {
+        let mut header = test_header();
+        header.minimum_gas_price = U256::ZERO;
+        let (pool, key, _addr) =
+            setup_pool_on(header, U256::from(10u64.pow(18)), 0, test_config(), None);
+        let mut value = 1_000;
+        let mut offer = |gas_price: u64| {
+            // A new value each time: another transaction, of another hash.
+            value += 1;
+            let mut tx = make_tx(0, gas_price);
+            tx.value = U256::from(value);
+            sign_tx(&mut tx, &key, 33);
+            pool.add_transaction(&encode_tx(&tx))
+        };
+        offer(0).expect("the first");
+        for (gas_price, replaces) in [
+            (0, false),
+            (1, true),
+            (1, false),
+            (2, true),
+            (2, false),
+            (3, true),
+            // 3 raised by 40% is 4.
+            (3, false),
+            (4, true),
+        ] {
+            let added = offer(gas_price);
+            if replaces {
+                added.unwrap_or_else(|err| panic!("{gas_price} replaces: {err}"));
+            } else {
+                assert!(
+                    matches!(added, Err(PoolError::ReplacementGasPriceTooLow)),
+                    "{gas_price} does not replace: {added:?}"
+                );
+            }
+        }
     }
 
     // ========== rskj: removeObsoletePendingTransactionsByBlock ==========
