@@ -14622,6 +14622,9 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
         results: Vec<(bool, u64, Vec<revm::primitives::Log>)>,
         /// The Bridge's storage after the transactions.
         cells: std::collections::BTreeMap<U256, Vec<u8>>,
+        /// Those of its cells that hold more than 4,096 bytes, each by the
+        /// hash and the length of what it holds.
+        long_cells: std::collections::BTreeMap<U256, (B256, usize)>,
         root: B256,
     }
 
@@ -14692,6 +14695,15 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
                 "cell" => {
                     run.cells
                         .insert(U256::from_be_slice(&bytes(fields[1])), bytes(fields[2]));
+                }
+                "cellhash" => {
+                    run.long_cells.insert(
+                        U256::from_be_slice(&bytes(fields[1])),
+                        (
+                            B256::from_slice(&bytes(fields[2])),
+                            fields[3].parse().unwrap(),
+                        ),
+                    );
                 }
                 "root" => run.root = B256::from_slice(&bytes(fields[1])),
                 "itx" | "end" | "enc" => {}
@@ -14765,15 +14777,27 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
                 _ => cells.remove(&key),
             };
         }
-        let keys: std::collections::BTreeSet<&U256> =
-            cells.keys().chain(run.cells.keys()).collect();
+        let keys: std::collections::BTreeSet<&U256> = cells
+            .keys()
+            .chain(run.cells.keys())
+            .chain(run.long_cells.keys())
+            .collect();
         for key in keys {
-            assert_eq!(
-                cells.get(key).map(hex::encode),
-                run.cells.get(key).map(hex::encode),
-                "{}: the Bridge's cell {key:#066x}",
-                run.name
-            );
+            let what = format!("{}: the Bridge's cell {key:#066x}", run.name);
+            match run.long_cells.get(key) {
+                // A long cell, which the file holds by its hash and its length.
+                Some(rskjs) => {
+                    let ours = cells
+                        .get(key)
+                        .map(|value| (alloy_primitives::keccak256(value), value.len()));
+                    assert_eq!(ours.as_ref(), Some(rskjs), "{what}");
+                }
+                None => assert_eq!(
+                    cells.get(key).map(hex::encode),
+                    run.cells.get(key).map(hex::encode),
+                    "{what}"
+                ),
+            }
         }
         let after = crate::state::apply_state_changes(
             &root,
@@ -14819,10 +14843,19 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
         let names: Vec<&str> = runs.iter().map(|run| run.name.as_str()).collect();
         assert_eq!(
             names,
-            ["direct", "relay", "nested", "delegate", "low-fee", "flyover"]
+            [
+                "direct",
+                "relay",
+                "nested",
+                "delegate",
+                "low-fee",
+                "flyover",
+                "many-outputs"
+            ]
         );
         replays_as_rskj_ran_it(&runs[0]);
         replays_as_rskj_ran_it(&runs[4]);
         replays_as_rskj_ran_it(&runs[5]);
+        replays_as_rskj_ran_it(&runs[6]);
     }
 }

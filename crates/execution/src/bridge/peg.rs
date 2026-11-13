@@ -2656,8 +2656,8 @@ fn emit_flyover_rejection_release<CTX: crate::RskContextTr>(
 /// `feePerKb * size / 1000`, no less than the reference minimum, where `size`
 /// is the empty-scriptSig serialized length plus, per input, `threshold *
 /// SIG_SIZE + redeemScript.len()`, segwit-weighted for a P2SH-P2WSH federation
-/// (`is_segwit`), whose inputs carry their witnesses. The final
-/// placeholder-filled tx must not exceed MAX_STANDARD_TX_SIZE.
+/// (`is_segwit`), whose inputs carry their witnesses. The size limit is
+/// `release_tx::fill_inputs`'s.
 fn build_flyover_empty_wallet_multi(
     utxos: &[BridgeUtxo],
     input_redeems: &[&[u8]],
@@ -2669,11 +2669,9 @@ fn build_flyover_empty_wallet_multi(
     use bitcoin::{
         absolute::LockTime, transaction::Version, Amount, OutPoint, Sequence, TxIn, TxOut, Witness,
     };
-    // bitcoinj constants (see release_tx.rs): SIG_SIZE=75, min fee 5000 sat/kB,
-    // MAX_STANDARD_TX_SIZE=100k.
+    // bitcoinj constants (see release_tx.rs): SIG_SIZE=75, min fee 5000 sat/kB.
     const SIG_SIZE: usize = 75;
     const REFERENCE_DEFAULT_MIN_TX_FEE: u64 = 5000;
-    const MAX_STANDARD_TX_SIZE: usize = 100_000;
 
     if utxos.is_empty() {
         return None;
@@ -2741,18 +2739,7 @@ fn build_flyover_empty_wallet_multi(
     }
     tx.output[0].value = Amount::from_sat(value);
 
-    for (input, (redeem, threshold)) in tx.input.iter_mut().zip(input_redeems.iter().zip(&thresholds)) {
-        if is_segwit {
-            let (script_sig, witness) = super::release_tx::segwit_base_input(redeem, *threshold);
-            input.script_sig = script_sig;
-            input.witness = witness;
-        } else {
-            input.script_sig = bitcoin::ScriptBuf::from_bytes(
-                super::release_tx::placeholder_scriptsig(redeem, *threshold),
-            );
-        }
-    }
-    if bitcoin::consensus::serialize(&tx).len() > MAX_STANDARD_TX_SIZE {
+    if !super::release_tx::fill_inputs(&mut tx, input_redeems.iter().copied(), is_segwit) {
         return None;
     }
     Some(super::release_tx::BuiltPegout { tx, used_utxos: utxos.to_vec() })

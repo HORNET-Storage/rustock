@@ -20,8 +20,10 @@
 //! - scriptSigs: `MissingSigsMode.USE_OP_ZERO` placeholders,
 //!   `OP_0 <OP_0 x threshold> <redeemScript>` per input.
 //! - Size: fee sizing uses the empty-scriptSig serialization plus
-//!   `threshold * SIG_SIZE(75) + redeemScript.len()` per input; the final
-//!   placeholder-filled tx must not exceed `MAX_STANDARD_TX_SIZE` (100k).
+//!   `threshold * SIG_SIZE(75) + redeemScript.len()` per input; the tx must
+//!   not exceed `MAX_STANDARD_TX_SIZE` (100k) where `completeTx` checks it,
+//!   which is with its placeholders for a legacy federation and with its
+//!   inputs still empty for a P2SH-P2WSH one (`fill_inputs`).
 
 use bitcoin::absolute::LockTime;
 use bitcoin::transaction::Version;
@@ -123,6 +125,37 @@ pub fn segwit_base_input(redeem: &[u8], threshold: usize) -> (ScriptBuf, Witness
     witness.push([] as [u8; 0]); // OP_NOTIF default-branch flag
     witness.push(redeem);
     (ScriptBuf::from_bytes(script_sig), witness)
+}
+
+/// Fills each input in as rskj leaves it, from that input's redeem script, and
+/// answers whether the transaction is within bitcoinj's size where
+/// `Wallet.completeTx` checks it. A legacy federation's inputs are signed by
+/// then, with their placeholders (`MissingSigsMode.USE_OP_ZERO`), so those
+/// count. A P2SH-P2WSH federation's are still empty, as `setSrConfiguration`
+/// turns `signInputs` off for it, and rskj fills them in once `completeTx` has
+/// returned (`ReleaseTransactionBuilder.signSegwitTxInputs`) and checks
+/// nothing again: such a transaction may well come out over the size.
+pub(super) fn fill_inputs<'r>(
+    tx: &mut BtcTransaction,
+    redeems: impl IntoIterator<Item = &'r [u8]>,
+    is_segwit: bool,
+) -> bool {
+    let within =
+        |tx: &BtcTransaction| bitcoin::consensus::serialize(tx).len() <= MAX_STANDARD_TX_SIZE;
+    if is_segwit && !within(tx) {
+        return false;
+    }
+    for (input, redeem) in tx.input.iter_mut().zip(redeems) {
+        let threshold = redeem_script_threshold(redeem);
+        if is_segwit {
+            let (script_sig, witness) = segwit_base_input(redeem, threshold);
+            input.script_sig = script_sig;
+            input.witness = witness;
+        } else {
+            input.script_sig = ScriptBuf::from_bytes(placeholder_scriptsig(redeem, threshold));
+        }
+    }
+    is_segwit || within(tx)
 }
 
 /// Append a minimal data push to a script (bitcoinj `ScriptBuilder.data`).
@@ -319,17 +352,11 @@ where
             // the witness-program scriptSig + base witness; a legacy input the
             // USE_OP_ZERO placeholder scriptSig (per-input redeem, so a flyover
             // input embeds the flyover redeem).
-            for (input, (_, redeem)) in tx.input.iter_mut().zip(&selected) {
-                let threshold = redeem_script_threshold(redeem);
-                if is_segwit {
-                    let (script_sig, witness) = segwit_base_input(redeem, threshold);
-                    input.script_sig = script_sig;
-                    input.witness = witness;
-                } else {
-                    input.script_sig = ScriptBuf::from_bytes(placeholder_scriptsig(redeem, threshold));
-                }
-            }
-            if bitcoin::consensus::serialize(&tx).len() > MAX_STANDARD_TX_SIZE {
+            if !fill_inputs(
+                &mut tx,
+                selected.iter().map(|(_, redeem)| *redeem),
+                is_segwit,
+            ) {
                 return None;
             }
             let used_utxos = selected.into_iter().map(|(u, _)| u.clone()).collect();
@@ -450,18 +477,11 @@ where
         let fee_needed = fee_rate * size as u64 / 1000;
 
         if fee >= fee_needed {
-            for (input, (_, redeem)) in tx.input.iter_mut().zip(&selected) {
-                let threshold = redeem_script_threshold(redeem);
-                if is_segwit {
-                    let (script_sig, witness) = segwit_base_input(redeem, threshold);
-                    input.script_sig = script_sig;
-                    input.witness = witness;
-                } else {
-                    input.script_sig =
-                        ScriptBuf::from_bytes(placeholder_scriptsig(redeem, threshold));
-                }
-            }
-            if bitcoin::consensus::serialize(&tx).len() > MAX_STANDARD_TX_SIZE {
+            if !fill_inputs(
+                &mut tx,
+                selected.iter().map(|(_, redeem)| *redeem),
+                is_segwit,
+            ) {
                 return None;
             }
             let used_utxos = selected.into_iter().map(|(u, _)| u.clone()).collect();
@@ -546,17 +566,7 @@ pub fn build_empty_wallet_to(
     }
     tx.output[0].value = Amount::from_sat(value);
 
-    for input in &mut tx.input {
-        if is_segwit {
-            let (script_sig, witness) = segwit_base_input(redeem_script, threshold);
-            input.script_sig = script_sig;
-            input.witness = witness;
-        } else {
-            input.script_sig =
-                ScriptBuf::from_bytes(placeholder_scriptsig(redeem_script, threshold));
-        }
-    }
-    if bitcoin::consensus::serialize(&tx).len() > MAX_STANDARD_TX_SIZE {
+    if !fill_inputs(&mut tx, std::iter::repeat(redeem_script), is_segwit) {
         return None;
     }
     Some(BuiltPegout { tx, used_utxos: utxos.to_vec() })
@@ -1441,6 +1451,62 @@ mod tests {
             false,
         )
         .is_none());
+    }
+
+    /// bitcoinj checks a release's size where `Wallet.completeTx` ends. A legacy
+    /// federation's inputs hold their placeholders by then, and count. A
+    /// P2SH-P2WSH federation's are still empty, and rskj fills them in
+    /// afterwards without checking again. So 700 inputs make no release for the
+    /// one, which they take over 100,000 bytes, and for the other a release
+    /// that is well over them once it is filled in:
+    /// `testdata/rskj_refunded_pegins.txt` holds one that rskj's release built.
+    #[test]
+    fn a_release_is_sized_where_bitcoinj_sizes_it() {
+        let utxos: Vec<BridgeUtxo> = (0..800).map(|vout| utxo(1, vout, 1_000_000)).collect();
+        let redeem = erp_redeem(2, 3);
+        let filled = |built: &BuiltPegout| bitcoin::consensus::serialize(&built.tx).len();
+        let to = |script: ScriptBuf| {
+            [PegoutOutput {
+                script,
+                amount_satoshis: 700_000_000,
+            }]
+        };
+
+        // A pegout, whose recipients pay the fee.
+        let pegout = |segwit| {
+            let redeem_for = |_: &BridgeUtxo| redeem.as_slice();
+            complete_pegout_tx(&utxos, &to(p2pkh(7)), &p2sh(8), redeem_for, 5000, 2, segwit)
+        };
+        assert!(pegout(false).is_none());
+        let built = pegout(true).expect("a segwit pegout");
+        assert_eq!(built.tx.input.len(), 700);
+        assert!(filled(&built) > MAX_STANDARD_TX_SIZE);
+
+        // A release whose change pays the fee.
+        let fund = |segwit| {
+            let redeem_for = |_: &BridgeUtxo| redeem.as_slice();
+            complete_recipients_dont_pay_fees_tx(
+                &utxos,
+                &to(p2sh(7)),
+                &p2sh(8),
+                redeem_for,
+                5000,
+                2,
+                segwit,
+            )
+        };
+        assert!(fund(false).is_none());
+        let built = fund(true).expect("a segwit release");
+        assert_eq!(built.tx.input.len(), 701);
+        assert!(filled(&built) > MAX_STANDARD_TX_SIZE);
+
+        // A refund, which empties what it is given.
+        let refund =
+            |segwit| build_empty_wallet_to(&utxos[..700], &p2pkh(7), &redeem, 5000, 2, segwit);
+        assert!(refund(false).is_none());
+        let built = refund(true).expect("a segwit refund");
+        assert_eq!(built.tx.input.len(), 700);
+        assert!(filled(&built) > MAX_STANDARD_TX_SIZE);
     }
 
     #[test]
