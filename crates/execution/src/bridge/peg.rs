@@ -102,12 +102,14 @@ fn pegin_below_minimum(live_output_values: &[u64], min: u64, rskip293: bool) -> 
 enum Invalid {
     /// `return false`.
     Swallowed(&'static str),
-    /// A throw: `VerificationException`, `BlockStoreException`, or the
-    /// `NullPointerException` of a block the store does not have.
+    /// A throw of anything else: the `VerificationException` of a transaction
+    /// without inputs, a `BlockStoreException`, or the `NullPointerException`
+    /// of a block the store does not have.
     Thrown(&'static str),
-    /// A throw of `BridgeIllegalArgumentException`: as `Thrown` from RSKIP88,
-    /// but before it `Bridge.execute` answers it with null, a success with no
-    /// output.
+    /// A throw of `BridgeIllegalArgumentException`, which is also what a
+    /// partial merkle tree's `VerificationException` is rethrown as: as
+    /// `Thrown` from RSKIP88, but before it `Bridge.execute` answers it with
+    /// null, a success with no output.
     IllegalArgument(&'static str),
 }
 
@@ -146,13 +148,16 @@ fn validations_for_register_btc_transaction<CTX: crate::RskContextTr>(
             "PartialMerkleTree doesn't have expected size",
         ));
     }
-    // `BridgeUtils.calculateMerkleRoot` builds the tree and walks it, and
-    // rethrows a VerificationException from either. A transaction that is not
-    // among its matches gets null back, which is false.
-    let pmt = PartialMerkleTree::parse(pmt_data).ok_or(Invalid::Thrown("failed to parse PMT"))?;
+    // `BridgeUtils.calculateMerkleRoot` builds the tree and walks it, and a
+    // VerificationException from either, bitcoinj's ProtocolException being
+    // one, is rethrown as a `BridgeIllegalArgumentException` (BridgeSupport
+    // l.3389-3396). A transaction that is not among its matches gets null
+    // back, which is false.
+    let pmt = PartialMerkleTree::parse(pmt_data)
+        .ok_or(Invalid::IllegalArgument("failed to parse PMT"))?;
     let pmt_result = pmt
         .extract_matches()
-        .ok_or(Invalid::Thrown("PMT verification failed"))?;
+        .ok_or(Invalid::IllegalArgument("PMT verification failed"))?;
     if !pmt_result.matched_hashes.contains(btc_tx_hash) {
         return Err(Invalid::Swallowed("tx not in PMT"));
     }
@@ -9039,6 +9044,15 @@ mod tests {
         // Then the tree: the wrong size throws BridgeIllegalArgumentException,
         // and a tree without the transaction is false.
         assert_eq!(run(0, &garbage, &ONE_INPUT).0, "illegal argument");
+        // So does a tree of the right size that bitcoinj will not walk, here
+        // one of a block with no transactions: rskj rethrows bitcoinj's
+        // VerificationException as one.
+        let mut no_transactions = one_leaf_tree(&ONE_INPUT);
+        no_transactions[..4].copy_from_slice(&0u32.to_le_bytes());
+        assert_eq!(
+            run(0, &no_transactions, &ONE_INPUT),
+            ("illegal argument", "PMT verification failed")
+        );
         assert_eq!(
             run(0, &one_leaf_tree(&NO_INPUTS), &ONE_INPUT),
             ("false", "tx not in PMT")
@@ -9566,43 +9580,49 @@ mod tests {
 
     /// rskj's `validationsForRegisterBtcTransaction` throws
     /// `BridgeIllegalArgumentException` for a partial merkle tree of the wrong
-    /// size, which `Bridge.execute` answers with null before RSKIP88: the call
-    /// succeeds with no output, charged its gas, and registers nothing. From
-    /// RSKIP88 it throws.
+    /// size, and for one bitcoinj will not walk, whose `VerificationException`
+    /// it rethrows as one. `Bridge.execute` answers that with null before
+    /// RSKIP88: the call succeeds with no output, charged its gas, and
+    /// registers nothing. From RSKIP88 it throws.
     #[test]
-    fn before_rskip88_a_tree_of_the_wrong_size_is_a_success_with_no_output() {
+    fn before_rskip88_a_tree_rskj_refuses_is_a_success_with_no_output() {
         use revm::MainContext;
         let (config, cfg) = (BridgeConstants::mainnet(), RskHardforkConfig::mainnet());
         assert!(!cfg.has_rskip88(728_999) && cfg.has_rskip88(729_000));
         let (_, checkpoint, _) = config.btc_checkpoint.unwrap();
         let tx = tx_with(vec![], vec![]);
         let raw = btc_serialize(&tx);
-        // Confirmed well past the minimum, so the tree's size is the check
-        // that answers.
-        let args = encode::args(&[
-            Arg::Bytes(&raw),
-            Arg::Word(encode::int(i64::from(checkpoint) - 200)),
-            Arg::Bytes(&[0u8; 3]),
-        ]);
-        let at = |number: u64| {
-            let mut ctx =
-                revm::Context::mainnet().with_chain(crate::raw_storage::RskChainExt::default());
-            ctx.block.number = U256::from(number);
-            let out = register_btc_transaction(
-                &mut ctx,
-                &args,
-                7_000,
-                &config,
-                &cfg,
-                &BridgeTxContext::default(),
-            );
-            (out, is_btc_tx_processed(&mut ctx, &legacy_btc_txid(&tx)))
-        };
-        let (out, processed) = at(728_999);
-        let out = out.expect("a success before RSKIP88");
-        assert!(out.bytes.is_empty() && !processed);
-        assert_eq!(out.gas_used, 7_000);
-        assert!(at(729_000).0.is_err(), "a throw from RSKIP88");
+        // Of the right size, and of a block with no transactions.
+        let mut no_transactions = one_leaf_tree(&raw);
+        no_transactions[..4].copy_from_slice(&0u32.to_le_bytes());
+        for tree in [&[0u8; 3][..], &no_transactions] {
+            // Confirmed well past the minimum, so the tree is the check that
+            // answers.
+            let args = encode::args(&[
+                Arg::Bytes(&raw),
+                Arg::Word(encode::int(i64::from(checkpoint) - 200)),
+                Arg::Bytes(tree),
+            ]);
+            let at = |number: u64| {
+                let mut ctx =
+                    revm::Context::mainnet().with_chain(crate::raw_storage::RskChainExt::default());
+                ctx.block.number = U256::from(number);
+                let out = register_btc_transaction(
+                    &mut ctx,
+                    &args,
+                    7_000,
+                    &config,
+                    &cfg,
+                    &BridgeTxContext::default(),
+                );
+                (out, is_btc_tx_processed(&mut ctx, &legacy_btc_txid(&tx)))
+            };
+            let (out, processed) = at(728_999);
+            let out = out.expect("a success before RSKIP88");
+            assert!(out.bytes.is_empty() && !processed);
+            assert_eq!(out.gas_used, 7_000);
+            assert!(at(729_000).0.is_err(), "a throw from RSKIP88");
+        }
     }
 
     /// `registerBtcTransaction` of `tx` at Bitcoin `height` in `ctx`, with RSKj's
