@@ -867,14 +867,17 @@ impl RskPrecompileProvider {
         };
 
         // rskj Program.callToPrecompiledAddress: the zero-value transfer
-        // CREATES the precompile account node on first call (isExist becomes
-        // true, so NEW_ACCT_CALL is charged at most once per address ever).
-        // Touching the loaded account persists it under the pinned
-        // pre-spurious journal semantics.
+        // CREATES the account of the call's context address on first call
+        // (isExist becomes true, so NEW_ACCT_CALL is charged at most once per
+        // address ever). That is the precompile for CALL and STATICCALL, and
+        // the caller itself for CALLCODE and DELEGATECALL
+        // (`msg.getType().isStateless()`), which leave the precompile without
+        // an account. Touching the loaded account persists it under the
+        // pinned pre-spurious journal semantics.
         {
             use revm::context_interface::JournalTr;
-            let _ = context.journal_mut().load_account(*addr);
-            context.journal_mut().touch_account(*addr);
+            let _ = context.journal_mut().load_account(inputs.target_address);
+            context.journal_mut().touch_account(inputs.target_address);
         }
 
         let exec_result = if *addr == BRIDGE_ADDR {
@@ -1042,8 +1045,8 @@ impl RskPrecompileProvider {
     /// here is a user tx or an internal CALL. rskj (Remasc.processMinersFees)
     /// throws RemascInvalidInvocationException for those, EXCEPT
     /// getStateForDebugging(), which has no caller guard and answers with the
-    /// contract's state. (Its `save()` also writes the `siblings` cell, which
-    /// every block's REMASC transaction has written since block 1.)
+    /// contract's state, and then saves as every REMASC method that returns
+    /// does (`RemascContract.execute`).
     fn run_remasc<CTX: crate::RskContextTr>(
         &self,
         context: &mut CTX,
@@ -1053,6 +1056,22 @@ impl RskPrecompileProvider {
         // `RemascContract.getFunction` takes a selector of exactly four bytes.
         if input == crate::remasc::GET_STATE_FOR_DEBUGGING {
             let state = crate::remasc::state_for_debugging(context);
+            // `RemascStorageProvider.save`: the method set no balance and no
+            // flag, so the siblings cell is all it writes, as it always does
+            // (`saveSiblings`). It writes through `addStorageBytes`, which
+            // creates REMASC's account where there is none: the one thing
+            // of this a later call can tell, since every block's REMASC
+            // transaction has written the same cell since block 1.
+            {
+                use revm::context_interface::JournalTr;
+                let _ = context.journal_mut().load_account(REMASC_ADDR);
+                context.journal_mut().touch_account(REMASC_ADDR);
+            }
+            context.chain_mut().raw_storage.put(
+                REMASC_ADDR,
+                crate::remasc::remasc_storage_key("siblings"),
+                Some(vec![alloy_rlp::EMPTY_LIST_CODE]),
+            );
             return Ok(PrecompileOutput::new(0, state.into()));
         }
         // Everything else throws in rskj: invisible for a direct tx
@@ -1219,12 +1238,13 @@ impl<CTX: crate::RskContextTr> PrecompileProvider<CTX> for RskPrecompileProvider
             return Ok(None);
         };
 
-        // rskj creates the precompile account node on first call (see the
-        // stateful path above).
+        // rskj creates the account of the call's context address on first
+        // call: the precompile's, or for CALLCODE and DELEGATECALL the
+        // caller's own (see the stateful path above).
         {
             use revm::context_interface::JournalTr;
-            let _ = context.journal_mut().load_account(addr);
-            context.journal_mut().touch_account(addr);
+            let _ = context.journal_mut().load_account(inputs.target_address);
+            context.journal_mut().touch_account(inputs.target_address);
         }
 
         let rskip197 = self.rskip197_active(context);

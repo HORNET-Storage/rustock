@@ -5711,6 +5711,116 @@ mod tests {
         );
     }
 
+    /// One transaction to a contract holding `code`, in a state where no
+    /// precompile has an account yet. Answers, for `precompile` afterwards:
+    /// whether it has an account, its storage-prefix marker, and the cell at
+    /// `slot` of its storage.
+    fn after_a_call_from_code(
+        code: &[u8],
+        precompile: Address,
+        slot: U256,
+    ) -> (bool, Option<Vec<u8>>, Option<Vec<u8>>) {
+        let sender = Address::repeat_byte(0xAA);
+        let contract = Address::repeat_byte(0xCC);
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
+        let root = put_account(&root, store.as_ref(), &contract, 1, U256::ZERO);
+        let root = root.put(
+            &TrieKeySlice::from_key(&rustock_trie::code_key(&contract)),
+            code,
+            store.as_ref(),
+        );
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+        let tx = rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(200_000),
+            to: Bytes::copy_from_slice(contract.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::new(),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
+        };
+        let result = executor
+            .execute_block(
+                &dummy_header(466_503),
+                &[(tx, sender)],
+                &root,
+                store.clone(),
+            )
+            .expect("block");
+        assert!(result.tx_results[0].success);
+        let root = crate::state::apply_state_changes(
+            &root,
+            store.as_ref(),
+            &result.state_changes,
+            &result.markers,
+        );
+        let cell = |key: Vec<u8>| root.get(&TrieKeySlice::from_key(&key), store.as_ref());
+        (
+            cell(rustock_trie::account_key(&precompile)).is_some(),
+            cell(rustock_trie::storage_prefix_key(&precompile)),
+            cell(rustock_trie::storage_key(&precompile, &B256::from(slot))),
+        )
+    }
+
+    /// rskj `Program.callToPrecompiledAddress`: the zero-value transfer that
+    /// creates a precompile's account goes to the call's context address,
+    /// which for CALLCODE and DELEGATECALL is the caller itself
+    /// (`msg.getType().isStateless()`). Those leave the precompile with the
+    /// marker `setupContract` writes for the code address and no account, so
+    /// the first CALL to it still pays NEW_ACCT_CALL.
+    #[test]
+    fn a_stateless_call_to_a_precompile_creates_no_account_for_it() {
+        let identity = Address::with_last_byte(0x04);
+        // The call with no input, no output and 3000 gas, then STOP. CALL and
+        // CALLCODE take a value, here zero; DELEGATECALL takes none.
+        let after = |opcode: u8| {
+            let mut code = vec![0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00];
+            if opcode != 0xf4 {
+                code.extend_from_slice(&[0x60, 0x00]);
+            }
+            code.push(0x73);
+            code.extend_from_slice(identity.as_slice());
+            code.extend_from_slice(&[0x61, 0x0b, 0xb8, opcode, 0x00]);
+            let (account, marker, _) = after_a_call_from_code(&code, identity, U256::ZERO);
+            (account, marker)
+        };
+        let marker = Some(vec![1]);
+        assert_eq!(after(0xf1), (true, marker.clone()), "CALL");
+        assert_eq!(after(0xf2), (false, marker.clone()), "CALLCODE");
+        assert_eq!(after(0xf4), (false, marker), "DELEGATECALL");
+    }
+
+    /// rskj `RemascContract.execute` saves after every method that returns,
+    /// `getStateForDebugging` included, and `RemascStorageProvider.save` always
+    /// writes the siblings cell, through `addStorageBytes`, which creates the
+    /// account of a contract that has none. So REMASC has its account after a
+    /// DELEGATECALL too, which by itself would create none.
+    #[test]
+    fn remascs_state_for_debugging_saves_as_any_remasc_method_does() {
+        // The selector to memory, then DELEGATECALL(3000, REMASC, 28, 4, 0, 0).
+        let mut code = vec![0x63];
+        code.extend_from_slice(&crate::remasc::GET_STATE_FOR_DEBUGGING);
+        code.extend_from_slice(&[0x60, 0x00, 0x52]);
+        code.extend_from_slice(&[0x60, 0x00, 0x60, 0x00, 0x60, 0x04, 0x60, 0x1c, 0x73]);
+        code.extend_from_slice(REMASC_ADDR.as_slice());
+        code.extend_from_slice(&[0x61, 0x0b, 0xb8, 0xf4, 0x00]);
+        assert_eq!(
+            after_a_call_from_code(
+                &code,
+                REMASC_ADDR,
+                crate::remasc::remasc_storage_key("siblings")
+            ),
+            (true, Some(vec![1]), Some(vec![0xc0]))
+        );
+    }
+
     /// rskj `doSUICIDE` (VM.java) charges NEW_ACCT_SUICIDE (25,000) whenever the
     /// beneficiary does not exist (`!track.isExist`), UNCONDITIONAL on the
     /// suiciding contract's balance. revm's selfdestruct instead gates the
