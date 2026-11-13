@@ -194,6 +194,39 @@ impl SyncManager {
         }
     }
 
+    /// Record what a block sent whole adds to the chain's work, from the
+    /// uncles that came with it: its own difficulty and theirs, once they
+    /// pass the whole uncle rule against the ancestry this node holds. The
+    /// header's ingest then gives the block the total rskj gives it on
+    /// connecting it (`Block.getCumulativeDifficulty`), and the head is
+    /// picked by that, where a bare header's lower bound would leave a block
+    /// whose uncles carry it past the head beside the chain.
+    ///
+    /// The caller has held the body to the header's commitments, so the list
+    /// is the one the block's miner chose. Uncles that can't be judged, or
+    /// that fail the rule, are left to the ordinary path, which counts the
+    /// header alone.
+    pub(crate) fn note_whole_block_difficulty(&self, header: &Header, uncles: &[Header]) {
+        if uncles.is_empty() {
+            return;
+        }
+        match crate::total_difficulty::credited_uncles(&self.store, &self.verifier, header, uncles)
+        {
+            Ok(credited) => {
+                let mut proven = self.proven.lock().unwrap_or_else(PoisonError::into_inner);
+                if proven.len() >= MAX_PROVEN {
+                    proven.clear();
+                }
+                proven.insert(header.hash(), header.difficulty.saturating_add(credited));
+            }
+            Err(why) => debug!(
+                target: "rustock::sync",
+                "Block #{}: its uncles are not credited with their difficulty: {why}",
+                header.number
+            ),
+        }
+    }
+
     /// Settle the total difficulty of each of `blocks`, oldest first, now that
     /// their bodies are held. See [`crate::total_difficulty`].
     ///

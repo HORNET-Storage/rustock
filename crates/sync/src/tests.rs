@@ -8493,6 +8493,63 @@ async fn a_followed_block_counts_its_uncles_when_its_body_comes() {
     );
 }
 
+/// rskj gives a block it is sent whole its parent's total and its cumulative
+/// difficulty, uncles included (`BlockChainImpl.internalTryToConnect`), and
+/// picks its best block by that. A block beside the head whose own
+/// difficulty is below the head's, and whose uncles carry it past, is the
+/// new head.
+#[tokio::test]
+async fn a_whole_block_is_weighed_with_the_uncles_it_brings() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let (b1, uncles) = genesis_and_siblings(&store, 7, 5);
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(
+        store.clone(),
+        Arc::new(HeaderVerifier::new()),
+        peer_store.clone(),
+    ));
+    manager
+        .handle_headers_response(vec![b1.clone()], test_peer())
+        .unwrap();
+    store.put_body(b1.hash(), &[], &[]).unwrap();
+    store.set_exec_head(b1.hash(), B256::ZERO).unwrap();
+    // The head: #2, worth 10, for a total of 21.
+    let head = dummy_header(2, b1.hash(), U256::from(10));
+    manager
+        .handle_headers_response(vec![head.clone()], test_peer())
+        .unwrap();
+    store.put_body(head.hash(), &[], &[]).unwrap();
+    assert_eq!(store.head().unwrap(), Some(head.hash()));
+
+    // Its rival: worth 9 itself, and 12 more through the two uncles it names.
+    let rival = naming_uncles(fork_header(2, b1.hash(), U256::from(9), 0xee), &uncles);
+    let (_event_tx, event_rx) = mpsc::unbounded_channel();
+    let mut service = SyncService::new(manager, peer_store, event_rx);
+    service.state = SyncState::Following;
+    service
+        .on_new_block(
+            B512::repeat_byte(9),
+            rustock_core::Block {
+                header: rival.clone(),
+                transactions: Vec::new(),
+                ommers: uncles,
+            },
+        )
+        .await;
+
+    assert_eq!(
+        store.total_difficulty(rival.hash()).unwrap(),
+        Some(U256::from(32)),
+        "its parent's 11, its own 9 and its uncles' 12"
+    );
+    assert_eq!(
+        store.head().unwrap(),
+        Some(rival.hash()),
+        "the heavier block is the head"
+    );
+}
+
 /// A header ingested again with its body held, as a fork announcement does to
 /// the last few hundred, is credited the body's uncles only once they pass the
 /// whole uncle rule, as settling does.

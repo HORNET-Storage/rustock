@@ -4327,9 +4327,11 @@ impl SyncService {
     /// or not. Here the body is held to its header's commitments, the header is
     /// verified and stored as any header at the tip is (the same rules, the
     /// extra data's size among them), the block is relayed, and it is executed
-    /// once it is the canonical block at its height. A block whose parent this
-    /// node lacks is taken as an announcement of it: the headers up to it are
-    /// asked of the sender, where rskj asks it for the missing block.
+    /// once it is the canonical block at its height. Its uncles are in hand, so
+    /// it is weighed with them, as rskj weighs a block it connects. A block
+    /// whose parent this node lacks is taken as an announcement of it: the
+    /// headers up to it are asked of the sender, where rskj asks it for the
+    /// missing block.
     pub(crate) async fn on_new_block(&mut self, peer: B512, block: Block) {
         // rskj processes it while syncing too, but relays nothing then
         // (`hasBetterBlockToSync`); this node takes nothing unasked at the tip
@@ -4370,6 +4372,7 @@ impl SyncService {
             self.charge_bad_body(peer, number, what);
             return;
         }
+        self.manager.note_whole_block_difficulty(&header, &ommers);
         let before_height = self.our_head_number();
         let before_hash = self.manager.store.head().ok().flatten();
         match self
