@@ -6857,16 +6857,31 @@ async fn test_signing_is_refused_for_an_account_the_wallet_does_not_hold() {
     let (state, _tmp) = setup_state_with_wallet();
     let stranger = "0x00000000000000000000000000000000000000ff";
 
-    for (method, params) in [
-        ("eth_sign", json!([stranger, "0xdeadbeef"])),
-        ("eth_signTransaction", json!([{"from": stranger}])),
-        ("eth_sendTransaction", json!([{"from": stranger}])),
+    // rskj's words for it: `EthModuleWalletEnabled.sign`, and
+    // `EthModuleTransactionBase.sendTransaction`.
+    let unknown = format!("Could not find account for address: {stranger}");
+    for (method, params, message) in [
+        (
+            "eth_sign",
+            json!([stranger, "0xdeadbeef"]),
+            "Account not found",
+        ),
+        (
+            "eth_signTransaction",
+            json!([{"from": stranger}]),
+            unknown.as_str(),
+        ),
+        (
+            "eth_sendTransaction",
+            json!([{"from": stranger}]),
+            unknown.as_str(),
+        ),
     ] {
         let resp = dispatch_for_test(&state, make_request(method, params)).await;
         assert!(resp.result.is_none(), "{method} must not sign for a stranger");
         let err = resp.error.expect("an error");
         assert_eq!(err.code, INVALID_PARAMS, "{method}");
-        assert!(err.message.contains("No key for"), "{method}: {}", err.message);
+        assert_eq!(err.message, message, "{method}");
     }
 }
 
@@ -6941,6 +6956,121 @@ async fn test_a_null_recipient_is_a_contract_creation() {
     use alloy_rlp::Decodable;
     let tx = rustock_core::Transaction::decode(&mut raw.as_slice()).unwrap();
     assert!(tx.to.is_empty(), "a creation has an empty recipient, not a zero address");
+}
+
+/// A pool in which every sender's next nonce is 7.
+struct SeventhNonce;
+
+impl crate::server::TxPoolReader for SeventhNonce {
+    fn get_pending_tx(
+        &self,
+        _: &alloy_primitives::B256,
+    ) -> Option<(rustock_core::Transaction, Address, alloy_primitives::B256)> {
+        None
+    }
+
+    fn pending_nonce(&self, _: &Address) -> Option<u64> {
+        Some(7)
+    }
+
+    fn pool_status(&self) -> (usize, usize) {
+        (0, 0)
+    }
+
+    fn pool_content(&self) -> crate::server::PoolContent {
+        crate::server::PoolContent::default()
+    }
+
+    fn quota_report(&self, _: &Address) -> Option<(f64, u64)> {
+        None
+    }
+}
+
+/// A relay that takes every transaction, and names it by its hash.
+struct TakesEvery;
+
+#[async_trait::async_trait]
+impl crate::server::TxSubmitter for TakesEvery {
+    async fn submit_transaction(
+        &self,
+        raw: alloy_primitives::Bytes,
+    ) -> Result<alloy_primitives::B256, String> {
+        use sha3::Digest;
+        Ok(alloy_primitives::B256::from_slice(
+            &sha3::Keccak256::digest(&raw),
+        ))
+    }
+}
+
+/// The methods that sign, and the personal module, answer as rskj's release
+/// answers them, request by request: `testdata/rskj_wallet_methods.txt` is
+/// its own server's answers with its wallet off and on, and the transactions
+/// it signs.
+///
+/// What used to differ: a number written without its `0x` was read as hex
+/// where rskj reads a decimal, so that a value of "1000000000000000000" was
+/// signed as some 4,722 times that; a chain the arguments named went unread;
+/// `data` was read over `input`; a gas price of zero was written empty, which
+/// is another transaction than rskj's; and a malformed parameter was answered
+/// by the method, or as the wallet being off, where rskj refuses it first.
+#[tokio::test]
+async fn the_wallet_methods_answer_as_rskjs_release_answers() {
+    let key = secp256k1::SecretKey::from_byte_array([0x11; 32]).unwrap();
+    let wallet = crate::wallet::Wallet::from_keys([key]);
+    let held = format!("{:#x}", wallet.accounts()[0]);
+    let (off, _tmp_off) = setup_state();
+    let (mut on, _tmp_on) = setup_state();
+    on.wallet = Some(Arc::new(wallet));
+    on.hardfork_cfg = Some(rustock_execution::hardfork::RskHardforkConfig::all_active_parallel(33));
+    on.tx_pool = Some(Arc::new(SeventhNonce));
+    on.tx_submitter = Some(Arc::new(TakesEvery));
+
+    let mut lines = 0;
+    for line in include_str!("testdata/rskj_wallet_methods.txt").lines() {
+        if line.starts_with('#') {
+            continue;
+        }
+        lines += 1;
+        let line = line.replace("HELD", &held);
+        let (kind, rest) = line.split_once(' ').unwrap();
+        let (asked, answer) = rest.split_once(" => ").unwrap();
+        if kind == "signed" {
+            // `eth_signTransaction` gives the transaction, and
+            // `eth_sendTransaction` its hash.
+            let arguments: Value = serde_json::from_str(asked).unwrap();
+            let request = |method| make_request(method, json!([arguments]));
+            let signed = dispatch_for_test(&on, request("eth_signTransaction")).await;
+            let sent = dispatch_for_test(&on, request("eth_sendTransaction")).await;
+            match answer.split_once(" hash ") {
+                Some((raw, hash)) => {
+                    assert_eq!(signed.result, Some(json!(format!("0x{raw}"))), "{line}");
+                    assert_eq!(sent.result, Some(json!(hash)), "{line}");
+                }
+                None => {
+                    // A code, the message, and what rskj threw in brackets.
+                    let (code, message) = answer.split_once(' ').unwrap();
+                    let message = &message[..message.rfind(" [").unwrap()];
+                    let refusal = Some((code.parse::<i64>().unwrap(), message.to_string()));
+                    for resp in [signed, sent] {
+                        let error = resp.error.map(|error| (error.code, error.message));
+                        assert_eq!(error, refusal, "{line}");
+                    }
+                }
+            }
+            continue;
+        }
+        let state = match kind {
+            "off" => &off,
+            "on" => &on,
+            other => panic!("{other}"),
+        };
+        let (method, params) = asked.split_once(' ').unwrap();
+        let params: Value = serde_json::from_str(params).unwrap();
+        let answer: Value = serde_json::from_str(answer).unwrap();
+        let ours = dispatch_for_test(state, make_request(method, params)).await;
+        assert_eq!(serde_json::to_value(&ours).unwrap(), answer, "{line}");
+    }
+    assert_eq!(lines, 197, "every line of the file was asked");
 }
 
 /// Reading a key file is the only way a key gets in, so the parsing has

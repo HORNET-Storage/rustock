@@ -189,15 +189,55 @@ impl LogDto {
 /// isn't hex or a decimal, data that isn't hex. A field that is absent or
 /// `null` is not there, and what isn't an object has no fields. Then, with the
 /// block in hand, `CallArgumentsToByteArray` reads the numbers
-/// ([`CallArguments::request`]).
+/// ([`CallArguments::request`]). A transaction the node is to sign has them
+/// read another way ([`CallArguments::transaction`]).
 #[derive(Debug)]
 pub struct CallArguments {
     from: Option<Address>,
     to: Option<Address>,
     gas: Option<String>,
     gas_price: Option<String>,
+    gas_limit: Option<String>,
+    nonce: Option<String>,
+    chain_id: Option<String>,
     value: Option<String>,
     data: Option<Vec<u8>>,
+}
+
+/// What rskj makes of a call's arguments to build a transaction it signs
+/// (`TransactionArgumentsUtil.processArguments`).
+#[derive(Debug)]
+pub struct TransactionArguments {
+    pub to: Option<Address>,
+    /// `None` where the arguments name none: the sender's next.
+    pub nonce: Option<U256>,
+    pub value: U256,
+    pub gas_price: U256,
+    pub gas_limit: U256,
+    pub data: Vec<u8>,
+    /// The chain the arguments name, and how they wrote it. `None` where they
+    /// name none, or name 0: the node's own.
+    pub chain_id: Option<(u8, String)>,
+}
+
+/// The gas a sent transaction names when the caller names none: rskj's
+/// `GasCost.TRANSACTION_DEFAULT`.
+const TRANSACTION_DEFAULT_GAS: u64 = 90_000;
+
+/// The chain a transaction's arguments name (`TransactionArgumentsUtil
+/// .hexToChainId`): the one byte their `chainId` writes, read as a call's
+/// numbers are ([`crate::params::number_bytes`]). `None` for 0, which is the
+/// node's own chain. Anything that isn't one byte, and anything thrown on the
+/// way, is `-32602 Invalid chainId`.
+fn named_chain(written: String) -> Result<Option<(u8, String)>, crate::params::Refusal> {
+    match crate::params::number_bytes(&written).as_deref() {
+        Ok([0]) => Ok(None),
+        Ok(&[chain]) => Ok(Some((chain, written))),
+        _ => Err((
+            crate::types::INVALID_PARAMS,
+            format!("Invalid chainId: {written}"),
+        )),
+    }
 }
 
 impl CallArguments {
@@ -215,10 +255,10 @@ impl CallArguments {
         let to = field("to").map(|text| hex_address(&text)).transpose()?;
         let gas = number("gas")?;
         let gas_price = number("gasPrice")?;
-        // Checked, and read by no call.
-        number("gasLimit")?;
-        number("nonce")?;
-        number("chainId")?;
+        // Checked, and read only for a transaction the node signs.
+        let gas_limit = number("gasLimit")?;
+        let nonce = number("nonce")?;
+        let chain_id = number("chainId")?;
         let value = number("value")?;
         let data = field("data").map(|text| hex_data(&text)).transpose()?;
         let input = field("input").map(|text| hex_data(&text)).transpose()?;
@@ -227,9 +267,50 @@ impl CallArguments {
             to,
             gas,
             gas_price,
+            gas_limit,
+            nonce,
+            chain_id,
             value,
             // `CallArguments.setInput` writes over what `setData` wrote.
             data: input.or(data),
+        })
+    }
+
+    /// The sender the arguments name.
+    pub fn from(&self) -> Option<Address> {
+        self.from
+    }
+
+    /// `TransactionArgumentsUtil.processArguments`: the arguments of a
+    /// transaction the node is to sign, read in rskj's order -- the nonce,
+    /// the value, the gas price, the gas, the chain -- each number as
+    /// [`crate::params::transaction_number`] reads it.
+    ///
+    /// The defaults are rskj's: no value, a gas price of 0, and the gas
+    /// named as `gas`, or else as `gasLimit`, which is read only then, or
+    /// else 90,000.
+    pub fn transaction(self) -> Result<TransactionArguments, crate::params::Refusal> {
+        use crate::params::transaction_number;
+        let read = |text: Option<String>| text.map(|text| transaction_number(&text)).transpose();
+        let nonce = read(self.nonce)?;
+        let value = read(self.value)?.unwrap_or_default();
+        let gas_price = read(self.gas_price)?.unwrap_or_default();
+        let gas_limit = match read(self.gas)? {
+            Some(gas) => gas,
+            None => read(self.gas_limit)?.unwrap_or(U256::from(TRANSACTION_DEFAULT_GAS)),
+        };
+        let chain_id = match self.chain_id {
+            Some(written) => named_chain(written)?,
+            None => None,
+        };
+        Ok(TransactionArguments {
+            to: self.to,
+            nonce,
+            value,
+            gas_price,
+            gas_limit,
+            data: self.data.unwrap_or_default(),
+            chain_id,
         })
     }
 

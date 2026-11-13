@@ -123,16 +123,58 @@ pub fn local_wallet_disabled(id: Value) -> JsonRpcResponse {
     JsonRpcResponse::error(id, INVALID_PARAMS, "Local wallet is disabled in this node")
 }
 
-/// The `personal_` methods as rskj answers them with the wallet off:
+/// The `personal_` methods as rskj answers them with the wallet off.
+///
+/// jsonrpc4j makes each parameter of its type before the method runs, in the
+/// method's order (`Web3` L57-64), and what a type refuses is the answer: an
+/// address, a key, a duration and a transaction's arguments refuse with
+/// -32602 ([`crate::params`]), and a seed or a passphrase that is an object
+/// or an array is -32700 "JSON parse error", answered to no request
+/// ([`crate::params::unparsed`]). A `null` is made of nothing, and passes.
+///
+/// Then `Web3Impl` refuses a null seed or passphrase (L1130-1144), and
 /// `PersonalModuleWalletDisabled` throws `DisabledWalletException` from every
-/// one (L27-74), -32604 "The local wallet feature is disabled", once
-/// `Web3Impl` has refused a null seed or passphrase (L1130-1144). A name rskj
-/// doesn't have is "method not found".
+/// method (L27-74), -32604 "The local wallet feature is disabled". A name
+/// rskj doesn't have is "method not found".
 ///
 /// This node has no personal module, so it answers so whether or not
 /// `--wallet-file` gave it keys, which serve only the `eth_` methods that
 /// sign.
 pub fn personal(id: Value, method: &str, params: &Value) -> JsonRpcResponse {
+    use crate::params::{hex_address, hex_duration, hex_key, string, text, Refusal};
+    type Made = Result<(), Refusal>;
+    let of_text = |index: usize, check: &dyn Fn(&str) -> Made| -> Made {
+        match params.get(index).and_then(text) {
+            Some(text) => check(&text),
+            None => Ok(()),
+        }
+    };
+    let address = |index| of_text(index, &|text| hex_address(text).map(drop));
+    let words = |index: usize| -> Made { string(&params[index]).map(drop) };
+    let arguments = |index: usize| -> Made {
+        match params.get(index) {
+            None | Some(Value::Null) => Ok(()),
+            Some(arguments) => crate::dto::CallArguments::read(arguments).map(drop),
+        }
+    };
+    let made = match method {
+        "personal_newAccountWithSeed" | "personal_newAccount" => words(0),
+        "personal_listAccounts" => Ok(()),
+        "personal_importRawKey" => of_text(0, &hex_key).and_then(|()| words(1)),
+        "personal_sendTransaction" => arguments(0).and_then(|()| words(1)),
+        "personal_unlockAccount" => address(0)
+            .and_then(|()| words(1))
+            .and_then(|()| of_text(2, &hex_duration)),
+        "personal_lockAccount" | "personal_dumpRawKey" => address(0),
+        _ => return method_not_found(id),
+    };
+    if let Err((code, message)) = made {
+        let id = match code {
+            crate::types::PARSE_ERROR => json!(crate::params::UNPARSED_ID),
+            _ => id,
+        };
+        return JsonRpcResponse::error(id, code, message);
+    }
     match method {
         "personal_newAccountWithSeed" if params[0].is_null() => {
             JsonRpcResponse::error(id, INVALID_PARAMS, "Seed is null")
@@ -140,16 +182,6 @@ pub fn personal(id: Value, method: &str, params: &Value) -> JsonRpcResponse {
         "personal_newAccount" if params[0].is_null() => {
             JsonRpcResponse::error(id, INVALID_PARAMS, "Passphrase is null")
         }
-        "personal_newAccountWithSeed"
-        | "personal_newAccount"
-        | "personal_listAccounts"
-        | "personal_importRawKey"
-        | "personal_sendTransaction"
-        | "personal_unlockAccount"
-        | "personal_lockAccount"
-        | "personal_dumpRawKey" => {
-            JsonRpcResponse::error(id, DISABLED_WALLET, "The local wallet feature is disabled")
-        }
-        _ => method_not_found(id),
+        _ => JsonRpcResponse::error(id, DISABLED_WALLET, "The local wallet feature is disabled"),
     }
 }

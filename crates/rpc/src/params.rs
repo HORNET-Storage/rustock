@@ -6,16 +6,19 @@
 //! these refusals come before anything the method itself says. What a
 //! parameter's constructor throws is an `RskJsonRpcRequestException`, which
 //! `RskErrorResolver` answers with its own code and message; anything else
-//! thrown on the way is `-32603 Internal server error`.
+//! thrown on the way is `-32603 Internal server error`, but for what Jackson
+//! itself throws where it can't make a parameter of its type, which
+//! jsonrpc4j takes for a request it couldn't parse ([`unparsed`]).
 //!
 //! Each answer here is the release's own: its parameter classes and its
-//! error resolver were run on the values the tests use.
+//! error resolver were run on the values the tests use, and so was its
+//! server, over its `Web3RskImpl`, on whole requests.
 
 use alloy_primitives::{Address, U256};
 use serde_json::Value;
 
-use crate::helpers::{abbreviated, hex_to_bytes};
-use crate::types::{INTERNAL_ERROR, INVALID_PARAMS};
+use crate::helpers::{abbreviated, hex_to_bytes, is_lower_hex};
+use crate::types::{INTERNAL_ERROR, INVALID_PARAMS, PARSE_ERROR};
 
 /// The code and message rskj answers in place of a result.
 pub type Refusal = (i64, String);
@@ -28,6 +31,18 @@ fn invalid(message: impl Into<String>) -> Refusal {
 pub fn uncaught() -> Refusal {
     (INTERNAL_ERROR, "Internal server error".to_string())
 }
+
+/// What rskj answers where Jackson can't make a parameter of its type: a
+/// `JsonMappingException`, which jsonrpc4j takes for a request it couldn't
+/// parse (`JsonRpcBasicServer.handleRequest`). The answer names no request:
+/// its id is the string [`UNPARSED_ID`], whatever the request's was.
+pub fn unparsed() -> Refusal {
+    (PARSE_ERROR, "JSON parse error".to_string())
+}
+
+/// The id of jsonrpc4j's answer to a request it couldn't parse: the word
+/// `null` as a string, not a JSON `null`.
+pub const UNPARSED_ID: &str = "null";
 
 /// The text a parameter's deserializer reads (`jp.getText()`): a string as it
 /// is, a number as Jackson prints it back ([`number_text`]), a boolean as
@@ -71,11 +86,25 @@ pub fn field_text(value: &Value) -> Option<String> {
     }
 }
 
+/// A string's length as Java counts it: its UTF-16 units.
+fn java_length(text: &str) -> usize {
+    text.encode_utf16().count()
+}
+
+/// A `String` parameter as Jackson reads one: a scalar is its text, and an
+/// object or an array is none ([`unparsed`]). `None` for `null`.
+pub fn string(value: &Value) -> Result<Option<String>, Refusal> {
+    match value {
+        Value::Array(_) | Value::Object(_) => Err(unparsed()),
+        scalar => Ok(text(scalar)),
+    }
+}
+
 /// `HexAddressParam`: 40 to 42 characters that `RskAddress` reads as 20
 /// bytes -- with the prefix or without, in either case, and 39 digits behind
 /// a prefix, which are padded.
 pub fn hex_address(text: &str) -> Result<Address, Refusal> {
-    if !(40..=42).contains(&text.len()) {
+    if !(40..=42).contains(&java_length(text)) {
         return Err(invalid(
             "Invalid address: null, empty or invalid hex value.",
         ));
@@ -90,7 +119,7 @@ pub fn hex_address(text: &str) -> Result<Address, Refusal> {
 /// characters, of hex in either case, with the prefix or without, or what
 /// `new BigInteger(String)` reads, a decimal with or without a sign.
 pub fn hex_number(text: &str) -> Result<(), Refusal> {
-    if text.len() > 66 {
+    if java_length(text) > 66 {
         return Err(invalid(format!("Invalid param: {}", abbreviated(text))));
     }
     let digits = text.strip_prefix("0x").unwrap_or(text);
@@ -116,6 +145,43 @@ fn is_decimal(text: &str) -> bool {
 /// `HexDataParam`: what `HexUtils.stringHexToByteArray` decodes.
 pub fn hex_data(text: &str) -> Result<Vec<u8>, Refusal> {
     hex_to_bytes(text).ok_or_else(|| invalid("Invalid data format: invalid hex value."))
+}
+
+/// `HexKeyParam`: hex in either case, with the prefix or without, and
+/// nothing at all.
+pub fn hex_key(text: &str) -> Result<(), Refusal> {
+    let digits = text.strip_prefix("0x").unwrap_or(text);
+    if digits.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Ok(());
+    }
+    Err(invalid(format!(
+        "Invalid param {text}: value must be a valid hex."
+    )))
+}
+
+/// `HexDurationParam`: nothing at all, or a `0x` and lower-case hex digits
+/// (`HexStringParam`) that `Long.parseLong` reads.
+pub fn hex_duration(text: &str) -> Result<(), Refusal> {
+    if text.is_empty() {
+        return Ok(());
+    }
+    if java_length(text) > 66 {
+        return Err(invalid(format!("Invalid argument: {}", abbreviated(text))));
+    }
+    let Some(digits) = text
+        .strip_prefix("0x")
+        .filter(|digits| is_lower_hex(digits))
+    else {
+        return Err(invalid(format!(
+            "Invalid argument \"{text}\": param should be a hex value string."
+        )));
+    };
+    match i64::from_str_radix(digits, 16) {
+        Ok(_) => Ok(()),
+        Err(_) => Err(invalid(
+            "Invalid duration param: value must be a valid hex number.",
+        )),
+    }
 }
 
 /// The bytes of a number as rskj reads one a [`hex_number`] let through
@@ -155,6 +221,18 @@ pub fn number_bytes(text: &str) -> Result<Vec<u8>, Refusal> {
 /// [`number_bytes`] as the number they write.
 pub fn number(text: &str) -> Result<U256, Refusal> {
     U256::try_from_be_slice(&number_bytes(text)?).ok_or_else(uncaught)
+}
+
+/// A number as rskj reads one for a transaction it signs
+/// (`HexUtils.strHexOrStrNumberToBigInteger`, then the bytes its builder
+/// makes of it): as [`number`], but that a bare `0x` leaves `new BigInteger`
+/// no digits to read, which nothing catches. Nothing written is no decimal:
+/// `-32602`.
+pub fn transaction_number(text: &str) -> Result<U256, Refusal> {
+    if text == "0x" {
+        return Err(uncaught());
+    }
+    number(text)
 }
 
 #[cfg(test)]

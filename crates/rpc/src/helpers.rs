@@ -141,7 +141,7 @@ fn is_block_tag(s: &str) -> bool {
 
 /// rskj's lower-case hex (`HexUtils.isHex`): digits and `a` to `f`, and no
 /// characters at all.
-fn is_lower_hex(s: &str) -> bool {
+pub(crate) fn is_lower_hex(s: &str) -> bool {
     s.bytes()
         .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
