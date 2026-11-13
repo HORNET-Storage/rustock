@@ -494,7 +494,7 @@ async fn route(state: &RpcState, req: JsonRpcRequest) -> JsonRpcResponse {
         "rsk_getRawBlockHeaderByHash" => rsk::rsk_get_raw_block_header_by_hash(id, params, &state.store),
         "rsk_getRawBlockHeaderByNumber" => rsk::rsk_get_raw_block_header_by_number(id, params, &state.store),
 
-        "eth_sendRawTransaction" => eth::eth_send_raw_transaction(id, params, &state.tx_submitter).await,
+        "eth_sendRawTransaction" => eth::eth_send_raw_transaction(id, params, state).await,
 
         // -- state queries --
         "eth_getBalance" => state::eth_get_balance(id, params, state),

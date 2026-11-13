@@ -9,9 +9,44 @@
 //! and `bytesToLength`, with `RLPItem` and `RLPList`, rather than decoding
 //! canonically.
 
-/// Where rskj's decoder throws.
+/// Where rskj's decoder throws, and for which reason.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RlpError;
+pub enum RlpError {
+    /// An element runs past the end of the bytes.
+    PastEnd,
+    /// A length's own bytes run past the end.
+    LengthPastEnd,
+    /// A length with its sign bit set.
+    NegativeLength,
+    /// A list's length, with its prefix or with where it starts, is past a
+    /// Java `int`.
+    TooLong,
+    /// An item where a list is read. rskj throws no `RLPException` here: its
+    /// cast to `RLPList` fails.
+    NotAList,
+    /// No bytes to read an element from, where rskj reads past its array.
+    Empty,
+}
+
+impl RlpError {
+    /// What rskj's `RLPException` says, where rskj throws one: what a caller
+    /// that catches it, as `eth_sendRawTransaction` does, reports.
+    pub fn message(&self) -> Option<&'static str> {
+        match self {
+            Self::PastEnd => Some(
+                "The RLP byte array doesn't have enough space to hold an element with the specified length",
+            ),
+            Self::LengthPastEnd => {
+                Some("The length of the RLP item length can't possibly fit the data byte array")
+            }
+            Self::NegativeLength => Some("The length of the RLP item can't be negative"),
+            Self::TooLong => Some(
+                "The current implementation doesn't support lengths longer than Integer.MAX_VALUE because that is the largest number of elements an array can have. integer overflow",
+            ),
+            Self::NotAList | Self::Empty => None,
+        }
+    }
+}
 
 /// One element, as `RLP.decodeElement` cuts it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,7 +80,7 @@ impl<'a> Element<'a> {
     pub fn elements(&self) -> Result<Vec<Element<'a>>, RlpError> {
         match *self {
             Element::List { encoding, offset } => decode2(&encoding[offset..]),
-            Element::Item(_) => Err(RlpError),
+            Element::Item(_) => Err(RlpError::NotAList),
         }
     }
 }
@@ -66,7 +101,7 @@ pub fn decode2(data: &[u8]) -> Result<Vec<Element<'_>>, RlpError> {
 /// starts.
 pub fn first_element(data: &[u8]) -> Result<(Element<'_>, usize), RlpError> {
     if data.is_empty() {
-        return Err(RlpError);
+        return Err(RlpError::Empty);
     }
     decode_element(data, 0)
 }
@@ -82,11 +117,16 @@ fn decode_element(data: &[u8], position: usize) -> Result<(Element<'_>, usize), 
             let nbytes = usize::from(b0 - 0xf7);
             let offset = 1 + nbytes as i32;
             let payload = bytes_to_length(data, position + 1, nbytes)?;
-            (offset.checked_add(payload).ok_or(RlpError)?, offset)
+            (
+                offset.checked_add(payload).ok_or(RlpError::TooLong)?,
+                offset,
+            )
         };
-        let ending = (position as i32).checked_add(length).ok_or(RlpError)? as usize;
+        let ending = (position as i32)
+            .checked_add(length)
+            .ok_or(RlpError::TooLong)? as usize;
         if ending > data.len() {
-            return Err(RlpError);
+            return Err(RlpError::PastEnd);
         }
         let encoding = &data[position..ending];
         return Ok((
@@ -114,7 +154,7 @@ fn decode_element(data: &[u8], position: usize) -> Result<(Element<'_>, usize), 
     let from = position + offset;
     let to = from + length as usize;
     if to > data.len() {
-        return Err(RlpError);
+        return Err(RlpError::PastEnd);
     }
     Ok((Element::Item(&data[from..to]), to))
 }
@@ -123,14 +163,14 @@ fn decode_element(data: &[u8], position: usize) -> Result<(Element<'_>, usize), 
 /// four bytes keeps only its low 32 bits, and a negative one is refused.
 fn bytes_to_length(data: &[u8], position: usize, size: usize) -> Result<i32, RlpError> {
     if position + size > data.len() {
-        return Err(RlpError);
+        return Err(RlpError::LengthPastEnd);
     }
     let mut length = 0i32;
     for byte in &data[position..position + size] {
         length = length.wrapping_shl(8).wrapping_add(i32::from(*byte));
     }
     if length < 0 {
-        return Err(RlpError);
+        return Err(RlpError::NegativeLength);
     }
     Ok(length)
 }
@@ -165,7 +205,11 @@ mod tests {
         );
         let inner = decoded[0].elements().unwrap();
         assert_eq!(inner, vec![Element::Item(&[0x1b]), Element::Item(&[0x80])]);
-        assert_eq!(inner[0].elements(), Err(RlpError), "an item is no list");
+        assert_eq!(
+            inner[0].elements(),
+            Err(RlpError::NotAList),
+            "an item is no list"
+        );
     }
 
     /// rskj takes what canonical RLP refuses: a byte below 0x80 as a string,
@@ -192,23 +236,29 @@ mod tests {
     fn a_long_length_wraps_and_a_negative_one_is_refused() {
         let wrapped = [0xbc, 0x01, 0x00, 0x00, 0x00, 0x02, 0xaa, 0xbb];
         assert_eq!(items(&wrapped), Ok(vec![Some(vec![0xaa, 0xbb])]));
-        assert_eq!(items(&[0xbb, 0x80, 0x00, 0x00, 0x00]), Err(RlpError));
-        assert_eq!(items(&[0xfb, 0x80, 0x00, 0x00, 0x00]), Err(RlpError));
+        let negative = Err(RlpError::NegativeLength);
+        assert_eq!(items(&[0xbb, 0x80, 0x00, 0x00, 0x00]), negative);
+        assert_eq!(items(&[0xfb, 0x80, 0x00, 0x00, 0x00]), negative);
         // A list's length counts its prefix, so a length of -1 would net the
         // five-byte prefix a list of four bytes, and reading would go on to
         // the well-formed list after it. rskj refuses it before that.
         let minus_one = [0xfb, 0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0, 0, 0, 0, 0];
-        assert_eq!(items(&minus_one), Err(RlpError));
+        assert_eq!(items(&minus_one), negative);
+        // A list's length and its prefix together past an `int`.
+        assert_eq!(
+            items(&[0xfb, 0x7f, 0xff, 0xff, 0xff]),
+            Err(RlpError::TooLong)
+        );
     }
 
     /// Anything that runs past the end is refused, an item's length bytes too.
     #[test]
     fn an_overrun_is_refused() {
-        assert_eq!(items(&[0x83, 0x01]), Err(RlpError));
-        assert_eq!(items(&[0xb9, 0x01]), Err(RlpError));
-        assert_eq!(items(&[0xc3, 0x01]), Err(RlpError));
-        assert_eq!(items(&[0xf9, 0x00]), Err(RlpError));
-        assert_eq!(items(&[0x01, 0x82, 0xaa]), Err(RlpError));
+        assert_eq!(items(&[0x83, 0x01]), Err(RlpError::PastEnd));
+        assert_eq!(items(&[0xb9, 0x01]), Err(RlpError::LengthPastEnd));
+        assert_eq!(items(&[0xc3, 0x01]), Err(RlpError::PastEnd));
+        assert_eq!(items(&[0xf9, 0x00]), Err(RlpError::LengthPastEnd));
+        assert_eq!(items(&[0x01, 0x82, 0xaa]), Err(RlpError::PastEnd));
     }
 
     /// No variation on nested lists makes reading them, at any depth, panic:

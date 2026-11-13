@@ -6,6 +6,9 @@ pub const INVALID_REQUEST: i64 = -32600;
 pub const METHOD_NOT_FOUND: i64 = -32601;
 pub const INVALID_PARAMS: i64 = -32602;
 pub const INTERNAL_ERROR: i64 = -32603;
+/// rskj's own, `RskJsonRpcRequestException.transactionError`: a transaction
+/// its pool refuses.
+pub const TRANSACTION_ERROR: i64 = -32010;
 
 #[derive(Debug, Deserialize)]
 pub struct JsonRpcRequest {

@@ -1034,13 +1034,19 @@ async fn test_eth_send_raw_transaction_with_submitter() {
         events: None,
     };
 
-    let req = make_request("eth_sendRawTransaction", json!(["0xdeadbeef"]));
+    // A transfer signed for regtest: a relay is handed nothing less than a
+    // transaction rskj would hand its pool.
+    let raw = "f86480830f424082520894bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb8203e88066\
+               a00afb0a237587b9df05d9cc04fac838c19d27e55cb2eb7a7e48d2ed9764d4d339\
+               a019fa1a246958cbe41757aa014972af79d4d844bdf67d06c2b2afaa778dd71b9d";
+    let req = make_request("eth_sendRawTransaction", json!([format!("0x{raw}")]));
     let resp = dispatch_for_test(&state, req).await;
     assert!(resp.error.is_none(), "Should succeed with a submitter");
-    let result = resp.result.unwrap();
-    let hash_str = result.as_str().unwrap();
-    assert!(hash_str.starts_with("0x"));
-    assert_eq!(hash_str.len(), 66);
+    let hash = sha3::Keccak256::digest(hex::decode(raw).unwrap());
+    assert_eq!(
+        resp.result.unwrap(),
+        json!(format!("0x{}", hex::encode(hash)))
+    );
 }
 
 #[tokio::test]
@@ -1092,6 +1098,112 @@ async fn test_eth_send_raw_transaction_invalid_hex() {
     let req = make_request("eth_sendRawTransaction", json!(["0xZZZZ"]));
     let resp = dispatch_for_test(&state, req).await;
     assert!(resp.error.is_some(), "Should error on invalid hex");
+}
+
+/// The bytes a testdata line writes in hex, a run of one byte as
+/// `(bb*count)`.
+fn written_bytes(text: &str) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    let mut rest = text;
+    while !rest.is_empty() {
+        if let Some(run) = rest.strip_prefix('(') {
+            let (value, after) = run.split_once('*').unwrap();
+            let (count, after) = after.split_once(')').unwrap();
+            let value = u8::from_str_radix(value, 16).unwrap();
+            bytes.extend(std::iter::repeat_n(value, count.parse().unwrap()));
+            rest = after;
+        } else {
+            bytes.push(u8::from_str_radix(&rest[..2], 16).unwrap());
+            rest = &rest[2..];
+        }
+    }
+    bytes
+}
+
+/// A relay that answers a transaction as the testdata line being replayed
+/// says rskj's pool answered it: with the reason it was refused for, or with
+/// the transaction's hash as rskj reckons it.
+#[derive(Default)]
+struct AnswersAsRskjsPool {
+    refusal: std::sync::Mutex<Option<String>>,
+    asked: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl crate::server::TxSubmitter for AnswersAsRskjsPool {
+    async fn submit_transaction(
+        &self,
+        raw: alloy_primitives::Bytes,
+    ) -> Result<alloy_primitives::B256, String> {
+        self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if let Some(reason) = self.refusal.lock().unwrap().clone() {
+            return Err(reason);
+        }
+        rustock_core::Transaction::from_rskj(&raw)
+            .map(|tx| tx.tx_hash())
+            .map_err(|unread| unread.to_string())
+    }
+}
+
+/// `eth_sendRawTransaction` and `eth_sendTransaction` answer as rskj's
+/// release answers them, request by request: the testdata, which the pool's
+/// own test replays too, is that release's server answering over its real
+/// pool. The pool here says what rskj's said, so this is what the methods
+/// make of it, and what they refuse before any pool is asked.
+///
+/// What used to differ: a transaction the pool refused was answered -32602,
+/// where rskj answers -32010; and what rskj refuses first was the pool's to
+/// refuse, in the pool's words: bytes that are no RLP, or no transaction, a
+/// transaction with no gas limit, and a signature for another chain, in the
+/// upper half of the curve's order, or missing.
+#[tokio::test]
+async fn a_sent_transaction_is_answered_as_rskj_answers_it() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let relay = Arc::new(AnswersAsRskjsPool::default());
+    let (mut state, _tmp) = setup_state();
+    // The key of the account `w`, which rskj's node was given too.
+    let key = secp256k1::SecretKey::from_byte_array(alloy_primitives::keccak256("w").0).unwrap();
+    state.wallet = Some(Arc::new(crate::wallet::Wallet::from_keys([key])));
+    state.hardfork_cfg = Some(rustock_execution::hardfork::RskHardforkConfig::rskj_regtest());
+    state.tx_submitter = Some(relay.clone());
+
+    let mut lines = 0;
+    for line in include_str!("../../sync/src/testdata/rskj_pool_answers.txt").lines() {
+        let (kind, rest) = line.split_once(' ').unwrap_or_default();
+        if !matches!(kind, "tx" | "call") {
+            continue;
+        }
+        lines += 1;
+        let (asked, rest) = rest.split_once(" => ").unwrap();
+        let (answer, _held) = rest.split_once(" | pending ").unwrap();
+        let answer: Value = serde_json::from_str(answer).unwrap();
+        let (label, asked) = asked.split_once(' ').unwrap();
+        let (method, params) = match kind {
+            "tx" => {
+                let raw = format!("0x{}", hex::encode(written_bytes(asked)));
+                ("eth_sendRawTransaction", json!([raw]))
+            }
+            _ => {
+                let (method, params) = asked.split_once(' ').unwrap();
+                (method, serde_json::from_str(params).unwrap())
+            }
+        };
+
+        // What rskj's pool said of it, where it got that far.
+        let refused_by_pool = answer["error"]["code"] == json!(TRANSACTION_ERROR);
+        let reason = answer["error"]["message"].as_str().map(str::to_string);
+        *relay.refusal.lock().unwrap() = reason.filter(|_| refused_by_pool);
+        let before = relay.asked.load(SeqCst);
+        let ours = dispatch_for_test(&state, make_request(method, params)).await;
+        assert_eq!(serde_json::to_value(&ours).unwrap(), answer, "{label}");
+        let reached = refused_by_pool || answer.get("result").is_some();
+        assert_eq!(
+            relay.asked.load(SeqCst) - before,
+            usize::from(reached),
+            "{label}: whether the pool was asked"
+        );
+    }
+    assert_eq!(lines, 115, "every request of the file was asked");
 }
 
 // ========== Phase 6: State queries with trie ==========

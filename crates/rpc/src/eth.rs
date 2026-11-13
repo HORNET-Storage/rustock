@@ -2,12 +2,10 @@ use crate::helpers::{
     parse_b256, parse_block_number, parse_hex_u32, to_hex_b256, to_hex_u64,
     BlockResultDto,
 };
-use crate::server::TxSubmitter;
 use crate::types::*;
 use rustock_core::config::ChainConfig;
 use rustock_storage::BlockStore;
 use serde_json::{json, Value};
-use std::sync::Arc;
 
 /// rskj's `eth_protocolVersion` answers `rsk_protocolVersion()` (`Web3Impl`
 /// L300-303).
@@ -518,30 +516,46 @@ fn header_claims_an_empty_body(header: &rustock_core::types::header::Header) -> 
     empty_txs && empty_ommers
 }
 
+/// `eth_sendRawTransaction`, answered as rskj answers it
+/// (`EthModuleTransactionBase.sendRawTransaction`).
+///
+/// The one parameter is data (`HexDataParam`), and a `null` reaches the
+/// method as no data at all, which nothing catches. What rskj refuses before
+/// its pool sees the transaction is [`crate::raw_tx::refused`]'s to say; what
+/// the pool refuses is rskj's `transactionError`, -32010, with the pool's
+/// reason; and what it takes is answered with the transaction's hash.
 pub async fn eth_send_raw_transaction(
     id: Value,
     params: &Value,
-    tx_submitter: &Option<Arc<dyn TxSubmitter>>,
+    state: &crate::server::RpcState,
 ) -> JsonRpcResponse {
-    let Some(submitter) = tx_submitter else {
+    let Some(submitter) = &state.tx_submitter else {
         return JsonRpcResponse::error(id, METHOD_NOT_FOUND, "Transaction relay not available");
     };
 
-    let Some(raw_hex) = params.as_array().and_then(|a| a.first()).and_then(|v| v.as_str()) else {
-        return JsonRpcResponse::error(id, INVALID_PARAMS, "Missing raw transaction hex");
+    // jsonrpc4j finds no method of the name for any other count.
+    let [sent] = params.as_array().map(Vec::as_slice).unwrap_or_default() else {
+        return JsonRpcResponse::error(id, INVALID_PARAMS, "method parameters invalid");
     };
-
-    let raw_hex = raw_hex.strip_prefix("0x").unwrap_or(raw_hex);
-    let Ok(raw_bytes) = hex::decode(raw_hex) else {
-        return JsonRpcResponse::error(id, INVALID_PARAMS, "Invalid hex");
+    let read = match crate::params::text(sent) {
+        Some(written) => crate::params::hex_data(&written).map(|raw| (raw, written)),
+        None => Err(crate::params::uncaught()),
+    };
+    let chain = state.hardfork_cfg.as_ref().map(|config| config.chain_id);
+    let raw = match read.and_then(|(raw, written)| {
+        crate::raw_tx::refused(&raw, &written, chain)?;
+        Ok(raw)
+    }) {
+        Ok(raw) => raw,
+        Err((code, message)) => return JsonRpcResponse::error(id, code, message),
     };
 
     match submitter
-        .submit_transaction(alloy_primitives::Bytes::from(raw_bytes))
+        .submit_transaction(alloy_primitives::Bytes::from(raw))
         .await
     {
         Ok(tx_hash) => JsonRpcResponse::success(id, json!(format!("0x{:x}", tx_hash))),
-        Err(e) => JsonRpcResponse::error(id, INVALID_PARAMS, e),
+        Err(e) => JsonRpcResponse::error(id, TRANSACTION_ERROR, e),
     }
 }
 

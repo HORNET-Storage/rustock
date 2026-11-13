@@ -120,7 +120,8 @@ pub async fn eth_send_transaction(id: Value, params: &Value, state: &RpcState) -
 
     match submitter.submit_transaction(alloy_primitives::Bytes::from(raw)).await {
         Ok(hash) => JsonRpcResponse::success(id, json!(format!("0x{hash:x}"))),
-        Err(e) => JsonRpcResponse::error(id, INVALID_PARAMS, e),
+        // rskj `transactionError`: what its pool refuses.
+        Err(e) => JsonRpcResponse::error(id, crate::types::TRANSACTION_ERROR, e),
     }
 }
 
