@@ -278,10 +278,9 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
     // the sender the full gas limit (quirks-frozen-bugs.md §9d). Treating the
     // two alike diverged mainnet #9,227,292.
     //
-    // rskj then parses the transaction and runs bitcoinj's `verify()` on it,
-    // whose throw fails the transaction too. Only a transaction committed in a
-    // stored block's merkle tree gets that far, and a block's transactions
-    // pass `verify()`, so that check is not repeated here.
+    // rskj then parses the transaction with bitcoinj and runs its `verify()`
+    // on it (BridgeSupport l.400-401). A throw from either fails the
+    // transaction too.
     let validation = if is_btc_tx_processed(ctx, &btc_tx_hash) {
         Err(Invalid::Swallowed("transaction already processed"))
     } else {
@@ -322,10 +321,10 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
         }
     }
 
-    // Parse the BTC transaction
-    let btc_tx: BtcTransaction = deserialize(&btc_tx_data).map_err(|_| {
-        PrecompileError::other("registerBtcTransaction: invalid BTC transaction")
-    })?;
+    // The transaction as bitcoinj reads the bytes, which the tree above has
+    // proved as they were given: bitcoinj takes more ways of writing one than
+    // the standard, and every hash from here on is of what it read.
+    let btc_tx = read_btc_transaction(&btc_tx_data).map_err(PrecompileError::other)?;
 
     // rskj re-checks "already processed" using the witness-stripped txid
     // (BridgeSupport.registerBtcTransaction l.404, `btcTx.getHash(false)`):
@@ -2003,9 +2002,10 @@ pub fn register_fast_bridge_btc_transaction<CTX: crate::RskContextTr>(
         }
     }
 
-    // Parse the BTC tx and compute the witness-stripped txid (getHash(false)).
-    // A transaction bitcoinj cannot parse throws, which the same catch answers.
-    let Ok(btc_tx) = deserialize::<BtcTransaction>(&btc_tx_data) else {
+    // Parse the BTC tx as bitcoinj does, hold it to `verify()` (BridgeSupport
+    // l.2771-2772), and compute the witness-stripped txid (getHash(false)). A
+    // throw from either is answered by the same catch.
+    let Ok(btc_tx) = read_btc_transaction(&btc_tx_data) else {
         return ok(flyover_code_output(flyover_codes::GENERIC_ERROR));
     };
     let btc_tx_hash_no_witness = legacy_btc_txid(&btc_tx);
@@ -9548,6 +9548,11 @@ mod tests {
     /// below the height RSKj's regtest reads the pegout index from, and one at
     /// it.
     fn regtest_bridge_with(tx: &BtcTransaction) -> impl crate::RskContextTr {
+        regtest_bridge_with_bytes(&btc_serialize(tx))
+    }
+
+    /// The same, with the transaction as the bytes its block's tree holds.
+    fn regtest_bridge_with_bytes(raw: &[u8]) -> impl crate::RskContextTr {
         use revm::MainContext;
         let block = revm::context::BlockEnv {
             number: U256::from(10u64),
@@ -9557,7 +9562,7 @@ mod tests {
         let mut ctx = revm::Context::mainnet()
             .with_block(block)
             .with_chain(crate::raw_storage::RskChainExt::default());
-        let root = calculate_btc_tx_hash(&btc_serialize(tx));
+        let root = calculate_btc_tx_hash(raw);
         let mut prev = bitcoin::constants::genesis_block(bitcoin::Network::Regtest)
             .header
             .block_hash();
@@ -9682,10 +9687,20 @@ mod tests {
         height: i64,
         cfg: &RskHardforkConfig,
     ) -> (bool, bool, usize, usize) {
-        let raw = btc_serialize(tx);
-        let tree = one_leaf_tree(&raw);
+        outcome_of_bytes(ctx, &btc_serialize(tx), tx, height, cfg)
+    }
+
+    /// The same, with `tx` given as `raw`.
+    fn outcome_of_bytes<CTX: crate::RskContextTr>(
+        ctx: &mut CTX,
+        raw: &[u8],
+        tx: &BtcTransaction,
+        height: i64,
+        cfg: &RskHardforkConfig,
+    ) -> (bool, bool, usize, usize) {
+        let tree = one_leaf_tree(raw);
         let args = encode::args(&[
-            Arg::Bytes(&raw),
+            Arg::Bytes(raw),
             Arg::Word(encode::int(height)),
             Arg::Bytes(&tree),
         ]);
@@ -9756,6 +9771,117 @@ mod tests {
         assert_eq!(registered(&tx, 350, None, None), (true, false, 0, 0));
         // A peg-in of nothing: turned down with two events, not marked processed.
         assert_eq!(registered(&tx, 349, None, None), (true, false, 2, 0));
+    }
+
+    /// A transaction of two inputs written in ways bitcoinj reads and
+    /// rust-bitcoin refuses: with a byte left over, with its count of inputs
+    /// in five bytes, and with segwit's marker and flag before inputs that
+    /// carry no witness.
+    fn written_otherwise(tx: &BtcTransaction) -> [Vec<u8>; 3] {
+        assert_eq!(tx.input.len(), 2);
+        let raw = btc_serialize(tx);
+        let (version, rest) = raw.split_at(4);
+        let (body, lock_time) = rest.split_at(rest.len() - 4);
+        let written = [
+            [&raw[..], &[0xFF]].concat(),
+            [version, &[0xFE, 2, 0, 0, 0], &body[1..], lock_time].concat(),
+            [version, &[0x00, 0x01], body, &[0x00, 0x00], lock_time].concat(),
+        ];
+        for bytes in &written {
+            assert!(deserialize::<BtcTransaction>(bytes).is_err());
+        }
+        written
+    }
+
+    /// rskj reads the transaction with bitcoinj (`tx::parse_btc_transaction`),
+    /// so one written in a way rust-bitcoin refuses is registered as the same
+    /// transaction is when written the standard way: the tree proves the bytes
+    /// given, and the transaction is marked processed by the hash of what was
+    /// read. And rskj holds what it has read to bitcoinj's `verify()`, whose
+    /// throw fails the call.
+    #[test]
+    fn a_peg_in_is_registered_however_bitcoinj_reads_its_bytes() {
+        let redeem = build_federation_redeem_script(&test_keys(0x10), 2);
+        let tx = spend(
+            vec![signed_multisig(&redeem), signed_multisig(&redeem)],
+            &[(1_000_000_000, regtest_federation_script())],
+        );
+        // Turned down and refunded, as a multisig's peg-in is: marked
+        // processed, with three events.
+        let standard = registered(&tx, 350, None, None);
+        assert_eq!(standard, (true, true, 3, 0));
+        let cfg = RskHardforkConfig::rskj_regtest();
+        for bytes in &written_otherwise(&tx) {
+            let mut ctx = regtest_bridge_with_bytes(bytes);
+            assert_eq!(outcome_of_bytes(&mut ctx, bytes, &tx, 350, &cfg), standard);
+        }
+
+        // The same outpoint spent twice: bitcoinj's `DuplicatedOutPoint`.
+        let mut twice = tx.clone();
+        twice.input[1].previous_output = twice.input[0].previous_output;
+        assert_eq!(registered(&twice, 350, None, None), (false, false, 0, 0));
+    }
+
+    /// The flyover method reads its transaction the same way
+    /// (`BridgeSupport.registerFlyoverBtcTransaction` l.2771-2772): whatever
+    /// it does with the transaction written the standard way, it does with
+    /// the others. A throw from bitcoinj it answers with its generic error.
+    #[test]
+    fn a_flyover_payment_is_registered_however_bitcoinj_reads_its_bytes() {
+        let (config, cfg) = (
+            BridgeConstants::rskj_regtest(),
+            RskHardforkConfig::rskj_regtest(),
+        );
+        let lbc = RskAddress::repeat_byte(0x42);
+        let mut lbc_word = [0u8; 32];
+        lbc_word[12..].copy_from_slice(lbc.as_slice());
+        let (derivation_arguments, address) = ([0x11; 32], [0x6F; 21]);
+        // The federation's flyover address for those arguments.
+        let flyover_address = {
+            let mut ctx = queue_ctx();
+            let (_, redeem) = active_federation_keys_and_redeem(&mut ctx, &config, &cfg, 10);
+            let format = active_federation_format(&mut ctx, &config, &cfg, 10);
+            let hash = flyover_derivation_hash(&derivation_arguments, &address, &lbc, &address);
+            let script = flyover_redeem_script(&hash, &redeem);
+            p2sh_output_script(&federation_output_hash160(&script, format))
+        };
+        let payer = build_federation_redeem_script(&test_keys(0x10), 2);
+        let tx = spend(
+            vec![signed_multisig(&payer), signed_multisig(&payer)],
+            &[(1_000_000_000, flyover_address)],
+        );
+        let answer = |bytes: &[u8]| {
+            let tree = one_leaf_tree(bytes);
+            let args = encode::args(&[
+                Arg::Bytes(bytes),
+                Arg::Word(encode::int(350)),
+                Arg::Bytes(&tree),
+                Arg::Word(derivation_arguments),
+                Arg::Bytes(&address),
+                Arg::Word(lbc_word),
+                Arg::Bytes(&address),
+                Arg::Word([0; 32]),
+            ]);
+            let mut ctx = regtest_bridge_with_bytes(bytes);
+            let ctx_tx = BridgeTxContext::default();
+            register_fast_bridge_btc_transaction(&mut ctx, &args, 0, &config, &cfg, &ctx_tx, lbc, 2)
+                .unwrap()
+                .bytes
+        };
+        // This Bridge holds no balance, so every bitcoin counts as locked and
+        // the payment is over the cap: read, and refunded to its user.
+        let standard = answer(&btc_serialize(&tx));
+        assert_eq!(standard, flyover_code_output(flyover_codes::REFUNDED_USER));
+        for bytes in &written_otherwise(&tx) {
+            assert_eq!(answer(bytes), standard);
+        }
+
+        let mut twice = tx.clone();
+        twice.input[1].previous_output = twice.input[0].previous_output;
+        assert_eq!(
+            answer(&btc_serialize(&twice)),
+            flyover_code_output(flyover_codes::GENERIC_ERROR)
+        );
     }
 
     /// RSKj looks for its SVP transactions only where it reads the pegout

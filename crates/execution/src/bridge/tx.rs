@@ -254,9 +254,7 @@ pub fn register_btc_coinbase_transaction<CTX: crate::RskContextTr>(
 
     // rskj parses the transaction and runs bitcoinj's `btcTx.verify()` on it
     // (BridgeSupport l.2559-2560). Either throws.
-    let btc_tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&btc_tx_data)
-        .map_err(|_| PrecompileError::other("registerBtcCoinbaseTransaction: invalid btc tx"))?;
-    verify_btc_transaction(&btc_tx, btc_tx_data.len()).map_err(PrecompileError::other)?;
+    let btc_tx = read_btc_transaction(&btc_tx_data).map_err(PrecompileError::other)?;
 
     // `findWitnessCommitment` opens with `Preconditions.checkState(tx.isCoinBase())`:
     // only a block's coinbase names its witness root.
@@ -533,7 +531,8 @@ const MAX_MONEY: i64 = 21_000_000 * 100_000_000;
 
 /// bitcoinj `BtcTransaction.verify()`. Every failure is an exception
 /// `Bridge.execute` rethrows. `serialized_size` is the transaction's
-/// `getMessageSize()`: the bytes it was parsed from.
+/// `getMessageSize()`: how many bytes it was parsed from, not counting any
+/// left over after it.
 fn verify_btc_transaction(
     tx: &bitcoin::Transaction,
     serialized_size: usize,
@@ -573,6 +572,156 @@ fn verify_btc_transaction(
         return Err("bitcoinj verify: a coinbase input in a transaction that isn't one");
     }
     Ok(())
+}
+
+/// bitcoinj `Message.MAX_SIZE`: the most bytes `readBytes` reads at once.
+const MAX_READ_SIZE: i32 = 0x0200_0000;
+
+/// A transaction's bytes, read as bitcoinj's `Message` reads them. A `None`
+/// is a throw.
+struct BitcoinjReader<'a> {
+    payload: &'a [u8],
+    cursor: usize,
+}
+
+impl<'a> BitcoinjReader<'a> {
+    /// `readBytes`. The length is an `int`, and one that is negative, over
+    /// `MAX_SIZE` or past the end throws.
+    fn bytes(&mut self, length: i32) -> Option<&'a [u8]> {
+        if !(0..=MAX_READ_SIZE).contains(&length) {
+            return None;
+        }
+        let end = self.cursor.checked_add(length as usize)?;
+        let bytes = self.payload.get(self.cursor..end)?;
+        self.cursor = end;
+        Some(bytes)
+    }
+
+    fn array<const N: usize>(&mut self) -> Option<[u8; N]> {
+        self.bytes(N as i32)?.try_into().ok()
+    }
+
+    /// `readVarInt`: a `long` from one, three, five or nine bytes, whichever
+    /// the first byte says and however small the number. So a number may be
+    /// written longer than it needs, and in nine bytes it may be negative.
+    fn var_int(&mut self) -> Option<i64> {
+        Some(match self.array::<1>()?[0] {
+            253 => i64::from(u16::from_le_bytes(self.array()?)),
+            254 => i64::from(u32::from_le_bytes(self.array()?)),
+            255 => i64::from_le_bytes(self.array()?),
+            short => i64::from(short),
+        })
+    }
+
+    /// How many inputs, outputs or pushes follow. bitcoinj makes room for
+    /// them with `new ArrayList<>(Math.min((int) count, 20))`, which throws
+    /// for a count whose low 32 bits are negative as an `int`, and then loops
+    /// while a `long` index is under the count: for a negative one, never.
+    fn count(&mut self) -> Option<u64> {
+        let count = self.var_int()?;
+        ((count as i32) >= 0).then_some(count.max(0) as u64)
+    }
+
+    /// A script or a push: its length, which bitcoinj casts to an `int`, and
+    /// that many bytes.
+    fn var_bytes(&mut self) -> Option<&'a [u8]> {
+        let length = self.var_int()? as i32;
+        self.bytes(length)
+    }
+
+    /// `readInputs`. A count is no promise: the loop ends where the bytes do.
+    fn inputs(&mut self) -> Option<Vec<bitcoin::TxIn>> {
+        let mut inputs = Vec::new();
+        for _ in 0..self.count()? {
+            let txid = bitcoin::Txid::from_byte_array(self.array()?);
+            let vout = u32::from_le_bytes(self.array()?);
+            let script_sig = bitcoin::ScriptBuf::from_bytes(self.var_bytes()?.to_vec());
+            let sequence = bitcoin::Sequence(u32::from_le_bytes(self.array()?));
+            inputs.push(bitcoin::TxIn {
+                previous_output: bitcoin::OutPoint { txid, vout },
+                script_sig,
+                sequence,
+                witness: bitcoin::Witness::new(),
+            });
+        }
+        Some(inputs)
+    }
+
+    /// `readOutputs`. bitcoinj reads a value as a signed number. Here it
+    /// keeps its bits, which `verify_btc_transaction` reads as bitcoinj does.
+    fn outputs(&mut self) -> Option<Vec<bitcoin::TxOut>> {
+        let mut outputs = Vec::new();
+        for _ in 0..self.count()? {
+            let value = bitcoin::Amount::from_sat(u64::from_le_bytes(self.array()?));
+            let script_pubkey = bitcoin::ScriptBuf::from_bytes(self.var_bytes()?.to_vec());
+            outputs.push(bitcoin::TxOut {
+                value,
+                script_pubkey,
+            });
+        }
+        Some(outputs)
+    }
+}
+
+/// A Bitcoin transaction as bitcoinj reads the bytes a Bridge method is given
+/// (`new BtcTransaction(params, bytes)`, which is `BtcTransaction.parse`),
+/// and how many of them it read, its `getMessageSize()`. `None` where
+/// bitcoinj throws.
+///
+/// bitcoinj takes what rust-bitcoin's `deserialize` refuses: bytes left over
+/// after the transaction; a count or a length written in more bytes than it
+/// needs, or in nine of which it then drops the high four; and a segwit
+/// marker whose flag is 1 before inputs that carry no witness, or 0 before
+/// nothing at all. What it has read it writes again in the one standard way,
+/// so the transaction's hashes are those of the standard form, whatever the
+/// bytes given hash to.
+pub fn parse_btc_transaction(payload: &[u8]) -> Option<(bitcoin::Transaction, usize)> {
+    let mut reader = BitcoinjReader { payload, cursor: 0 };
+    let version = bitcoin::transaction::Version(i32::from_le_bytes(reader.array()?));
+    let mut input = reader.inputs()?;
+    // No inputs is segwit's marker, and the byte after it holds the flags.
+    let mut flags = 0;
+    let output = if input.is_empty() {
+        flags = reader.array::<1>()?[0];
+        if flags != 0 {
+            input = reader.inputs()?;
+            reader.outputs()?
+        } else {
+            Vec::new()
+        }
+    } else {
+        reader.outputs()?
+    };
+    if flags & 1 != 0 {
+        flags ^= 1;
+        for spent in &mut input {
+            for _ in 0..reader.count()? {
+                spent.witness.push(reader.var_bytes()?);
+            }
+        }
+    }
+    if flags != 0 {
+        return None;
+    }
+    let lock_time =
+        bitcoin::absolute::LockTime::from_consensus(u32::from_le_bytes(reader.array()?));
+    let tx = bitcoin::Transaction {
+        version,
+        lock_time,
+        input,
+        output,
+    };
+    Some((tx, reader.cursor))
+}
+
+/// The transaction a Bridge method is given, as rskj takes it: parsed by
+/// bitcoinj and then held to `BtcTransaction.verify()`. An error is a throw of
+/// either.
+pub fn read_btc_transaction(payload: &[u8]) -> Result<bitcoin::Transaction, &'static str> {
+    let (tx, size) =
+        parse_btc_transaction(payload).ok_or("bitcoinj can't parse the transaction")?;
+    verify_btc_transaction(&tx, size)?;
+    Ok(tx)
 }
 
 fn encode_int_output(gas_cost: u64, value: i64) -> PrecompileOutput {
@@ -970,6 +1119,107 @@ mod tests {
         for tx in &accepted {
             assert_eq!(register_sole_transaction(tx, AFTER_RSKIP460), REGISTERED);
         }
+    }
+
+    /// The file's transactions as bitcoinj reads them, or refuses to: the size
+    /// it counts, both hashes, what `verify()` makes of each, and the bytes it
+    /// writes again. They are written every way a count or a length can be,
+    /// with bytes left over, with segwit's marker and each kind of flag and
+    /// witness, cut short, and with the values and inputs `verify()` refuses.
+    #[test]
+    fn reads_a_transaction_as_bitcoinj_reads_it() {
+        let vectors = include_str!("testdata/bitcoinj_transactions.txt");
+        let (mut read, mut refused_by_rust_bitcoin) = (0, 0);
+        for line in vectors.lines().filter(|line| !line.starts_with('#')) {
+            let fields: Vec<&str> = line.split(' ').collect();
+            let label = fields[0];
+            let payload = match fields[1] {
+                "-" => Vec::new(),
+                given => hex::decode(given).unwrap(),
+            };
+            let ours = parse_btc_transaction(&payload);
+            read += 1;
+            if fields[2] == "throws" {
+                assert!(ours.is_none(), "{label}: bitcoinj throws");
+                assert!(read_btc_transaction(&payload).is_err(), "{label}");
+                continue;
+            }
+            let (tx, size) = ours.unwrap_or_else(|| panic!("{label}: bitcoinj reads it"));
+            assert_eq!(size.to_string(), fields[3], "{label}: its size");
+            assert_eq!(
+                tx.compute_txid().to_string(),
+                fields[4],
+                "{label}: its hash"
+            );
+            // rust-bitcoin writes a transaction without inputs in segwit's form,
+            // which bitcoinj doesn't. `verify()` refuses one before anything
+            // asks for more than the hash above.
+            if !tx.input.is_empty() {
+                assert_eq!(
+                    tx.compute_wtxid().to_string(),
+                    fields[5],
+                    "{label}: its hash with witnesses"
+                );
+                assert_eq!(
+                    hex::encode(bitcoin::consensus::serialize(&tx)),
+                    fields[7],
+                    "{label}: written again"
+                );
+            }
+            let verified = verify_btc_transaction(&tx, size).is_ok();
+            assert_eq!(verified, fields[6] == "ok", "{label}: verify()");
+            assert_eq!(
+                read_btc_transaction(&payload).ok(),
+                verified.then_some(tx.clone())
+            );
+            // What rust-bitcoin reads as well, it reads the same.
+            match bitcoin::consensus::deserialize::<bitcoin::Transaction>(&payload) {
+                Ok(theirs) => assert_eq!(theirs, tx, "{label}"),
+                Err(_) => refused_by_rust_bitcoin += 1,
+            }
+        }
+        assert_eq!(read, 88);
+        // Of the 58 that bitcoinj reads.
+        assert_eq!(refused_by_rust_bitcoin, 33);
+    }
+
+    /// rskj reads the coinbase with bitcoinj, so one written in a way
+    /// rust-bitcoin refuses is registered all the same: it is the bytes given
+    /// that the block's tree holds, and the transaction read from them that
+    /// carries the commitment. `verify()` holds it to a block's size by the
+    /// bytes read, not by those given.
+    #[test]
+    fn a_coinbase_is_registered_however_bitcoinj_reads_its_bytes() {
+        let tx = coinbase(
+            vec![0x51, 0x51],
+            vec![output(50, vec![0x51]), commitment_output()],
+        );
+        let (version, rest) = tx.split_at(4);
+        let (body, lock_time) = rest.split_at(rest.len() - 4);
+        let written = [
+            // Bytes left over after the transaction.
+            [&tx[..], &[0x00]].concat(),
+            // The count of inputs in three bytes.
+            [version, &[0xfd, 0x01, 0x00], &body[1..], lock_time].concat(),
+            // Segwit's marker and flag, and an input without a witness.
+            [version, &[0x00, 0x01], body, &[0x00], lock_time].concat(),
+        ];
+        for raw in &written {
+            assert!(bitcoin::consensus::deserialize::<bitcoin::Transaction>(raw).is_err());
+            assert_eq!(register_sole_transaction(raw, AFTER_RSKIP460), REGISTERED);
+        }
+
+        // A transaction of exactly a block's size, and ten bytes after it.
+        let largest = coinbase(
+            vec![0x51, 0x51],
+            vec![output(50, vec![0x51; 999_887]), commitment_output()],
+        );
+        assert_eq!(largest.len(), MAX_BLOCK_SIZE);
+        let followed = [&largest[..], &[0u8; 10]].concat();
+        assert_eq!(
+            register_sole_transaction(&followed, AFTER_RSKIP460),
+            REGISTERED
+        );
     }
 
     /// Before RSKIP460 rskj reads each output's script with
