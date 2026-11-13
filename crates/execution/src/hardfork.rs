@@ -805,6 +805,13 @@ impl RskHardforkConfig {
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Lovell700
     }
 
+    /// RSKIP460 (Lovell700): the Bridge reads a Bitcoin output's script bytes
+    /// as they are when it looks for a coinbase's witness commitment. Before
+    /// it, it parsed each script first, and one bitcoinj can't parse threw.
+    pub fn has_rskip460(&self, block_number: u64) -> bool {
+        self.active_upgrade(block_number) >= RskNetworkUpgrade::Lovell700
+    }
+
     /// RSKIP459: mark rejected non-refundable peg-ins as processed (Lovell700).
     /// Disabled again by RSKIP551 at Vetiver900.
     pub fn has_rskip459(&self, block_number: u64) -> bool {

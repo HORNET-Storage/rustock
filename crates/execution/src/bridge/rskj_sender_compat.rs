@@ -333,6 +333,12 @@ fn parse_script_program(program: &[u8]) -> Option<Vec<JChunk>> {
     Some(chunks)
 }
 
+/// Whether bitcoinj parses `program` as a script. `new Script(program)` throws
+/// a `ScriptException` for one it can't: a push that runs past the end.
+pub fn parses_as_script(program: &[u8]) -> bool {
+    parse_script_program(program).is_some()
+}
+
 // --- RedeemScriptValidator -------------------------------------------------
 
 fn is_redeem_like_script(chunks: &[JChunk]) -> bool {

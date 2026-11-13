@@ -224,7 +224,7 @@ pub fn register_btc_coinbase_transaction<CTX: crate::RskContextTr>(
     })?;
 
     // Check that the tx hash is among the matched hashes. rskj
-    // (BridgeSupport.registerBtcCoinbaseTransaction l.2503-2511) logs a
+    // (BridgeSupport.registerBtcCoinbaseTransaction l.2505-2513) logs a
     // warning and `return`s — it does NOT throw — so the call SUCCEEDS as a
     // no-op (no coinbase info stored). A throw here would mark the summary
     // failed and bill the full gas limit instead of gasUsed.
@@ -243,7 +243,7 @@ pub fn register_btc_coinbase_transaction<CTX: crate::RskContextTr>(
         *raw.as_byte_array()
     };
 
-    // rskj (BridgeSupport.registerBtcCoinbaseTransaction l.2546-2555) logs the
+    // rskj (BridgeSupport.registerBtcCoinbaseTransaction l.2548-2557) logs the
     // panic message and `return`s on a merkle-root mismatch — it does NOT
     // throw. The call SUCCEEDS as a no-op (no coinbase info stored), so the
     // summary is NOT marked failed and the sender is billed gasUsed, not the
@@ -252,13 +252,22 @@ pub fn register_btc_coinbase_transaction<CTX: crate::RskContextTr>(
         return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
     }
 
-    // rskj verifies the tx parses and is internally consistent
-    // (`btcTx.verify()`, BridgeSupport l.2557-2558). A parse failure throws.
+    // rskj parses the transaction and runs bitcoinj's `btcTx.verify()` on it
+    // (BridgeSupport l.2559-2560). Either throws.
     let btc_tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&btc_tx_data)
         .map_err(|_| PrecompileError::other("registerBtcCoinbaseTransaction: invalid btc tx"))?;
+    verify_btc_transaction(&btc_tx, btc_tx_data.len()).map_err(PrecompileError::other)?;
+
+    // `findWitnessCommitment` opens with `Preconditions.checkState(tx.isCoinBase())`:
+    // only a block's coinbase names its witness root.
+    if !btc_tx.is_coinbase() {
+        return Err(PrecompileError::other(
+            "registerBtcCoinbaseTransaction: the transaction isn't a coinbase",
+        ));
+    }
 
     // Validate the witness commitment (rskj `validateWitnessInformation`,
-    // BridgeSupport l.2568-2587). The commitment embedded in the coinbase tx
+    // BridgeSupport l.2570-2589). The commitment embedded in the coinbase tx
     // must equal SHA256d(witnessMerkleRoot.getReversedBytes() || witnessReservedValue).
     // The ABI arg is the witness merkle root in display order (bitcoinj
     // `Sha256Hash.wrap` keeps the bytes as given), and the commitment hashes it
@@ -270,11 +279,14 @@ pub fn register_btc_coinbase_transaction<CTX: crate::RskContextTr>(
     let calculated_commitment = *sha256d::Hash::hash(&commitment_data).as_byte_array();
 
     // If the embedded commitment is missing or does not match, rskj throws
-    // `BridgeIllegalArgumentException` (BridgeSupport l.2576-2584), which
+    // `BridgeIllegalArgumentException` (BridgeSupport l.2578-2587), which
     // `Bridge.execute` wraps in a `VMException` — the call FAILS (no store),
     // unlike the no-op `return` paths above. A `PrecompileError::other` here is
     // translated by the bridge dispatch into the same VMException gas semantics.
-    match find_witness_commitment(&btc_tx) {
+    let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
+    let found = find_witness_commitment(&btc_tx, !hardfork_cfg.has_rskip460(block_number))
+        .map_err(PrecompileError::other)?;
+    match found {
         Some(expected) if expected == calculated_commitment => {}
         _ => {
             return Err(PrecompileError::other(
@@ -478,25 +490,89 @@ const MINIMUM_WITNESS_COMMITMENT_SIZE: usize = 38;
 
 /// Find the witness commitment hash embedded in a coinbase transaction's
 /// outputs, mirroring rskj `BitcoinUtils.findWitnessCommitment`
-/// (rskj-core .../peg/bitcoin/BitcoinUtils.java l.300-357).
+/// (rskj-core .../peg/bitcoin/BitcoinUtils.java l.309-365).
 ///
 /// The commitment lives in an output whose scriptPubKey is
 /// `OP_RETURN <push 36> aa21a9ed <32-byte commitment>`. If several such
 /// outputs exist, BIP141 takes the LAST one, so rskj iterates the outputs
 /// reversed and returns the first match. Returns the 32-byte commitment in
-/// internal byte order (bitcoinj `Sha256Hash.wrap`). Pre-RSKIP460 rskj parses
-/// `getScriptPubKey().getProgram()`; for a well-formed commitment output that
-/// is byte-identical to the raw script bytes used here. RSKIP460 is not active
-/// over the current sync range.
-fn find_witness_commitment(tx: &bitcoin::Transaction) -> Option<[u8; 32]> {
-    tx.output.iter().rev().find_map(|out| {
+/// internal byte order (bitcoinj `Sha256Hash.wrap`).
+///
+/// Before RSKIP460 rskj reads each script with `getScriptPubKey().getProgram()`,
+/// which answers the same bytes but first parses them, and throws a
+/// `ScriptException` for a script bitcoinj can't parse: the `Err`. The scan
+/// stops at the commitment, so outputs before it are never parsed.
+fn find_witness_commitment(
+    tx: &bitcoin::Transaction,
+    before_rskip460: bool,
+) -> Result<Option<[u8; 32]>, &'static str> {
+    for out in tx.output.iter().rev() {
         let spk = out.script_pubkey.as_bytes();
-        (spk.len() >= MINIMUM_WITNESS_COMMITMENT_SIZE
+        if before_rskip460 && !super::rskj_sender_compat::parses_as_script(spk) {
+            return Err(
+                "registerBtcCoinbaseTransaction: ScriptException parsing an output's script",
+            );
+        }
+        if spk.len() >= MINIMUM_WITNESS_COMMITMENT_SIZE
             && spk[0] == OP_RETURN
             && spk[1] == WITNESS_COMMITMENT_LENGTH
-            && spk[2..6] == WITNESS_COMMITMENT_HEADER)
-            .then(|| spk[6..MINIMUM_WITNESS_COMMITMENT_SIZE].try_into().unwrap())
-    })
+            && spk[2..6] == WITNESS_COMMITMENT_HEADER
+        {
+            return Ok(spk[6..MINIMUM_WITNESS_COMMITMENT_SIZE].try_into().ok());
+        }
+    }
+    Ok(None)
+}
+
+/// bitcoinj `BtcBlock.MAX_BLOCK_SIZE`, which `BtcTransaction.verify()` holds a
+/// transaction's serialized size to.
+const MAX_BLOCK_SIZE: usize = 1_000_000;
+
+/// bitcoinj `NetworkParameters.MAX_MONEY`, in satoshis.
+const MAX_MONEY: i64 = 21_000_000 * 100_000_000;
+
+/// bitcoinj `BtcTransaction.verify()`. Every failure is an exception
+/// `Bridge.execute` rethrows. `serialized_size` is the transaction's
+/// `getMessageSize()`: the bytes it was parsed from.
+fn verify_btc_transaction(
+    tx: &bitcoin::Transaction,
+    serialized_size: usize,
+) -> Result<(), &'static str> {
+    if tx.input.is_empty() || tx.output.is_empty() {
+        return Err("bitcoinj verify: no inputs or no outputs");
+    }
+    if serialized_size > MAX_BLOCK_SIZE {
+        return Err("bitcoinj verify: larger than a block");
+    }
+    let mut outpoints = std::collections::HashSet::new();
+    if !tx
+        .input
+        .iter()
+        .all(|input| outpoints.insert(input.previous_output))
+    {
+        return Err("bitcoinj verify: an outpoint spent twice");
+    }
+    // bitcoinj reads a value as a signed 64-bit number, and holds the running
+    // sum to the 21 million bitcoins after each output.
+    let mut value_out: i64 = 0;
+    for output in &tx.output {
+        let value = output.value.to_sat() as i64;
+        if value < 0 {
+            return Err("bitcoinj verify: a negative output value");
+        }
+        value_out = match value_out.checked_add(value) {
+            Some(sum) if sum <= MAX_MONEY => sum,
+            _ => return Err("bitcoinj verify: more output value than there is money"),
+        };
+    }
+    if tx.is_coinbase() {
+        if !(2..=100).contains(&tx.input[0].script_sig.len()) {
+            return Err("bitcoinj verify: coinbase script size out of range");
+        }
+    } else if tx.input.iter().any(|input| input.previous_output.is_null()) {
+        return Err("bitcoinj verify: a coinbase input in a transaction that isn't one");
+    }
+    Ok(())
 }
 
 fn encode_int_output(gas_cost: u64, value: i64) -> PrecompileOutput {
@@ -630,7 +706,9 @@ mod tests {
         let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&raw_tx).unwrap();
 
         // The embedded commitment (32 bytes after the aa21a9ed header), internal order.
-        let expected = find_witness_commitment(&tx).expect("coinbase has a witness commitment");
+        let expected = find_witness_commitment(&tx, false)
+            .unwrap()
+            .expect("coinbase has a witness commitment");
         assert_eq!(
             to_hex(&expected),
             "feb3b9170ae765cc6586edd67229eaa8bc19f9674d64cb10ee8a205f4ccf0bc6"
@@ -669,7 +747,7 @@ mod tests {
         )
         .unwrap();
         let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&raw_tx).unwrap();
-        let expected = find_witness_commitment(&tx).unwrap();
+        let expected = find_witness_commitment(&tx, false).unwrap().unwrap();
 
         // Tweak the last byte of the witness merkle root -> commitment must differ.
         let mut witness_merkle_root: [u8; 32] =
@@ -720,6 +798,211 @@ mod tests {
         );
     }
 
+    /// The witness root the registrations below name, as the ABI carries it.
+    const WITNESS_ROOT: [u8; 32] = [0x77; 32];
+
+    /// The output that commits to `WITNESS_ROOT` with a reserved value of zeros.
+    fn commitment_output() -> bitcoin::TxOut {
+        let mut preimage = [0u8; 64];
+        preimage[..32].copy_from_slice(&WITNESS_ROOT);
+        preimage[..32].reverse();
+        let mut script = vec![OP_RETURN, WITNESS_COMMITMENT_LENGTH];
+        script.extend_from_slice(&WITNESS_COMMITMENT_HEADER);
+        script.extend_from_slice(sha256d::Hash::hash(&preimage).as_byte_array());
+        output(0, script)
+    }
+
+    fn output(sats: u64, script: Vec<u8>) -> bitcoin::TxOut {
+        bitcoin::TxOut {
+            value: bitcoin::Amount::from_sat(sats),
+            script_pubkey: bitcoin::ScriptBuf::from_bytes(script),
+        }
+    }
+
+    /// A serialized transaction of one input, which spends `previous_output`.
+    fn one_input_tx(
+        previous_output: bitcoin::OutPoint,
+        script_sig: Vec<u8>,
+        output: Vec<bitcoin::TxOut>,
+    ) -> Vec<u8> {
+        bitcoin::consensus::serialize(&bitcoin::Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output,
+                script_sig: bitcoin::ScriptBuf::from_bytes(script_sig),
+                sequence: bitcoin::Sequence::MAX,
+                witness: bitcoin::Witness::new(),
+            }],
+            output,
+        })
+    }
+
+    fn coinbase(script_sig: Vec<u8>, output: Vec<bitcoin::TxOut>) -> Vec<u8> {
+        one_input_tx(bitcoin::OutPoint::null(), script_sig, output)
+    }
+
+    /// Calls `registerBtcCoinbaseTransaction` at mainnet's `block_number` with
+    /// `raw_tx` as the only transaction of a stored Bitcoin block, naming
+    /// `WITNESS_ROOT`. Answers whether the call returned, and whether it stored
+    /// the block's coinbase information.
+    fn register_sole_transaction(raw_tx: &[u8], block_number: u64) -> (bool, bool) {
+        use crate::abi::encode::{self, Arg};
+        use revm::MainContext;
+        let config = super::super::constants::BridgeConstants::mainnet();
+        let cfg = crate::hardfork::RskHardforkConfig::mainnet();
+        let mut ctx =
+            revm::Context::mainnet().with_chain(crate::raw_storage::RskChainExt::default());
+        ctx.block.number = U256::from(block_number);
+
+        let tx_hash = calculate_btc_tx_hash(raw_tx);
+        let header = bitcoin::block::Header {
+            version: bitcoin::block::Version::TWO,
+            prev_blockhash: bitcoin::BlockHash::all_zeros(),
+            merkle_root: bitcoin::TxMerkleNode::from_byte_array(tx_hash),
+            time: 1_700_000_000,
+            bits: bitcoin::CompactTarget::from_consensus(0x1d00_ffff),
+            nonce: 0,
+        };
+        let block = super::super::btc_store::StoredBlock::new(header, 800_000, U256::from(1));
+        super::super::btc_store::put_stored_block(
+            &mut ctx,
+            &block,
+            cfg.has_stored_block_v2(block_number),
+        );
+        let mut block_hash = block.block_hash().to_byte_array();
+        block_hash.reverse();
+
+        // A tree of the one transaction: its hash is the root.
+        let mut pmt = 1u32.to_le_bytes().to_vec();
+        pmt.push(1);
+        pmt.extend_from_slice(&tx_hash);
+        pmt.extend_from_slice(&[1, 0x01]);
+        let args = encode::args(&[
+            Arg::Bytes(raw_tx),
+            Arg::Word(block_hash),
+            Arg::Bytes(&pmt),
+            Arg::Word(WITNESS_ROOT),
+            Arg::Word([0; 32]),
+        ]);
+
+        let returned = register_btc_coinbase_transaction(&mut ctx, &args, 0, &config, &cfg).is_ok();
+        (returned, has_coinbase_information(&mut ctx, &block_hash))
+    }
+
+    /// Mainnet heights on either side of lovell700 (7,338,024), where RSKIP460
+    /// activates.
+    const BEFORE_RSKIP460: u64 = 7_000_000;
+    const AFTER_RSKIP460: u64 = 7_400_000;
+
+    const REGISTERED: (bool, bool) = (true, true);
+    const THROWN: (bool, bool) = (false, false);
+
+    #[test]
+    fn a_coinbase_whose_commitment_matches_is_registered() {
+        let tx = coinbase(
+            vec![0x51, 0x51],
+            vec![output(50, vec![0x51]), commitment_output()],
+        );
+        assert_eq!(register_sole_transaction(&tx, BEFORE_RSKIP460), REGISTERED);
+        assert_eq!(register_sole_transaction(&tx, AFTER_RSKIP460), REGISTERED);
+    }
+
+    /// rskj's `findWitnessCommitment` opens with
+    /// `Preconditions.checkState(tx.isCoinBase())`. Without it any transaction
+    /// of a block could name the block's witness root, with an output that
+    /// looks like a commitment, and a peg-in nobody made could then be proved
+    /// against that root.
+    #[test]
+    fn a_transaction_that_is_not_a_coinbase_names_no_witness_root() {
+        let spends = |previous_output| {
+            one_input_tx(previous_output, vec![0x51, 0x51], vec![commitment_output()])
+        };
+        let payment = bitcoin::OutPoint {
+            txid: bitcoin::Txid::from_byte_array([0xaa; 32]),
+            vout: 0,
+        };
+        // A null hash with any index but 0xffffffff isn't a coinbase's either.
+        let null_hash = bitcoin::OutPoint {
+            txid: bitcoin::Txid::all_zeros(),
+            vout: 0,
+        };
+        for block_number in [BEFORE_RSKIP460, AFTER_RSKIP460] {
+            assert_eq!(
+                register_sole_transaction(&spends(payment), block_number),
+                THROWN
+            );
+            assert_eq!(
+                register_sole_transaction(&spends(null_hash), block_number),
+                THROWN
+            );
+        }
+    }
+
+    /// rskj runs bitcoinj's `BtcTransaction.verify()` on the transaction before
+    /// it looks for the commitment. Each row was run through bitcoinj-thin
+    /// `0.14.4-rsk-18`, which threw the exception named.
+    #[test]
+    fn a_coinbase_bitcoinj_does_not_verify_is_refused() {
+        let commits = |script_sig: Vec<u8>, first: bitcoin::TxOut| {
+            coinbase(script_sig, vec![first, commitment_output()])
+        };
+        let max_money = 21_000_000 * 100_000_000u64;
+        let refused = [
+            // CoinbaseScriptSizeOutOfRange: 2 to 100 bytes.
+            commits(vec![0x51], output(50, vec![0x51])),
+            commits(vec![0x51; 101], output(50, vec![0x51])),
+            // NegativeValueOutput: the value is a signed 64-bit number.
+            commits(vec![0x51, 0x51], output(u64::MAX, vec![0x51])),
+            // ExcessiveValue: more than 21 million bitcoins.
+            commits(vec![0x51, 0x51], output(max_money + 1, vec![0x51])),
+            // LargerThanMaxBlockSize: over 1,000,000 bytes serialized.
+            commits(vec![0x51, 0x51], output(50, vec![0x51; 1_000_000])),
+        ];
+        for tx in &refused {
+            assert_eq!(register_sole_transaction(tx, AFTER_RSKIP460), THROWN);
+        }
+
+        let accepted = [
+            commits(vec![0x51; 100], output(50, vec![0x51])),
+            commits(vec![0x51, 0x51], output(max_money, vec![0x51])),
+        ];
+        for tx in &accepted {
+            assert_eq!(register_sole_transaction(tx, AFTER_RSKIP460), REGISTERED);
+        }
+    }
+
+    /// Before RSKIP460 rskj reads each output's script with
+    /// `getScriptPubKey().getProgram()`, which throws a `ScriptException` for
+    /// one bitcoinj can't parse. It reads them last to first and stops at the
+    /// commitment, so only an output after the commitment is reached.
+    #[test]
+    fn before_rskip460_a_script_bitcoinj_cannot_parse_is_refused() {
+        // OP_PUSHDATA1 with no length byte after it.
+        let unparseable = || output(1, vec![0x4c]);
+        let after_the_commitment =
+            coinbase(vec![0x51, 0x51], vec![commitment_output(), unparseable()]);
+        assert_eq!(
+            register_sole_transaction(&after_the_commitment, BEFORE_RSKIP460),
+            THROWN
+        );
+        assert_eq!(
+            register_sole_transaction(&after_the_commitment, AFTER_RSKIP460),
+            REGISTERED
+        );
+
+        let before_the_commitment =
+            coinbase(vec![0x51, 0x51], vec![unparseable(), commitment_output()]);
+        assert_eq!(
+            register_sole_transaction(&before_the_commitment, BEFORE_RSKIP460),
+            REGISTERED
+        );
+        assert_eq!(
+            register_sole_transaction(&before_the_commitment, AFTER_RSKIP460),
+            REGISTERED
+        );
+    }
+
     /// `find_witness_commitment` must take the LAST matching output (BIP141 / rskj
     /// `findWitnessCommitment` iterates outputs reversed) and ignore non-commitment
     /// outputs.
@@ -753,7 +1036,9 @@ mod tests {
                 mk(&commitment_b),
             ],
         };
-        assert_eq!(find_witness_commitment(&tx), Some(commitment_b));
+        // Parsing the scripts first, as before RSKIP460, finds the same one.
+        assert_eq!(find_witness_commitment(&tx, false), Ok(Some(commitment_b)));
+        assert_eq!(find_witness_commitment(&tx, true), Ok(Some(commitment_b)));
     }
 
     /// Ground truth: rskj `BridgeSupport.java:90-94`. These integers are the
