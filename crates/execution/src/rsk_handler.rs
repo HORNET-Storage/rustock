@@ -128,15 +128,12 @@ invisible_exception: Arc<AtomicBool>,
     /// gives a storage root (`setupContract`) in the call's own track. `None`
     /// where the run applies none of them.
     called_precompiles: Option<Arc<Mutex<Vec<Address>>>>,
-    /// For each frame of contract code running, innermost last: where what
-    /// the precompiles called under it write outside revm's journal begins,
-    /// in `RawStorage` (`frame_start`) and in `called_precompiles`. A frame
-    /// that fails takes it back, as rskj rolls back the track of a call or
-    /// create that reverts or fails, with what the calls under it committed
-    /// into it. And what a local call's accounts owed as the frame opened
-    /// (`RskChainExt::debts`), which a frame that fails leaves as it was: the
-    /// journal gives back what they held.
-    frames: Vec<(usize, usize, crate::raw_storage::Debts)>,
+    /// Each frame of contract code running, innermost last (see `OpenFrame`).
+    frames: Vec<OpenFrame>,
+    /// Shared with `RskPrecompileProvider`, which hands it to the executor:
+    /// the transaction reached REMASC or the Bridge, as rskj counts it
+    /// (`note_call`). `None` where the run doesn't ask.
+    reached_sequential_only: Option<Arc<AtomicBool>>,
     /// A local call: rskj's `TransactionExecutor` with `setLocalCall(true)`,
     /// which serves `eth_call` and `eth_estimateGas`
     /// (`ReversibleTransactionExecutor.reversibleExecution`). `init()` returns
@@ -168,6 +165,26 @@ invisible_exception: Arc<AtomicBool>,
     /// the value and transfers none.
     moves_nothing: std::cell::Cell<bool>,
     _phantom: core::marker::PhantomData<(CTX, ERROR, FRAME)>,
+}
+
+/// What `RskHandler` keeps of a frame of contract code while it runs.
+#[derive(Debug, Clone)]
+struct OpenFrame {
+    /// Where what the precompiles called under it write outside revm's
+    /// journal begins, in `RawStorage` (`frame_start`) and in
+    /// `called_precompiles`. A frame that fails takes it back, as rskj rolls
+    /// back the track of a call or create that reverts or fails, with what
+    /// the calls under it committed into it.
+    raw: usize,
+    called: usize,
+    /// What a local call's accounts owed as it opened
+    /// (`RskChainExt::debts`), which a frame that fails leaves as it was: the
+    /// journal gives back what they held.
+    debts: crate::raw_storage::Debts,
+    /// It runs the constructor of a CREATE or CREATE2, where the transaction's
+    /// own program doesn't: rskj drops what such a program counts as called
+    /// (`note_call`).
+    creation: bool,
 }
 
 impl<CTX, ERROR, FRAME> RskHandler<CTX, ERROR, FRAME> {
@@ -204,6 +221,13 @@ impl<CTX, ERROR, FRAME> RskHandler<CTX, ERROR, FRAME> {
     /// that fails takes its calls back off it. See the field.
     pub fn with_called_precompiles(mut self, called: Arc<Mutex<Vec<Address>>>) -> Self {
         self.called_precompiles = Some(called);
+        self
+    }
+
+    /// Where to say that the transaction reached REMASC or the Bridge. See the
+    /// field.
+    pub fn with_reached_sequential_only(mut self, reached: Arc<AtomicBool>) -> Self {
+        self.reached_sequential_only = Some(reached);
         self
     }
 
@@ -315,6 +339,7 @@ impl<CTX, ERROR, FRAME> RskHandler<CTX, ERROR, FRAME> {
             fail_programs: false,
             called_precompiles: None,
             frames: Vec::new(),
+            reached_sequential_only: None,
             local_call: false,
             rskip136_active: true,
             starved: std::cell::Cell::new(false),
@@ -743,6 +768,11 @@ where
             // pays for one.
             self.local_call && (gas_price.bit_len() == 256 || ctx.tx().value().bit_len() == 256)
         };
+        if let revm::interpreter::interpreter_action::FrameInput::Call(call) =
+            &first_frame_input.frame_input
+        {
+            self.note_call(call.bytecode_address);
+        }
         match D::init(evm, first_frame_input)? {
             ItemOrResult::Result(mut frame_result) => {
                 if let Some(limit) = lent {
@@ -785,7 +815,7 @@ where
         // Top-level CREATE transaction: rskj's TransactionExecutor.create never
         // bumps the nonce (even post-RSKIP125), so it stays 0.
         set_created_contract_nonce(evm, 0);
-        self.open_frame(evm);
+        self.open_frame(evm, false);
         evm.ctx().chain_mut().internal_txs.enter(None);
         // A local call whose gas limit can't pay its intrinsic cost (see
         // `validate`): rskj's `go()` throws as it charges the cost, before the
@@ -819,6 +849,14 @@ where
                         }
                         _ => None,
                     };
+                    let creates = matches!(
+                        init.frame_input,
+                        revm::interpreter::interpreter_action::FrameInput::Create(_)
+                    );
+                    // Before anything can refuse the call (`note_call`).
+                    if let Some(callee) = callee {
+                        self.note_call(callee);
+                    }
                     // RSKIP150 lowers the call-stack limit from 1024 to 400
                     // (rskj Program.getMaxDepth); revm hard-codes 1024, so
                     // the cap is enforced here. rskj's deep checks push 0,
@@ -893,7 +931,7 @@ where
                             // created contract's nonce to 1; before, it is 0.
                             let nonce = u64::from(self.rskip125_active);
                             set_created_contract_nonce(evm, nonce);
-                            self.open_frame(evm);
+                            self.open_frame(evm, creates);
                             // The program runs as that internal transaction,
                             // which carries the code it runs.
                             let code = evm
@@ -1184,16 +1222,22 @@ impl<EVM, ERROR> RskHandler<EVM, ERROR, EthFrame<EthInterpreter>>
 where
     EVM: EvmTr<Context: crate::RskContextTr>,
 {
-    /// A frame of contract code opens (see `frames`).
-    fn open_frame(&mut self, evm: &mut EVM) {
+    /// A frame of contract code opens (see `frames`), one that runs a
+    /// constructor of a CREATE or CREATE2 where `creation`.
+    fn open_frame(&mut self, evm: &mut EVM, creation: bool) {
         let raw = evm.ctx().chain().raw_storage.frame_start();
         let called = self
             .called_precompiles
             .as_ref()
             .and_then(|list| list.lock().ok().map(|list| list.len()))
             .unwrap_or_default();
-        let owed = evm.ctx().chain().debts.clone();
-        self.frames.push((raw, called, owed));
+        let debts = evm.ctx().chain().debts.clone();
+        self.frames.push(OpenFrame {
+            raw,
+            called,
+            debts,
+            creation,
+        });
     }
 
     /// The innermost frame of contract code ends, having `committed` or not.
@@ -1201,16 +1245,38 @@ where
     /// outside revm's journal, and what was done under it to what a local
     /// call's accounts owe (see `frames`).
     fn close_frame(&mut self, evm: &mut EVM, committed: bool) {
-        let Some((raw, called, owed)) = self.frames.pop() else {
+        let Some(frame) = self.frames.pop() else {
             return;
         };
         if committed {
             return;
         }
-        evm.ctx().chain_mut().raw_storage.revert_frame(raw);
-        evm.ctx().chain_mut().debts = owed;
+        evm.ctx().chain_mut().raw_storage.revert_frame(frame.raw);
+        evm.ctx().chain_mut().debts = frame.debts;
         if let Some(Ok(mut list)) = self.called_precompiles.as_ref().map(|list| list.lock()) {
-            list.truncate(called);
+            list.truncate(frame.called);
+        }
+    }
+
+    /// A program calls `callee`, or the transaction does, with no frame open.
+    /// rskj counts a call to a precompile as the call starts
+    /// (`Program.callToPrecompiledAddress`, `TransactionExecutor.call`), before
+    /// it checks the depth or the caller's balance, so a call it then refuses
+    /// counts too. A program hands what it counted to its caller only where
+    /// the caller called it, whatever became of the call
+    /// (`Program.executeCode`), and not where the caller ran its CREATE: so a
+    /// call counts for the transaction unless a constructor of a CREATE or
+    /// CREATE2 is running. Under RSKIP-144 a transaction that reached REMASC
+    /// or the Bridge may only sit in the sequential sublist
+    /// (`TransactionListExecutor`, `BlockExecutor`).
+    fn note_call(&self, callee: Address) {
+        if !crate::precompiles::SEQUENTIAL_ONLY_PRECOMPILES.contains(&callee)
+            || self.frames.iter().any(|frame| frame.creation)
+        {
+            return;
+        }
+        if let Some(reached) = &self.reached_sequential_only {
+            reached.store(true, Ordering::Relaxed);
         }
     }
 

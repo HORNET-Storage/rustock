@@ -30,8 +30,10 @@ pub struct TxExecutionResult {
     pub created_address: Option<Address>,
     /// The transaction reached REMASC or the Bridge, so under RSKIP-144 it
     /// may only sit in the sequential sublist
-    /// (`SEQUENTIAL_ONLY_PRECOMPILES`). True whatever the call returned --
-    /// reaching the precompile is what counts.
+    /// (`SEQUENTIAL_ONLY_PRECOMPILES`). As rskj counts it: whatever the call
+    /// returned, and though it was refused for the depth or the caller's
+    /// balance, but not from under a constructor of a CREATE or CREATE2
+    /// (`RskHandler`'s `note_call`).
     pub reached_sequential_only: bool,
     /// rskj's `ProgramResult.isRevert`: the transaction's own program ended
     /// with REVERT, and `output` is what it reverted with. `eth_call` and
@@ -534,7 +536,8 @@ impl RskExecutor {
             )
             .failing_programs(!header_fits_program_invoke(header))
             .as_local_call(local_call, self.hardfork_cfg.has_rskip136(header.number))
-            .from_nobody(no_sender);
+            .from_nobody(no_sender)
+            .with_reached_sequential_only(reached_sequential_only.clone());
             let out = handler
                 .run(&mut evm)
                 .map_err(|e: revm::context::result::EVMError<_>| {
@@ -676,7 +679,8 @@ impl RskExecutor {
                 self.hardfork_cfg.has_rskip171(header.number),
             )
             .failing_programs(!header_fits_program_invoke(header))
-            .as_local_call(local_call, self.hardfork_cfg.has_rskip136(header.number));
+            .as_local_call(local_call, self.hardfork_cfg.has_rskip136(header.number))
+            .with_reached_sequential_only(reached_sequential_only.clone());
             use revm::inspector::InspectorHandler;
             let out = handler
                 .inspect_run(&mut evm)
@@ -876,7 +880,8 @@ impl RskExecutor {
             )
             .failing_programs(!header_fits_program_invoke(header))
             .as_local_call(local_call, self.hardfork_cfg.has_rskip136(header.number))
-            .from_nobody(no_sender);
+            .from_nobody(no_sender)
+            .with_reached_sequential_only(reached_sequential_only.clone());
             use revm::inspector::InspectorHandler;
             let out = handler
                 .inspect_run(&mut evm)
@@ -2242,7 +2247,8 @@ impl RskExecutor {
             )
             .postponing_fees(postpone_fees)
             .failing_programs(fails_programs)
-            .with_called_precompiles(called_precompiles.clone());
+            .with_called_precompiles(called_precompiles.clone())
+            .with_reached_sequential_only(reached_sequential_only.clone());
                 // `inspect_run` for the one transaction being traced, `run`
                 // for every other -- and `run` is the same code path an EVM
                 // built without an inspector takes, because revm carries the
@@ -15008,6 +15014,9 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
         transactions: Vec<(rustock_core::Transaction, Address)>,
         /// For each transaction: whether it succeeded, the gas it used, its logs.
         results: Vec<(bool, u64, Vec<revm::primitives::Log>)>,
+        /// For each transaction, where the file says: the precompiles rskj
+        /// counts it as having called (`precompiledContractsCalled`).
+        called: Vec<Vec<Address>>,
         /// The Bridge's storage after the transactions.
         cells: std::collections::BTreeMap<U256, Vec<u8>>,
         /// Those of its cells that hold more than 4,096 bytes, each by the
@@ -15094,6 +15103,13 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
                     );
                 }
                 "root" => run.root = B256::from_slice(&bytes(fields[1])),
+                "called" => run.called.push(
+                    fields[1]
+                        .split(',')
+                        .filter(|address| *address != "-")
+                        .map(|address| Address::from_slice(&bytes(address)))
+                        .collect(),
+                ),
                 "itx" | "end" | "enc" => {}
                 other => panic!("an unknown line: {other}"),
             }
@@ -15101,10 +15117,8 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
         runs
     }
 
-    /// Runs one of rskj's runs here and holds what comes of it to what came of
-    /// it in rskj: each transaction's outcome, logs and gas, the Bridge's
-    /// storage, and the state root.
-    fn replays_as_rskj_ran_it(run: &RskjRun) {
+    /// The state one of rskj's runs starts from: its accounts and its cells.
+    fn state_of_rskj_run(run: &RskjRun) -> (Arc<MemoryTrieStore>, TrieNode) {
         let store = Arc::new(MemoryTrieStore::new());
         let mut root = TrieNode::empty();
         for (address, nonce, balance, code) in &run.accounts {
@@ -15118,6 +15132,15 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
             let key = rustock_trie::storage_key(address, &B256::from(*key));
             root = root.put(&TrieKeySlice::from_key(&key), value, store.as_ref());
         }
+        (store, root)
+    }
+
+    /// Runs one of rskj's runs here and holds what comes of it to what came of
+    /// it in rskj: each transaction's outcome, logs and gas, whether it reached
+    /// REMASC or the Bridge where the file says what it called, the Bridge's
+    /// storage, and the state root.
+    fn replays_as_rskj_ran_it(run: &RskjRun) {
+        let (store, root) = state_of_rskj_run(run);
         assert_eq!(
             root.compute_hash(store.as_ref()),
             run.preroot,
@@ -15145,6 +15168,15 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
                 assert_eq!(log, rskjs, "{what}: log {at}");
             }
             assert_eq!(outcome.gas_used, *gas_used, "{what}: gas");
+            if let Some(called) = run.called.get(index) {
+                let reached = called.iter().any(|address| {
+                    crate::precompiles::SEQUENTIAL_ONLY_PRECOMPILES.contains(address)
+                });
+                assert_eq!(
+                    outcome.reached_sequential_only, reached,
+                    "{what}: whether it reached REMASC or the Bridge (rskj called {called:?})"
+                );
+            }
         }
         // The Bridge's storage: what it started with, and over it what the
         // transactions wrote, in order.
@@ -15273,6 +15305,86 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
         let runs = rskj_runs(include_str!("bridge/testdata/rskj_refunded_pegins.txt"));
         for name in ["relay", "nested", "delegate", "constructor", "deploy"] {
             replays_as_rskj_ran_it(run_named(&runs, name));
+        }
+    }
+
+    /// Which transactions reach REMASC or the Bridge, as rskj counts them:
+    /// under RSKIP-144 such a transaction may only sit in a block's sequential
+    /// sublist, and a block with one in a parallel sublist is invalid
+    /// (`TransactionListExecutor`). `testdata/rskj_precompiles_called.txt` is
+    /// rskj's own `TransactionExecutor` running each transaction and saying
+    /// which precompiles it counted (`precompiledContractsCalled`).
+    ///
+    /// rskj counts a call to a precompile as the call starts
+    /// (`Program.callToPrecompiledAddress`), before it checks the depth and the
+    /// caller's balance: a call to the Bridge or REMASC that is then refused
+    /// counts (`calls-bridge-unpaid`, `callcodes-bridge-unpaid`,
+    /// `calls-remasc-unpaid`, and `deep-bridge`, at the depth limit). And a
+    /// program hands what it counted to its caller only from a call, whether
+    /// the call succeeded or not (`Program.executeCode`), and the transaction
+    /// keeps it though it then reverts (`calls-bridge-then-reverts`): what a
+    /// constructor run by CREATE or CREATE2 counted is dropped (the
+    /// `creates-*-calling-*` runs and `deploy-creating-child-calling-bridge`),
+    /// though not the constructor of a transaction that creates
+    /// (`deploy-calling-bridge`), nor what its creator calls once it has ended
+    /// (`creates-reverting-then-calls-bridge`, `creates-empty-then-calls-bridge`).
+    ///
+    /// A block's run, which a block is checked and built with, is held to all
+    /// rskj did; the runs of one transaction by itself (a local call, a
+    /// trace, an estimate) only to what it counted.
+    #[test]
+    fn a_transaction_reaches_remasc_or_the_bridge_as_rskj_counts_it() {
+        let runs = rskj_runs(include_str!("testdata/rskj_precompiles_called.txt"));
+        assert_eq!(runs.len(), 26);
+        let failed: Vec<&str> = runs
+            .iter()
+            .filter(|run| {
+                assert_eq!(run.called.len(), run.results.len(), "{}", run.name);
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    replays_as_rskj_ran_it(run)
+                }))
+                .is_err()
+            })
+            .map(|run| run.name.as_str())
+            .collect();
+        assert!(
+            failed.is_empty(),
+            "{} of 26 differ: {failed:?}",
+            failed.len()
+        );
+
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let executor = RskExecutor::new(RskHardforkConfig::rskj_regtest(), block_store)
+            .with_bridge_constants(crate::bridge::constants::BridgeConstants::rskj_regtest());
+        let header = Header {
+            difficulty: U256::from(1),
+            ..dummy_header(10)
+        };
+        for run in &runs {
+            let (store, root) = state_of_rskj_run(run);
+            let (tx, sender) = &run.transactions[0];
+            let reached = run.called[0]
+                .iter()
+                .any(|address| crate::precompiles::SEQUENTIAL_ONLY_PRECOMPILES.contains(address));
+            let alone = executor
+                .execute_tx(&header, tx, *sender, &root, store.clone())
+                .unwrap();
+            let (traced, _) = executor
+                .execute_tx_traced(&header, tx, *sender, &root, store.clone(), false, 0)
+                .unwrap();
+            let (estimated, _) = executor
+                .execute_tx_for_estimate(&header, tx, *sender, &root, store.clone(), false)
+                .unwrap();
+            assert_eq!(
+                [
+                    alone.reached_sequential_only,
+                    traced.reached_sequential_only,
+                    estimated.reached_sequential_only
+                ],
+                [reached; 3],
+                "{}: alone, traced and estimated",
+                run.name
+            );
         }
     }
 }

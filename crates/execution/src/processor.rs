@@ -1601,7 +1601,7 @@ mod tests {
     /// consensus, not a miner's preference.
     #[test]
     fn a_bridge_call_in_a_parallel_sublist_invalidates_the_block() {
-        let (block, root, store, block_store) = bridge_calling_block(Some(vec![1, 2]));
+        let (block, root, store, block_store) = bridge_calling_block(Some(vec![1, 2]), None);
         let processor = BlockProcessor::new(
             RskHardforkConfig::testnet(), // reed810 is scheduled there
             block_store,
@@ -1626,7 +1626,7 @@ mod tests {
         // too, so put the Bridge call where the sequential set starts by
         // declaring a single transaction's worth of parallel sublists above
         // it: with no edges at all there is no partition and no rule.
-        let (block, root, store, block_store) = bridge_calling_block(None);
+        let (block, root, store, block_store) = bridge_calling_block(None, None);
         let processor = BlockProcessor::new(RskHardforkConfig::testnet(), block_store);
         let out = processor.execute_block(&block, &root, store);
         assert!(
@@ -1636,6 +1636,58 @@ mod tests {
             ),
             "a block with no partition cannot break the partition rule"
         );
+    }
+
+    /// rskj counts a call to the Bridge as it starts, before it checks the
+    /// caller's balance (`Program.callToPrecompiledAddress`): a contract's call
+    /// it refuses because the contract can't pay the value bars the
+    /// transaction from a parallel sublist all the same. The contract is
+    /// `calls-bridge-unpaid` of `testdata/rskj_precompiles_called.txt`.
+    #[test]
+    fn a_refused_bridge_call_in_a_parallel_sublist_invalidates_the_block() {
+        let (block, root, store, block_store) = bridge_calling_block(
+            Some(vec![1, 2]),
+            Some(
+                "7f6923fa8500000000000000000000000000000000000000000000000000000000\
+                 6000526000600060046000600163010000065af15000",
+            ),
+        );
+        let processor = BlockProcessor::new(RskHardforkConfig::testnet(), block_store);
+        let err = processor
+            .execute_block(&block, &root, store)
+            .expect_err("a refused Bridge call in a parallel sublist is invalid");
+        assert!(
+            matches!(
+                err,
+                ProcessError::SequentialOnlyPrecompileInParallelSublist {
+                    index: 0,
+                    sublist: 0,
+                    ..
+                }
+            ),
+            "got {err}"
+        );
+    }
+
+    /// What a constructor run by CREATE calls doesn't count for the
+    /// transaction in rskj (`Program.createContract` never hands it on), so a
+    /// transaction whose only Bridge call is a constructor's may sit in a
+    /// parallel sublist. The contract is `creates-child-calling-bridge` of
+    /// `testdata/rskj_precompiles_called.txt`.
+    #[test]
+    fn a_constructors_bridge_call_leaves_a_parallel_sublist_open() {
+        let (block, root, store, block_store) = bridge_calling_block(
+            Some(vec![1, 2]),
+            Some(
+                "60376010600039603760006000f050007f6923fa850000000000000000000000\
+                 0000000000000000000000000000000000600052600060006004600060006301\
+                 0000065af15000",
+            ),
+        );
+        let processor = BlockProcessor::new(RskHardforkConfig::testnet(), block_store);
+        processor
+            .execute_block(&block, &root, store)
+            .expect("a constructor's Bridge call bars no sublist");
     }
 
     /// A block whose transactions reach nothing of the sort is unaffected,
@@ -1953,22 +2005,37 @@ mod tests {
     }
 
     /// A block whose first transaction calls the Bridge, with `edges` as
-    /// given. Returns everything `execute_block` needs.
+    /// given, or calls a contract whose code is `through` (hex). Returns
+    /// everything `execute_block` needs.
     #[allow(clippy::type_complexity)]
     fn bridge_calling_block(
         edges: Option<Vec<i16>>,
+        through: Option<&str>,
     ) -> (Block, TrieNode, Arc<dyn TrieStore>, Arc<BlockStore>) {
         let store: Arc<dyn TrieStore> = Arc::new(MemoryTrieStore::new());
         let chain_id = 31u64;
         let key = SigningKey::from_slice(&[9u8; 32]).unwrap();
         let sender = sender_address(&key);
-        let root = put_account(
+        let mut root = put_account(
             &TrieNode::empty(),
             store.as_ref(),
             &sender,
             0,
             U256::from(10u64).pow(U256::from(18)),
         );
+        let mut to = crate::precompiles::BRIDGE_ADDR;
+        let mut input = Bytes::from(vec![0x00, 0x00, 0x00, 0x00]);
+        if let Some(code) = through {
+            to = Address::repeat_byte(0xC1);
+            input = Bytes::new();
+            root = put_account(&root, store.as_ref(), &to, 0, U256::ZERO);
+            let code_key = rustock_trie::code_key(&to);
+            root = root.put(
+                &TrieKeySlice::from_key(&code_key),
+                &hex::decode(code).unwrap(),
+                store.as_ref(),
+            );
+        }
         let block_store =
             Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
 
@@ -1978,9 +2045,9 @@ mod tests {
             nonce: 0,
             gas_price: U256::from(0),
             gas_limit: U256::from(500_000),
-            to: Bytes::copy_from_slice(crate::precompiles::BRIDGE_ADDR.as_slice()),
+            to: Bytes::copy_from_slice(to.as_slice()),
             value: U256::ZERO,
-            input: Bytes::from(vec![0x00, 0x00, 0x00, 0x00]),
+            input,
             v: 0,
             r: U256::ZERO,
             s: U256::ZERO,

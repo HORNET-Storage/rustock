@@ -669,8 +669,8 @@ pub struct RskPrecompileProvider {
     /// tx committed. A frame that fails takes its calls back off it
     /// (`RskHandler`), as rskj rolls that track back with the frame's.
     called_precompiles: std::sync::Arc<std::sync::Mutex<Vec<Address>>>,
-    /// Set when this transaction reaches REMASC or the Bridge. See
-    /// [`RskPrecompileProvider::reached_sequential_only_slot`].
+    /// Whether this transaction reached REMASC or the Bridge. `RskHandler`
+    /// sets it. See [`RskPrecompileProvider::reached_sequential_only_slot`].
     reached_sequential_only: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -715,12 +715,14 @@ impl RskPrecompileProvider {
     ///
     /// Deliberately **not** the same question as `called_precompiles_slot`,
     /// which records a precompile that returned successfully because that is
-    /// when rskj writes its storage-prefix marker. This one records reaching
-    /// the precompile at all, whatever came of it, because that is what rskj
-    /// records: `Program.callToPrecompiledAddress` adds the address before
-    /// doing anything, and a child frame's set merges into its parent's
-    /// before the parent checks whether the child succeeded. A Bridge call
-    /// that reverts still bars the transaction.
+    /// when rskj writes its storage-prefix marker. This one records the call
+    /// as it starts, whatever came of it, as rskj does
+    /// (`Program.callToPrecompiledAddress` adds the address before it checks
+    /// the depth or the caller's balance), and the run sets it, not the
+    /// precompile, which a call refused before it opens never reaches
+    /// (`RskHandler::with_reached_sequential_only`). A Bridge call that
+    /// reverts still bars the transaction; one made under a constructor of
+    /// a CREATE or CREATE2 doesn't.
     pub fn reached_sequential_only_slot(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
         std::sync::Arc::clone(&self.reached_sequential_only)
     }
@@ -851,14 +853,8 @@ impl RskPrecompileProvider {
             return Ok(None);
         }
 
-        // Before dispatch, so the outcome cannot change the answer: under
-        // RSKIP-144 a transaction that reaches REMASC or the Bridge may only
-        // sit in the sequential sublist, and rskj records the address on the
-        // way in (`Program.callToPrecompiledAddress`).
-        if SEQUENTIAL_ONLY_PRECOMPILES.contains(addr) {
-            self.reached_sequential_only
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-        }
+        // Whether the transaction reached REMASC or the Bridge is the run's
+        // to record, as each call starts (`RskHandler`'s `note_call`).
 
         // Copy input to owned bytes so we can pass &mut CTX to the handler
         // without conflicting with the SharedBuffer borrow.
