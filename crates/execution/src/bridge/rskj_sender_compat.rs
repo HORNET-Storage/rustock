@@ -114,7 +114,9 @@ pub enum Verdict {
     /// Demonstrated against the pinned artifact: a redeem script whose first
     /// chunk is `OP_0` reaches `decodePositiveNConsideringEncoding`, which
     /// indexes `data[data.length - 1]` on empty data and raises
-    /// `ArrayIndexOutOfBoundsException`.
+    /// `ArrayIndexOutOfBoundsException`. So does an ERP-shaped script whose
+    /// `OP_ELSE` is third from the end: both ERP validators read one chunk
+    /// past it, and `List.get` raises `IndexOutOfBoundsException`.
     RskjThrows(&'static str),
 }
 
@@ -379,8 +381,11 @@ fn has_standard_structure(chunks: &[JChunk]) -> Result<bool, ()> {
     Ok(true)
 }
 
+/// `hasFlyoverPrefix`. The hash is pushed by the opcode 32 itself: 32 bytes
+/// behind an `OP_PUSHDATA` opcode aren't a prefix.
 fn has_flyover_prefix(chunks: &[JChunk]) -> bool {
     chunks.len() > 2
+        && chunks[0].opcode == 32
         && chunks[0].data.as_ref().is_some_and(|d| d.len() == 32)
         && chunks[1].equals_op_code(OP_DROP)
 }
@@ -389,44 +394,61 @@ fn has_flyover_structure(chunks: &[JChunk]) -> bool {
     has_flyover_prefix(chunks) && is_redeem_like_script(&chunks[2..])
 }
 
-/// The OP_ELSE scan shared by both ERP validators: the first `OP_ELSE` with
-/// room for three more chunks, which must be a push, `OP_CSV` and `OP_DROP`.
-fn find_erp_else(chunks: &[JChunk]) -> Option<usize> {
+/// The OP_ELSE scan shared by both ERP validators: the first `OP_ELSE` that is
+/// at least third from the end, whose next three chunks must be a push,
+/// `OP_CSV` and `OP_DROP`. Java reads all three before it tests any, and its
+/// bound lets the third lie one past the end: `Err` is the
+/// `IndexOutOfBoundsException` that read raises.
+fn find_erp_else(chunks: &[JChunk]) -> Result<Option<usize>, &'static str> {
     for i in 1..chunks.len() {
         if chunks[i].equals_op_code(OP_ELSE) && chunks.len() >= i + 3 {
-            let ok = chunks.get(i + 1).is_some_and(|c| c.is_push_data())
-                && chunks.get(i + 2).is_some_and(|c| c.equals_op_code(OP_CHECKSEQUENCEVERIFY))
-                && chunks.get(i + 3).is_some_and(|c| c.equals_op_code(OP_DROP));
-            return if ok { Some(i) } else { None };
+            let Some(drop) = chunks.get(i + 3) else {
+                return Err("IndexOutOfBoundsException reading past an ERP script's OP_ELSE");
+            };
+            let ok = chunks[i + 1].is_push_data()
+                && chunks[i + 2].equals_op_code(OP_CHECKSEQUENCEVERIFY)
+                && drop.equals_op_code(OP_DROP);
+            return Ok(ok.then_some(i));
         }
     }
-    None
+    Ok(None)
 }
 
-fn has_p2sh_erp_structure(chunks: &[JChunk]) -> Result<bool, ()> {
+/// `hasP2shErpRedeemScriptStructure`. `Err` is an index error nothing catches,
+/// named.
+fn has_p2sh_erp_structure(chunks: &[JChunk]) -> Result<bool, &'static str> {
     if !is_redeem_like_script(chunks) {
         return Ok(false);
     }
     if !chunks[0].equals_op_code(OP_NOTIF) || !chunks[chunks.len() - 1].equals_op_code(OP_ENDIF) {
         return Ok(false);
     }
-    let Some(else_index) = find_erp_else(chunks) else { return Ok(false) };
+    let Some(else_index) = find_erp_else(chunks)? else {
+        return Ok(false);
+    };
     let default_fed = &chunks[1..else_index];
     if else_index + 4 > chunks.len() - 1 {
         return Ok(false);
     }
     let erp_fed = &chunks[else_index + 4..chunks.len() - 1];
-    Ok(has_standard_structure(default_fed)? && has_standard_structure(erp_fed)?)
+    let standard = |fed: &[JChunk]| {
+        has_standard_structure(fed)
+            .map_err(|()| "ArrayIndexOutOfBoundsException decoding the P2SH-ERP inner redeem")
+    };
+    Ok(standard(default_fed)? && standard(erp_fed)?)
 }
 
-fn has_non_standard_erp_structure(chunks: &[JChunk]) -> Result<bool, ()> {
+/// `hasNonStandardErpRedeemScriptStructure`, with the same `Err`.
+fn has_non_standard_erp_structure(chunks: &[JChunk]) -> Result<bool, &'static str> {
     if !is_redeem_like_script(chunks) {
         return Ok(false);
     }
     if chunks[0].opcode != OP_NOTIF || !chunks[chunks.len() - 2].equals_op_code(OP_ENDIF) {
         return Ok(false);
     }
-    let Some(else_index) = find_erp_else(chunks) else { return Ok(false) };
+    let Some(else_index) = find_erp_else(chunks)? else {
+        return Ok(false);
+    };
 
     // Both halves are validated with OP_CHECKMULTISIG appended, because a
     // non-standard ERP redeem carries it once at the end rather than in each
@@ -440,7 +462,12 @@ fn has_non_standard_erp_structure(chunks: &[JChunk]) -> Result<bool, ()> {
     let mut erp_fed: Vec<JChunk> = chunks[else_index + 4..chunks.len() - 2].to_vec();
     erp_fed.push(cms);
 
-    Ok(has_standard_structure(&default_fed)? && has_standard_structure(&erp_fed)?)
+    let standard = |fed: &[JChunk]| {
+        has_standard_structure(fed).map_err(|()| {
+            "ArrayIndexOutOfBoundsException decoding the non-standard ERP inner redeem"
+        })
+    };
+    Ok(standard(&default_fed)? && standard(&erp_fed)?)
 }
 
 // --- the dispatch ----------------------------------------------------------
@@ -449,10 +476,10 @@ fn has_non_standard_erp_structure(chunks: &[JChunk]) -> Result<bool, ()> {
 ///
 /// Mirrors `RedeemScriptParserFactory.get` followed by `getM() > 0`. Every
 /// parser the factory can return delegates `getM()` inward to a standard
-/// parser, whose M is `decodePositiveN(chunk 0)` and therefore at least 1 once
-/// the structure check has passed -- so selecting a parser *is* the answer.
-/// The single exception is the hardcoded testnet script, whose parser returns
-/// -1 on purpose.
+/// parser, whose M is `decodePositiveN(chunk 0)`. That refuses a negative
+/// number and nothing else, so an M pushed as zero passes the structure check
+/// and selects a parser, and the answer is then false. The hardcoded testnet
+/// script's parser returns -1 on purpose.
 pub fn is_sent_to_multisig(redeem_script: &[u8]) -> Verdict {
     let Some(chunks) = parse_script_program(redeem_script) else {
         return Verdict::NotMultisig; // ScriptException, caught
@@ -465,9 +492,13 @@ fn dispatch(chunks: &[JChunk], depth: usize) -> Verdict {
         return Verdict::NotMultisig;
     }
     // The hardcoded testnet script is compared before anything else, and its
-    // parser reports M = -1.
-    if let Some(hardcoded) = parse_script_program(&hex_decode(NON_STANDARD_ERP_TESTNET_REDEEM_SCRIPT)) {
-        if chunks == hardcoded.as_slice() {
+    // parser reports M = -1. bitcoinj compares the chunks with `List.equals`,
+    // and a chunk equals another only at the same offset in its program, so
+    // the script is matched as a whole program alone. Behind a flyover prefix
+    // its chunks start 34 bytes on, and it is parsed like any other script.
+    if depth == 0 {
+        let hardcoded = parse_script_program(&hex_decode(NON_STANDARD_ERP_TESTNET_REDEEM_SCRIPT));
+        if hardcoded.is_some_and(|hardcoded| chunks == hardcoded.as_slice()) {
             return Verdict::NotMultisig;
         }
     }
@@ -482,24 +513,30 @@ fn dispatch(chunks: &[JChunk], depth: usize) -> Verdict {
         Err(()) => return Verdict::RskjThrows(
             "ArrayIndexOutOfBoundsException decoding M or N from an empty push",
         ),
-        Ok(true) => return Verdict::Multisig,
+        Ok(true) => return positive_m(&chunks[0]),
         Ok(false) => {}
     }
+    // An ERP script's M is its default federation's, which follows OP_NOTIF.
     match has_p2sh_erp_structure(chunks) {
-        Err(()) => return Verdict::RskjThrows(
-            "ArrayIndexOutOfBoundsException decoding the P2SH-ERP inner redeem",
-        ),
-        Ok(true) => return Verdict::Multisig,
+        Err(why) => return Verdict::RskjThrows(why),
+        Ok(true) => return positive_m(&chunks[1]),
         Ok(false) => {}
     }
     match has_non_standard_erp_structure(chunks) {
-        Err(()) => return Verdict::RskjThrows(
-            "ArrayIndexOutOfBoundsException decoding the non-standard ERP inner redeem",
-        ),
-        Ok(true) => return Verdict::Multisig,
+        Err(why) => return Verdict::RskjThrows(why),
+        Ok(true) => return positive_m(&chunks[1]),
         Ok(false) => {}
     }
     Verdict::NotMultisig // factory throws "unknown redeem script", caught
+}
+
+/// `getM() > 0` over the chunk the selected parser reads M from. The structure
+/// check has decoded that chunk already, so only a zero is left to refuse.
+fn positive_m(m: &JChunk) -> Verdict {
+    match m.decode_positive_n() {
+        Ok(m) if m > 0 => Verdict::Multisig,
+        _ => Verdict::NotMultisig,
+    }
 }
 
 // --- signature stripping ----------------------------------------------------
@@ -617,6 +654,39 @@ mod tests {
         s
     }
 
+    /// A flyover prefix, which is a hash pushed by the opcode 32 and `OP_DROP`,
+    /// in front of `inner`.
+    fn flyover(inner: &[u8]) -> Vec<u8> {
+        let mut s = vec![32];
+        s.extend_from_slice(&[0xAB; 32]);
+        s.push(OP_DROP);
+        s.extend_from_slice(inner);
+        s
+    }
+
+    /// What both ERP shapes carry between their two federations.
+    const ELSE_CSV_DROP: [u8; 6] = [OP_ELSE, 0x02, 0x00, 0x20, OP_CHECKSEQUENCEVERIFY, OP_DROP];
+
+    fn p2sh_erp(default_fed: &[u8], erp_fed: &[u8]) -> Vec<u8> {
+        let mut s = vec![OP_NOTIF];
+        s.extend_from_slice(default_fed);
+        s.extend_from_slice(&ELSE_CSV_DROP);
+        s.extend_from_slice(erp_fed);
+        s.push(OP_ENDIF);
+        s
+    }
+
+    /// The older ERP shape: neither multisig keeps its own `OP_CHECKMULTISIG`,
+    /// and one closes the script.
+    fn non_standard_erp(default_fed: &[u8], erp_fed: &[u8]) -> Vec<u8> {
+        let mut s = vec![OP_NOTIF];
+        s.extend_from_slice(&default_fed[..default_fed.len() - 1]);
+        s.extend_from_slice(&ELSE_CSV_DROP);
+        s.extend_from_slice(&erp_fed[..erp_fed.len() - 1]);
+        s.extend_from_slice(&[OP_ENDIF, OP_CHECKMULTISIG]);
+        s
+    }
+
     #[test]
     fn standard_multisig_is_multisig() {
         assert_eq!(is_sent_to_multisig(&standard_redeem(2, 3)), Verdict::Multisig);
@@ -689,6 +759,113 @@ mod tests {
             Verdict::NotMultisig,
             "its parser returns M = -1 on purpose, to preserve testnet consensus"
         );
+    }
+
+    /// Demonstrated against bitcoinj-thin 0.14.4-rsk-18:
+    ///   new Script(hex("6467ae68")).isSentToMultiSig()
+    ///   -> java.lang.IndexOutOfBoundsException: Index 4 out of bounds for length 4
+    ///
+    /// Both ERP validators look for an `OP_ELSE` with `chunks.size() >= i + 3`
+    /// and then read `chunks.get(i + 3)`, so an `OP_ELSE` third from the end
+    /// has them read one chunk past it.
+    #[test]
+    fn an_op_else_third_from_the_end_makes_rskj_throw() {
+        let p2sh_erp_shape = [OP_NOTIF, OP_ELSE, OP_CHECKMULTISIG, OP_ENDIF];
+        let non_standard_shape = [OP_NOTIF, OP_ELSE, OP_ENDIF, OP_CHECKMULTISIG];
+        // A real default federation in front of the OP_ELSE changes nothing.
+        let mut after_a_federation = vec![OP_NOTIF];
+        after_a_federation.extend_from_slice(&standard_redeem(2, 3));
+        after_a_federation.extend_from_slice(&[OP_ELSE, OP_CHECKMULTISIG, OP_ENDIF]);
+        for script in [
+            &p2sh_erp_shape[..],
+            &non_standard_shape[..],
+            &after_a_federation,
+            &flyover(&p2sh_erp_shape),
+        ] {
+            assert!(
+                matches!(is_sent_to_multisig(script), Verdict::RskjThrows(_)),
+                "{script:02x?}"
+            );
+        }
+
+        // With one more chunk after the OP_ELSE the read stays inside.
+        let inside = [OP_NOTIF, OP_1, OP_ELSE, OP_1, OP_ENDIF, OP_CHECKMULTISIG];
+        assert_eq!(is_sent_to_multisig(&inside), Verdict::NotMultisig);
+    }
+
+    /// `hasFlyoverPrefix` wants the hash pushed by the opcode 32 itself. Pushed
+    /// with `OP_PUSHDATA1` or `OP_PUSHDATA2`, the same 32 bytes aren't a flyover
+    /// prefix, and the script is no redeem script bitcoinj knows.
+    #[test]
+    fn a_flyover_prefix_is_a_direct_push_of_32_bytes() {
+        let wrapped = flyover(&standard_redeem(2, 3));
+        assert_eq!(is_sent_to_multisig(&wrapped), Verdict::Multisig);
+
+        let mut pushdata1 = vec![OP_PUSHDATA1];
+        pushdata1.extend_from_slice(&wrapped);
+        assert_eq!(is_sent_to_multisig(&pushdata1), Verdict::NotMultisig);
+
+        let mut pushdata2 = vec![OP_PUSHDATA2, 32, 0];
+        pushdata2.extend_from_slice(&wrapped[1..]);
+        assert_eq!(is_sent_to_multisig(&pushdata2), Verdict::NotMultisig);
+    }
+
+    /// `decodePositiveN` refuses a negative number and nothing else, so the
+    /// structure checks pass an M pushed as zero and a parser is selected.
+    /// `getM() > 0` is then false.
+    #[test]
+    fn an_m_pushed_as_zero_is_not_multisig() {
+        let zero_of_three = |push: &[u8]| {
+            let mut s = push.to_vec();
+            s.extend_from_slice(&standard_redeem(2, 3)[1..]);
+            s
+        };
+        let standard = zero_of_three(&[0x01, 0x00]);
+        let one_of_two = standard_redeem(1, 2);
+        for script in [
+            standard.clone(),
+            zero_of_three(&[0x02, 0x00, 0x00]),
+            flyover(&standard),
+            p2sh_erp(&standard, &one_of_two),
+            non_standard_erp(&standard, &one_of_two),
+        ] {
+            assert_eq!(
+                is_sent_to_multisig(&script),
+                Verdict::NotMultisig,
+                "{script:02x?}"
+            );
+        }
+        // bitcoinj: IllegalStateException("Unsupported script type").
+        assert!(signatures_required_to_spend(&standard).is_err());
+
+        // An ERP script's M is its default federation's. The emergency
+        // multisig's isn't read.
+        let erp_side_only = p2sh_erp(&standard_redeem(2, 3), &zero_of_three(&[0x01, 0x00]));
+        assert_eq!(is_sent_to_multisig(&erp_side_only), Verdict::Multisig);
+        assert_eq!(signatures_required_to_spend(&erp_side_only), Ok(2));
+    }
+
+    /// The factory compares the hardcoded script with `List.equals`, and a
+    /// `ScriptChunk` equals another only at the same offset in its program.
+    /// Behind a flyover prefix every chunk starts 34 bytes later, so the script
+    /// isn't matched there, and it parses as the non-standard ERP redeem it is,
+    /// with M = 3.
+    #[test]
+    fn the_hardcoded_testnet_script_is_matched_only_as_the_whole_program() {
+        let script = hex_decode(NON_STANDARD_ERP_TESTNET_REDEEM_SCRIPT);
+        assert_eq!(is_sent_to_multisig(&script), Verdict::NotMultisig);
+        assert!(signatures_required_to_spend(&script).is_err());
+
+        let wrapped = flyover(&script);
+        assert_eq!(is_sent_to_multisig(&wrapped), Verdict::Multisig);
+        assert_eq!(signatures_required_to_spend(&wrapped), Ok(3));
+    }
+
+    #[test]
+    fn a_non_standard_erp_redeem_is_multisig() {
+        let script = non_standard_erp(&standard_redeem(2, 3), &standard_redeem(1, 2));
+        assert_eq!(is_sent_to_multisig(&script), Verdict::Multisig);
+        assert_eq!(signatures_required_to_spend(&script), Ok(2));
     }
 
     /// bitcoinj's decodePositiveN accepts a PUSHED number as well as
@@ -770,6 +947,22 @@ mod tests {
              Verdict::NotMultisig),
             ("hardcoded testnet script", NON_STANDARD_ERP_TESTNET_REDEEM_SCRIPT,
              Verdict::NotMultisig),
+            ("non-standard erp",
+             "64522102020202020202020202020202020202020202020202020202020202020202020021020202020202020202020202020202020202020202020202020202020202020201210202020202020202020202020202020202020202020202020202020202020202025367020020b2755121020202020202020202020202020202020202020202020202020202020202020200210202020202020202020202020202020202020202020202020202020202020202015268ae",
+             Verdict::Multisig),
+            ("p2sh-erp, CSV value pushed as OP_16",
+             "645221020202020202020202020202020202020202020202020202020202020202020200210202020202020202020202020202020202020202020202020202020202020202012102020202020202020202020202020202020202020202020202020202020202020253ae6760b27551210202020202020202020202020202020202020202020202020202020202020202002102020202020202020202020202020202020202020202020202020202020202020152ae68",
+             Verdict::Multisig),
+            ("flyover prefix pushed with OP_PUSHDATA1",
+             "4c20abababababababababababababababababababababababababababababababab755221020202020202020202020202020202020202020202020202020202020202020200210202020202020202020202020202020202020202020202020202020202020202012102020202020202020202020202020202020202020202020202020202020202020253ae",
+             Verdict::NotMultisig),
+            ("M pushed as zero",
+             "010021020202020202020202020202020202020202020202020202020202020202020200210202020202020202020202020202020202020202020202020202020202020202012102020202020202020202020202020202020202020202020202020202020202020253ae",
+             Verdict::NotMultisig),
+            ("p2sh-erp, an OP_ELSE inside the default federation",
+             "645221020202020202020202020202020202020202020202020202020202020202020200672102020202020202020202020202020202020202020202020202020202020202020253ae67020020b27551210202020202020202020202020202020202020202020202020202020202020202002102020202020202020202020202020202020202020202020202020202020202020152ae68",
+             Verdict::NotMultisig),
+            ("OP_ELSE fourth from the end", "6451675168ae", Verdict::NotMultisig),
         ];
 
         for (label, hex, expected) in vectors {
@@ -777,14 +970,31 @@ mod tests {
             assert_eq!(&got, expected, "diverged from bitcoinj-thin on: {label}");
         }
 
+        // The hardcoded testnet script behind a flyover prefix: true, and
+        // getNumberOfSignaturesRequiredToSpend() is 3.
+        let mut wrapped =
+            hex_decode("20abababababababababababababababababababababababababababababababab75");
+        wrapped.extend_from_slice(&hex_decode(NON_STANDARD_ERP_TESTNET_REDEEM_SCRIPT));
+        assert_eq!(is_sent_to_multisig(&wrapped), Verdict::Multisig);
+        assert_eq!(signatures_required_to_spend(&wrapped), Ok(3));
+
         // Recorded separately because the Java outcome is an exception rather
         // than a return value:
         //   new Script(hex("0001aa01bbae")).isSentToMultiSig()
         //     -> java.lang.ArrayIndexOutOfBoundsException: Index -1 out of bounds for length 0
-        assert!(
-            matches!(is_sent_to_multisig(&hex_decode("0001aa01bbae")), Verdict::RskjThrows(_)),
-            "diverged from bitcoinj-thin on: OP_0 as M (Java throws)"
-        );
+        //   new Script(hex("6467ae68")).isSentToMultiSig()
+        //     -> java.lang.IndexOutOfBoundsException: Index 4 out of bounds for length 4
+        //   new Script(hex("646768ae")).isSentToMultiSig()
+        //     -> java.lang.IndexOutOfBoundsException: Index 4 out of bounds for length 4
+        for hex in ["0001aa01bbae", "6467ae68", "646768ae"] {
+            assert!(
+                matches!(
+                    is_sent_to_multisig(&hex_decode(hex)),
+                    Verdict::RskjThrows(_)
+                ),
+                "diverged from bitcoinj-thin on: {hex} (Java throws)"
+            );
+        }
     }
 
     #[test]
