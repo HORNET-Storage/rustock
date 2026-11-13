@@ -879,15 +879,12 @@ impl BlockProcessor {
     /// Shared with the miner, which applies the same cap when it selects
     /// transactions (rskj `MinerUtils.isHighGasPriced`).
     pub fn rskip252_height(&self) -> u64 {
-        rskip252_height_for(self.hardfork_cfg.chain_id)
+        self.hardfork_cfg.rskip252_height()
     }
 
     /// RSKIP110 (`wasabi100`) for this chain.
     fn rskip110_height(&self) -> u64 {
-        match self.hardfork_cfg.chain_id {
-            crate::hardfork::RSK_MAINNET_CHAIN_ID => 1_591_000,
-            _ => 0,
-        }
+        self.hardfork_cfg.rskip110_height()
     }
 
     /// Execute all transactions in a block and validate results against the header.
@@ -1742,6 +1739,32 @@ mod tests {
             processor(moved).validate_block_body_rules(&block(Some(vec![1])), None),
             Ok(())
         );
+    }
+
+    /// `reference.conf` has RSKIP252, the cap on a transaction's gas price,
+    /// at fingerroot500, and RSKIP110, the fork detection data, at wasabi100.
+    /// Each is read at its upgrade's height, wherever the chain has it.
+    #[test]
+    fn the_price_cap_and_fork_detection_move_with_their_upgrades() {
+        let heights = |cfg: RskHardforkConfig| {
+            let block_store =
+                Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+            let processor = BlockProcessor::new(cfg, block_store);
+            (processor.rskip252_height(), processor.rskip110_height())
+        };
+        assert_eq!(
+            heights(RskHardforkConfig::mainnet()),
+            (5_468_000, 1_591_000)
+        );
+        assert_eq!(heights(RskHardforkConfig::testnet()), (4_015_800, 0));
+        assert_eq!(heights(RskHardforkConfig::regtest()), (0, 0));
+        assert_eq!(heights(RskHardforkConfig::rskj_regtest()), (0, 0));
+
+        let at = |name: &str, height: u64| (name.to_string(), Some(height));
+        let (moved, _) = RskHardforkConfig::testnet()
+            .with_rskj_overrides(&[at("wasabi100", 100), at("fingerroot500", 4_500_000)], &[])
+            .unwrap();
+        assert_eq!(heights(moved), (4_500_000, 100));
     }
 
     /// What REMASC pays the null address reaches its account after the
@@ -3505,16 +3528,5 @@ mod sender_cache_integration {
             matches!(error, ProcessError::SenderRecovery { index: 0, .. }),
             "{error}"
         );
-    }
-}
-
-/// RSKIP252 (`fingerroot500`) for a chain id: mainnet's and testnet's
-/// heights, genesis anywhere else. The block rule, the miner's selection
-/// and the pool's per-transaction cap all read it.
-pub fn rskip252_height_for(chain_id: u64) -> u64 {
-    match chain_id {
-        crate::hardfork::RSK_MAINNET_CHAIN_ID => 5_468_000,
-        crate::hardfork::RSK_TESTNET_CHAIN_ID => 4_015_800,
-        _ => 0,
     }
 }

@@ -113,13 +113,13 @@ impl ActivationHeights {
 
     /// Set the height this struct carries for an rskj upgrade name, for the
     /// names it carries: `orchid`, `wasabi100`, `papyrus200`, `iris300`,
-    /// `fingerroot500` and `reed810`. `None` is rskj's `-1`. Any other name is
-    /// the execution ladder's to judge and is left alone here.
+    /// `hop400`, `fingerroot500` and `reed810`. `None` is rskj's `-1`. Any
+    /// other name is the execution ladder's to judge and is left alone here.
     ///
     /// The rules `reference.conf` puts at an upgrade move with it where the
-    /// chain keeps them there: RSKIPUMM with papyrus200, RSKIP144 and
-    /// RSKIP351 with reed810. A chain that sets its own, as rskj's regtest
-    /// does, keeps them.
+    /// chain keeps them there: RSKIPUMM with papyrus200, RSKIP290 with
+    /// hop400, RSKIP144 and RSKIP351 with reed810. A chain that sets its own,
+    /// as rskj's regtest does and testnet for RSKIP290, keeps them.
     pub fn set_rskj_hardfork(&mut self, name: &str, height: Option<u64>) {
         let never = u64::MAX;
         let at = |upgrade: u64| (upgrade != never).then_some(upgrade);
@@ -133,6 +133,12 @@ impl ActivationHeights {
                 self.papyrus200 = height.unwrap_or(never);
             }
             "iris300" => self.iris300 = height.unwrap_or(never),
+            "hop400" => {
+                if self.rskip290 == at(self.hop400) {
+                    self.rskip290 = height;
+                }
+                self.hop400 = height.unwrap_or(never);
+            }
             "fingerroot500" => self.fingerroot500 = height.unwrap_or(never),
             "reed810" => {
                 let followed = at(self.reed810);
@@ -877,6 +883,47 @@ mod tests {
         assert_eq!((regtest.papyrus200, regtest.rskip_umm), (0, Some(1)));
         regtest.set_rskj_hardfork("reed810", Some(5));
         assert_eq!(reed(&regtest), (5, Some(1), Some(1)));
+    }
+
+    /// `reference.conf` has RSKIP297 and RSKIP290 at hop400. Moving hop400
+    /// moves RSKIP297's wider Bitcoin timestamp window, which testnet reads
+    /// at it, and RSKIP290 where the chain keeps it there: `testnet.conf`
+    /// gives RSKIP290 a height of its own.
+    #[test]
+    fn hop400_moves_what_the_chain_keeps_at_it() {
+        use crate::validation::merged_mining::BitcoinTimestampRule;
+
+        let mut testnet = ChainConfig::testnet();
+        testnet
+            .activation_heights
+            .set_rskj_hardfork("hop400", Some(3_200_000));
+        assert_eq!(
+            (
+                testnet.activation_heights.hop400,
+                testnet.activation_heights.rskip290
+            ),
+            (3_200_000, Some(2_581_800))
+        );
+        let rule = BitcoinTimestampRule {
+            config: std::sync::Arc::new(testnet),
+        };
+        assert_eq!(
+            rule.max_timestamps_diff(3_199_999),
+            BitcoinTimestampRule::DEFAULT_MAX_TIMESTAMPS_DIFF_IN_SECS
+        );
+        assert_eq!(
+            rule.max_timestamps_diff(3_200_000),
+            BitcoinTimestampRule::TESTNET_MAX_TIMESTAMPS_DIFF_IN_SECS
+        );
+
+        let mut mainnet = ActivationHeights::mainnet();
+        mainnet.set_rskj_hardfork("hop400", Some(5_000_000));
+        assert_eq!(
+            (mainnet.hop400, mainnet.rskip290),
+            (5_000_000, Some(5_000_000))
+        );
+        mainnet.set_rskj_hardfork("hop400", None);
+        assert_eq!((mainnet.hop400, mainnet.rskip290), (u64::MAX, None));
     }
 
     #[test]

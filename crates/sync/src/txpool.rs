@@ -74,7 +74,7 @@ impl ChainRules {
         let constants = rustock_execution::executor::bridge_constants_for(hardfork_cfg.chain_id);
         Self {
             free_bridge_senders: rustock_execution::executor::free_bridge_senders(&constants),
-            rskip252_height: rustock_execution::processor::rskip252_height_for(hardfork_cfg.chain_id),
+            rskip252_height: hardfork_cfg.rskip252_height(),
             min_sequential_set_gas_limit,
             hardfork_cfg,
         }
@@ -2151,6 +2151,14 @@ mod tests {
     fn validate_when_rskip252_disabled_then_tx_valid_regardless_gas_price() {
         let rules = ChainRules::for_chain(rustock_execution::hardfork::RskHardforkConfig::mainnet(), 10_000_000);
         assert_eq!(rules.rskip252_height, 5_468_000);
+        // It is fingerroot500's height, wherever the chain has that.
+        let (moved, _) = rustock_execution::hardfork::RskHardforkConfig::mainnet()
+            .with_rskj_overrides(&[("fingerroot500".to_string(), Some(6_000_000))], &[])
+            .unwrap();
+        assert_eq!(
+            ChainRules::for_chain(moved, 10_000_000).rskip252_height,
+            6_000_000
+        );
         let (pool, key, _) =
             setup_pool_with_rules(U256::from(10u64).pow(U256::from(20)), 0, test_config(), Some(rules));
         let cap = 59_240_000 * TX_GAS_PRICE_CAP_MULTIPLIER;
