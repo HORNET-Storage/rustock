@@ -266,6 +266,20 @@ fn execute_federation_change<CTX: crate::RskContextTr>(
     if function == "commit" && args[0].len() != 32 {
         return Err("commitFederation: the pending federation's hash isn't 32 bytes");
     }
+    // The dry run answers before any federation is built. The commit itself
+    // builds it, in every era, and the build throws for one Bitcoin could
+    // not spend from.
+    if function == "commit"
+        && !dry_run
+        && federation_change_code(ctx, function, args, true, config, hardfork_cfg) == 1
+    {
+        let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
+        let pending = bridge_load_bytes_named(ctx, PENDING_FEDERATION_KEY);
+        let members = deserialize_pending_federation(&pending);
+        if let Some(why) = unbuildable_federation(&members, config, hardfork_cfg, block_number) {
+            return Err(why);
+        }
+    }
     Ok(federation_change_code(
         ctx,
         function,
@@ -274,6 +288,47 @@ fn execute_federation_change<CTX: crate::RskContextTr>(
         config,
         hardfork_cfg,
     ))
+}
+
+/// rskj `ScriptValidations.MAX_P2SH_REDEEM_SCRIPT_SIZE`: what a scriptSig
+/// element holds (bitcoinj `Script.MAX_SCRIPT_ELEMENT_SIZE`, 520 bytes) less
+/// the 34 bytes a flyover prefix adds to a redeem script.
+const MAX_P2SH_REDEEM_SCRIPT_SIZE: usize = 520 - 34;
+
+/// rskj `ScriptValidations.MAX_P2WSH_REDEEM_SCRIPT_SIZE`: a standard P2WSH
+/// script (`Script.MAX_STANDARD_P2WSH_SCRIPT_SIZE`, 3600 bytes) less the same.
+const MAX_P2WSH_REDEEM_SCRIPT_SIZE: usize = 3600 - 34;
+
+/// Why rskj can't build the federation these pending members make at
+/// `block_number`, where it can't. bitcoinj's
+/// `ScriptBuilder.createMultiSigOutputScript`, which every format's redeem
+/// script goes through, takes no more than 20 keys, "the max OP_CHECKMULTISIG
+/// allows". An `ErpFederation` checks its redeem script's size as it is made
+/// (`validateRedeemScript`): against what a scriptSig holds, or for a
+/// P2SH-P2WSH federation against what a witness script may be.
+fn unbuildable_federation(
+    members: &[StoredMember],
+    config: &super::constants::BridgeConstants,
+    hardfork_cfg: &crate::hardfork::RskHardforkConfig,
+    block_number: u64,
+) -> Option<&'static str> {
+    if members.len() > 20 {
+        return Some("commitFederation: a federation of more than 20 keys");
+    }
+    let limit = match federation_format_version(hardfork_cfg, block_number) {
+        1000 => return None,
+        4000 => MAX_P2WSH_REDEEM_SCRIPT_SIZE,
+        _ => MAX_P2SH_REDEEM_SCRIPT_SIZE,
+    };
+    let mut keys: Vec<[u8; 33]> = members.iter().map(|m| m.btc).collect();
+    keys.sort();
+    let redeem = super::peg::build_committed_federation_redeem_script(
+        &keys,
+        config,
+        hardfork_cfg,
+        block_number,
+    );
+    (redeem.len() > limit).then_some("commitFederation: the redeem script is too long")
 }
 
 /// The code the change's function answers.
@@ -1910,6 +1965,83 @@ mod tests {
             -10,
             "an uncompressed key's prefix on 33"
         );
+    }
+
+    /// rskj builds the federation as a commit goes through, and the build
+    /// throws for one Bitcoin could not spend from: more than 20 keys
+    /// (`ScriptBuilder.createMultiSigOutputScript`), or an ERP redeem script
+    /// longer than a scriptSig element holds, less a flyover prefix
+    /// (`ErpFederation.validateRedeemScript`). The dry run builds nothing, so
+    /// the votes before the deciding one are taken; the deciding one throws.
+    #[test]
+    fn a_federation_bitcoin_could_not_spend_from_is_not_committed() {
+        use crate::precompiles::BridgeTxContext;
+        use revm::MainContext;
+        use sha3::{Digest, Keccak256};
+
+        let config = super::super::constants::BridgeConstants::mainnet();
+        let cfg = crate::hardfork::RskHardforkConfig::mainnet();
+        let member = |i: u8| {
+            let secp = bitcoin::secp256k1::Secp256k1::new();
+            let secret = bitcoin::secp256k1::SecretKey::from_slice(&[i + 1; 32]).unwrap();
+            let key = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &secret);
+            StoredMember::from_btc(key.serialize())
+        };
+        let authorizers = federation_change_authorizers(&config);
+        let deciding = authorizers.len() / 2 + 1;
+        // Each authorizer's vote, up to the deciding one, to commit a pending
+        // federation of `n` members at `block`: its answer, or none where the
+        // call throws.
+        let votes = |block: u64, n: u8| -> Vec<Option<i64>> {
+            let mut ctx = revm::Context::mainnet()
+                .with_block(revm::context::BlockEnv {
+                    number: alloy_primitives::U256::from(block),
+                    ..Default::default()
+                })
+                .with_chain(crate::raw_storage::RskChainExt::default());
+            let members: Vec<StoredMember> = (0..n).map(member).collect();
+            store_pending_federation(&mut ctx, Some(&members), true);
+            let hash = Keccak256::digest(serialize_pending_federation_btc_keys(&members));
+            let args = crate::abi::encode::args(&[crate::abi::encode::Arg::Bytes(&hash)]);
+            authorizers[..deciding]
+                .iter()
+                .map(|authorizer| {
+                    let tx_ctx = BridgeTxContext {
+                        rsk_sender: *authorizer,
+                        ..BridgeTxContext::default()
+                    };
+                    commit_federation(&mut ctx, &args, 0, &config, &cfg, &tx_ctx)
+                        .ok()
+                        .map(|out| i64::from_be_bytes(out.bytes[24..32].try_into().unwrap()))
+                })
+                .collect()
+        };
+        let committed = vec![Some(1); deciding];
+        let mut thrown = committed.clone();
+        *thrown.last_mut().unwrap() = None;
+
+        // A standard multisig, before RSKIP201: 20 keys and no more.
+        let standard = 2_000_000;
+        assert_eq!(federation_format_version(&cfg, standard), 1000);
+        assert_eq!(votes(standard, 20), committed);
+        assert_eq!(votes(standard, 21), thrown);
+
+        // A P2SH ERP federation's redeem script goes in a scriptSig: 486
+        // bytes and no more.
+        let p2sh_erp = 5_000_000;
+        assert_eq!(federation_format_version(&cfg, p2sh_erp), 3000);
+        let size = |n: u8| {
+            let mut keys: Vec<[u8; 33]> = (0..n).map(|i| member(i).btc).collect();
+            keys.sort();
+            super::super::peg::build_committed_federation_redeem_script(
+                &keys, &config, &cfg, p2sh_erp,
+            )
+            .len()
+        };
+        let largest = (2..20u8).rev().find(|n| size(*n) <= 486).unwrap();
+        assert!(size(largest + 1) > 486);
+        assert_eq!(votes(p2sh_erp, largest), committed);
+        assert_eq!(votes(p2sh_erp, largest + 1), thrown);
     }
 
     /// A Bridge call that reads the whitelist writes it back as the call
