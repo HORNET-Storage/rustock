@@ -5335,6 +5335,82 @@ mod tests {
         }
     }
 
+    /// Regression for testnet #5,214,732: when a creation's init code reverts,
+    /// rskj's `Program.getProgramResult` sets the creator's returnDataBuffer to
+    /// `result.getHReturn()`, the creator's own result rather than the
+    /// creation's (`programResult`). A program still running has returned
+    /// nothing, so RETURNDATASIZE after a reverted CREATE reads 0 where revm
+    /// (EIP-211) keeps the revert data, and no activation guards it. A CALL
+    /// that reverts still hands its data over. RSKj's release VETIVER-9.0.4
+    /// reads 0 after such a CREATE and 36 after such a CALL.
+    #[test]
+    fn test_reverted_create_leaves_return_data_empty_at_every_height() {
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let sender = Address::repeat_byte(0xAC);
+        // Reverter: REVERT with 36 zero bytes.
+        let reverter = Address::repeat_byte(0xB8);
+        let reverter_code = [0x60, 0x24, 0x60, 0x00, 0xfd];
+        // Main: CALL reverter; POP; SSTORE(1, RETURNDATASIZE + 1);
+        //       CREATE(0, init that REVERTs with 68 zero bytes); POP;
+        //       SSTORE(0, RETURNDATASIZE + 1); STOP.
+        let main = Address::repeat_byte(0xB9);
+        let mut main_code = vec![
+            0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x73,
+        ];
+        main_code.extend_from_slice(reverter.as_slice());
+        main_code.extend_from_slice(&[0x5a, 0xf1, 0x50]);
+        main_code.extend_from_slice(&[0x3d, 0x60, 0x01, 0x01, 0x60, 0x01, 0x55]);
+        // PUSH5 0x60446000fd; PUSH1 0; MSTORE; CREATE(0, 27, 5); POP.
+        main_code.extend_from_slice(&[
+            0x64, 0x60, 0x44, 0x60, 0x00, 0xfd, 0x60, 0x00, 0x52, 0x60, 0x05, 0x60, 0x1b, 0x60,
+            0x00, 0xf0, 0x50,
+        ]);
+        main_code.extend_from_slice(&[0x3d, 0x60, 0x01, 0x01, 0x60, 0x00, 0x55, 0x00]);
+
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = put_account(&TrieNode::empty(), store.as_ref(), &sender, 0, one_rbtc);
+        let root = put_account_with_code(
+            &root,
+            store.as_ref(),
+            &reverter,
+            1,
+            U256::ZERO,
+            &reverter_code,
+        );
+        let root = put_account_with_code(&root, store.as_ref(), &main, 1, U256::ZERO, &main_code);
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+        // Before iris300 (#3,614,800), after it, and after vetiver900 (#8,804,200).
+        for number in [3_000_000u64, 3_616_094, 8_900_000] {
+            let call = plain_tx(0, &main, U256::ZERO);
+            let r = executor
+                .execute_block(
+                    &dummy_header(number),
+                    &[(call, sender)],
+                    &root,
+                    store.clone(),
+                )
+                .expect("block");
+            assert!(r.tx_results[0].success, "#{number}");
+            let slot = |key: u64| {
+                r.state_changes
+                    .get(&main)
+                    .and_then(|a| a.storage.get(&U256::from(key)))
+                    .map_or(U256::ZERO, |s| s.present_value)
+            };
+            assert_eq!(
+                slot(1),
+                U256::from(37),
+                "#{number}: RETURNDATASIZE + 1 after the reverted CALL"
+            );
+            assert_eq!(
+                slot(0),
+                U256::from(1),
+                "#{number}: RETURNDATASIZE + 1 after the reverted CREATE"
+            );
+        }
+    }
+
     /// Regression for mainnet #1,661,324: rskj's VM.doCODESIZE (RSKIP90, orchid)
     /// reports EXTCODESIZE of an active precompile as 2^256-1. A proxy that
     /// guards `extcodesize(impl) != 0` before forwarding to the BlockHeader

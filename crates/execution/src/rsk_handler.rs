@@ -841,6 +841,9 @@ where
             // return data, restored after `frame_return_result` when rskj
             // would not have touched the buffer (see field docs).
             let mut preserved_return_buffer: Option<Bytes> = None;
+            // A creation whose init code reverted: rskj leaves its creator's
+            // return data empty, after `frame_return_result` (see there).
+            let mut creation_reverted = false;
 
             let mut result = match call_or_result {
                 ItemOrResult::Item(init) => {
@@ -1035,6 +1038,11 @@ where
                 // A frame of contract code ended, having committed exactly
                 // when its result is ok (`rsk_frame_return`).
                 ItemOrResult::Result(result) => {
+                    creation_reverted = matches!(
+                        &result,
+                        FrameResult::Create(outcome)
+                            if matches!(outcome.instruction_result(), InstructionResult::Revert)
+                    );
                     self.close_frame(evm, result.instruction_result().is_ok());
                     // The program's internal transactions (`crate::internal_tx`).
                     // rskj `Program.suicide` makes one of the balance it
@@ -1097,6 +1105,16 @@ where
                 use revm::interpreter::interpreter_types::ReturnData;
                 // Undo revm's insert_call_outcome buffer clear (EIP-211).
                 evm.frame_stack().get().interpreter.return_data.set_buffer(buffer);
+            }
+            // rskj `Program.getProgramResult`, when a creation's init code
+            // reverts: `returnDataBuffer = result.getHReturn()`. `result` is the
+            // creator's own ProgramResult, not the creation's (`programResult`),
+            // and a program still running has returned nothing, so RETURNDATASIZE
+            // reads 0 where revm (EIP-211) keeps the revert data. No activation
+            // guards it (testnet #5,214,732).
+            if creation_reverted {
+                use revm::interpreter::interpreter_types::ReturnData;
+                evm.frame_stack().get().interpreter.return_data.clear();
             }
             // The precompile this contract just called threw before RSKIP197:
             // the contract stops here, its gas spent and its changes undone,

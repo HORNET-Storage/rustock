@@ -95,6 +95,7 @@ implementation quirk, it is cross-referenced below.
 | 73 | EIP-2929 dropped EXTCODECOPY's flat base — re-pin to 700 | [`design-divergences.md`](./design-divergences.md) |
 | 76 | Rejected peg-out refund: full wei vs satoshi-truncated (RSKIP427) | [`consensus-port-log.md`](./consensus-port-log.md) |
 | 88 | Empty Bridge `byte[]` return ABI-encodes to 96 bytes | [`consensus-port-log.md`](./consensus-port-log.md) |
+| 93 | A reverted CREATE/CREATE2 leaves its creator's return data empty | [`quirks-frozen-bugs.md`](./quirks-frozen-bugs.md) |
 | — | Discovery NodeTable eviction (liveness, non-consensus) | [`wire-protocol.md`](./wire-protocol.md) |
 
 ## Quirks logged with their feature (cross-reference to `consensus-port-log.md`)

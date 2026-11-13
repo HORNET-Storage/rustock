@@ -634,3 +634,45 @@ constructor — clearing adds 5000 and earns no 15000 refund; without the fix it
 costs ~10000 less). Verified: exec-head #6,362,185 → #6,362,188 replays clean;
 #6,362,186 tx[3] gas_used = 1,197,343 with exact state and receipts roots.
 
+---
+
+## §93 A reverted CREATE/CREATE2 leaves its creator's return data empty (testnet #5,214,732)
+
+When a creation's init code ends in `REVERT`, canonical EVM (EIP-211, and
+revm) hands the revert data to the creator: `RETURNDATASIZE` reads its length
+and `RETURNDATACOPY` copies it. rskj's `Program.getProgramResult` instead does
+
+```java
+returnDataBuffer = result.getHReturn();
+```
+
+(Program.java:685 at VETIVER-9.0.4), where `result` is the creator's **own**
+`ProgramResult` (the field, Program.java:122), not the creation's
+(`programResult`). A program that is still running has returned nothing: its
+`hReturn` is set only by `STOP`, `RETURN` and `REVERT`, which end it, and
+`ProgramResult.merge` never copies it. So after a reverted CREATE or CREATE2
+the creator's buffer is empty and `RETURNDATASIZE` reads 0. No activation
+guards the line, so this holds at every height. A CALL whose callee reverts
+still hands the data over (`returnDataBuffer = buffer`, Program.java:994).
+
+**Trigger**: testnet #5,214,732 tx[0] deploys a contract whose constructor
+creates another, whose own constructor reverts; the outer constructor then
+passes the reason on with Solidity's `returndatacopy(0, 0, returndatasize())`
+and `revert(0, returndatasize())`. rustock copied the inner revert data, for
+6 gas, where rskj copied nothing: gasUsed 606,364 against the header's
+606,358.
+
+**Ground truth**: RSKj's release VETIVER-9.0.4, run as the jar through
+`TransactionExecutor` on regtest, reads RETURNDATASIZE 0 after a CREATE whose
+init code reverts with 36 bytes, from a called contract and from init code
+alike, and 36 after a CALL whose callee reverts with the same bytes.
+
+**rustock**: `RskHandler::exec_loop` (crates/execution/src/rsk_handler.rs)
+notes a `FrameResult::Create` that ended in `InstructionResult::Revert` and
+clears the creator's buffer after `frame_return_result` has put the revert
+data in it. Test
+`executor::tests::test_reverted_create_leaves_return_data_empty_at_every_height`
+(without the fix RETURNDATASIZE reads the 68 bytes the creation reverted
+with). Verified: testnet #5,214,732 replays to the header's state and
+receipts roots.
+
