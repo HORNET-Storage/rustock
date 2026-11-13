@@ -14,10 +14,12 @@
 //!    caller charges it before anything runs, and a call that cannot pay it is
 //!    out of gas.
 //! 3. `execute` runs the method and ABI-encodes its result. It throws when
-//!    there is no call, and wherever the method refuses its arguments.
+//!    there is no call, and wherever the method refuses its arguments. A
+//!    method's `null` it returns as it is, with nothing encoded.
 //!
 //! What a throw costs depends on who made the call, a transaction or a
-//! contract, and on RSKIP197: `RskPrecompileProvider` settles it.
+//! contract, and on RSKIP197; what a `null` does depends on the same and on
+//! RSKIP150. `RskPrecompileProvider` settles both.
 
 pub(crate) mod block_header;
 pub(crate) mod environment;
@@ -31,6 +33,10 @@ pub(crate) enum Outcome {
     /// `execute` returned `output`, and the call cost `gas`: its
     /// `getGasForData`.
     Returned { gas: u64, output: Bytes },
+    /// `execute` returned rskj's `null`, and the call cost `gas`: its
+    /// `getGasForData`. A transaction's own call ends with no output, and a
+    /// contract's as `Program` takes a null output where the block is.
+    Null { gas: u64 },
     /// `getGasForData` asked for more gas than the call carries, so nothing
     /// ran.
     OutOfGas,
@@ -42,11 +48,14 @@ pub(crate) enum Outcome {
     Fatal(String),
 }
 
-/// Why a method did not return.
+/// Why a method has no result to encode.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Failure {
     /// rskj's method throws.
     Threw(String),
+    /// rskj's method returns `null`, which `NativeContract.execute` returns
+    /// in its turn.
+    Null,
     /// The node could not read what rskj's method reads.
     Fatal(String),
 }
@@ -96,6 +105,7 @@ pub(crate) fn call<C: NativeContract>(contract: &C, input: &[u8], gas_limit: u64
             gas,
             output: output.into(),
         },
+        Err(Failure::Null) => Outcome::Null { gas },
         Err(Failure::Threw(reason)) => Outcome::Threw { gas, reason },
         Err(Failure::Fatal(reason)) => Outcome::Fatal(reason),
     }

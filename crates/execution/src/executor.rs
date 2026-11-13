@@ -5822,13 +5822,33 @@ mod tests {
     }
 
     /// One transaction at mainnet's `block` to a contract that reaches the
-    /// Bridge with `opcode`, `input` and 100,000 gas, then stores the call's
-    /// flag plus one in its slot 0. Answers whether the transaction
+    /// Bridge with `opcode`, `input` and 100,000 gas:
+    /// [`a_precompile_called_from_a_contract`] says what this answers.
+    fn the_bridge_called_from_a_contract(
+        block: u64,
+        opcode: u8,
+        input: &[u8],
+    ) -> (bool, u64, usize) {
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        a_precompile_called_from_a_contract(
+            block_store,
+            &dummy_header(block),
+            crate::precompiles::BRIDGE_ADDR,
+            opcode,
+            input,
+        )
+    }
+
+    /// One transaction in mainnet's block `header` to a contract that reaches
+    /// `precompile` with `opcode`, `input` and 100,000 gas, then stores the
+    /// call's flag plus one in its slot 0. Answers whether the transaction
     /// succeeded, that slot (2 after a call that succeeded, 1 after one that
     /// failed, 0 where the contract never got to store it), and how many logs
     /// the transaction left.
-    fn the_bridge_called_from_a_contract(
-        block: u64,
+    fn a_precompile_called_from_a_contract(
+        block_store: Arc<BlockStore>,
+        header: &Header,
+        precompile: Address,
         opcode: u8,
         input: &[u8],
     ) -> (bool, u64, usize) {
@@ -5845,7 +5865,7 @@ mod tests {
                 code.extend_from_slice(&[0x60, 0x00]);
             }
             code.push(0x73);
-            code.extend_from_slice(crate::precompiles::BRIDGE_ADDR.as_slice());
+            code.extend_from_slice(precompile.as_slice());
             code.extend_from_slice(&[0x62, 0x01, 0x86, 0xa0, opcode]);
             // The flag plus one to slot 0, then STOP.
             code.extend_from_slice(&[0x60, 0x01, 0x01, 0x60, 0x00, 0x55, 0x00]);
@@ -5864,7 +5884,6 @@ mod tests {
             &code,
             store.as_ref(),
         );
-        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
         let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
         let tx = rustock_core::Transaction {
             nonce: 0,
@@ -5879,7 +5898,7 @@ mod tests {
             cached_rlp: None,
         };
         let result = executor
-            .execute_block(&dummy_header(block), &[(tx, sender)], &root, store.clone())
+            .execute_block(header, &[(tx, sender)], &root, store.clone())
             .expect("block");
         let stored = result
             .state_changes
@@ -5974,6 +5993,78 @@ mod tests {
         };
         assert!(!output_at(700_000).is_empty(), "before RSKIP88");
         assert!(output_at(764_123).is_empty(), "from RSKIP88");
+    }
+
+    /// rskj's `getBitcoinHeader` answers null for a block with no Bitcoin
+    /// header, which only a genesis block read from a file without one is:
+    /// every later block needs one for its proof of work.
+    /// `NativeContract.execute` passes the null on, and `Program` makes of it
+    /// what it makes of the Bridge's.
+    #[test]
+    fn a_native_contracts_null_ends_a_contracts_call_as_rskj_ends_it_in_each_era() {
+        let get_bitcoin_header = {
+            let mut input = crate::abi::selector("getBitcoinHeader(int256)").to_vec();
+            input.extend_from_slice(&[0u8; 32]);
+            input
+        };
+        // Mainnet's block `number`, and a store that holds its parent, which
+        // has no Bitcoin header.
+        let on_a_parent_without_one = |number: u64| {
+            let block_store =
+                Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+            let parent = dummy_header(number - 1);
+            assert!(parent.bitcoin_merged_mining_header.is_none());
+            block_store.put_header(&parent).unwrap();
+            block_store
+                .put_canonical_hash(parent.number, parent.hash())
+                .unwrap();
+            let mut header = dummy_header(number);
+            header.parent_hash = parent.hash();
+            (block_store, header)
+        };
+        let from_a_contract = |number: u64| {
+            let (block_store, header) = on_a_parent_without_one(number);
+            a_precompile_called_from_a_contract(
+                block_store,
+                &header,
+                crate::precompiles::BLOCK_HEADER_ADDR,
+                0xf1,
+                &get_bitcoin_header,
+            )
+        };
+        // Before RSKIP150 `Program.memorySave` reads the null's length, which
+        // nothing in the VM catches: the contract ends there.
+        assert_eq!(from_a_contract(1_700_000), (false, 0, 0));
+        // From RSKIP150 `saveOutAfterExecution` skips a null.
+        assert_eq!(from_a_contract(2_100_000), (true, 2, 0));
+        // From RSKIP197 `Memory.write` reads its length inside the try, and
+        // the call fails.
+        assert_eq!(from_a_contract(4_000_000), (true, 1, 0));
+
+        // A transaction's own call succeeds with no output
+        // (`TransactionExecutor.call`).
+        let (block_store, header) = on_a_parent_without_one(4_000_000);
+        let store = Arc::new(MemoryTrieStore::new());
+        let sender = Address::repeat_byte(0xAA);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&TrieNode::empty(), store.as_ref(), &sender, 0, one_rbtc);
+        let tx = rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::ZERO,
+            gas_limit: U256::from(100_000),
+            to: Bytes::copy_from_slice(crate::precompiles::BLOCK_HEADER_ADDR.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::from(get_bitcoin_header.clone()),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
+        };
+        let result = RskExecutor::new(RskHardforkConfig::mainnet(), block_store)
+            .execute_block(&header, &[(tx, sender)], &root, store.clone())
+            .expect("block");
+        assert!(result.tx_results[0].success);
+        assert!(result.tx_results[0].output.is_empty());
     }
 
     /// rskj `doSUICIDE` (VM.java) charges NEW_ACCT_SUICIDE (25,000) whenever the

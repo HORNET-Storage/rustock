@@ -122,11 +122,10 @@ impl NativeContract for BlockHeader<'_> {
         let Some((hash, header)) = block else {
             return Ok(encode_bytes(&[]));
         };
-        Ok(match self.read(&call, hash, &header)? {
-            Some(value) => encode_bytes(&value),
-            // A method's `null`: `NativeContract.execute` returns no bytes at all.
-            None => Vec::new(),
-        })
+        match self.read(&call, hash, &header)? {
+            Some(value) => Ok(encode_bytes(&value)),
+            None => Err(Failure::Null),
+        }
     }
 }
 
@@ -663,8 +662,10 @@ mod tests {
         assert!(fatal(get("getCoinbaseAddress(int256)", &[int(6)])));
     }
 
+    /// rskj holds a header's field it read from an empty item as null, and
+    /// `getBitcoinHeader` returns the field as it is.
     #[test]
-    fn a_block_without_a_bitcoin_header_answers_with_no_bytes_at_all() {
+    fn a_block_without_a_bitcoin_header_answers_null() {
         let (_dir, blocks, hashes) = chain_with(12, |block| match block.number {
             11 => block.bitcoin_merged_mining_header = None,
             // Stored and read back as an empty field, which rskj reads as null.
@@ -675,10 +676,7 @@ mod tests {
         for number in [12, 13] {
             assert_eq!(
                 call(&at(&blocks, &hashes, number), &get, 1_000_000),
-                Outcome::Returned {
-                    gas: 4_072,
-                    output: Bytes::new()
-                },
+                Outcome::Null { gas: 4_072 },
                 "block {}",
                 number - 1
             );

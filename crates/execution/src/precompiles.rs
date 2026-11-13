@@ -1188,6 +1188,15 @@ impl RskPrecompileProvider {
     /// asked for and the call fails. Before it the throw escapes the VM and
     /// fails the contract that made the call, with all its gas: the call fails
     /// here, and `RskHandler` halts that contract on the flag set here.
+    ///
+    /// A precompile that returns rskj's `null` gives a transaction's own call
+    /// no output. In a contract's call `Program` reads the output's length as
+    /// it writes the output to memory. From RSKIP197 it does so inside the
+    /// call's own `try` (`executePrecompiledAndHandleError`), and the call
+    /// fails as it does for a throw. Before RSKIP150 `memorySave` does, with
+    /// nothing to catch it, and the contract that made the call fails as it
+    /// did for a throw then. Between the two `saveOutAfterExecution` skips a
+    /// null, and the call succeeds with nothing written.
     fn finish<CTX: crate::RskContextTr>(
         &self,
         context: &CTX,
@@ -1201,7 +1210,9 @@ impl RskPrecompileProvider {
             output: Bytes::new(),
         };
         let gas = match &outcome {
-            Outcome::Returned { gas, .. } | Outcome::Threw { gas, .. } => *gas,
+            Outcome::Returned { gas, .. } | Outcome::Null { gas } | Outcome::Threw { gas, .. } => {
+                *gas
+            }
             Outcome::OutOfGas | Outcome::Fatal(_) => 0,
         };
         // Held to the limit before the precompile ran, so this always fits.
@@ -1214,6 +1225,22 @@ impl RskPrecompileProvider {
                 // rskj's setupContract, for a precompile that returns.
                 self.record_called(addr);
                 result.output = output;
+            }
+            Outcome::Null { .. } => {
+                let rskip197 = self.rskip197_active(context);
+                let skipped = !rskip197
+                    && self
+                        .hardfork_cfg
+                        .has_rskip150(context.block().number().to::<u64>());
+                if context.journal().depth() == 1 || skipped {
+                    self.record_called(addr);
+                } else if rskip197 {
+                    result.result = InstructionResult::Revert;
+                } else {
+                    self.aborts_caller
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    result.result = InstructionResult::PrecompileError;
+                }
             }
             Outcome::OutOfGas => result.result = InstructionResult::PrecompileOOG,
             Outcome::Threw { reason, .. } => {
