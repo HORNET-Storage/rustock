@@ -479,19 +479,20 @@ fn held_or_implied_body(
     // locally by `setup_genesis`, never fetched from a peer, so "no body row"
     // cannot mean "body not arrived yet" the way it does at any other height.
     //
-    // This is load-bearing rather than belt-and-braces. Only mainnet's genesis
-    // header carries the real empty-list and empty-trie hashes; testnet's and
-    // regtest's carry `B256::ZERO` for `ommers_hash` and `transactions_root`,
-    // which is not a root any empty trie produces, so the claim check below
-    // says "not empty" and the whole block came back `null` -- by number, by
-    // tag and by hash alike. On a chain whose head *is* genesis that made
-    // `eth_getBlockByNumber("latest")` answer `null` to every client, which is
-    // the state of a fresh regtest node until something is mined.
+    // This is load-bearing rather than belt-and-braces. Mainnet's and
+    // testnet's genesis headers carry the real empty-list and empty-trie
+    // hashes, as rskj's do; rustock's own regtest carries `B256::ZERO` for
+    // `ommers_hash` and `transactions_root`, which is not a root any empty
+    // trie produces, so the claim check below says "not empty" and the whole
+    // block came back `null` -- by number, by tag and by hash alike. On a
+    // chain whose head *is* genesis that made `eth_getBlockByNumber("latest")`
+    // answer `null` to every client, which is the state of a fresh regtest
+    // node until something is mined.
     //
-    // Fixed here rather than in the headers themselves: mainnet's and
-    // testnet's genesis hashes are pinned by `known_genesis_hash`, so editing
-    // their fields would leave a stored header that does not hash to the key
-    // it is stored under.
+    // Fixed here rather than in that header: its hash is computed from its
+    // fields, so editing them would move rustock's regtest to another genesis
+    // block. And a testnet database written while testnet's header carried
+    // zeros too still holds that header.
     if header.number == 0 {
         return Some(None);
     }

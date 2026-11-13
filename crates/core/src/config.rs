@@ -456,13 +456,15 @@ impl ChainConfig {
                 cached_hash_for_merged_mining: None,
                 kept: None,
             },
+            // rskj's `orchid-testnet.json`, with what `GenesisLoaderImpl` and
+            // `GenesisHeader` fill in: the uncles' hash and the two roots.
             31 => Header {
                 parent_hash: B256::ZERO,
-                ommers_hash: B256::ZERO,
-                beneficiary: Address::ZERO,
+                ommers_hash: empty_list_hash,
+                beneficiary: "0x3333333333333333333333333333333333333333".parse().unwrap(),
                 state_root: "0x45bce5168430c42b3d568331753f900a32457b4f3748697cbd8375ff4da72641".parse().unwrap(),
-                transactions_root: B256::ZERO,
-                receipts_root: B256::ZERO,
+                transactions_root: empty_trie_hash,
+                receipts_root: empty_trie_hash,
                 logs_bloom: Default::default(),
                 extension_data: None,
                 difficulty: U256::from(0x00100000),
@@ -476,9 +478,9 @@ impl ChainConfig {
                 uncle_count: 0,
                 umm_root: None,
                 version_fields: None,
-                bitcoin_merged_mining_header: None,
-                bitcoin_merged_mining_merkle_proof: None,
-                bitcoin_merged_mining_coinbase_transaction: None,
+                bitcoin_merged_mining_header: Some(Bytes::from_static(&[0x00])),
+                bitcoin_merged_mining_merkle_proof: Some(Bytes::from_static(&[0x00])),
+                bitcoin_merged_mining_coinbase_transaction: Some(Bytes::from_static(&[0x00])),
                 cached_hash: None,
                 cached_hash_for_merged_mining: None,
                 kept: None,
@@ -928,13 +930,47 @@ mod tests {
         assert_eq!(orchid_state_root(&root, &store), config.genesis_header().state_root);
     }
 
+    /// Testnet's genesis header is the one rskj builds from
+    /// `orchid-testnet.json`: the file's coinbase and the zero byte it gives
+    /// each merged-mining field, and what `GenesisLoaderImpl` and
+    /// `GenesisHeader` fill in, the empty list's hash for the uncles and the
+    /// empty trie's for the transactions and receipts. Hashed as rskj hashes
+    /// a genesis block, with the difficulty as the file writes it, those
+    /// fields give testnet's genesis hash.
     #[test]
     fn test_testnet_genesis_header() {
         let config = ChainConfig::testnet();
         let genesis = config.genesis_header();
         assert_eq!(genesis.number, 0);
         assert_eq!(genesis.difficulty, U256::from(0x00100000));
-        assert!(genesis.bitcoin_merged_mining_header.is_none());
+
+        let zero_byte = Bytes::from_static(&[0x00]);
+        let file = crate::rskj_genesis::GenesisSpec {
+            parent_hash: B256::ZERO,
+            coinbase: Address::repeat_byte(0x33),
+            timestamp: 0,
+            extra_data: Bytes::from_static(&hex_literal::hex!("434d272841")),
+            gas_limit: U256::from(0x4c4b40),
+            difficulty_bytes: Bytes::from_static(&hex_literal::hex!("0000100000")),
+            minimum_gas_price: U256::ZERO,
+            bitcoin_merged_mining_header: zero_byte.clone(),
+            bitcoin_merged_mining_merkle_proof: zero_byte.clone(),
+            bitcoin_merged_mining_coinbase_transaction: zero_byte,
+            alloc: Vec::new(),
+            state_root: Some(
+                "0x45bce5168430c42b3d568331753f900a32457b4f3748697cbd8375ff4da72641"
+                    .parse()
+                    .unwrap(),
+            ),
+        };
+        assert_eq!(Some(file.hash()), config.known_genesis_hash());
+        // The file's header carries that hash; this one leaves it to
+        // `known_genesis_hash`.
+        let as_rskj_builds_it = Header {
+            cached_hash: None,
+            ..file.header()
+        };
+        assert_eq!(genesis, as_rskj_builds_it);
     }
 
     #[test]
