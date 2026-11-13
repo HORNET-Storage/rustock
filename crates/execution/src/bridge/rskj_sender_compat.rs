@@ -339,6 +339,19 @@ pub fn parses_as_script(program: &[u8]) -> bool {
     parse_script_program(program).is_some()
 }
 
+/// A script's chunks as bitcoinj holds them, each by its data: `None` for an
+/// opcode, which has none, and the bytes for a push, which `OP_0` makes of
+/// nothing. `None` overall is the `ScriptException` for a script bitcoinj
+/// can't parse.
+pub fn chunk_data(program: &[u8]) -> Option<Vec<Option<Vec<u8>>>> {
+    Some(
+        parse_script_program(program)?
+            .into_iter()
+            .map(|chunk| chunk.data)
+            .collect(),
+    )
+}
+
 // --- RedeemScriptValidator -------------------------------------------------
 
 fn is_redeem_like_script(chunks: &[JChunk]) -> bool {

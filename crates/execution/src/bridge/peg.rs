@@ -997,16 +997,19 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
     // can lock; other processable types are refunded ("Btc tx type not
     // supported, returning funds to sender") without consulting the
     // whitelist or the locking cap.
-    let (sender_hash160, sender_is_p2sh, sender_pubkey, lockable): ([u8; 20], bool, Option<&[u8]>, bool) =
-        match &sender {
-            PeginSender::P2pkh { pubkey } => (pubkey_hash160(pubkey), false, Some(pubkey), true),
-            PeginSender::P2shP2wpkh { pubkey, p2sh_hash } => {
-                (*p2sh_hash, true, Some(pubkey), true)
-            }
-            PeginSender::P2shMultisig { p2sh_hash } | PeginSender::P2shP2wsh { p2sh_hash } => {
-                (*p2sh_hash, true, None, false)
-            }
-        };
+    let (sender_hash160, sender_is_p2sh, sender_rsk_address, lockable) = match &sender {
+        PeginSender::P2pkh {
+            btc_hash160,
+            rsk_address,
+        } => (*btc_hash160, false, Some(*rsk_address), true),
+        PeginSender::P2shP2wpkh {
+            p2sh_hash,
+            rsk_address,
+        } => (*p2sh_hash, true, Some(*rsk_address), true),
+        PeginSender::P2shMultisig { p2sh_hash } | PeginSender::P2shP2wsh { p2sh_hash } => {
+            (*p2sh_hash, true, None, false)
+        }
+    };
 
     // Lock whitelist gate (rskj verifyLockSenderIsWhitelisted): the matching
     // one-off entry is consumed on success; rejection generates a refund
@@ -1100,10 +1103,10 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
         return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
     }
 
-    // RSK destination: rskj's legacy peg-in credits the address derived from
-    // the sender's public key (ethereumj ECKey.getAddress over the
-    // UNCOMPRESSED point — mainnet #267,460 used a 65-byte pubkey).
-    let rsk_destination = sender_pubkey.and_then(super::federation::rsk_address_from_public_key);
+    // RSK destination: rskj's legacy peg-in credits the address its sender
+    // parser derived from the sender's public key (ethereumj ECKey.getAddress
+    // over the UNCOMPRESSED point — mainnet #267,460 used a 65-byte pubkey).
+    let rsk_destination = sender_rsk_address;
 
     // Credit the derived destination address (transfer from Bridge balance)
     if let Some(dest) = rsk_destination {
@@ -1302,7 +1305,7 @@ fn refund_fields(
 /// hash160 and whether it is a P2SH address.
 fn sender_refund_target(sender: &PeginSender) -> ([u8; 20], bool) {
     match sender {
-        PeginSender::P2pkh { pubkey } => (pubkey_hash160(pubkey), false),
+        PeginSender::P2pkh { btc_hash160, .. } => (*btc_hash160, false),
         PeginSender::P2shP2wpkh { p2sh_hash, .. }
         | PeginSender::P2shMultisig { p2sh_hash }
         | PeginSender::P2shP2wsh { p2sh_hash } => (*p2sh_hash, true),
@@ -1427,84 +1430,171 @@ fn emit_pegin_rejection_release<CTX: crate::RskContextTr>(
     }
 }
 
-/// rskj `BtcLockSender.TxType`: the peg-in sender classification derived
-/// from the FIRST input. `hash160` is the sender's BTC address hash (pubkey
-/// hash for P2PKH, script hash for the P2SH variants) — what rskj's
-/// `senderBtcAddress` carries into the whitelist check and the refund.
+/// rskj `BtcLockSender`: what a peg-in's FIRST input says of its sender, as
+/// one of the four parsers reads it. Each variant carries what the parser
+/// derives. The hash is the sender's Bitcoin address's (`getBTCAddress`: a
+/// public key's hash for P2PKH, a script's for the P2SH variants), which is
+/// what the whitelist is asked about and what a refund pays. The two
+/// single-key shapes also have an RSK address (`getRskAddress`), which a
+/// version 0 peg-in credits.
 enum PeginSender {
-    P2pkh { pubkey: Vec<u8> },
-    P2shP2wpkh { pubkey: Vec<u8>, p2sh_hash: [u8; 20] },
-    P2shMultisig { p2sh_hash: [u8; 20] },
-    P2shP2wsh { p2sh_hash: [u8; 20] },
+    P2pkh {
+        btc_hash160: [u8; 20],
+        rsk_address: alloy_primitives::Address,
+    },
+    P2shP2wpkh {
+        p2sh_hash: [u8; 20],
+        rsk_address: alloy_primitives::Address,
+    },
+    P2shMultisig {
+        p2sh_hash: [u8; 20],
+    },
+    P2shP2wsh {
+        p2sh_hash: [u8; 20],
+    },
 }
+
+/// A public key as rskj's sender parsers read one, with bitcoinj's
+/// `BtcECKey.fromPublicOnly` and then its own `ECKey.fromPublicOnly`. Both are
+/// Bouncy Castle's `decodePoint`, which takes what libsecp256k1 takes, hybrid
+/// keys among it, and also the one byte 0x00, the point at infinity.
+struct SenderKey {
+    /// `BtcECKey.isCompressed()`: the key came in 33 bytes.
+    compressed: bool,
+    /// `BtcECKey.getPubKeyHash()`. bitcoinj encodes the point again before it
+    /// hashes it, compressed if it came compressed and uncompressed if not,
+    /// so a hybrid key hashes as its uncompressed form.
+    btc_hash160: [u8; 20],
+    /// `ECKey.getAddress()`: the hash of the uncompressed point less its first
+    /// byte. Of the point at infinity that is the hash of nothing.
+    rsk_address: alloy_primitives::Address,
+}
+
+/// `None` where `decodePoint` throws.
+fn decode_sender_key(key: &[u8]) -> Option<SenderKey> {
+    use sha3::Digest;
+    let rsk_address = |coordinates: &[u8]| {
+        alloy_primitives::Address::from_slice(&sha3::Keccak256::digest(coordinates)[12..])
+    };
+    if key == [0x00] {
+        return Some(SenderKey {
+            compressed: false,
+            btc_hash160: pubkey_hash160(key),
+            rsk_address: rsk_address(&[]),
+        });
+    }
+    let point = bitcoin::secp256k1::PublicKey::from_slice(key).ok()?;
+    let uncompressed = point.serialize_uncompressed();
+    let compressed = key.len() == 33;
+    Some(SenderKey {
+        compressed,
+        btc_hash160: if compressed {
+            pubkey_hash160(&point.serialize())
+        } else {
+            pubkey_hash160(&uncompressed)
+        },
+        rsk_address: rsk_address(&uncompressed[1..]),
+    })
+}
+
+/// `new Script(redeemScript)` and then `isSentToMultiSig()`, as both multisig
+/// sender parsers run them before their `try`: a redeem script bitcoinj can't
+/// parse throws, and so does one its parser dispatch throws for.
+fn is_multisig_redeem(redeem: &[u8]) -> Result<bool, &'static str> {
+    use super::rskj_sender_compat::{self as bitcoinj, Verdict};
+    if !bitcoinj::parses_as_script(redeem) {
+        return Err("ScriptException parsing the sender's redeem script");
+    }
+    match bitcoinj::is_sent_to_multisig(redeem) {
+        Verdict::Multisig => Ok(true),
+        Verdict::NotMultisig => Ok(false),
+        Verdict::RskjThrows(why) => Err(why),
+    }
+}
+
 /// rskj `BtcLockSenderProvider.tryGetBtcLockSender`: try P2PKH, then
 /// P2SH-P2WPKH, then P2SH-MULTISIG, then P2SH-P2WSH — all on the first
 /// input. Returns `None` when no parser matches (rskj then returns from
 /// registerBtcTransaction WITHOUT marking the tx as processed).
+///
+/// Each parser answers false for what it catches and throws for what it does
+/// outside its `try`, which nothing between it and `Bridge.execute` catches:
+/// the `Err`.
 fn classify_pegin_sender(
     tx: &BtcTransaction,
 ) -> Result<Option<PeginSender>, &'static str> {
-    use super::release_tx::{parse_chunks, Chunk};
+    use super::rskj_sender_compat as bitcoinj;
     let Some(first) = tx.input.first() else { return Ok(None) };
-    let Some(chunks) = parse_chunks(first.script_sig.as_bytes()) else { return Ok(None) };
 
-    // P2PKH: scriptSig is exactly [sig, pubkey] with a valid curve point
-    // (rskj derives both the BTC and RSK addresses from it).
-    if let [Chunk::Data(_sig), Chunk::Data(pubkey)] = chunks.as_slice() {
-        if compress_pubkey(pubkey).is_some() {
-            return Ok(Some(PeginSender::P2pkh { pubkey: pubkey.clone() }));
+    // The first parser tried opens with `getScriptSig()`, which parses the
+    // script, and the later ones read the script it parsed.
+    let Some(chunks) = bitcoinj::chunk_data(first.script_sig.as_bytes()) else {
+        return Err("ScriptException parsing the first input's scriptSig");
+    };
+
+    // P2PKH: a scriptSig of two chunks whose second is a public key, from
+    // which rskj derives both the BTC and RSK addresses. The first chunk is
+    // never looked at. An opcode in the key's place has no data, and decoding
+    // it throws as decoding what isn't a key does: inside the `try`.
+    if chunks.len() == 2 {
+        if let Some(key) = chunks[1].as_deref().and_then(decode_sender_key) {
+            return Ok(Some(PeginSender::P2pkh {
+                btc_hash160: key.btc_hash160,
+                rsk_address: key.rsk_address,
+            }));
         }
     }
 
     let witness: Vec<&[u8]> = first.witness.iter().collect();
 
     // P2SH-P2WPKH: single-chunk scriptSig, witness [sig, compressed pubkey];
-    // P2SH hash = hash160(0x0014 || hash160(pubkey)).
+    // P2SH hash = hash160(0x0014 || hash160(pubkey)). The key is decoded
+    // before the `try`, and one that isn't compressed is not this parser's.
     if chunks.len() == 1 && witness.len() == 2 {
-        let pubkey = witness[1];
-        if pubkey.len() == 33 && compress_pubkey(pubkey).is_some() {
+        let Some(key) = decode_sender_key(witness[1]) else {
+            return Err("IllegalArgumentException decoding the witness's public key");
+        };
+        if key.compressed {
             let mut redeem = vec![0x00, 0x14];
-            redeem.extend_from_slice(&pubkey_hash160(pubkey));
+            redeem.extend_from_slice(&key.btc_hash160);
             return Ok(Some(PeginSender::P2shP2wpkh {
-                pubkey: pubkey.to_vec(),
                 p2sh_hash: pubkey_hash160(&redeem),
+                rsk_address: key.rsk_address,
             }));
         }
     }
 
     // P2SH-MULTISIG: scriptSig [.., sigs.., redeem] with a multisig redeem;
-    // P2SH hash = hash160(redeem).
+    // P2SH hash = hash160(redeem). A scriptSig that ends in an opcode has no
+    // data to build the redeem script from: a NullPointerException.
     //
     // The predicate lives in `rskj_sender_compat` rather than here: it is a
     // faithful port of bitcoinj's parser dispatch, kept apart so that it can be
     // switched off and deleted when the RSKIP retiring this path activates.
-    if super::rskj_sender_compat::enabled() && chunks.len() >= 3 {
-        if let Some(Chunk::Data(redeem)) = chunks.last() {
-            match super::rskj_sender_compat::is_sent_to_multisig(redeem) {
-                super::rskj_sender_compat::Verdict::Multisig => {
-                    return Ok(Some(PeginSender::P2shMultisig {
-                        p2sh_hash: pubkey_hash160(redeem),
-                    }));
-                }
-                super::rskj_sender_compat::Verdict::RskjThrows(why) => return Err(why),
-                super::rskj_sender_compat::Verdict::NotMultisig => {}
-            }
+    if bitcoinj::enabled() && chunks.len() >= 3 {
+        let Some(redeem) = chunks[chunks.len() - 1].as_deref() else {
+            return Err(
+                "NullPointerException: the scriptSig ends in an opcode, not a redeem script",
+            );
+        };
+        if is_multisig_redeem(redeem)? {
+            return Ok(Some(PeginSender::P2shMultisig {
+                p2sh_hash: pubkey_hash160(redeem),
+            }));
         }
     }
 
     // P2SH-P2WSH: single-chunk scriptSig, witness [.., sigs.., redeem] with
     // a multisig redeem; P2SH hash = hash160(0x0020 || sha256(redeem)).
-    if super::rskj_sender_compat::enabled() && chunks.len() == 1 && witness.len() >= 3 {
+    if bitcoinj::enabled() && chunks.len() == 1 && witness.len() >= 3 {
         let redeem = witness[witness.len() - 1];
-        match super::rskj_sender_compat::is_sent_to_multisig(redeem) {
-            super::rskj_sender_compat::Verdict::Multisig => {
-                use sha2::Digest;
-                let mut merged = vec![0x00, 0x20];
-                merged.extend_from_slice(&sha2::Sha256::digest(redeem));
-                return Ok(Some(PeginSender::P2shP2wsh { p2sh_hash: pubkey_hash160(&merged) }));
-            }
-            super::rskj_sender_compat::Verdict::RskjThrows(why) => return Err(why),
-            super::rskj_sender_compat::Verdict::NotMultisig => {}
+        if is_multisig_redeem(redeem)? {
+            use sha2::Digest;
+            let mut merged = vec![0x00, 0x20];
+            merged.extend_from_slice(&sha2::Sha256::digest(redeem));
+            return Ok(Some(PeginSender::P2shP2wsh {
+                p2sh_hash: pubkey_hash160(&merged),
+            }));
         }
     }
 
@@ -7647,7 +7737,13 @@ mod tests {
             output: vec![],
         };
         match classify_pegin_sender(&tx).unwrap() {
-            Some(PeginSender::P2pkh { pubkey: parsed }) => assert_eq!(parsed, pubkey),
+            Some(PeginSender::P2pkh {
+                btc_hash160,
+                rsk_address,
+            }) => {
+                assert_eq!(rsk_address, addr);
+                assert_eq!(btc_hash160, pubkey_hash160(&pubkey));
+            }
             other => panic!("expected P2PKH sender, got {}", other.is_some()),
         }
     }
@@ -7777,13 +7873,20 @@ mod tests {
     #[test]
     fn sender_refund_target_distinguishes_p2pkh_from_the_p2sh_shapes() {
         let pubkey = real_pubkey().to_vec();
-        let (hash, is_p2sh) = sender_refund_target(&PeginSender::P2pkh { pubkey: pubkey.clone() });
+        let rsk_address = crate::bridge::federation::rsk_address_from_public_key(&pubkey).unwrap();
+        let (hash, is_p2sh) = sender_refund_target(&PeginSender::P2pkh {
+            btc_hash160: pubkey_hash160(&pubkey),
+            rsk_address,
+        });
         assert_eq!(hash, pubkey_hash160(&pubkey), "P2PKH refunds to hash160(pubkey)");
         assert!(!is_p2sh, "P2PKH is not a P2SH address");
 
         let marker = [0xABu8; 20];
         for sender in [
-            PeginSender::P2shP2wpkh { pubkey, p2sh_hash: marker },
+            PeginSender::P2shP2wpkh {
+                p2sh_hash: marker,
+                rsk_address,
+            },
             PeginSender::P2shMultisig { p2sh_hash: marker },
             PeginSender::P2shP2wsh { p2sh_hash: marker },
         ] {
@@ -7929,17 +8032,32 @@ mod tests {
             "witness with a single push matches no shape"
         );
 
-        // Witness has two pushes but the second is not a valid compressed key.
+        // Witness has two pushes but the second is a key that isn't compressed.
+        // One that isn't a key at all throws: see
+        // `the_p2sh_p2wpkh_parser_throws_for_a_witness_key_it_cannot_decode`.
+        let mut uncompressed = vec![0x04];
+        uncompressed.extend_from_slice(&alloy_primitives::hex::decode(GX).unwrap());
+        uncompressed.extend_from_slice(&alloy_primitives::hex::decode(GY).unwrap());
         assert!(
-            classify_pegin_sender(&tx_with(vec![2, 0x00, 0x14],
-                vec![vec![0x30; 71], vec![0xFFu8; 33]])).unwrap().is_none(),
-            "P2SH-P2WPKH requires the witness key to be a curve point"
+            classify_pegin_sender(&tx_with(
+                vec![2, 0x00, 0x14],
+                vec![vec![0x30; 71], uncompressed]
+            ))
+            .unwrap()
+            .is_none(),
+            "P2SH-P2WPKH requires the witness key to be compressed"
         );
 
-        // Three witness items but the last is not a multisig redeem.
+        // Three witness items but the last is a script that isn't a multisig
+        // redeem. One bitcoinj can't parse throws: see
+        // `the_multisig_parsers_throw_for_a_redeem_script_they_cannot_build`.
         assert!(
-            classify_pegin_sender(&tx_with(vec![2, 0x00, 0x20],
-                vec![vec![], vec![0x30; 71], vec![0x01, 0x02, 0x03]])).unwrap().is_none(),
+            classify_pegin_sender(&tx_with(
+                vec![2, 0x00, 0x20],
+                vec![vec![], vec![0x30; 71], vec![0x51, 0x52, 0x53]]
+            ))
+            .unwrap()
+            .is_none(),
             "P2SH-P2WSH requires a multisig redeem as the last witness item"
         );
     }
@@ -8149,21 +8267,192 @@ mod tests {
         assert_eq!(varied, seeds.len() * 1_500);
     }
 
-    /// The P2PKH branch accepts only a real curve point. rskj gets this from
-    /// BtcECKey.fromPublicOnly throwing; rustock from `compress_pubkey`
-    /// returning None. Without it a two-chunk scriptSig whose second push is
-    /// arbitrary bytes would be read as P2PKH and refunded to a hash160 of
-    /// data the sender never controlled.
+    // --- the four sender parsers, case by case -----------------------------
+    //
+    // Every key below was decoded by the release's own libraries, bitcoinj-thin
+    // `0.14.4-rsk-18` for `BtcECKey.fromPublicOnly` and Bouncy Castle for
+    // `org.ethereum.crypto.ECKey.fromPublicOnly`, and the hashes and addresses
+    // are the ones they answered.
+
+    /// The generator's coordinates.
+    const GX: &str = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+    const GY: &str = "483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8";
+    /// `ECKey.getAddress()` of the generator, however it is encoded.
+    const G_RSK_ADDRESS: &str = "7e5f4552091a69125d5dfcb7b8c2659029395bdf";
+    /// `BtcECKey.getPubKeyHash()` of the generator compressed, and uncompressed.
+    const G_COMPRESSED_HASH160: &str = "751e76e8199196d454941c45d1b3a323f1433bd6";
+    const G_UNCOMPRESSED_HASH160: &str = "91b24bf9f5288532960ac687abb035127b1d28a5";
+
+    fn sec1(prefix: &str, rest: &[&str]) -> Vec<u8> {
+        alloy_primitives::hex::decode(format!("{prefix}{}", rest.concat())).unwrap()
+    }
+
+    /// A scriptSig of `first` and then `second` pushed.
+    fn then_push(first: &[u8], second: &[u8]) -> Vec<u8> {
+        let mut script = first.to_vec();
+        script.push(second.len() as u8);
+        script.extend_from_slice(second);
+        script
+    }
+
+    /// The sender rskj reads off a first input: its type, its Bitcoin address's
+    /// hash and its RSK address, in hex.
+    fn sender_read_off(
+        script_sig: Vec<u8>,
+        witness: Vec<Vec<u8>>,
+    ) -> Result<Option<(&'static str, String, Option<String>)>, &'static str> {
+        Ok(
+            classify_pegin_sender(&tx_with(script_sig, witness))?.map(|sender| {
+                (
+                    sender_type_name(Some(&sender)),
+                    alloy_primitives::hex::encode(sender_refund_target(&sender).0),
+                    rsk_address_of(&sender).map(alloy_primitives::hex::encode),
+                )
+            }),
+        )
+    }
+
+    fn rsk_address_of(sender: &PeginSender) -> Option<alloy_primitives::Address> {
+        match sender {
+            PeginSender::P2pkh { rsk_address, .. }
+            | PeginSender::P2shP2wpkh { rsk_address, .. } => Some(*rsk_address),
+            _ => None,
+        }
+    }
+
+    fn p2pkh(hash160: &str, rsk_address: &str) -> Option<(&'static str, String, Option<String>)> {
+        Some(("P2PKH", hash160.into(), Some(rsk_address.into())))
+    }
+
+    /// `P2pkhBtcLockSender` counts the scriptSig's chunks and reads the second.
+    /// It never looks at the first, which need not be a signature or a push.
     #[test]
-    fn classify_pegin_sender_p2pkh_requires_a_valid_public_key() {
-        let mut script = vec![71];
-        script.extend_from_slice(&[0x30; 71]);
-        script.push(33);
-        script.extend_from_slice(&[0xFFu8; 33]); // not on the curve
-        assert!(
-            classify_pegin_sender(&tx_with(script, vec![])).unwrap().is_none(),
-            "a non-curve 33-byte push must not classify as P2PKH"
+    fn the_p2pkh_parser_reads_the_second_chunk_alone() {
+        let compressed = sec1("02", &[GX]);
+        let signature = then_push(&[], &[0x30; 71]);
+        // OP_0, OP_1 and OP_DUP in the signature's place.
+        for first in [&signature[..], &[0x00], &[0x51], &[0x76]] {
+            assert_eq!(
+                sender_read_off(then_push(first, &compressed), vec![]),
+                Ok(p2pkh(G_COMPRESSED_HASH160, G_RSK_ADDRESS)),
+                "{first:02x?}"
+            );
+        }
+    }
+
+    /// Bouncy Castle's `decodePoint` takes a hybrid key and the point at
+    /// infinity besides the two usual encodings. bitcoinj encodes a point
+    /// again before it hashes it, so a hybrid key has its uncompressed form's
+    /// address, and rskj's address of the point at infinity is the hash of
+    /// nothing.
+    #[test]
+    fn the_p2pkh_parser_takes_every_key_bouncy_castle_decodes() {
+        let sender_with = |key: &[u8]| sender_read_off(then_push(&[0x00], key), vec![]);
+        assert_eq!(
+            sender_with(&sec1("02", &[GX])),
+            Ok(p2pkh(G_COMPRESSED_HASH160, G_RSK_ADDRESS))
         );
+        assert_eq!(
+            sender_with(&sec1("04", &[GX, GY])),
+            Ok(p2pkh(G_UNCOMPRESSED_HASH160, G_RSK_ADDRESS))
+        );
+        // The generator's y is even: 0x06 says so, 0x07 contradicts it.
+        assert_eq!(
+            sender_with(&sec1("06", &[GX, GY])),
+            Ok(p2pkh(G_UNCOMPRESSED_HASH160, G_RSK_ADDRESS))
+        );
+        assert_eq!(
+            sender_with(&[0x00]),
+            Ok(p2pkh(
+                "9f7fd096d37ed2c0e3f7f0cfc924beef4ffceb68",
+                "dcc703c0e500b653ca82273b7bfad8045d85a470"
+            ))
+        );
+
+        // What it throws for is caught there: the parser answers false, and
+        // with no witness no other parser takes the input.
+        let not_keys = [
+            sec1("07", &[GX, GY]),
+            sec1("02", &[&"ff".repeat(32)]),
+            sec1("00", &[&"00".repeat(32)]),
+            sec1("04", &[GX]),
+            sec1("05", &[GX]),
+            vec![],
+        ];
+        for not_a_key in &not_keys {
+            assert_eq!(sender_with(not_a_key), Ok(None), "{not_a_key:02x?}");
+        }
+        // An opcode in the key's place has no data at all.
+        assert_eq!(sender_read_off(vec![0x00, 0x51], vec![]), Ok(None));
+    }
+
+    /// `P2pkhBtcLockSender.tryParse`, the first parser tried, opens with
+    /// `getScriptSig()`, which parses the script outside every `try`.
+    #[test]
+    fn a_script_sig_bitcoinj_cannot_parse_makes_rskj_throw() {
+        // OP_PUSHDATA1 with nothing after it, and a push longer than the script.
+        assert!(sender_read_off(vec![0x4c], vec![]).is_err());
+        assert!(sender_read_off(vec![0x05, 0x01], vec![]).is_err());
+    }
+
+    /// `P2shP2wpkhBtcLockSender` decodes the witness's second push with
+    /// `BtcECKey.fromPublicOnly` before its `try`: what isn't a key throws. A
+    /// key that isn't compressed is none of this parser's.
+    #[test]
+    fn the_p2sh_p2wpkh_parser_throws_for_a_witness_key_it_cannot_decode() {
+        let one_chunk = vec![2, 0x00, 0x14];
+        let with_key = |key: Vec<u8>| sender_read_off(one_chunk.clone(), vec![vec![0x30; 71], key]);
+
+        assert!(with_key(vec![0xff; 33]).is_err());
+        assert!(with_key(vec![]).is_err());
+        assert!(with_key(sec1("07", &[GX, GY])).is_err());
+
+        assert_eq!(with_key(sec1("04", &[GX, GY])), Ok(None));
+        assert_eq!(with_key(sec1("06", &[GX, GY])), Ok(None));
+        assert_eq!(with_key(vec![0x00]), Ok(None));
+
+        // hash160(0x0014 || hash160(key)), and the key's RSK address.
+        let mut program = vec![0x00, 0x14];
+        program.extend_from_slice(&alloy_primitives::hex::decode(G_COMPRESSED_HASH160).unwrap());
+        assert_eq!(
+            with_key(sec1("02", &[GX])),
+            Ok(Some((
+                "P2SH-P2WPKH",
+                alloy_primitives::hex::encode(pubkey_hash160(&program)),
+                Some(G_RSK_ADDRESS.into())
+            )))
+        );
+    }
+
+    /// Both multisig parsers build `new Script(redeemScript)` before their
+    /// `try`. A scriptSig that ends in an opcode has no data to build it from,
+    /// a `NullPointerException`, and a redeem script bitcoinj can't parse is a
+    /// `ScriptException`. One it parses that isn't a multisig is just not this
+    /// parser's.
+    #[test]
+    fn the_multisig_parsers_throw_for_a_redeem_script_they_cannot_build() {
+        let three_chunks = |last: &[u8]| {
+            let mut script = vec![0x00, 0x01, 0x30];
+            script.extend_from_slice(last);
+            script
+        };
+        // OP_1 as the last chunk, then OP_PUSHDATA1 alone pushed as the redeem.
+        assert!(sender_read_off(three_chunks(&[0x51]), vec![]).is_err());
+        assert!(sender_read_off(three_chunks(&[0x01, 0x4c]), vec![]).is_err());
+        // OP_1 pushed, and nothing pushed: scripts, not multisigs.
+        assert_eq!(
+            sender_read_off(three_chunks(&[0x01, 0x51]), vec![]),
+            Ok(None)
+        );
+        assert_eq!(sender_read_off(three_chunks(&[0x00]), vec![]), Ok(None));
+
+        let one_chunk = vec![2, 0x00, 0x20];
+        let witness_ending =
+            |last: Vec<u8>| sender_read_off(one_chunk.clone(), vec![vec![], vec![0x30; 71], last]);
+        assert!(witness_ending(vec![0x4c]).is_err());
+        assert!(witness_ending(vec![0x01, 0x02, 0x03]).is_err());
+        assert_eq!(witness_ending(vec![0x51]), Ok(None));
+        assert_eq!(witness_ending(vec![]), Ok(None));
     }
 
     /// sender address = P2SH(hash160(redeem)) — processable post-RSKIP143
