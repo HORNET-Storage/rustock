@@ -508,8 +508,11 @@ pub struct BlockResultDto {
     /// An RSK header field (number 14, where Ethereum has `mixHash`), so this
     /// is the chain's own figure rather than one recomputed here: it is
     /// committed to by the block hash. Summing `gasUsed * gasPrice` over the
-    /// block's receipts reproduces it exactly, which is what `block_fees
-    /// --verify` checks.
+    /// block's receipts reproduces it, which is what `block_fees --verify`
+    /// checks, except where a direct Bridge call ended in rskj's invisible
+    /// exception: its sender pays for the whole gas limit while its receipt
+    /// shows the gas spent (`RskHandler`'s `invisible_exception`; mainnet
+    /// #764,123).
     ///
     /// rskj's `BlockResultDTO` also carries it, so serving it is parity, not
     /// an extension.

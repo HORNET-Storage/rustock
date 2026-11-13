@@ -225,7 +225,11 @@ pub fn eth_get_proof(id: Value, params: &Value, state: &RpcState) -> JsonRpcResp
 /// down from the root, and must reach the same answer as `present`. The block
 /// is named in the answer, so the caller knows which header's state root the
 /// nodes hang from. A node the store cannot produce is an error, never an
-/// absence.
+/// absence. A value too long to sit in its node (over 32 bytes, as some of
+/// the Bridge's cells are) is stored apart from it: one of those the store
+/// has lost is answered as absent, though the slot's node still carries its
+/// hash and length, so a caller that walks the nodes, as it must, finds it
+/// held and the answer wrong.
 pub fn rsk_get_storage_nodes(id: Value, params: &Value, state: &RpcState) -> JsonRpcResponse {
     let Some(addr) = params
         .get(0)

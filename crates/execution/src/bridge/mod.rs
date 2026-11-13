@@ -1199,7 +1199,8 @@ mod tests {
     fn method_table_has_83_entries() {
         // 69 pre-vetiver methods + getEstimatedFeesForPegOutAmount (RSKIP540)
         // + the seven union bridge methods (RSKIP502, reed810) + its six
-        // event methods (RSKIP529, reed810): rskj 9.1's BridgeMethods, whole.
+        // event methods (RSKIP529, reed810): BridgeMethods of rskj's release
+        // VETIVER-9.0.4, whole.
         assert_eq!(BRIDGE_METHODS.len(), 83);
     }
 
@@ -1324,7 +1325,7 @@ mod tests {
         assert!(!method_allows_static_call("clearBaseEvent"));
 
         // rskj's BridgeMethods marks 54 methods ALLOW_STATIC_CALL (counted
-        // from its enum, rskj 9.1), and this table names every one.
+        // from its enum, VETIVER-9.0.4), and this table names every one.
         let static_callable = BRIDGE_METHODS
             .iter()
             .filter(|m| method_allows_static_call(m.name))

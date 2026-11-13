@@ -64,8 +64,9 @@ pub const MAINNET_ACTIVATIONS: &[(u64, RskNetworkUpgrade)] = &[
 /// Testnet activation heights.
 ///
 /// Ground truth is rskj `rskj-core/src/main/resources/config/testnet.conf`
-/// (rskj 9.1.0). Testnet starts already on wasabi100: bahamas, orchid,
-/// orchid060 and wasabi100 are all height 0 there, unlike mainnet.
+/// (rskj's release VETIVER-9.0.4). Testnet starts already on wasabi100:
+/// bahamas, orchid, orchid060 and wasabi100 are all height 0 there, unlike
+/// mainnet.
 pub const TESTNET_ACTIVATIONS: &[(u64, RskNetworkUpgrade)] = &[
     (0, RskNetworkUpgrade::Genesis),
     (0, RskNetworkUpgrade::Orchid),
@@ -1190,7 +1191,7 @@ mod tests {
         assert!(testnet.has_rskip91(0));
     }
 
-    /// rskj `rskj-core/src/main/resources/config/testnet.conf` (rskj 9.1.0),
+    /// rskj `rskj-core/src/main/resources/config/testnet.conf` (VETIVER-9.0.4),
     /// transcribed as a block. rustock's testnet ladder had drifted: wasabi100
     /// was 863,000 (rskj: 0 — that number is rskj's *papyrus200*), papyrus200
     /// was 1,580,000 (a value that appears nowhere in rskj), twoToThree was
@@ -1708,7 +1709,8 @@ mod rskj_schedule_tests {
 
     type Predicate = fn(&RskHardforkConfig, u64) -> bool;
 
-    /// (rule, predicate, mainnet, testnet), from rskj 9.1's config files.
+    /// (rule, predicate, mainnet, testnet), from the config files of rskj's
+    /// release VETIVER-9.0.4.
     /// `None` is rskj's `-1`: never.
     #[rustfmt::skip]
     const SCHEDULE: &[(&str, Predicate, Option<u64>, Option<u64>)] = &[
