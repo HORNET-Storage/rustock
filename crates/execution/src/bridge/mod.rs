@@ -867,6 +867,15 @@ fn execute_method<CTX: crate::RskContextTr>(
         }
     }
 
+    // rskj hands the Bridge the transaction that called it. For a contract's
+    // call that is an internal transaction whose sender is the contract
+    // (`Program.callToPrecompiledAddress`), not the account that signed the
+    // transaction the block holds.
+    let as_called = BridgeTxContext {
+        rsk_sender: caller,
+        ..tx_ctx.clone()
+    };
+
     match method_name {
         // Phase 2: BTC header chain
         "receiveHeader" => {
@@ -964,20 +973,21 @@ fn execute_method<CTX: crate::RskContextTr>(
         "updateCollections" => peg::update_collections(ctx, gas_cost, config, hardfork_cfg, tx_ctx),
         "addSignature" => peg::add_signature(ctx, args, gas_cost, config, hardfork_cfg),
 
-        // Phase 6: Governance
-        "createFederation" => governance::create_federation(ctx, gas_cost, config, hardfork_cfg, tx_ctx),
-        "commitFederation" => governance::commit_federation(ctx, args, gas_cost, config, hardfork_cfg, tx_ctx),
-        "rollbackFederation" => governance::rollback_federation(ctx, gas_cost, config, hardfork_cfg, tx_ctx),
-        "addFederatorPublicKey" => governance::add_federator_public_key(ctx, args, gas_cost, config, hardfork_cfg, tx_ctx),
-        "addFederatorPublicKeyMultikey" => governance::add_federator_public_key_multikey(ctx, args, gas_cost, config, hardfork_cfg, tx_ctx),
-        "voteFeePerKbChange" => governance::vote_fee_per_kb_change(ctx, args, gas_cost, config, tx_ctx),
-        "increaseLockingCap" => governance::increase_locking_cap(ctx, args, gas_cost, config, tx_ctx),
-        "addLockWhitelistAddress" => governance::add_lock_whitelist_address(ctx, args, gas_cost, config, hardfork_cfg, tx_ctx),
-        "addOneOffLockWhitelistAddress" => governance::add_one_off_lock_whitelist_address(ctx, args, gas_cost, config, hardfork_cfg, tx_ctx),
-        "addUnlimitedLockWhitelistAddress" => governance::add_unlimited_lock_whitelist_address(ctx, args, gas_cost, config, hardfork_cfg, tx_ctx),
-        "removeLockWhitelistAddress" => governance::remove_lock_whitelist_address(ctx, args, gas_cost, config, hardfork_cfg, tx_ctx),
+        // Phase 6: Governance, each method of which asks an authorizer about
+        // the transaction it was called by: `as_called`.
+        "createFederation" => governance::create_federation(ctx, gas_cost, config, hardfork_cfg, &as_called),
+        "commitFederation" => governance::commit_federation(ctx, args, gas_cost, config, hardfork_cfg, &as_called),
+        "rollbackFederation" => governance::rollback_federation(ctx, gas_cost, config, hardfork_cfg, &as_called),
+        "addFederatorPublicKey" => governance::add_federator_public_key(ctx, args, gas_cost, config, hardfork_cfg, &as_called),
+        "addFederatorPublicKeyMultikey" => governance::add_federator_public_key_multikey(ctx, args, gas_cost, config, hardfork_cfg, &as_called),
+        "voteFeePerKbChange" => governance::vote_fee_per_kb_change(ctx, args, gas_cost, config, &as_called),
+        "increaseLockingCap" => governance::increase_locking_cap(ctx, args, gas_cost, config, &as_called),
+        "addLockWhitelistAddress" => governance::add_lock_whitelist_address(ctx, args, gas_cost, config, hardfork_cfg, &as_called),
+        "addOneOffLockWhitelistAddress" => governance::add_one_off_lock_whitelist_address(ctx, args, gas_cost, config, hardfork_cfg, &as_called),
+        "addUnlimitedLockWhitelistAddress" => governance::add_unlimited_lock_whitelist_address(ctx, args, gas_cost, config, hardfork_cfg, &as_called),
+        "removeLockWhitelistAddress" => governance::remove_lock_whitelist_address(ctx, args, gas_cost, config, hardfork_cfg, &as_called),
         "setLockWhitelistDisableBlockDelay" => {
-            governance::set_lock_whitelist_disable_block_delay(ctx, args, gas_cost, config, hardfork_cfg, tx_ctx)
+            governance::set_lock_whitelist_disable_block_delay(ctx, args, gas_cost, config, hardfork_cfg, &as_called)
         }
 
         // Transaction-callable read-only
@@ -1539,6 +1549,61 @@ mod tests {
                 caller
             ));
         }
+    }
+
+    /// rskj hands the Bridge the transaction that called it: for a contract's
+    /// call, an internal one whose sender is the contract
+    /// (`Program.callToPrecompiledAddress`). The governance methods ask their
+    /// authorizers about that sender, so an authorizer's key is not authorized
+    /// from behind a contract that forwards its call.
+    #[test]
+    fn governance_authorizes_the_caller_not_the_transactions_sender() {
+        use crate::abi::encode::{self, Arg};
+        let (config, cfg) = (BridgeConstants::mainnet(), RskHardforkConfig::mainnet());
+        let address_of = |key: &str| {
+            let key = alloy_primitives::hex::decode(key).unwrap();
+            federation::rsk_address_from_public_key(&key).unwrap()
+        };
+        let forwarder = alloy_primitives::Address::repeat_byte(0x77);
+        let code = |method: &str, args: &[u8], origin, caller| {
+            let mut ctx = mainnet_at(1);
+            let tx_ctx = BridgeTxContext {
+                rsk_sender: origin,
+                ..Default::default()
+            };
+            let out = execute_method(
+                &mut ctx,
+                method,
+                args,
+                0,
+                &config,
+                None,
+                false,
+                &cfg,
+                &tx_ctx,
+                caller,
+                0,
+                U256::ZERO,
+            )
+            .unwrap();
+            i64::from_be_bytes(out.bytes[24..32].try_into().unwrap())
+        };
+
+        let authorizer = address_of(config.federation_change_authorizer_keys[0]);
+        assert_eq!(code("createFederation", &[], authorizer, authorizer), 1);
+        assert_eq!(code("createFederation", &[], authorizer, forwarder), -10);
+        assert_eq!(code("createFederation", &[], forwarder, authorizer), 1);
+
+        let fee_authorizer = address_of(config.fee_per_kb_authorizer_keys[0]);
+        let fee = encode::args(&[Arg::Word(encode::int(1_000))]);
+        assert_eq!(
+            code("voteFeePerKbChange", &fee, fee_authorizer, fee_authorizer),
+            1
+        );
+        assert_eq!(
+            code("voteFeePerKbChange", &fee, fee_authorizer, forwarder),
+            -10
+        );
     }
 
     /// rskj Bridge.receiveHeadersGetCost groundtruth: 22_000 pre-RSKIP124;
