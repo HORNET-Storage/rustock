@@ -5493,6 +5493,13 @@ fn setup_state_of_scenario(
 /// taken off; a creation inside a program, a DELEGATECALL of a program that
 /// was sent value, and a call inside a program that then failed each counted
 /// for what rskj doesn't count them for (the scenario `spend`).
+///
+/// And of a sender the value took below zero, called back within the call
+/// (the scenario `below`): it could call and create as if it held nothing,
+/// where rskj's can do neither, not even for a value of nothing, until it is
+/// paid what it lacks; and one that destroyed itself left what it lacked
+/// behind, where rskj's hands its beneficiary a balance below zero, which
+/// that account then lacks.
 #[tokio::test]
 async fn a_local_call_answers_as_rskj_answers_it() {
     let text = include_str!("testdata/rskj_local_calls.txt");
@@ -5536,7 +5543,7 @@ async fn a_local_call_answers_as_rskj_answers_it() {
         differing.len(),
         differing.join("\n")
     );
-    assert_eq!(asked, 305, "every request of the file was asked");
+    assert_eq!(asked, 451, "every request of the file was asked");
 }
 
 /// A sent transaction's defaults are rskj's

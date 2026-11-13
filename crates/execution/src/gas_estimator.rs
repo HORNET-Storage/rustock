@@ -68,7 +68,9 @@
 //! - A CREATE spends all the gas its program has left, and what the
 //!   constructor doesn't use comes back (`Program.createContract`). So the
 //!   peak of a program that creates is all it was given, and the estimate is
-//!   the cap, unless a call of that program took all it had left.
+//!   the cap, unless a call of that program took all it had left. A CREATE
+//!   it refuses for the depth or for a balance short of the value spends
+//!   none of that: the refusal comes first.
 //! - The two flags belong to a program (`ProgramResult`). A CALL, CALLCODE,
 //!   DELEGATECALL or STATICCALL sets them in the program that runs it
 //!   (`VM.doCALL`), whether or not the call is then made. They pass to the
@@ -82,7 +84,8 @@ use alloy_primitives::Address;
 use revm::context::ContextTr;
 use revm::inspector::Inspector;
 use revm::interpreter::{
-    CallInputs, CallOutcome, CreateInputs, CreateOutcome, Interpreter, InterpreterTypes,
+    CallInputs, CallOutcome, CreateInputs, CreateOutcome, InstructionResult, Interpreter,
+    InterpreterTypes,
 };
 
 /// rskj `GasCost.STIPEND_CALL`.
@@ -180,6 +183,9 @@ pub struct EstimationInspector {
     stepped: bool,
     /// The most the transaction's own program had spent of `root_limit`.
     max_committed: u64,
+    /// What `max_committed` was before that program's last completed step,
+    /// for a CREATE that turns out to have spent nothing (`create_end`).
+    max_before_step: u64,
 }
 
 impl EstimationInspector {
@@ -251,6 +257,7 @@ where
         self.remaining = interp.gas.remaining();
         if self.open.len() == 1 {
             let committed = self.root_limit.saturating_sub(self.remaining);
+            self.max_before_step = self.max_committed;
             self.max_committed = self.max_committed.max(committed);
         }
     }
@@ -283,8 +290,18 @@ where
         &mut self,
         _context: &mut CTX,
         _inputs: &CreateInputs,
-        _outcome: &mut CreateOutcome,
+        outcome: &mut CreateOutcome,
     ) {
+        // rskj refuses a CREATE whose program holds less than the value
+        // before it spends the gas (`Program.createContract`), so the
+        // transaction's own program never held what the step took off for
+        // the constructor: its peak is what it was before that step. What
+        // the opcode itself cost is in what the program has spent by its
+        // next step. (The depth, rskj's other such refusal, is never the
+        // reason in that program.)
+        if self.open.len() == 2 && outcome.result.result == InstructionResult::OutOfFunds {
+            self.max_committed = self.max_before_step;
+        }
         self.close_program(false);
     }
 }

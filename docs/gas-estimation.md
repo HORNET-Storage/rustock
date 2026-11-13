@@ -164,6 +164,13 @@ rskj's `rpc.gasEstimationCap`.
 The exception is a program of which a call also took all it had left. That
 sets the flag, and the estimate is what was spent, as in §2.
 
+And a `CREATE` that rskj refuses before it begins spends none of that gas:
+one whose program holds less than the value it names. The 0 is pushed first
+(`Program.createContract`), so the peak is what it was, and the estimate is
+not the cap: `create-unpaid-estimate` and `calls-then-create-unpaid-estimate`,
+in the scenario `below`. A creation that fails once it has begun, its
+constructor reverting, has spent it: `create-reverting-estimate`.
+
 rskj's release answers so, and so does Rustock: `creates-estimate`,
 `create-creates-estimate` and `creates-then-calls-all-estimate`, in the same
 scenario. Binary search finds the smallest limit instead, which is far below

@@ -892,7 +892,7 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
         // executePegIn: credit the v1 destination from the OP_RETURN payload.
         let dest = RskAddress::from(instr.rsk_destination);
         if !rbtc_amount.is_zero() {
-            let _ = ctx.journal_mut().transfer(BRIDGE_ADDR, dest, rbtc_amount);
+            let _ = bridge_transfer(ctx, dest, rbtc_amount);
         } else {
             // transferTo(dest, 0) still creates+persists the account (RSK keeps
             // empty touched accounts — see the legacy path below).
@@ -1115,7 +1115,7 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
     // Credit the derived destination address (transfer from Bridge balance)
     if let Some(dest) = rsk_destination {
         if !rbtc_amount.is_zero() {
-            let _ = ctx.journal_mut().transfer(BRIDGE_ADDR, dest, rbtc_amount);
+            let _ = bridge_transfer(ctx, dest, rbtc_amount);
         } else {
             // rskj executePegIn always calls transferTo(dest, amount); a 0-value
             // transfer still creates and persists the destination account (RSK
@@ -2206,7 +2206,7 @@ pub fn register_fast_bridge_btc_transaction<CTX: crate::RskContextTr>(
     // transferTo(lbcAddress, amount): credit the LBC contract.
     let rbtc_amount = btc_satoshi_to_rbtc_wei(total_satoshis);
     if !rbtc_amount.is_zero() {
-        let _ = ctx.journal_mut().transfer(BRIDGE_ADDR, lbc_address, rbtc_amount);
+        let _ = bridge_transfer(ctx, lbc_address, rbtc_amount);
     }
     crate::tracer::record_precompile_transfer(ctx, BRIDGE_ADDR, lbc_address, rbtc_amount);
 
@@ -3192,8 +3192,8 @@ pub fn update_collections<CTX: crate::RskContextTr>(
                         let spent_by_federation = sum_inputs.saturating_sub(change);
                         if spent_by_federation < amount {
                             let to_burn = amount - spent_by_federation;
-                            let _ = ctx.journal_mut().transfer(
-                                BRIDGE_ADDR,
+                            let _ = bridge_transfer(
+                                ctx,
                                 BURN_ADDR,
                                 btc_satoshi_to_rbtc_wei(to_burn),
                             );

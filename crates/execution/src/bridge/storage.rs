@@ -220,15 +220,36 @@ pub fn bridge_load_bytes_named<CTX: crate::RskContextTr>(ctx: &mut CTX, key_name
     bridge_load_bytes(ctx, key)
 }
 
-/// Transfer amount from Bridge contract to recipient.
-pub fn bridge_transfer<CTX: crate::RskContextTr>(ctx: &mut CTX, recipient: Address, amount: U256) -> bool {
-    if amount.is_zero() {
-        return true;
+/// Moves `amount`, which is more than nothing, from the Bridge to
+/// `recipient`, as rskj's `BridgeSupport.transferTo` moves it: with
+/// `Repository.transfer`, which takes it off the Bridge whatever the Bridge
+/// holds. On a chain the Bridge holds what it pays. A local call can name
+/// the Bridge as its sender and have it send what it holds away first, or
+/// run over a state in which it holds too little; rskj's Bridge pays all the
+/// same, and is left below zero. No balance here can be, so the Bridge is
+/// lifted to the amount and owes what it was lifted by
+/// (`RskChainExt::debts`), as the sender of a local call is.
+///
+/// Nothing a Bridge method does after it has paid can fail, so what the
+/// Bridge owes is taken back with the frame its caller runs in and not
+/// otherwise (`RskHandler`'s `frames`).
+pub fn bridge_transfer<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    recipient: Address,
+    amount: U256,
+) -> Result<
+    Option<revm::context_interface::journaled_state::TransferError>,
+    <CTX::Db as revm::Database>::Error,
+> {
+    use revm::context_interface::journaled_state::account::JournaledAccountTr;
+    let held = *ctx.journal_mut().load_account_mut(BRIDGE_ADDR)?.balance();
+    if held < amount {
+        ctx.journal_mut()
+            .load_account_mut(BRIDGE_ADDR)?
+            .set_balance(amount);
+        ctx.chain_mut().debts.add(BRIDGE_ADDR, amount - held);
     }
-    matches!(
-        ctx.journal_mut().transfer(BRIDGE_ADDR, recipient, amount),
-        Ok(None)
-    )
+    ctx.journal_mut().transfer(BRIDGE_ADDR, recipient, amount)
 }
 
 // ---------------------------------------------------------------------------
@@ -1209,5 +1230,47 @@ mod tests {
         let data = serialize_utxo_list(&[]);
         let decoded = deserialize_utxo_list(&data);
         assert!(decoded.is_empty());
+    }
+
+    /// The Bridge pays whatever it holds, as rskj's `Repository.transfer`
+    /// moves a balance: one that doesn't cover the payment is left below
+    /// zero, which here is what the Bridge owes. rskj's release answered a
+    /// Bridge that holds too little through `eth_call` (the rpc crate's
+    /// `testdata/rskj_local_calls.txt`, the scenarios `bridgepays` and
+    /// `bridgepoor`).
+    #[test]
+    fn the_bridge_pays_whatever_it_holds() {
+        use revm::context_interface::journaled_state::account::JournaledAccountTr;
+        use revm::context_interface::ContextTr;
+        use revm::MainContext;
+
+        let mut ctx =
+            revm::Context::mainnet().with_chain(crate::raw_storage::RskChainExt::default());
+        let to = Address::repeat_byte(0x77);
+        ctx.journal_mut()
+            .load_account_mut(BRIDGE_ADDR)
+            .unwrap()
+            .set_balance(U256::from(7));
+        // What the Bridge holds and owes after it has paid 5, and what the
+        // account it paid holds.
+        let mut pay = || {
+            assert!(matches!(
+                bridge_transfer(&mut ctx, to, U256::from(5)),
+                Ok(None)
+            ));
+            let mut held = |who| ctx.journal_mut().load_account(who).unwrap().info.balance;
+            let (bridge, paid) = (held(BRIDGE_ADDR), held(to));
+            (
+                bridge.to::<u64>(),
+                ctx.chain().debts.of(BRIDGE_ADDR).to::<u64>(),
+                paid.to::<u64>(),
+            )
+        };
+        // It holds 7: 2 are left, and it owes nothing.
+        assert_eq!(pay(), (2, 0, 5));
+        // It holds 2: it is left 3 below zero.
+        assert_eq!(pay(), (0, 3, 10));
+        // And nothing: 8 below.
+        assert_eq!(pay(), (0, 8, 15));
     }
 }

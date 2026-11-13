@@ -76,18 +76,57 @@ pub struct RskChainExt {
     /// Bridge when a contract calls it. `RskHandler` follows the programs,
     /// and the precompiles tell it of the calls that reach them.
     pub internal_txs: crate::internal_tx::InternalTxs,
-    /// What a local call's sender owes: the part of the value it sent that it
-    /// didn't hold. rskj's `Repository.transfer` takes a sender below zero
-    /// rather than fail (`TransactionExecutor.call`), which no balance here
-    /// can show, so `RskHandler` lifts the sender by this much before the
-    /// value moves, and BALANCE and SELFBALANCE take it off again as they
-    /// read the account (`rsk_instructions::LocalCallWords`). `None` in a
-    /// block's run.
-    pub owed: Option<(Address, U256)>,
+    /// What a local call has taken accounts below zero by ([`Debts`]).
+    /// Nothing in a block's run.
+    pub debts: Debts,
     /// A local call's gas price where revm's transaction can't hold it, at
     /// 2^128 or more. rskj carries whatever price a call names, and GASPRICE
     /// pushes it whole.
     pub whole_gas_price: Option<U256>,
+}
+
+/// What accounts owe: each one's balance in rskj is what the journal holds
+/// for it less what it owes here, and is below zero where it owes the more.
+///
+/// rskj's `Repository.transfer` takes what it moves off the sender whatever
+/// the sender holds, and where it is called without a check of the balance a
+/// sender that held less is left below zero: a local call's own sender
+/// (`TransactionExecutor.call`), and the Bridge as it pays
+/// (`BridgeSupport.transferTo`). No balance here can show that, so the
+/// account is lifted to what it sends before that moves, and what it was
+/// lifted by is kept here (`RskHandler`, `bridge::storage::bridge_transfer`).
+/// BALANCE and SELFBALANCE read the account less that
+/// (`rsk_instructions::LocalCallWords`), an account that holds less than it
+/// owes can call and create nothing (`rsk_handler::unpaid_by_debtor`), and
+/// one that destroys itself hands what it still owes to its beneficiary
+/// (`rsk_instructions::hand_on_debt`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Debts(Vec<(Address, U256)>);
+
+impl Debts {
+    /// What `address` owes, which is nothing unless it is below zero.
+    pub fn of(&self, address: Address) -> U256 {
+        self.0
+            .iter()
+            .find(|(debtor, _)| *debtor == address)
+            .map_or(U256::ZERO, |(_, owed)| *owed)
+    }
+
+    /// `address` owes `amount` more, which is more than nothing.
+    pub fn add(&mut self, address: Address, amount: U256) {
+        match self.0.iter_mut().find(|(debtor, _)| *debtor == address) {
+            Some((_, owed)) => *owed = owed.saturating_add(amount),
+            None => self.0.push((address, amount)),
+        }
+    }
+
+    /// `address` owes nothing from here on. What it owed.
+    pub fn take(&mut self, address: Address) -> U256 {
+        match self.0.iter().position(|(debtor, _)| *debtor == address) {
+            Some(at) => self.0.swap_remove(at).1,
+            None => U256::ZERO,
+        }
+    }
 }
 
 /// Raw-bytes storage overlay for the block being executed.

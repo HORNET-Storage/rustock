@@ -664,13 +664,18 @@ where
     }
 }
 
-/// What BALANCE, SELFBALANCE and GASPRICE read of a local call (`eth_call`,
-/// `eth_estimateGas`) that revm's `Host` can't tell them: rskj holds a
-/// balance with its sign and a gas price at any width.
+/// What BALANCE, SELFBALANCE, GASPRICE and SELFDESTRUCT ask of a local call
+/// (`eth_call`, `eth_estimateGas`) that revm's `Host` can't tell them: rskj
+/// holds a balance with its sign and a gas price at any width.
 pub trait LocalCallWords {
-    /// What `address` owes: the part of a local call's value that its sender
-    /// didn't hold (`RskChainExt::owed`), and nothing for any other account.
+    /// What `address` owes: what a local call took its balance below zero by
+    /// (`RskChainExt::debts`), and nothing for any other account.
     fn owed_by(&self, address: Address) -> U256;
+
+    /// `address` is about to destroy itself, naming `beneficiary`: it pays
+    /// what it owes out of what it holds, and what it still owes becomes the
+    /// beneficiary's ([`hand_on_debt`]). Whether anything was handed on.
+    fn hand_on_debt(&mut self, address: Address, beneficiary: Address) -> bool;
 
     /// The gas price of a local call, where revm's transaction can't hold it
     /// (`RskChainExt::whole_gas_price`).
@@ -691,15 +696,66 @@ where
     LOCAL: revm::context_interface::LocalContextTr,
 {
     fn owed_by(&self, address: Address) -> U256 {
-        match self.chain.owed {
-            Some((sender, owed)) if sender == address => owed,
-            _ => U256::ZERO,
-        }
+        self.chain.debts.of(address)
+    }
+
+    fn hand_on_debt(&mut self, address: Address, beneficiary: Address) -> bool {
+        let journal = &mut self.journaled_state.inner;
+        hand_on_debt(
+            &mut journal.state,
+            &mut journal.journal,
+            &mut self.chain,
+            address,
+            beneficiary,
+        )
     }
 
     fn whole_gas_price(&self) -> Option<U256> {
         self.chain.whole_gas_price
     }
+}
+
+/// What rskj's `Program.suicide` does with a balance below zero, which only a
+/// local call can leave an account with (`RskChainExt::debts`). It moves it
+/// to the beneficiary like any balance that isn't zero, so the beneficiary's
+/// falls by it, and makes an internal transaction of it; where the account
+/// names itself, it brings the balance to zero.
+///
+/// So before SELFDESTRUCT moves what `address` holds, the account pays what
+/// it owes out of that. What it still owes is the beneficiary's to owe from
+/// here, nobody's where it names itself, and counts as the internal
+/// transaction, which the nothing it has left to move won't. Whether
+/// anything was handed on: the beneficiary is an account from then on,
+/// whatever it was before.
+pub(crate) fn hand_on_debt(
+    state: &mut revm::state::EvmState,
+    journal: &mut Vec<revm::context::JournalEntry>,
+    chain: &mut crate::raw_storage::RskChainExt,
+    address: Address,
+    beneficiary: Address,
+) -> bool {
+    let Some(account) = state.get_mut(&address) else {
+        return false;
+    };
+    let owed = chain.debts.take(address);
+    let held = account.info.balance;
+    let paid = held.min(owed);
+    if !paid.is_zero() {
+        account.info.balance = held - paid;
+        journal.push(revm::context::JournalEntry::BalanceChange {
+            address,
+            old_balance: held,
+        });
+    }
+    let left = owed - paid;
+    if left.is_zero() {
+        return false;
+    }
+    if beneficiary != address {
+        chain.debts.add(beneficiary, left);
+    }
+    chain.internal_txs.count();
+    true
 }
 
 /// The word rskj's `Program.getBalance` makes of a balance: `DataWord.valueOf`
@@ -1341,8 +1397,13 @@ pub fn rsk_call<WIRE: InterpreterTypes, H: Host + ?Sized>(
 /// left as it was, and one that did not exist still does not, though the
 /// 25,000 for it was charged. revm's journal touches the beneficiary whatever
 /// the balance, which under RSK's frontier account rules would create it, so
-/// that touch is taken back ([`BeneficiaryTouch`]).
-pub fn rsk_selfdestruct<WIRE: InterpreterTypes, H: Host + BeneficiaryTouch + ?Sized>(
+/// that touch is taken back ([`BeneficiaryTouch`]). A balance below zero,
+/// which a local call can leave, is one to hand over too
+/// ([`LocalCallWords::hand_on_debt`]).
+pub fn rsk_selfdestruct<
+    WIRE: InterpreterTypes,
+    H: Host + BeneficiaryTouch + LocalCallWords + ?Sized,
+>(
     context: InstructionContext<'_, H, WIRE>,
 ) {
     if context.interpreter.runtime_flag.is_static() {
@@ -1363,13 +1424,14 @@ pub fn rsk_selfdestruct<WIRE: InterpreterTypes, H: Host + BeneficiaryTouch + ?Si
     let skip_cold_load = context.interpreter.gas.remaining() < cold_load_gas;
     // Whether the touch revm is about to give the beneficiary is a new one.
     let touches = address != target && !context.host.is_touched(target);
+    let hands_on_debt = context.host.hand_on_debt(address, target);
     let res = match context.host.selfdestruct(address, target, skip_cold_load) {
         Ok(res) => res,
         Err(LoadError::ColdLoadSkipped) => return context.interpreter.halt_oog(),
         Err(LoadError::DBError) => return context.interpreter.halt_fatal(),
     };
 
-    if touches && !res.had_value {
+    if touches && !res.had_value && !hands_on_debt {
         context.host.take_back_touch(target);
     }
 
@@ -1653,6 +1715,97 @@ mod tests {
         assert_eq!(balance_word(U256::ZERO, top), Some(top));
         assert_eq!(balance_word(U256::ZERO, top + one), None);
         assert_eq!(balance_word(U256::ZERO, U256::MAX), None);
+    }
+
+    /// An account that destroys itself pays what it owes out of what it
+    /// holds, and hands the rest of it to its beneficiary, as rskj's
+    /// `Program.suicide` hands on a balance below zero: it makes an internal
+    /// transaction of it, as of any balance that isn't zero. rskj's release
+    /// answered what each account then holds through `eth_call` (the rpc
+    /// crate's `testdata/rskj_local_calls.txt`, the scenario `below`); the
+    /// internal transaction is its source's (`addInternalTx`, in the branch
+    /// that moves the balance).
+    #[test]
+    fn a_self_destruction_hands_on_what_the_account_owes() {
+        use crate::internal_tx::InternalTxs;
+        use crate::raw_storage::RskChainExt;
+        use revm::context::JournalEntry;
+        use revm::state::{Account, EvmState};
+
+        let (debtor, heir, other) = (
+            Address::repeat_byte(0xd1),
+            Address::repeat_byte(0xe1),
+            Address::repeat_byte(0xf1),
+        );
+        // How many internal transactions the running program has made shows
+        // in the hash of the next one it would hand the Bridge.
+        let started = || {
+            let mut txs = InternalTxs::default();
+            txs.begin(U256::from(1), U256::from(6_800_000));
+            txs.enter(None);
+            txs
+        };
+        let next = |txs: &mut InternalTxs| {
+            txs.reach_bridge(B256::repeat_byte(0x77), debtor, 0, heir, U256::ZERO)
+        };
+        let none_made = next(&mut started());
+        let one_made = {
+            let mut txs = started();
+            txs.count();
+            next(&mut txs)
+        };
+        assert_ne!(none_made, one_made);
+
+        // What the account holds and owes, and whom it names: whether it
+        // handed anything on, what it is left holding, what the journal took
+        // down, what it and its beneficiary owe, and whether an internal
+        // transaction was made.
+        let run = |held: u64, owed: u64, beneficiary: Address| {
+            let mut state = EvmState::default();
+            let mut account = Account::default();
+            account.info.balance = U256::from(held);
+            state.insert(debtor, account);
+            let mut journal = Vec::new();
+            let mut chain = RskChainExt {
+                internal_txs: started(),
+                ..Default::default()
+            };
+            chain.debts.add(other, U256::from(9));
+            if owed > 0 {
+                chain.debts.add(debtor, U256::from(owed));
+            }
+            let handed_on = hand_on_debt(&mut state, &mut journal, &mut chain, debtor, beneficiary);
+            assert_eq!(chain.debts.of(other), U256::from(9), "another's is its own");
+            let was_held = match journal.as_slice() {
+                [] => None,
+                [JournalEntry::BalanceChange {
+                    address,
+                    old_balance,
+                }] if *address == debtor => Some(old_balance.to::<u64>()),
+                entries => panic!("{entries:?}"),
+            };
+            (
+                handed_on,
+                state[&debtor].info.balance.to::<u64>(),
+                was_held,
+                chain.debts.of(debtor).to::<u64>(),
+                chain.debts.of(heir).to::<u64>(),
+                next(&mut chain.internal_txs) == one_made,
+            )
+        };
+        // It owes nothing: SELFDESTRUCT is revm's alone.
+        assert_eq!(run(4, 0, heir), (false, 4, None, 0, 0, false));
+        // It holds nothing of what it owes: all of it is handed on.
+        assert_eq!(run(0, 5, heir), (true, 0, None, 0, 5, true));
+        // It holds part of it: that is paid, and the rest handed on.
+        assert_eq!(run(2, 5, heir), (true, 0, Some(2), 0, 3, true));
+        // It holds all of it, or more: it is paid, and what is left is the
+        // account's to move as any balance.
+        assert_eq!(run(5, 5, heir), (false, 0, Some(5), 0, 0, false));
+        assert_eq!(run(8, 5, heir), (false, 3, Some(8), 0, 0, false));
+        // It names itself: rskj brings its balance to zero, and counts it.
+        assert_eq!(run(0, 5, debtor), (true, 0, None, 0, 0, true));
+        assert_eq!(run(2, 5, debtor), (true, 0, Some(2), 0, 0, true));
     }
 }
 

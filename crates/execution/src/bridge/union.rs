@@ -563,15 +563,14 @@ fn coin(value: &crate::abi::Int) -> Option<U256> {
     (!value.is_negative()).then(|| value.into_raw())
 }
 
-/// Moves RBTC out of the Bridge's own balance.
+/// Moves RBTC out of the Bridge's own balance, whatever it holds
+/// (`bridge_transfer`).
 fn transfer_from_bridge<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     to: Address,
     amount: U256,
 ) -> Result<(), PrecompileError> {
-    use revm::context_interface::JournalTr;
-    ctx.journal_mut()
-        .transfer(crate::precompiles::BRIDGE_ADDR, to, amount)
+    super::storage::bridge_transfer(ctx, to, amount)
         .map_err(|e| PrecompileError::other(format!("union bridge transfer: {e:?}")))?;
     // rskj `BridgeSupport.transferTo` reports it as a CALL subtrace.
     crate::tracer::record_precompile_transfer(ctx, crate::precompiles::BRIDGE_ADDR, to, amount);

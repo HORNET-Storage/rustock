@@ -133,8 +133,10 @@ invisible_exception: Arc<AtomicBool>,
     /// in `RawStorage` (`frame_start`) and in `called_precompiles`. A frame
     /// that fails takes it back, as rskj rolls back the track of a call or
     /// create that reverts or fails, with what the calls under it committed
-    /// into it.
-    frames: Vec<(usize, usize)>,
+    /// into it. And what a local call's accounts owed as the frame opened
+    /// (`RskChainExt::debts`), which a frame that fails leaves as it was: the
+    /// journal gives back what they held.
+    frames: Vec<(usize, usize, crate::raw_storage::Debts)>,
     /// A local call: rskj's `TransactionExecutor` with `setLocalCall(true)`,
     /// which serves `eth_call` and `eth_estimateGas`
     /// (`ReversibleTransactionExecutor.reversibleExecution`). `init()` returns
@@ -418,11 +420,10 @@ where
     /// and takes its balance below zero rather than fail. One here can't go
     /// below zero, so a sender short of the value is lifted to it, as revm
     /// lifts one for a simulation (`disable_balance_check`), and what it was
-    /// lifted by is kept as what it owes (`RskChainExt::owed`): BALANCE and
-    /// SELFBALANCE read the account less that, as rskj reads one below zero.
-    /// It is taken off what the account reads as, not off what it can spend:
-    /// a sender that is a contract, short of the value and paid back within
-    /// the call, can there send on what rskj's, still below zero, could not.
+    /// lifted by is kept as what it owes (`RskChainExt::debts`): BALANCE and
+    /// SELFBALANCE read the account less that, as rskj reads one below zero,
+    /// and while it holds less than it owes it can call and create nothing
+    /// (`unpaid_by_debtor`), as rskj's can't.
     ///
     /// Where the call names no sender (`no_sender`), rskj takes the value out
     /// of its null address's account, which no program can read, and the zero
@@ -469,7 +470,7 @@ where
             _ => false,
         };
         let mut moves_nothing = (!self.no_sender && to == Some(caller)) || past_the_top;
-        let mut owed = None;
+        let mut debts = crate::raw_storage::Debts::default();
         {
             let journal = ctx.journal_mut();
             if !self.no_sender {
@@ -480,7 +481,7 @@ where
                 let held = *sender.balance();
                 if !moves_nothing && held < value {
                     sender.set_balance(value);
-                    owed = Some((caller, value - held));
+                    debts.add(caller, value - held);
                 }
             } else if value.is_zero() || moves_nothing {
                 journal.load_account(caller).map_err(|e| ERROR::from(e))?;
@@ -500,7 +501,7 @@ where
             }
         }
         self.moves_nothing.set(moves_nothing);
-        ctx.chain_mut().owed = owed;
+        ctx.chain_mut().debts = debts;
         Ok(())
     }
 
@@ -827,7 +828,7 @@ where
                     // before it too, the creation's gas spent.
                     let rskip150_active = self.pre_rskip150_precompiles.is_none();
                     let refused = if rskip150_active && init.depth > 400 {
-                        call_too_deep_result(&init.frame_input)
+                        refusal(&init.frame_input, InstructionResult::CallTooDeep)
                     } else if self.rskip125_active {
                         deleted_address_collision(evm, &init)
                     } else {
@@ -872,7 +873,20 @@ where
                     // comes to make one: read before the frame opens, while a
                     // creator's nonce is still the one the creation carries.
                     let made = internal_tx_of(evm, &init.frame_input);
-                    match D::init(evm, init)? {
+                    // An account a local call left below zero can pay for no
+                    // call and no creation, and what it can't pay for comes
+                    // back as what revm refuses for the balance does: no frame
+                    // opens. rskj looks at the depth first, as is done above.
+                    let unpaid = {
+                        use revm::interpreter::interpreter_types::InputsTr;
+                        let owner = evm.frame_stack().get().interpreter.input.target_address();
+                        unpaid_by_debtor(evm, owner, &init.frame_input)
+                    };
+                    let opened = match unpaid {
+                        Some(unpaid) => ItemOrResult::Result(D::refuse(evm, init, unpaid)),
+                        None => D::init(evm, init)?,
+                    };
+                    match opened {
                         ItemOrResult::Item(()) => {
                             // Internal CREATE/CREATE2 opcode: post-RSKIP125
                             // (wasabi) rskj's Program.createContract bumps the
@@ -1071,8 +1085,8 @@ trait FrameDriver<EVM: EvmTr<Frame = EthFrame<EthInterpreter>>> {
         evm: &mut EVM,
         empty_create_on_unpayable_deposit: bool,
     ) -> Result<FrameInitOrResult<EthFrame<EthInterpreter>>, ContextTrDbError<EVM::Context>>;
-    /// A frame the loop refuses itself (RSKIP150's depth), with the result
-    /// revm gives a frame it refuses at its own limit.
+    /// A frame the loop refuses itself (RSKIP150's depth, a sender a local
+    /// call left below zero), with the result revm gives one it refuses.
     fn refuse(evm: &mut EVM, init: FrameInit, refused: FrameResult) -> FrameResult;
 }
 
@@ -1178,20 +1192,23 @@ where
             .as_ref()
             .and_then(|list| list.lock().ok().map(|list| list.len()))
             .unwrap_or_default();
-        self.frames.push((raw, called));
+        let owed = evm.ctx().chain().debts.clone();
+        self.frames.push((raw, called, owed));
     }
 
     /// The innermost frame of contract code ends, having `committed` or not.
     /// One that didn't takes back what the precompiles called under it wrote
-    /// outside revm's journal (see `frames`).
+    /// outside revm's journal, and what was done under it to what a local
+    /// call's accounts owe (see `frames`).
     fn close_frame(&mut self, evm: &mut EVM, committed: bool) {
-        let Some((raw, called)) = self.frames.pop() else {
+        let Some((raw, called, owed)) = self.frames.pop() else {
             return;
         };
         if committed {
             return;
         }
         evm.ctx().chain_mut().raw_storage.revert_frame(raw);
+        evm.ctx().chain_mut().debts = owed;
         if let Some(Ok(mut list)) = self.called_precompiles.as_ref().map(|list| list.lock()) {
             list.truncate(called);
         }
@@ -1451,16 +1468,60 @@ fn trace_frame_init(init: &FrameInit) {
     }
 }
 
-/// Synthesize the CallTooDeep rejection revm would produce at its own
-/// depth limit: the child's full gas refunded, empty output (rskj
-/// stackPushZero + refundGas at the Program deep checks).
-fn call_too_deep_result(
+/// A call or a creation by an account a local call left below zero
+/// (`RskChainExt::debts`), which `owner`, the account the running program
+/// runs as, can't pay for. rskj's `Program.callToAddress`,
+/// `callToPrecompiledAddress` and `createContract` each refuse one whose
+/// sender's balance is less than the value it sends: 0 is pushed and the gas
+/// comes back. A balance below zero is less than a value of nothing, so such
+/// an account makes no call at all, a DELEGATECALL or a STATICCALL no more
+/// than another, and creates nothing, until it is paid what it lacks. revm
+/// reads what the account holds and not what it owes, so the refusal is made
+/// here, with revm's result for a sender short of the value. `None` in a
+/// block's run, where nothing is owed.
+fn unpaid_by_debtor<EVM>(
+    evm: &mut EVM,
+    owner: Address,
     frame_input: &revm::interpreter::interpreter_action::FrameInput,
+) -> Option<FrameResult>
+where
+    EVM: EvmTr<Context: ContextTr<Chain = crate::raw_storage::RskChainExt, Journal: JournalExt>>,
+{
+    use revm::interpreter::interpreter_action::FrameInput;
+    let ctx = evm.ctx();
+    let owed = ctx.chain().debts.of(owner);
+    if owed.is_zero() {
+        return None;
+    }
+    let value = match frame_input {
+        FrameInput::Call(inputs) => inputs.transfer_value().unwrap_or_default(),
+        FrameInput::Create(inputs) => inputs.value(),
+        FrameInput::Empty => return None,
+    };
+    // What rskj holds for the account is what it holds here less what it
+    // owes.
+    let held = ctx.journal().evm_state().get(&owner)?.info.balance;
+    if held
+        .checked_sub(owed)
+        .is_some_and(|balance| balance >= value)
+    {
+        return None;
+    }
+    refusal(frame_input, InstructionResult::OutOfFunds)
+}
+
+/// The result revm gives a call or a creation it refuses before it opens a
+/// frame, for its depth (`CallTooDeep`) or for a sender short of the value
+/// (`OutOfFunds`): the child's full gas refunded, empty output (rskj
+/// stackPushZero + refundGas at the Program checks of depth and balance).
+fn refusal(
+    frame_input: &revm::interpreter::interpreter_action::FrameInput,
+    reason: InstructionResult,
 ) -> Option<FrameResult> {
     use revm::interpreter::interpreter_action::FrameInput;
     use revm::interpreter::{Gas, InterpreterResult};
     let interp_result = |gas_limit: u64| InterpreterResult {
-        result: InstructionResult::CallTooDeep,
+        result: reason,
         gas: Gas::new(gas_limit),
         output: Bytes::new(),
     };
