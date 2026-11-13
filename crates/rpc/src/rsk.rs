@@ -277,12 +277,9 @@ pub fn rsk_get_storage_bytes_at(
         return JsonRpcResponse::error(id, INVALID_PARAMS, "Missing or invalid storage key");
     };
 
-    let block_param = params.get(2).and_then(|v| v.as_str()).unwrap_or("latest");
-    if let Some(refused) = crate::helpers::refused_block_ref(&id, block_param) {
-        return refused;
-    }
-    let Some((root, _header)) = crate::state::resolve_state_root(block_param, state) else {
-        return JsonRpcResponse::error(id, INTERNAL_ERROR, "Cannot resolve block");
+    let (root, _header) = match crate::state::queried_state(&id, params.get(2), state) {
+        Ok(found) => found,
+        Err(refused) => return refused,
     };
 
     let Some(trie_store) = state.trie_store.clone() else {

@@ -139,28 +139,227 @@ fn is_block_tag(s: &str) -> bool {
         .any(|tag| tag.eq_ignore_ascii_case(s))
 }
 
-/// What rskj answers a block reference it refuses before it looks a block up,
-/// for `eth_getBalance`, `eth_getCode`, `eth_getStorageAt`,
-/// `eth_getTransactionCount` and `rsk_getStorageBytesAt`. `BlockRefParam`
-/// passes `earliest`, `latest` and `pending` as written, a decimal and a `0x`
-/// hex number, and refuses the rest -- `LATEST` among them -- with `-32602
-/// Invalid block identifier`. A decimal goes on to
-/// `Web3InformationRetriever.getBlock`, which reads only hex: `-32602 invalid
-/// blocknumber`.
-pub fn refused_block_ref(id: &serde_json::Value, s: &str) -> Option<crate::types::JsonRpcResponse> {
-    let message =
-        if !(matches!(s, "earliest" | "latest" | "pending") || is_decimal(s) || is_hex_number(s)) {
-            format!("Invalid block identifier '{s}'")
-        } else if is_decimal(s) {
-            format!("invalid blocknumber {s}")
-        } else {
-            return None;
+/// rskj's lower-case hex (`HexUtils.isHex`): digits and `a` to `f`, and no
+/// characters at all.
+fn is_lower_hex(s: &str) -> bool {
+    s.bytes()
+        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// A value as rskj's messages name it (`co.rsk.util.StringUtils.trim`): its
+/// first 66 characters, and three dots for the rest.
+pub(crate) fn abbreviated(s: &str) -> String {
+    match s.char_indices().nth(66) {
+        Some((end, _)) => format!("{}...", &s[..end]),
+        None => s.to_string(),
+    }
+}
+
+/// The bytes rskj's `HexUtils.stringHexToByteArray` reads: a `0x` taken off,
+/// and an odd count of digits padded with a zero in front. `None` where its
+/// decoder throws.
+fn hex_to_bytes(s: &str) -> Option<Vec<u8>> {
+    let digits = s.strip_prefix("0x").unwrap_or(s);
+    if digits.len().is_multiple_of(2) {
+        hex::decode(digits).ok()
+    } else {
+        hex::decode(format!("0{digits}")).ok()
+    }
+}
+
+/// A block parameter as rskj's `BlockRefParam` reads it, for `eth_call`,
+/// `eth_getBalance`, `eth_getCode`, `eth_getStorageAt`,
+/// `eth_getTransactionCount` and `rsk_getStorageBytesAt`: the identifier the
+/// method goes on with and whether an object named it, or the error code and
+/// message rskj answers.
+///
+/// A string is `earliest`, `latest` or `pending` as written, a decimal or a
+/// `0x` hex number; the rest -- `LATEST` among them -- is `-32602 Invalid
+/// block identifier`.
+///
+/// An object (EIP-1898) names the block by `blockHash` or by `blockNumber`.
+/// Its values are checked one by one (`validateMapItems`), and one that isn't
+/// a string is a `ClassCastException` nobody catches, `-32603`: the map is a
+/// `Map<String, String>` in name only, so `requireCanonical` has to be the
+/// string `"true"` or `"false"`. Then `Web3Impl.invokeByBlockRef` looks a
+/// hash up, `-32600` where the node has no such block or `requireCanonical`
+/// asks for one of the main chain, and goes on **with that block's number**:
+/// a block beside the chain answers as the main chain's block of its height.
+/// A number goes on as the object wrote it.
+///
+/// Anything else is `-32602 Invalid input`, but a `null`, which Jackson hands
+/// the method as no parameter at all, `-32603`. A parameter left out is the
+/// latest block here.
+///
+/// rskj's release answers each of these so: its own `BlockRefParam` and
+/// `RskErrorResolver` were run on them. One thing can't be followed: rskj
+/// checks an object's entries in the order they were written and stops at
+/// the first it refuses, and `serde_json` hands them over sorted by key, so
+/// of two entries rskj refuses, the one answered for may be the other.
+pub fn block_ref(
+    value: Option<&serde_json::Value>,
+    store: &rustock_storage::BlockStore,
+) -> Result<(String, bool), (i64, String)> {
+    use crate::types::{INTERNAL_ERROR, INVALID_PARAMS, INVALID_REQUEST};
+    use serde_json::Value;
+    let invalid = |message: &str| (INVALID_PARAMS, message.to_string());
+    let uncaught = || (INTERNAL_ERROR, "Internal server error".to_string());
+    let inputs = match value {
+        None => return Ok(("latest".to_string(), false)),
+        Some(Value::String(s)) => {
+            let tag = matches!(s.as_str(), "earliest" | "latest" | "pending");
+            if !(tag || is_decimal(s) || is_hex_number(s)) {
+                return Err((INVALID_PARAMS, format!("Invalid block identifier '{s}'")));
+            }
+            return Ok((s.clone(), false));
+        }
+        Some(Value::Object(inputs)) => inputs,
+        Some(Value::Null) => return Err(uncaught()),
+        Some(_) => return Err(invalid("Invalid input")),
+    };
+    if !(inputs.contains_key("blockHash") || inputs.contains_key("blockNumber")) {
+        return Err(invalid("Invalid block input"));
+    }
+    let mut hash = None;
+    for (key, value) in inputs {
+        let text = match value {
+            Value::String(text) => Some(text.as_str()),
+            Value::Null => None,
+            _ => return Err(uncaught()),
         };
-    Some(crate::types::JsonRpcResponse::error(
-        id.clone(),
-        crate::types::INVALID_PARAMS,
-        message,
-    ))
+        match key.as_str() {
+            "requireCanonical" => {
+                let text = text.ok_or_else(uncaught)?;
+                if !(text.eq_ignore_ascii_case("true") || text.eq_ignore_ascii_case("false")) {
+                    return Err(invalid(
+                        "Invalid input: requireCanonical must be a String \"true\" or \"false\"",
+                    ));
+                }
+            }
+            // `BlockHashParam`: 64 to 66 characters that decode to 32 bytes.
+            "blockHash" => {
+                let length = || invalid("Invalid block hash: incorrect length.");
+                let text = text
+                    .filter(|text| (64..=66).contains(&text.len()))
+                    .ok_or_else(length)?;
+                let bytes = hex_to_bytes(text)
+                    .ok_or_else(|| invalid("Invalid block hash format: invalid hex value"))?;
+                if bytes.len() != 32 {
+                    return Err(length());
+                }
+                hash = Some((B256::from_slice(&bytes), text));
+            }
+            // `HexNumberParam`: hex in either case, with the prefix or
+            // without, or what `new BigInteger(String)` reads.
+            "blockNumber" => {
+                let Some(text) = text.filter(|text| text.len() <= 66) else {
+                    let named = text.map_or("null".to_string(), abbreviated);
+                    return Err((INVALID_PARAMS, format!("Invalid param: {named}")));
+                };
+                let digits = text.strip_prefix("0x").unwrap_or(text);
+                let decimal = text.strip_prefix(['-', '+']).unwrap_or(text);
+                if !(digits.bytes().all(|b| b.is_ascii_hexdigit()) || is_decimal(decimal)) {
+                    return Err((
+                        INVALID_PARAMS,
+                        format!(
+                            "Invalid param {text}: value must be a valid hex or string number."
+                        ),
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some((hash, text)) = hash {
+        let Some(header) = store.header(hash).ok().flatten() else {
+            return Err((INVALID_REQUEST, format!("Block with hash {text} not found")));
+        };
+        let require_canonical = matches!(
+            inputs.get("requireCanonical"),
+            Some(Value::String(text)) if text.eq_ignore_ascii_case("true")
+        );
+        if require_canonical && store.canonical_hash(header.number).ok().flatten() != Some(hash) {
+            return Err((
+                INVALID_REQUEST,
+                format!("Block with hash {text} is not canonical and it is required"),
+            ));
+        }
+        return Ok((format!("{:#x}", header.number), true));
+    }
+    match inputs.get("blockNumber") {
+        Some(Value::String(text)) => Ok((text.clone(), true)),
+        _ => Err(invalid("Invalid block input")),
+    }
+}
+
+/// The block a state query reads, as rskj's `Web3InformationRetriever.getBlock`
+/// reads the identifier [`block_ref`] gave: in a form
+/// `state::resolve_state_root` reads, or the error code and message rskj
+/// answers.
+///
+/// What is 64 to 66 characters of lower-case hex is a block's hash, and
+/// `-32602 invalid block hash` if it isn't 32 bytes. The rest is a number in
+/// hex, which needs its `0x` -- a decimal is `-32602 invalid blocknumber` --
+/// and of which rskj keeps the low 64 bits as a signed number
+/// (`BigInteger.longValue`): no block has a number below zero, `-32600`.
+pub fn information_block(s: &str) -> Result<String, (i64, String)> {
+    use crate::types::{INVALID_PARAMS, INVALID_REQUEST};
+    if matches!(s, "earliest" | "latest" | "pending") {
+        return Ok(s.to_string());
+    }
+    if (64..=66).contains(&s.len()) && is_lower_hex(s.strip_prefix("0x").unwrap_or(s)) {
+        return match hex_to_bytes(s) {
+            Some(bytes) if bytes.len() == 32 => Ok(format!("0x{}", hex::encode(bytes))),
+            _ => Err((INVALID_PARAMS, format!("invalid block hash {s}"))),
+        };
+    }
+    if s.len() > 66 {
+        return Err((
+            INVALID_PARAMS,
+            format!("invalid block identifier {}", abbreviated(s)),
+        ));
+    }
+    let digits = s
+        .strip_prefix("0x")
+        .filter(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_hexdigit()));
+    let Some(digits) = digits else {
+        return Err((INVALID_PARAMS, format!("invalid blocknumber {s}")));
+    };
+    let low = &digits[digits.len().saturating_sub(16)..];
+    match u64::from_str_radix(low, 16).map(|number| number as i64) {
+        Ok(number) if number >= 0 => Ok(format!("{number:#x}")),
+        _ => Err((INVALID_REQUEST, format!("Block {s} not found"))),
+    }
+}
+
+/// The block `eth_call` runs on: its `BlockRefParam` ([`block_ref`]), then
+/// [`execution_block`]. What an object names goes through a
+/// `BlockIdentifierParam` on its way (`Web3Impl.eth_call`), as an estimate's
+/// block does.
+pub fn call_block(
+    value: Option<&serde_json::Value>,
+    store: &rustock_storage::BlockStore,
+) -> Result<String, (i64, String)> {
+    let (identifier, from_object) = block_ref(value, store)?;
+    execution_block(&identifier, from_object)
+}
+
+/// The block `eth_estimateGas` runs on. Its parameter is a
+/// `BlockIdentifierParam`, which rskj makes of the parameter's text whatever
+/// JSON it is (`jp.getText()`): a number is a decimal block, and an object is
+/// its opening brace, refused. Left out or `null`, it is the latest block
+/// (`Web3Impl.eth_estimateGas`).
+pub fn estimate_block(value: Option<&serde_json::Value>) -> Result<String, (i64, String)> {
+    use serde_json::Value;
+    let text = match value {
+        None | Some(Value::Null) => return Ok("latest".to_string()),
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Number(n)) => n.to_string(),
+        Some(Value::Bool(b)) => b.to_string(),
+        Some(Value::Array(_)) => "[".to_string(),
+        Some(Value::Object(_)) => "{".to_string(),
+    };
+    execution_block(&text, true)
 }
 
 /// The block `eth_call` (`estimate` false) or `eth_estimateGas` (true) runs
@@ -670,17 +869,25 @@ mod tests {
     }
 
     /// A block reference rskj refuses before it looks anything up: anything
-    /// but the three tags as written, a decimal and a hex number, and then a
-    /// decimal, which `getBlock` can't read.
+    /// but the three tags as written, a decimal and a hex number
+    /// (`BlockRefParam`), and then what `getBlock` can't read, a decimal
+    /// among it. And what `getBlock` takes for a hash.
     #[test]
     fn a_block_reference_is_refused_as_rskj_refuses_it() {
-        let refused = |s: &str| {
-            refused_block_ref(&serde_json::json!(1), s)
-                .and_then(|resp| resp.error)
-                .map(|error| (error.code, error.message))
+        let tmp = tempfile::tempdir().unwrap();
+        let store = rustock_storage::BlockStore::open(tmp.path()).unwrap();
+        let read = |s: &str| {
+            block_ref(Some(&serde_json::json!(s)), &store)
+                .and_then(|(identifier, _)| information_block(&identifier))
         };
-        for fine in ["latest", "pending", "earliest", "0x0", "0x1F"] {
-            assert_eq!(refused(fine), None, "{fine}");
+        for (fine, lookup) in [
+            ("latest", "latest"),
+            ("pending", "pending"),
+            ("earliest", "earliest"),
+            ("0x0", "0x0"),
+            ("0x1F", "0x1f"),
+        ] {
+            assert_eq!(read(fine), Ok(lookup.to_string()), "{fine}");
         }
         for (s, message) in [
             ("LATEST", "Invalid block identifier 'LATEST'"),
@@ -688,8 +895,43 @@ mod tests {
             ("0x", "Invalid block identifier '0x'"),
             ("12", "invalid blocknumber 12"),
         ] {
-            assert_eq!(refused(s), Some((-32602, message.to_string())), "{s}");
+            assert_eq!(read(s), Err((-32602, message.to_string())), "{s}");
         }
+
+        // 64 to 66 characters of lower-case hex are a hash, with the prefix
+        // or without, and an odd count of digits is padded: 63 are a hash
+        // too, and 62 are a byte short.
+        let hash = "ab".repeat(32);
+        assert_eq!(read(&format!("0x{hash}")), Ok(format!("0x{hash}")));
+        assert_eq!(information_block(&hash), Ok(format!("0x{hash}")));
+        assert_eq!(
+            read(&format!("0x{}", &hash[1..])),
+            Ok(format!("0x0{}", &hash[1..]))
+        );
+        let short = format!("0x{}", &hash[2..]);
+        assert_eq!(
+            read(&short),
+            Err((-32602, format!("invalid block hash {short}")))
+        );
+        // In upper case it isn't one (`HexUtils.isHex`). It is a number, of
+        // which the low 64 bits count, as a signed long.
+        let upper = format!("0x{}", "AB".repeat(32));
+        assert_eq!(
+            read(&upper),
+            Err((-32600, format!("Block {upper} not found")))
+        );
+        let wrapped = format!("0x{}{:016x}", "F".repeat(48), 5);
+        assert_eq!(read(&wrapped), Ok("0x5".to_string()));
+        // Past 66 characters it is neither, and rskj names it by its first
+        // 66.
+        let long = format!("0x{}", "1".repeat(65));
+        assert_eq!(
+            read(&long),
+            Err((
+                -32602,
+                format!("invalid block identifier {}...", &long[..66])
+            ))
+        );
     }
 
     /// The block a call or an estimate runs on: rskj's tags as written, a hex

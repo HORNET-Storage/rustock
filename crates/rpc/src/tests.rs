@@ -4583,6 +4583,326 @@ async fn block_tags_are_read_as_rskj_reads_them() {
     );
 }
 
+/// A block named by an object, as rskj's `BlockRefParam` reads it (EIP-1898)
+/// for `eth_call`, `eth_getBalance`, `eth_getCode`, `eth_getStorageAt`,
+/// `eth_getTransactionCount` and `rsk_getStorageBytesAt`: by `blockNumber`,
+/// or by `blockHash`, which rskj turns into that block's number -- so a block
+/// beside the chain answers as the main chain's block of its height, unless
+/// `requireCanonical` is the string "true". What is neither a string nor an
+/// object is refused, where it used to be read as the latest block. A block
+/// the node doesn't have is `-32600` to a state query and `-32602` to a call.
+#[tokio::test]
+async fn a_block_named_by_an_object_is_read_as_rskj_reads_it() {
+    use rustock_trie::{account_key, TrieKeySlice, TrieNode};
+
+    let (state, _tmp) = setup_state_with_trie();
+    let address = "0xcd2a3d9f938e13cd947ec05abc7fe734df8dd826";
+    let trie_store = state.trie_store.clone().unwrap();
+    let store = state.store.clone();
+
+    // #42 holds the account with 10,000. #43, the new head, holds it with 7,
+    // and so does a second block of height 42, beside the chain.
+    let at_42 = store.canonical_hash(42).unwrap().unwrap();
+    let old_root = store.header(at_42).unwrap().unwrap().state_root;
+    let root = TrieNode::from_message(&trie_store.get(old_root.as_slice()).unwrap(), &*trie_store);
+    let poorer = rustock_trie::AccountState::new(U256::from(2), U256::from(7));
+    let key = account_key(&address.parse::<Address>().unwrap());
+    let mut root = root.put(
+        &TrieKeySlice::from_key(&key),
+        &poorer.encode(),
+        &*trie_store,
+    );
+    root.save(&*trie_store, true);
+    let state_root = root.compute_hash(&*trie_store);
+    rustock_trie::TrieStore::put(
+        &*trie_store,
+        state_root.as_slice(),
+        &root.to_message(&*trie_store),
+    );
+    let head = Header {
+        state_root,
+        parent_hash: at_42,
+        ..test_header(43)
+    };
+    let at_43 = head.hash();
+    store.put_header(&head).unwrap();
+    store.put_canonical_hash(43, at_43).unwrap();
+    store.set_head(at_43).unwrap();
+    let beside = Header {
+        state_root,
+        timestamp: 7,
+        ..test_header(42)
+    };
+    let beside_42 = beside.hash();
+    store.put_header(&beside).unwrap();
+
+    let ask = |method: &str, params: Value| {
+        let request = make_request(method, params);
+        let state = &state;
+        async move { dispatch_for_test(state, request).await }
+    };
+    let error = |resp: JsonRpcResponse| resp.error.map(|error| (error.code, error.message));
+    let balance = |block: Value| ask("eth_getBalance", json!([address, block]));
+    let hex = |hash: B256| format!("{hash:#x}");
+
+    assert_eq!(balance(json!("latest")).await.result, Some(json!("0x7")));
+    for block in [
+        json!({"blockNumber": "0x2a"}),
+        json!({"blockHash": hex(at_42)}),
+        json!({"blockHash": hex(at_42), "requireCanonical": "true"}),
+        // Without its prefix, as `stringHexToByteArray` reads it.
+        json!({"blockHash": hex(at_42)[2..]}),
+        // The block beside the chain: its number is all rskj keeps of it.
+        json!({"blockHash": hex(beside_42)}),
+        json!({"blockHash": hex(beside_42), "requireCanonical": "FALSE"}),
+        // The hash is looked at first.
+        json!({"blockHash": hex(at_42), "blockNumber": "0x2b"}),
+    ] {
+        let resp = balance(block.clone()).await;
+        assert_eq!(
+            resp.result,
+            Some(json!("0x2710")),
+            "{block}: {:?}",
+            resp.error
+        );
+    }
+    let resp = balance(json!({"blockNumber": "0x2b"})).await;
+    assert_eq!(resp.result, Some(json!("0x7")), "{:?}", resp.error);
+    let resp = ask(
+        "eth_getTransactionCount",
+        json!([address, {"blockNumber": "0x2a"}]),
+    )
+    .await;
+    assert_eq!(resp.result, Some(json!("0x1")), "{:?}", resp.error);
+
+    // Each of the state queries, at a block the node doesn't have.
+    let nowhere = json!({"blockNumber": "0x63"});
+    for (method, params) in [
+        ("eth_getBalance", json!([address, nowhere])),
+        ("eth_getTransactionCount", json!([address, nowhere])),
+        ("eth_getCode", json!([address, nowhere])),
+        ("eth_getStorageAt", json!([address, "0x1", nowhere])),
+        ("rsk_getStorageBytesAt", json!([address, "0x1", nowhere])),
+    ] {
+        assert_eq!(
+            error(ask(method, params).await),
+            Some((-32600, "Block 0x63 not found".to_string())),
+            "{method}"
+        );
+    }
+
+    let unknown = hex(B256::repeat_byte(0x77));
+    let (known, beside) = (hex(at_42), hex(beside_42));
+    let canonical = "Invalid input: requireCanonical must be a String \"true\" or \"false\"";
+    let number = "value must be a valid hex or string number.";
+    for (block, code, message) in [
+        (json!("0x63"), -32600, "Block 0x63 not found".to_string()),
+        (json!(unknown), -32600, format!("Block {unknown} not found")),
+        (
+            json!({"blockHash": unknown}),
+            -32600,
+            format!("Block with hash {unknown} not found"),
+        ),
+        (
+            json!({"blockHash": beside, "requireCanonical": "true"}),
+            -32600,
+            format!("Block with hash {beside} is not canonical and it is required"),
+        ),
+        (json!({}), -32602, "Invalid block input".to_string()),
+        (
+            json!({"requireCanonical": "true"}),
+            -32602,
+            "Invalid block input".to_string(),
+        ),
+        (
+            json!({"blockHash": known, "requireCanonical": "yes"}),
+            -32602,
+            canonical.to_string(),
+        ),
+        // The map's values are strings in name only: one that isn't can't
+        // be cast to a string, and nothing catches that.
+        (
+            json!({"blockHash": known, "requireCanonical": true}),
+            -32603,
+            "Internal server error".to_string(),
+        ),
+        (
+            json!({"blockNumber": 42}),
+            -32603,
+            "Internal server error".to_string(),
+        ),
+        (
+            json!({"blockNumber": "0x2a", "other": 7}),
+            -32603,
+            "Internal server error".to_string(),
+        ),
+        (
+            json!({"blockHash": known, "requireCanonical": null}),
+            -32603,
+            "Internal server error".to_string(),
+        ),
+        (
+            json!({"blockNumber": null}),
+            -32602,
+            "Invalid param: null".to_string(),
+        ),
+        (
+            json!({"blockHash": null}),
+            -32602,
+            "Invalid block hash: incorrect length.".to_string(),
+        ),
+        (
+            json!({"blockNumber": "0x-5"}),
+            -32602,
+            format!("Invalid param 0x-5: {number}"),
+        ),
+        (
+            json!({"blockNumber": "0X1"}),
+            -32602,
+            format!("Invalid param 0X1: {number}"),
+        ),
+        // A bare prefix and no digits at all pass the object's check, and
+        // `getBlock` then reads no number in them.
+        (
+            json!({"blockNumber": "0x"}),
+            -32602,
+            "invalid blocknumber 0x".to_string(),
+        ),
+        (
+            json!({"blockNumber": ""}),
+            -32602,
+            "invalid blocknumber ".to_string(),
+        ),
+        (
+            json!({"blockNumber": "+5"}),
+            -32602,
+            "invalid blocknumber +5".to_string(),
+        ),
+        (
+            json!({"blockHash": "0x1234"}),
+            -32602,
+            "Invalid block hash: incorrect length.".to_string(),
+        ),
+        (
+            json!({"blockHash": format!("0x{}", "zz".repeat(32))}),
+            -32602,
+            "Invalid block hash format: invalid hex value".to_string(),
+        ),
+        (
+            json!({"blockNumber": "latest"}),
+            -32602,
+            format!("Invalid param latest: {number}"),
+        ),
+        // Numbers an object may write and `getBlock` then can't read.
+        (
+            json!({"blockNumber": "42"}),
+            -32602,
+            "invalid blocknumber 42".to_string(),
+        ),
+        (
+            json!({"blockNumber": "2a"}),
+            -32602,
+            "invalid blocknumber 2a".to_string(),
+        ),
+        (json!(42), -32602, "Invalid input".to_string()),
+        (json!(true), -32602, "Invalid input".to_string()),
+        (json!(["latest"]), -32602, "Invalid input".to_string()),
+        (json!(null), -32603, "Internal server error".to_string()),
+    ] {
+        assert_eq!(
+            error(balance(block.clone()).await),
+            Some((code, message)),
+            "{block}"
+        );
+    }
+
+    // A call, at the tracing fixture's #41. Its head, #42, has no state.
+    let (state, _tmp, _, _, _, callee) = setup_state_for_tracing();
+    let call = json!({"to": format!("{callee:#x}")});
+    let at_41 = hex(state.store.canonical_hash(41).unwrap().unwrap());
+    let at_42 = state.store.canonical_hash(42).unwrap().unwrap();
+    let ask = |method: &str, block: Value| {
+        let request = make_request(method, json!([call, block]));
+        let state = &state;
+        async move { dispatch_for_test(state, request).await }
+    };
+    for block in [
+        json!({"blockNumber": "0x29"}),
+        json!({"blockNumber": "41"}),
+        json!({"blockHash": at_41}),
+    ] {
+        let resp = ask("eth_call", block.clone()).await;
+        assert_eq!(
+            resp.result,
+            Some(json!(format!("0x{:064x}", 0x2a))),
+            "{block}: {:?}",
+            resp.error
+        );
+    }
+    let stateless = format!("State not found for block with hash {}", &hex(at_42)[2..]);
+    for (block, code, message) in [
+        (json!("0x63"), -32602, "Invalid block number 99".to_string()),
+        (
+            json!({"blockNumber": "0x63"}),
+            -32602,
+            "Invalid block number 99".to_string(),
+        ),
+        (
+            json!({"blockNumber": "2a"}),
+            -32602,
+            "Invalid block identifier '2a'".to_string(),
+        ),
+        (
+            json!({"blockHash": unknown}),
+            -32600,
+            format!("Block with hash {unknown} not found"),
+        ),
+        (json!(41), -32602, "Invalid input".to_string()),
+        (json!("latest"), -32603, stateless.clone()),
+    ] {
+        assert_eq!(
+            error(ask("eth_call", block.clone()).await),
+            Some((code, message)),
+            "{block}"
+        );
+    }
+    // An estimate's block is a `BlockIdentifierParam`, made of the
+    // parameter's text whatever JSON it is: a number is a decimal block, and
+    // an object is its opening brace.
+    let resp = ask("eth_estimateGas", json!(41)).await;
+    assert!(
+        resp.result.is_some_and(|gas| gas.is_string()),
+        "{:?}",
+        resp.error
+    );
+    for (block, code, message) in [
+        (
+            json!({"blockNumber": "0x29"}),
+            -32602,
+            "Invalid block identifier '{'".to_string(),
+        ),
+        (
+            json!(true),
+            -32602,
+            "Invalid block identifier 'true'".to_string(),
+        ),
+        (json!("0x63"), -32602, "Invalid block number 99".to_string()),
+        (json!(99), -32602, "Invalid block number 99".to_string()),
+    ] {
+        assert_eq!(
+            error(ask("eth_estimateGas", block.clone()).await),
+            Some((code, message)),
+            "{block}"
+        );
+    }
+    let resp = dispatch_for_test(
+        &state,
+        make_request("eth_getBalance", json!([format!("{callee:#x}"), "latest"])),
+    )
+    .await;
+    assert_eq!(error(resp), Some((-32600, stateless)));
+}
+
 /// A state for a call's defaults: `reader` returns the GASPRICE and the GAS
 /// it sees, as two words; `burner` loops `count` times at 26 gas a turn, so
 /// running it costs 21,003 + 26 * `count`. The head holds 6,800,000 gas and

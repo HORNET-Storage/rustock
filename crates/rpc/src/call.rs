@@ -1,6 +1,6 @@
 use crate::dto::CallRequest;
 use crate::server::RpcState;
-use crate::state::resolve_state_root;
+
 use crate::types::*;
 use alloy_primitives::{Address, Bytes, U256};
 use rustock_core::Transaction;
@@ -29,8 +29,7 @@ pub fn eth_call(id: Value, params: &Value, state: &RpcState) -> JsonRpcResponse 
     let Some(call_req) = params.get(0).and_then(CallRequest::from_json) else {
         return JsonRpcResponse::error(id, INVALID_PARAMS, "Missing or invalid call request");
     };
-    let block_param = params.get(1).and_then(|v| v.as_str()).unwrap_or("latest");
-    let block_param = match crate::helpers::execution_block(block_param, false) {
+    let block_param = match crate::helpers::call_block(params.get(1), &state.store) {
         Ok(block) => block,
         Err((code, message)) => return JsonRpcResponse::error(id, code, message),
     };
@@ -39,8 +38,9 @@ pub fn eth_call(id: Value, params: &Value, state: &RpcState) -> JsonRpcResponse 
         return JsonRpcResponse::error(id, INTERNAL_ERROR, "Execution engine not available");
     };
 
-    let Some((root, header)) = resolve_state_root(&block_param, state) else {
-        return JsonRpcResponse::error(id, INTERNAL_ERROR, "Cannot resolve block");
+    let (root, header) = match crate::state::execution_state(&id, &block_param, state) {
+        Ok(found) => found,
+        Err(refused) => return refused,
     };
 
     let sender = call_req.from.unwrap_or(Address::ZERO);
@@ -63,8 +63,7 @@ pub fn eth_estimate_gas(id: Value, params: &Value, state: &RpcState) -> JsonRpcR
     let Some(call_req) = params.get(0).and_then(CallRequest::from_json) else {
         return JsonRpcResponse::error(id, INVALID_PARAMS, "Missing or invalid call request");
     };
-    let block_param = params.get(1).and_then(|v| v.as_str()).unwrap_or("latest");
-    let block_param = match crate::helpers::execution_block(block_param, true) {
+    let block_param = match crate::helpers::estimate_block(params.get(1)) {
         Ok(block) => block,
         Err((code, message)) => return JsonRpcResponse::error(id, code, message),
     };
@@ -73,8 +72,9 @@ pub fn eth_estimate_gas(id: Value, params: &Value, state: &RpcState) -> JsonRpcR
         return JsonRpcResponse::error(id, INTERNAL_ERROR, "Execution engine not available");
     };
 
-    let Some((root, header)) = resolve_state_root(&block_param, state) else {
-        return JsonRpcResponse::error(id, INTERNAL_ERROR, "Cannot resolve block");
+    let (root, header) = match crate::state::execution_state(&id, &block_param, state) {
+        Ok(found) => found,
+        Err(refused) => return refused,
     };
 
     let sender = call_req.from.unwrap_or(Address::ZERO);

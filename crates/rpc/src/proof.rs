@@ -63,7 +63,7 @@
 //! truncated inclusion path would look like one without being one.
 
 use crate::server::RpcState;
-use crate::state::resolve_state_root;
+
 use crate::types::*;
 use alloy_primitives::{Address, B256, U256};
 use rustock_trie::{
@@ -127,9 +127,11 @@ pub fn eth_get_proof(id: Value, params: &Value, state: &RpcState) -> JsonRpcResp
         slots.push((raw.to_string(), slot));
     }
 
-    let block_param = params.get(2).and_then(|v| v.as_str()).unwrap_or("latest");
-    let Some((root, _header)) = resolve_state_root(block_param, state) else {
-        return JsonRpcResponse::error(id, INTERNAL_ERROR, "Cannot resolve block");
+    // The block as the state queries read it: a tag, a number, or an
+    // EIP-1898 object.
+    let (root, _header) = match crate::state::queried_state(&id, params.get(2), state) {
+        Ok(found) => found,
+        Err(refused) => return refused,
     };
     let Some(trie_store) = state.trie_store.clone() else {
         return JsonRpcResponse::error(id, INTERNAL_ERROR, "State not available");
@@ -250,9 +252,9 @@ pub fn rsk_get_storage_nodes(id: Value, params: &Value, state: &RpcState) -> Jso
         slots.push((raw.to_string(), slot));
     }
 
-    let block_param = params.get(2).and_then(|v| v.as_str()).unwrap_or("latest");
-    let Some((root, header)) = resolve_state_root(block_param, state) else {
-        return JsonRpcResponse::error(id, INTERNAL_ERROR, "Cannot resolve block");
+    let (root, header) = match crate::state::queried_state(&id, params.get(2), state) {
+        Ok(found) => found,
+        Err(refused) => return refused,
     };
     let Some(trie_store) = state.trie_store.clone() else {
         return JsonRpcResponse::error(id, INTERNAL_ERROR, "State not available");
