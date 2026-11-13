@@ -187,7 +187,7 @@ pub fn install<WIRE, HOST>(
     block: BlockWords,
 ) where
     WIRE: InterpreterTypes,
-    HOST: Host + ContractMarker,
+    HOST: Host + ContractMarker + BeneficiaryTouch,
 {
     // RSKIP446 (lovell700): transient storage TLOAD/TSTORE (0x5c/0x5d,
     // EIP-1153, rskj `GasCost.TLOAD`/`TSTORE` = 100 each). RSKIP445 (lovell700):
@@ -599,6 +599,66 @@ where
     }
 }
 
+/// What SELFDESTRUCT asks that revm's `Host` can't do: leave the beneficiary
+/// as it was. revm's journal touches it whatever the destroyed account held,
+/// and under RSK's frontier account rules a touch creates an account that
+/// wasn't there.
+pub trait BeneficiaryTouch {
+    /// Whether `address` is touched already, so that touching it again changes
+    /// nothing.
+    fn is_touched(&self, address: Address) -> bool;
+
+    /// Takes back the touch that the SELFDESTRUCT which has just run gave
+    /// `beneficiary`: the account's flag, and the journal's entry for it.
+    fn take_back_touch(&mut self, beneficiary: Address);
+}
+
+impl<BLOCK, TX, CFG, LOCAL> BeneficiaryTouch
+    for revm::Context<
+        BLOCK,
+        TX,
+        CFG,
+        RskDb,
+        revm::context::Journal<RskDb>,
+        crate::raw_storage::RskChainExt,
+        LOCAL,
+    >
+where
+    LOCAL: revm::context_interface::LocalContextTr,
+{
+    fn is_touched(&self, address: Address) -> bool {
+        self.journaled_state
+            .inner
+            .state
+            .get(&address)
+            .is_some_and(|account| account.is_touched())
+    }
+
+    fn take_back_touch(&mut self, beneficiary: Address) {
+        let journal = &mut self.journaled_state.inner;
+        if let Some(account) = journal.state.get_mut(&beneficiary) {
+            account.unmark_touch();
+        }
+        // revm's `JournalInner::selfdestruct` journals the touch and then the
+        // destruction, so the touch is the last entry but one. It goes too:
+        // the sublists' write sets are read from these entries, and rskj
+        // only reads this account (`isExist`, for the gas).
+        let touch = journal.journal.len().checked_sub(2).filter(|&at| {
+            matches!(
+                journal.journal[at],
+                revm::context::JournalEntry::AccountTouched { address } if address == beneficiary
+            )
+        });
+        debug_assert!(
+            touch.is_some(),
+            "SELFDESTRUCT journals its touch of {beneficiary}"
+        );
+        if let Some(at) = touch {
+            journal.journal.remove(at);
+        }
+    }
+}
+
 /// CHAINID without revm's ISTANBUL spec check (RSKIP152 activates it at
 /// papyrus200 while the spec stays PETERSBURG).
 fn rsk_chainid<WIRE: InterpreterTypes, H: Host + ?Sized>(
@@ -880,7 +940,7 @@ thread_local! {
 
 /// All-ops tracer: log pc/opcode/gas (post-static-charge), then dispatch to
 /// the real implementation (custom rsk op or default PETERSBURG table).
-fn traced_all<WIRE: InterpreterTypes, HOST: Host + ContractMarker>(
+fn traced_all<WIRE: InterpreterTypes, HOST: Host + ContractMarker + BeneficiaryTouch>(
     context: InstructionContext<'_, HOST, WIRE>,
 ) {
     use revm::interpreter::interpreter_types::{InputsTr, Jumps, LegacyBytecode};
@@ -1155,7 +1215,14 @@ pub fn rsk_call<WIRE: InterpreterTypes, H: Host + ?Sized>(
 /// the 25,000 charge and diverge. This override drops the value condition,
 /// matching rskj frontier-style suicide gas. Everything else (base 5,000 via
 /// static gas, cold cost, refund) mirrors revm's instruction.
-pub fn rsk_selfdestruct<WIRE: InterpreterTypes, H: Host + ?Sized>(
+///
+/// And with rskj's account semantics: `Program.suicide` transfers only a
+/// balance that is not zero, so with nothing to hand over the beneficiary is
+/// left as it was, and one that did not exist still does not, though the
+/// 25,000 for it was charged. revm's journal touches the beneficiary whatever
+/// the balance, which under RSK's frontier account rules would create it, so
+/// that touch is taken back ([`BeneficiaryTouch`]).
+pub fn rsk_selfdestruct<WIRE: InterpreterTypes, H: Host + BeneficiaryTouch + ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
 ) {
     if context.interpreter.runtime_flag.is_static() {
@@ -1170,17 +1237,21 @@ pub fn rsk_selfdestruct<WIRE: InterpreterTypes, H: Host + ?Sized>(
     };
     let target = Address::from_word(B256::from(target));
 
+    let address = context.interpreter.input.target_address();
+
     let cold_load_gas = context.host.gas_params().selfdestruct_cold_cost();
     let skip_cold_load = context.interpreter.gas.remaining() < cold_load_gas;
-    let res = match context.host.selfdestruct(
-        context.interpreter.input.target_address(),
-        target,
-        skip_cold_load,
-    ) {
+    // Whether the touch revm is about to give the beneficiary is a new one.
+    let touches = address != target && !context.host.is_touched(target);
+    let res = match context.host.selfdestruct(address, target, skip_cold_load) {
         Ok(res) => res,
         Err(LoadError::ColdLoadSkipped) => return context.interpreter.halt_oog(),
         Err(LoadError::DBError) => return context.interpreter.halt_fatal(),
     };
+
+    if touches && !res.had_value {
+        context.host.take_back_touch(target);
+    }
 
     // rskj charges NEW_ACCT_SUICIDE on beneficiary non-existence regardless of
     // value (no `had_value &&` gate, unlike revm's EIP-161 path).

@@ -8121,6 +8121,80 @@ mod tests {
         );
     }
 
+    /// A contract that holds nothing and destroys itself only reads the
+    /// account of the beneficiary it names: rskj `VM.doSUICIDE` asks `isExist`
+    /// for the gas, and `Program.suicide` then has no balance to transfer. So
+    /// a sublist that does this and another that reads the same account do
+    /// not collide. revm journals a touch of the beneficiary, which for an
+    /// account that does not exist would count as writing it.
+    #[test]
+    fn a_selfdestruct_with_no_balance_only_reads_its_beneficiary() {
+        let store: Arc<dyn TrieStore> = Arc::new(MemoryTrieStore::new());
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let beneficiary = Address::repeat_byte(0xB1);
+        let [dies, reads] = [0xC1, 0xC2].map(Address::repeat_byte);
+        let senders = [0x11, 0x12, 0x13].map(Address::repeat_byte);
+
+        let rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = senders.iter().fold(TrieNode::empty(), |root, sender| {
+            put_account(&root, store.as_ref(), sender, 0, rbtc)
+        });
+        // PUSH20 beneficiary; SELFDESTRUCT
+        let mut code = vec![0x73];
+        code.extend_from_slice(beneficiary.as_slice());
+        code.push(0xFF);
+        let root = seed_contract(&root, store.as_ref(), &dies, U256::ZERO, &code);
+        // PUSH20 beneficiary; BALANCE; POP
+        let mut code = vec![0x73];
+        code.extend_from_slice(beneficiary.as_slice());
+        code.extend_from_slice(&[0x31, 0x50]);
+        let root = seed_contract(&root, store.as_ref(), &reads, U256::ZERO, &code);
+
+        let mut header = dummy_header(8_000_000); // testnet reed810 is 7,139,600
+        header.gas_limit = U256::from(12_000_000);
+        header.version_fields = Some(rustock_core::types::header::HeaderVersionFields {
+            version: 1,
+            edges: Some(vec![1, 2]),
+            base_event: None,
+        });
+
+        let tx = |to: &Address| rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::from(1_000),
+            gas_limit: U256::from(100_000),
+            to: Bytes::copy_from_slice(to.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::new(),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
+        };
+        // One sublist destroys, the other reads, and the last transaction is
+        // the sequential set's.
+        let transactions = vec![
+            (tx(&dies), senders[0]),
+            (tx(&reads), senders[1]),
+            (tx(&Address::repeat_byte(0xA3)), senders[2]),
+        ];
+
+        crate::collision::start(
+            &[1i16, 2],
+            &[],
+            crate::collision::write_semantics(header.number),
+        );
+        let executor =
+            RskExecutor::new(RskHardforkConfig::testnet(), block_store).with_execution_threads(2);
+        let result = executor.execute_block(&header, &transactions, &root, store);
+        let collision = crate::collision::finish()
+            .expect("recording was started")
+            .first_collision()
+            .map(|collision| (collision.kind, collision.key));
+
+        assert!(result.expect("block").tx_results.iter().all(|t| t.success));
+        assert_eq!(collision, None, "both sublists only read the beneficiary");
+    }
+
     /// Transfers of 1,000 wei, each from a sender of its own with the gas
     /// limit given, in a testnet block above reed810 -- so one that runs as
     /// its sublists -- with `block_gas` and `edges`.
@@ -14233,6 +14307,105 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
         assert_subtree_deleted(&new_root, store.as_ref(), &victim);
         let sender_acct = trie_account(&new_root, store.as_ref(), &sender).unwrap();
         assert_eq!(sender_acct.balance, one_rbtc, "burned balance goes nowhere");
+    }
+
+    /// rskj `Program.suicide` transfers only a balance that is not zero
+    /// (`if (!balance.equals(Coin.ZERO))`), so a contract that holds nothing
+    /// leaves the beneficiary it names as it was: one that did not exist still
+    /// does not, though `VM.doSUICIDE` charged the 25,000 for it. revm touches
+    /// the beneficiary whatever the balance, and under RSK's frontier account
+    /// rules a touch creates the account. What else touches it still creates
+    /// it: a balance handed over, and a call for nothing (`addBalance` of
+    /// zero), whether before the destruction or after it.
+    #[test]
+    fn selfdestruct_with_no_balance_leaves_the_beneficiary_as_it_was() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let sender = Address::repeat_byte(0xAA);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+
+        // PUSH20 to; SELFDESTRUCT
+        let destroys = |to: &Address| {
+            let mut code = vec![0x73];
+            code.extend_from_slice(to.as_slice());
+            code.push(0xFF);
+            code
+        };
+        // CALL(GAS, to, 0, 0, 0, 0, 0); POP
+        let calls = |to: &Address| {
+            let mut code = vec![
+                0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x73,
+            ];
+            code.extend_from_slice(to.as_slice());
+            code.extend_from_slice(&[0x5A, 0xF1, 0x50]);
+            code
+        };
+
+        // The beneficiaries, none of which exists, and the contracts.
+        let [untouched, paid, called_before, called_after] =
+            [0xB1, 0xB2, 0xB3, 0xB4].map(Address::repeat_byte);
+        let [empty, funded, calls_first, destroyed_inside, calls_last] =
+            [0xC1, 0xC2, 0xC3, 0xC4, 0xC5].map(Address::repeat_byte);
+
+        let root = put_account(&TrieNode::empty(), store.as_ref(), &sender, 0, one_rbtc);
+        let contracts = [
+            (empty, U256::ZERO, destroys(&untouched)),
+            (funded, U256::from(1_000), destroys(&paid)),
+            (
+                calls_first,
+                U256::ZERO,
+                [calls(&called_before), destroys(&called_before)].concat(),
+            ),
+            (destroyed_inside, U256::ZERO, destroys(&called_after)),
+            (
+                calls_last,
+                U256::ZERO,
+                [calls(&destroyed_inside), calls(&called_after)].concat(),
+            ),
+        ];
+        let root = contracts.iter().fold(root, |root, (addr, balance, code)| {
+            seed_contract(&root, store.as_ref(), addr, *balance, code)
+        });
+
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+        let txs: Vec<_> = [empty, funded, calls_first, calls_last]
+            .iter()
+            .enumerate()
+            .map(|(nonce, to)| (plain_tx(nonce as u64, to, U256::ZERO), sender))
+            .collect();
+        let r = executor
+            .execute_block(&dummy_header(3_173_807), &txs, &root, store.clone())
+            .expect("block");
+        assert!(r.tx_results.iter().all(|t| t.success));
+
+        let new_root =
+            crate::state::apply_state_changes(&root, store.as_ref(), &r.state_changes, &r.markers);
+        let account = |addr: &Address| {
+            trie_account(&new_root, store.as_ref(), addr).map(|a| (a.nonce, a.balance))
+        };
+        for gone in [empty, funded, calls_first, destroyed_inside] {
+            assert_eq!(account(&gone), None, "{gone} destroyed itself");
+        }
+        assert_eq!(
+            account(&untouched),
+            None,
+            "nothing was handed over, so nothing made the beneficiary"
+        );
+        assert_eq!(
+            account(&paid),
+            Some((U256::ZERO, U256::from(1_000))),
+            "a balance handed over makes the beneficiary"
+        );
+        assert_eq!(
+            account(&called_before),
+            Some((U256::ZERO, U256::ZERO)),
+            "the call before the destruction made it, and it stays"
+        );
+        assert_eq!(
+            account(&called_after),
+            Some((U256::ZERO, U256::ZERO)),
+            "the call after the destruction makes it"
+        );
     }
 
     /// RSKIP-131: from RSKIP125 rskj's `Program.createContract` refuses a
