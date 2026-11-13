@@ -230,7 +230,7 @@ fn int_result(gas: u64, code: i64) -> Result<PrecompileOutput, PrecompileError> 
 /// `setUnionBridgeContractAddressForTestnet(address)` -> int256.
 ///
 /// rskj wraps this in `executeIfTestnetAndAuthorized`, so it is both
-/// network-gated and authorizer-gated.
+/// network-gated and authorizer-gated, and throws at either gate.
 pub fn set_contract_address_for_testnet<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     args: &[u8],
@@ -239,12 +239,16 @@ pub fn set_contract_address_for_testnet<CTX: crate::RskContextTr>(
     sender: Address,
 ) -> Result<PrecompileOutput, PrecompileError> {
     if hardfork_cfg.chain_id == RSK_MAINNET_CHAIN_ID {
-        return int_result(gas_cost, UnionResponse::GenericError.code());
+        return Err(PrecompileError::other(
+            "The setUnionBridgeContractAddressForTestnet function is disabled in Mainnet.",
+        ));
     }
     let constants = union_constants(hardfork_cfg);
-    if sender != constants.change_address_authorizer {
-        return int_result(gas_cost, UnionResponse::UnauthorizedCaller.code());
-    }
+    require_authorizer(
+        sender,
+        constants.change_address_authorizer,
+        "The sender is not authorized to call setUnionBridgeContractAddressForTestnet",
+    )?;
     // rskj `new RskAddress((DataWord) args[0])`: the address as its decoder
     // reads it, an empty argument list being the zero address.
     let Some(new_address) = crate::abi::Args::new(args).address(0) else {
@@ -288,9 +292,11 @@ pub fn increase_locking_cap<CTX: crate::RskContextTr>(
     sender: Address,
 ) -> Result<PrecompileOutput, PrecompileError> {
     let constants = union_constants(hardfork_cfg);
-    if sender != constants.change_locking_cap_authorizer {
-        return int_result(gas_cost, UnionResponse::UnauthorizedCaller.code());
-    }
+    require_authorizer(
+        sender,
+        constants.change_locking_cap_authorizer,
+        "The sender is not authorized to call increaseUnionBridgeLockingCap",
+    )?;
     let Some(new_cap) = crate::abi::Args::new(args).int(0) else {
         return int_result(gas_cost, UnionResponse::GenericError.code());
     };
@@ -417,9 +423,11 @@ pub fn set_transfer_permissions<CTX: crate::RskContextTr>(
     sender: Address,
 ) -> Result<PrecompileOutput, PrecompileError> {
     let constants = union_constants(hardfork_cfg);
-    if sender != constants.change_transfer_permissions_authorizer {
-        return int_result(gas_cost, UnionResponse::UnauthorizedCaller.code());
-    }
+    require_authorizer(
+        sender,
+        constants.change_transfer_permissions_authorizer,
+        "The sender is not authorized to call setUnionBridgeTransferPermissions",
+    )?;
     // rskj's `BoolType` looks at its word's low 32 bits only, and an empty
     // argument list reads as two falses.
     let args = crate::abi::Args::new(args);
@@ -499,6 +507,21 @@ pub fn clear_event<CTX: crate::RskContextTr>(
     require_union_bridge_caller(ctx, hardfork_cfg, sender)?;
     store_long(ctx, key, &[]);
     Ok(PrecompileOutput::new(gas_cost, Bytes::new()))
+}
+
+/// rskj `Bridge.executeIfAuthorized`: the executor of a method that only its
+/// authorizer may call throws a `VMException` for anyone else, before the
+/// method runs. `UNAUTHORIZED_CALLER` is not its answer but that of the two
+/// methods that check for the union bridge contract themselves.
+fn require_authorizer(
+    sender: Address,
+    authorizer: Address,
+    refusal: &'static str,
+) -> Result<(), PrecompileError> {
+    if sender != authorizer {
+        return Err(PrecompileError::other(refusal));
+    }
+    Ok(())
 }
 
 /// rskj `UnionBridgeSupportImpl.validateCallerIsUnionBridge`, which throws.
@@ -646,16 +669,60 @@ mod tests {
         assert_eq!(cap, current * U256::from(2u64));
     }
 
-    /// Only the configured authorizer may move the cap.
+    /// rskj gives three methods an executor that throws for anyone but the
+    /// method's authorizer (`Bridge.executeIfAuthorized`), before the method
+    /// runs. None of them answers `UNAUTHORIZED_CALLER`: that is the answer of
+    /// the two methods that check for the union bridge contract themselves.
     #[test]
-    fn an_unauthorized_caller_cannot_move_the_locking_cap() {
+    fn the_authorizers_methods_throw_for_anyone_else() {
         let cfg = RskHardforkConfig::testnet();
+        let stranger = Address::repeat_byte(0xAA);
+        let constants = union_constants(&cfg);
+
         let mut c = ctx();
-        let args = (one_rbtc() * U256::from(2u64)).to_be_bytes::<32>();
-        let out = increase_locking_cap(&mut c, &args, 0, &cfg, Address::repeat_byte(0xAA)).unwrap();
-        let code = i64::from_be_bytes(out.bytes[24..32].try_into().unwrap());
-        assert_eq!(code, UnionResponse::UnauthorizedCaller.code());
+        let cap = (one_rbtc() * U256::from(2u64)).to_be_bytes::<32>();
+        assert!(increase_locking_cap(&mut c, &cap, 0, &cfg, stranger).is_err());
         assert_eq!(locking_cap(&mut c, &cfg), one_rbtc(), "unchanged");
+        // Each authorizer is its own method's alone.
+        let another = constants.change_transfer_permissions_authorizer;
+        assert!(increase_locking_cap(&mut c, &cap, 0, &cfg, another).is_err());
+
+        let both_off = [0u8; 64];
+        assert!(set_transfer_permissions(&mut c, &both_off, 0, &cfg, stranger).is_err());
+        assert!(
+            request_enabled(&mut c) && release_enabled(&mut c),
+            "unchanged"
+        );
+        let authorizer = constants.change_transfer_permissions_authorizer;
+        let out = set_transfer_permissions(&mut c, &both_off, 0, &cfg, authorizer).unwrap();
+        assert_eq!(code(out), UnionResponse::Success.code());
+
+        let mut address = [0u8; 32];
+        address[12..].copy_from_slice(union_bridge().as_slice());
+        assert!(set_contract_address_for_testnet(&mut c, &address, 0, &cfg, stranger).is_err());
+        assert_eq!(
+            contract_address(&mut c, &cfg),
+            constants.address,
+            "unchanged"
+        );
+        let authorizer = constants.change_address_authorizer;
+        let out = set_contract_address_for_testnet(&mut c, &address, 0, &cfg, authorizer).unwrap();
+        assert_eq!(code(out), UnionResponse::Success.code());
+        assert_eq!(contract_address(&mut c, &cfg), union_bridge());
+    }
+
+    /// `executeIfTestnetAndAuthorized` throws on mainnet before it asks who is
+    /// calling.
+    #[test]
+    fn the_contract_address_is_never_set_on_mainnet() {
+        let cfg = RskHardforkConfig::mainnet();
+        let mut c = ctx();
+        for caller in [
+            Address::repeat_byte(0xAA),
+            union_constants(&cfg).change_address_authorizer,
+        ] {
+            assert!(set_contract_address_for_testnet(&mut c, &[0u8; 32], 0, &cfg, caller).is_err());
+        }
     }
 
     // -- RSKIP529: the super and base events ------------------------------
