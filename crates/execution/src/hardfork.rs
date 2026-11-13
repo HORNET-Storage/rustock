@@ -570,6 +570,14 @@ impl RskHardforkConfig {
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Iris300
     }
 
+    /// RSKIP417 (Arrowhead600): the Bridge refuses a method reached by a kind
+    /// of call it does not accept (`Bridge.validateCallMessageType`), and a
+    /// method with nothing to return answers an empty array where it
+    /// answered null (`Bridge.calculateVoidReturnValue`).
+    pub fn has_rskip417(&self, block_number: u64) -> bool {
+        self.active_upgrade(block_number) >= RskNetworkUpgrade::Arrowhead600
+    }
+
     /// RSKIP219: updated minimum peg-in tx value (Iris300).
     pub fn has_rskip219(&self, block_number: u64) -> bool {
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Iris300

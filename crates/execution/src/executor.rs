@@ -5821,6 +5821,161 @@ mod tests {
         );
     }
 
+    /// One transaction at mainnet's `block` to a contract that reaches the
+    /// Bridge with `opcode`, `input` and 100,000 gas, then stores the call's
+    /// flag plus one in its slot 0. Answers whether the transaction
+    /// succeeded, that slot (2 after a call that succeeded, 1 after one that
+    /// failed, 0 where the contract never got to store it), and how many logs
+    /// the transaction left.
+    fn the_bridge_called_from_a_contract(
+        block: u64,
+        opcode: u8,
+        input: &[u8],
+    ) -> (bool, u64, usize) {
+        let sender = Address::repeat_byte(0xAA);
+        let contract = Address::repeat_byte(0xCC);
+        let code_with_input_at = |input_at: u16| {
+            // CODECOPY the input, which follows the code, to memory 0.
+            let mut code = vec![0x60, input.len() as u8, 0x61];
+            code.extend_from_slice(&input_at.to_be_bytes());
+            code.extend_from_slice(&[0x60, 0x00, 0x39]);
+            // No output, the input, and for CALL and CALLCODE no value.
+            code.extend_from_slice(&[0x60, 0x00, 0x60, 0x00, 0x60, input.len() as u8, 0x60, 0x00]);
+            if matches!(opcode, 0xf1 | 0xf2) {
+                code.extend_from_slice(&[0x60, 0x00]);
+            }
+            code.push(0x73);
+            code.extend_from_slice(crate::precompiles::BRIDGE_ADDR.as_slice());
+            code.extend_from_slice(&[0x62, 0x01, 0x86, 0xa0, opcode]);
+            // The flag plus one to slot 0, then STOP.
+            code.extend_from_slice(&[0x60, 0x01, 0x01, 0x60, 0x00, 0x55, 0x00]);
+            code
+        };
+        let mut code = code_with_input_at(code_with_input_at(0).len() as u16);
+        code.extend_from_slice(input);
+
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
+        let root = put_account(&root, store.as_ref(), &contract, 1, U256::ZERO);
+        let root = root.put(
+            &TrieKeySlice::from_key(&rustock_trie::code_key(&contract)),
+            &code,
+            store.as_ref(),
+        );
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+        let tx = rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(500_000),
+            to: Bytes::copy_from_slice(contract.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::new(),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
+        };
+        let result = executor
+            .execute_block(&dummy_header(block), &[(tx, sender)], &root, store.clone())
+            .expect("block");
+        let stored = result
+            .state_changes
+            .get(&contract)
+            .and_then(|account| account.storage.get(&U256::ZERO))
+            .map_or(0, |slot| slot.present_value.to::<u64>());
+        let outcome = &result.tx_results[0];
+        (outcome.success, stored, outcome.logs.len())
+    }
+
+    /// How a contract's call to the Bridge ends in rskj, era by era, at
+    /// mainnet's heights.
+    #[test]
+    fn a_contracts_call_to_the_bridge_ends_as_rskj_ends_it_in_each_era() {
+        let (call, callcode, delegatecall, staticcall) = (0xf1, 0xf2, 0xf4, 0xfa);
+        let selector = |signature: &str| crate::abi::selector(signature).to_vec();
+        // receiveHeaders(bytes[]) of no headers: the array's offset, then its
+        // length. Anyone may call it between RSKIP124 and RSKIP200, and it
+        // returns nothing.
+        let no_headers = {
+            let mut input = selector("receiveHeaders(bytes[])");
+            input.extend_from_slice(&U256::from(32).to_be_bytes::<32>());
+            input.extend_from_slice(&[0u8; 32]);
+            input
+        };
+        let (ended, failed, succeeded) = ((false, 0, 0), (true, 1, 0), (true, 2, 0));
+        let after = the_bridge_called_from_a_contract;
+
+        // Before RSKIP88 `Bridge.getGasForData` throws a NullPointerException
+        // for any call from a contract, which nothing in the VM catches: the
+        // contract ends there.
+        assert_eq!(after(700_000, call, &[0xde, 0xad, 0xbe, 0xef]), ended);
+        // A method with nothing to return answers null before RSKIP417.
+        // Before RSKIP150 `Program.memorySave` reads the null's length, and
+        // that too ends the contract.
+        assert_eq!(after(1_700_000, call, &no_headers), ended);
+        // From RSKIP150 `saveOutAfterExecution` skips a null.
+        assert_eq!(after(2_100_000, call, &no_headers), succeeded);
+        // From RSKIP197 `executePrecompiledAndHandleError` hands the null to
+        // `Memory.write`, which reads its length inside the try: the call
+        // fails and its track is rolled back. The Bridge wrote its logs
+        // straight into the calling program's list, and those stay. No data
+        // is releaseBtc, which from a contract only logs its refusal.
+        assert_eq!(after(4_000_000, call, &[]), (true, 1, 1));
+        // From RSKIP417 such a method answers an empty array.
+        assert_eq!(after(7_000_000, call, &[]), (true, 2, 1));
+        // And from RSKIP417 the Bridge checks the kind of call it was reached
+        // by, releaseBtc with no data included: CALL alone.
+        for kind in [callcode, delegatecall, staticcall] {
+            assert_eq!(after(7_000_000, kind, &[]), failed, "{kind:#x}");
+        }
+        // Before it, every kind of call reaches a method.
+        let height = selector("getBtcBlockchainBestChainHeight()");
+        for kind in [call, callcode, delegatecall, staticcall] {
+            assert_eq!(after(4_000_000, kind, &height), succeeded, "{kind:#x}");
+        }
+        assert_eq!(after(7_000_000, delegatecall, &height), failed);
+        assert_eq!(after(7_000_000, staticcall, &height), succeeded);
+    }
+
+    /// rskj `Bridge.validateLocalCall` asks only from RSKIP88 whether a method
+    /// is for local calls alone. Before it a transaction's own call runs such
+    /// a method and gets its answer; from it the call throws, which a
+    /// transaction's own call shows as no output.
+    #[test]
+    fn before_rskip88_a_transaction_runs_a_local_only_bridge_method() {
+        let output_at = |block: u64| {
+            let store = Arc::new(MemoryTrieStore::new());
+            let sender = Address::repeat_byte(0xAA);
+            let one_rbtc = U256::from(10u64).pow(U256::from(18));
+            let root = put_account(&TrieNode::empty(), store.as_ref(), &sender, 0, one_rbtc);
+            let tx = rustock_core::Transaction {
+                nonce: 0,
+                gas_price: U256::ZERO,
+                gas_limit: U256::from(100_000),
+                to: Bytes::copy_from_slice(crate::precompiles::BRIDGE_ADDR.as_slice()),
+                value: U256::ZERO,
+                input: Bytes::copy_from_slice(&crate::abi::selector("getFederationAddress()")),
+                v: 0,
+                r: U256::ZERO,
+                s: U256::ZERO,
+                cached_rlp: None,
+            };
+            let block_store =
+                Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+            let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+            let result = executor
+                .execute_block(&dummy_header(block), &[(tx, sender)], &root, store.clone())
+                .expect("block");
+            assert!(result.tx_results[0].success);
+            result.tx_results[0].output.clone()
+        };
+        assert!(!output_at(700_000).is_empty(), "before RSKIP88");
+        assert!(output_at(764_123).is_empty(), "from RSKIP88");
+    }
+
     /// rskj `doSUICIDE` (VM.java) charges NEW_ACCT_SUICIDE (25,000) whenever the
     /// beneficiary does not exist (`!track.isExist`), UNCONDITIONAL on the
     /// suiciding contract's balance. revm's selfdestruct instead gates the

@@ -880,8 +880,32 @@ impl RskPrecompileProvider {
             context.journal_mut().touch_account(inputs.target_address);
         }
 
+        // What the journal holds of logs before the call, to tell the call's
+        // own apart afterwards.
+        let logs_before = {
+            use revm::context_interface::JournalTr;
+            context.journal().logs().len()
+        };
+
         let exec_result = if *addr == BRIDGE_ADDR {
-            self.run_bridge(context, &input_bytes, inputs.gas_limit, inputs.caller, inputs.scheme, inputs.call_value())
+            // rskj gives the Bridge an internal transaction from the program
+            // that made the call (`getOwnerRskAddress`), with the value the
+            // opcode took off the stack. DELEGATECALL takes none, and revm's
+            // caller and value for it are those of the frame that delegates.
+            let (owner, value) = match inputs.scheme {
+                revm::interpreter::CallScheme::DelegateCall => {
+                    (inputs.target_address, revm::primitives::U256::ZERO)
+                }
+                _ => (inputs.caller, inputs.call_value()),
+            };
+            self.run_bridge(
+                context,
+                &input_bytes,
+                inputs.gas_limit,
+                owner,
+                inputs.scheme,
+                value,
+            )
         } else {
             self.run_remasc(context, &input_bytes, inputs.gas_limit)
         };
@@ -922,6 +946,17 @@ impl RskPrecompileProvider {
                 assert!(underflow, "gas pre-checked against the cost");
                 return Ok(Some(result));
             }
+            // A call that ends the contract that made it, in every era
+            // (`bridge::CALLER_ABORT_MARKER`): `RskHandler` halts the contract
+            // on the flag, as for a throw before RSKIP197 below.
+            if crate::bridge::ends_its_caller(e) {
+                self.aborts_caller
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                let underflow = result.gas.record_cost(inputs.gas_limit);
+                assert!(underflow, "spending exactly the forwarded gas");
+                result.result = InstructionResult::PrecompileError;
+                return Ok(Some(result));
+            }
             // Internal (depth>1) throw, by a Bridge method or by REMASC: rskj
             // `Program.executePrecompiledAndHandleError` consumes only
             // `requiredGas` and the CALL fails (pushes zero). Record that cost
@@ -941,6 +976,17 @@ impl RskPrecompileProvider {
                     assert!(underflow, "spending exactly the forwarded gas");
                     result.result = InstructionResult::PrecompileError;
                     return Ok(Some(result));
+                }
+                // The catch rolls back the call's track and nothing else. The
+                // Bridge wrote its logs straight into the calling program's
+                // list (`callToPrecompiledAddress` hands it
+                // `result.getLogInfoList()`), so those stay with the caller;
+                // `RskHandler` writes them again once revm has dropped them
+                // with this call's checkpoint.
+                {
+                    use revm::context_interface::JournalTr;
+                    let kept = context.journal().logs()[logs_before..].to_vec();
+                    context.chain_mut().kept_logs.extend(kept);
                 }
                 let underflow = result.gas.record_cost(spent);
                 assert!(underflow, "gas pre-checked against requiredGas");

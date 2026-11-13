@@ -63,6 +63,14 @@ pub struct RskChainExt {
     /// standing. Each holds rskj's storage-prefix marker (`setupContract`
     /// writes it as the creation begins), whatever code it ended with.
     pub created_in_block: std::collections::HashSet<Address>,
+    /// The logs a contract's call to the Bridge wrote before the call failed.
+    /// rskj's Bridge writes its logs straight into the list of the program
+    /// that called it (`Program.callToPrecompiledAddress` hands it
+    /// `result.getLogInfoList()`), and `executePrecompiledAndHandleError`
+    /// rolls back the call's track and nothing else, so the logs stay with
+    /// the caller. revm drops them with the call's checkpoint; they wait here
+    /// for `RskHandler` to write them again once that checkpoint is gone.
+    pub kept_logs: Vec<revm::primitives::Log>,
 }
 
 /// Raw-bytes storage overlay for the block being executed.

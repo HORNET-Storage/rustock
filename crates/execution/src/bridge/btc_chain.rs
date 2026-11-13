@@ -593,10 +593,12 @@ pub fn receive_headers<CTX: crate::RskContextTr>(
     // rskj `receiveHeaders` is a VOID method (BridgeMethods.RECEIVE_HEADERS
     // declares no output, Bridge::receiveHeaders is BridgeMethodExecutorVoid).
     // Bridge.execute therefore returns the void value — `null` before RSKIP417
-    // and EMPTY_BYTE_ARRAY afterwards (Bridge.calculateVoidReturnValue) — both
-    // of which give the caller RETURNDATASIZE 0. Returning a 32-byte int here
-    // makes a calling contract decode 32 bytes where rskj sees 0, forking the
-    // execution (mainnet #6,223,768 tx[0]: relay 0x82494fb1 OOGs vs success).
+    // and EMPTY_BYTE_ARRAY afterwards (Bridge.calculateVoidReturnValue). No
+    // output here stands for both; what a contract's call makes of the null,
+    // which differs by era, is `execute_bridge`'s to say. Returning a 32-byte
+    // int here makes a calling contract decode 32 bytes where rskj sees 0,
+    // forking the execution (mainnet #6,223,768 tx[0]: relay 0x82494fb1 OOGs
+    // vs success).
     Ok(PrecompileOutput::new(gas_cost, Bytes::new()))
 }
 

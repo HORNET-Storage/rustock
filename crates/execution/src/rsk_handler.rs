@@ -671,6 +671,10 @@ where
                         // account, or a failed pre-check (depth/endowment)
                         // resolves.
                         ItemOrResult::Result(result) => {
+                            // A precompile's failed call has had its
+                            // checkpoint reverted by now; the logs rskj leaves
+                            // with the caller go back in as the caller's.
+                            self.keep_precompile_logs(evm);
                             if let (Some(precompiles), Some(callee), FrameResult::Call(outcome)) =
                                 (&self.pre_rskip150_precompiles, callee, &result)
                             {
@@ -926,6 +930,16 @@ where
         evm.ctx().chain_mut().raw_storage.revert_frame(raw);
         if let Some(Ok(mut list)) = self.called_precompiles.as_ref().map(|list| list.lock()) {
             list.truncate(called);
+        }
+    }
+
+    /// Writes again the logs a contract's failed call to the Bridge leaves
+    /// with the contract (`RskChainExt::kept_logs`). They are the caller's
+    /// from here on, and go with it if it fails.
+    fn keep_precompile_logs(&mut self, evm: &mut EVM) {
+        use revm::context_interface::JournalTr;
+        for log in std::mem::take(&mut evm.ctx().chain_mut().kept_logs) {
+            evm.ctx().journal_mut().log(log);
         }
     }
 }

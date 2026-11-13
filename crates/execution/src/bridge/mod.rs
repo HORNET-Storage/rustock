@@ -506,6 +506,20 @@ pub fn internal_throw_marker_with_gas(gas: u64) -> PrecompileError {
     marker_with_gas(INTERNAL_BRIDGE_THROW_MARKER, gas)
 }
 
+/// Marker for a contract's call to the Bridge that ends the contract itself,
+/// in every era: an exception `Program.callToPrecompiledAddress` lets out of
+/// the VM, which `VM.steps` turns into the failure of the program that made
+/// the call, all its gas spent. `Bridge.getGasForData` throws one for any
+/// call from a contract before RSKIP88, and before RSKIP150
+/// `Program.memorySave` throws one on the null a method with nothing to
+/// return answers.
+pub const CALLER_ABORT_MARKER: &str = "rskj bridge call ends its caller";
+
+/// Whether a Bridge error is [`CALLER_ABORT_MARKER`].
+pub fn ends_its_caller(e: &PrecompileError) -> bool {
+    matches!(e, PrecompileError::Other(msg) if msg == CALLER_ABORT_MARKER)
+}
+
 /// Marker prefix for the rskj `Program.callToPrecompiledAddress` insufficient-
 /// gas branch: when `requiredGas > msg.getGas()` for an INTERNAL (depth>1)
 /// call, rskj does `refundGas(0); stackPushZero(); track.rollback()` — the
@@ -566,30 +580,34 @@ pub fn execute_bridge<CTX: crate::RskContextTr>(
     call_kind: BridgeCallKind,
     call_value: U256,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    // Empty input → releaseBtc (legacy behavior matching rskj)
-    if input.is_empty() {
-        let gas_cost = 23_000u64;
-        if gas_limit < gas_cost {
-            return Err(insufficient_gas_marker(ctx, gas_limit));
-        }
-        return execute_method(ctx, "releaseBtc", &[], gas_cost, config, block_store, use_v2, hardfork_cfg, tx_ctx, caller, call_depth, call_value);
+    let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
+    // rskj `BridgeUtils.isContractTx`: the Bridge was given an internal
+    // transaction, a contract's call.
+    let from_contract = call_depth > 1;
+
+    // rskj `Bridge.getGasForData` (Bridge.java:297): before RSKIP88 a call
+    // from a contract throws a NullPointerException before anything is charged
+    // or run. `Program.callToPrecompiledAddress` asks for the gas outside
+    // every try, so the exception leaves the VM whatever the era.
+    if from_contract && !hardfork_cfg.has_rskip88(block_number) {
+        return Err(PrecompileError::other(CALLER_ABORT_MARKER));
     }
 
-    // rskj Bridge.parseData: 1-3 byte data, an unknown selector, or a method
-    // not enabled at this block is a parse failure. Before RSKIP88 (orchid)
-    // execute() returns null — the tx SUCCEEDS, charged the flat releaseBtc
-    // cost without executing anything (mainnet #648,914 sent ASCII text as
-    // calldata). Afterwards it throws BridgeIllegalArgumentException.
-    let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
-    let parsed = if input.len() < 4 {
-        None
-    } else {
-        find_bridge_method(&[input[0], input[1], input[2], input[3]])
-            .filter(|m| m.enabled.is_enabled(hardfork_cfg, block_number))
+    // rskj Bridge.parseData: no data at all is releaseBtc with no arguments.
+    // 1-3 byte data, an unknown selector, or a method not enabled at this
+    // block is a parse failure. Before RSKIP88 (orchid) execute() returns
+    // null — the tx SUCCEEDS, charged the flat releaseBtc cost without
+    // executing anything (mainnet #648,914 sent ASCII text as calldata).
+    // Afterwards it throws BridgeIllegalArgumentException.
+    let parsed = match input.len() {
+        0 => find_bridge_method(&compute_selector("releaseBtc()")),
+        1..=3 => None,
+        _ => find_bridge_method(&[input[0], input[1], input[2], input[3]])
             // rskj `parseData` ABI-decodes the arguments; a malformed payload
             // (e.g. an out-of-bounds dynamic offset) is a parse failure too.
-            .filter(|m| abi_args_decode_ok(&input[4..], m.signature))
-    };
+            .filter(|m| abi_args_decode_ok(&input[4..], m.signature)),
+    }
+    .filter(|m| m.enabled.is_enabled(hardfork_cfg, block_number));
     let Some(method) = parsed else {
         // Which selector, and from where. A Bridge method that exists in rskj
         // and not here fails exactly like a malformed call, and the two are
@@ -636,7 +654,7 @@ pub fn execute_bridge<CTX: crate::RskContextTr>(
         return Err(marker_with_gas(INTERNAL_BRIDGE_THROW_MARKER, gas_cost));
     };
 
-    let args = &input[4..];
+    let args = input.get(4..).unwrap_or_default();
     let gas_cost = bridge_call_gas_cost(ctx, input, config, hardfork_cfg)?;
 
     if gas_limit < gas_cost {
@@ -646,15 +664,17 @@ pub fn execute_bridge<CTX: crate::RskContextTr>(
     // rskj `Bridge.validateCall` (Bridge.java:426) runs two gates after the gas
     // is charged, both throwing `BridgeIllegalArgumentException` → `VMException`
     // (consume `requiredGas`, CALL returns empty). The first is
-    // `validateLocalCall` (Bridge.java:431): post-RSKIP88, a LOCAL-ONLY method
+    // `validateLocalCall` (Bridge.java:431): from RSKIP88, a LOCAL-ONLY method
     // reached by a non-local call throws. Only `eth_call` is a local call, so
     // every on-chain CALL/transaction during block execution is non-local — a
     // local-only getter invoked on-chain always throws here and returns empty
     // (mainnet #6,223,900: a relay plain-CALLs `getFederationAddress`, which
-    // rskj empties so the relay's RETURNDATASIZE check sees 0).
+    // rskj empties so the relay's RETURNDATASIZE check sees 0). Before RSKIP88
+    // rskj does not ask, and a transaction's own call runs such a method.
     // `!isLocalCall()` in rskj's condition: a local call (eth_call,
     // estimateGas) reaches these getters, on-chain execution never does.
-    if !tx_ctx.local_call
+    if hardfork_cfg.has_rskip88(block_number)
+        && !tx_ctx.local_call
         && method_only_allows_local_calls(method.permission, hardfork_cfg, block_number)
     {
         use revm::context_interface::JournalTr;
@@ -664,18 +684,20 @@ pub fn execute_bridge<CTX: crate::RskContextTr>(
         return Err(marker_with_gas(INTERNAL_BRIDGE_THROW_MARKER, gas_cost));
     }
 
-    // rskj `Bridge.validateCallMessageType` (Bridge.java:446): after the gas is
-    // charged, a method reached via a call type it does not accept throws. The
-    // default is CALL-only; the read getters also accept STATICCALL; no method
-    // accepts DELEGATECALL/CALLCODE. The throw consumes `requiredGas` and the
-    // CALL returns zero (mainnet #6,223,797-adjacent #6,223,812: a relay
-    // DELEGATECALLs receiveHeader, which rskj rejects so RETURNDATASIZE is 0).
+    // rskj `Bridge.validateCallMessageType` (Bridge.java:446): from RSKIP417,
+    // after the gas is charged, a method reached via a call type it does not
+    // accept throws. The default is CALL-only; the read getters also accept
+    // STATICCALL; no method accepts DELEGATECALL/CALLCODE. The throw consumes
+    // `requiredGas` and the CALL returns zero (mainnet #6,223,797-adjacent
+    // #6,223,812: a relay DELEGATECALLs receiveHeader, which rskj rejects so
+    // RETURNDATASIZE is 0). Before RSKIP417 rskj does not ask, and every kind
+    // of call runs the method.
     let accepts_call = match call_kind {
         BridgeCallKind::Call => true,
         BridgeCallKind::StaticCall => method_allows_static_call(method.name),
         BridgeCallKind::DelegateOrCallCode => false,
     };
-    if !accepts_call {
+    if hardfork_cfg.has_rskip417(block_number) && !accepts_call {
         use revm::context_interface::JournalTr;
         if ctx.journal().depth() == 1 {
             return Err(marker_with_gas(INVISIBLE_EXCEPTION_MARKER, gas_cost));
@@ -691,6 +713,28 @@ pub fn execute_bridge<CTX: crate::RskContextTr>(
     // depth-aware markers so the precompile frame records exactly `gas_cost`.
     // (OOG and Fatal keep their original semantics.)
     match result {
+        // rskj `Bridge.calculateVoidReturnValue`: before RSKIP417 a method with
+        // nothing to return answers null. To a transaction's own call that is
+        // no output. A contract's call hands the null to the VM.
+        Ok(output)
+            if from_contract
+                && output.bytes.is_empty()
+                && !output.reverted
+                && !hardfork_cfg.has_rskip417(block_number) =>
+        {
+            if hardfork_cfg.has_rskip197(block_number) {
+                // `Program.executePrecompiledAndHandleError` passes it to
+                // `Memory.write`, which reads its length inside the try: the
+                // call fails for its `requiredGas`, its track rolled back.
+                Err(marker_with_gas(INTERNAL_BRIDGE_THROW_MARKER, gas_cost))
+            } else if hardfork_cfg.has_rskip150(block_number) {
+                // `Program.saveOutAfterExecution` skips a null.
+                Ok(output)
+            } else {
+                // `Program.memorySave` reads its length, outside any try.
+                Err(PrecompileError::other(CALLER_ABORT_MARKER))
+            }
+        }
         Err(e) if !e.is_oog() && !matches!(e, PrecompileError::Fatal(_)) => {
             use revm::context_interface::JournalTr;
             if ctx.journal().depth() == 1 {
