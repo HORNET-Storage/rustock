@@ -185,6 +185,22 @@ pub fn is_recording() -> bool {
     SINK.with(|s| s.borrow().is_some())
 }
 
+/// How many records this thread holds: where what is recorded next begins,
+/// for [`truncate`].
+pub fn len() -> usize {
+    SINK.with(|s| s.borrow().as_ref().map_or(0, Vec::len))
+}
+
+/// Takes back what was recorded since [`len`] said `len`: the decisions made
+/// under a frame that failed, which stand no more than its writes do.
+pub fn truncate(len: usize) {
+    SINK.with(|s| {
+        if let Some(v) = s.borrow_mut().as_mut() {
+            v.truncate(len);
+        }
+    });
+}
+
 /// Records one decision. A no-op unless a tool called [`start`].
 pub fn record(
     kind: SilentKind,
@@ -240,6 +256,23 @@ mod tests {
         assert!(drain().is_empty(), "drain takes what it returned");
         assert!(finish().is_empty());
         assert!(!is_recording());
+    }
+
+    #[test]
+    fn what_was_recorded_since_a_length_can_be_taken_back() {
+        assert_eq!(len(), 0, "nothing is held while nobody records");
+        start();
+        record(SilentKind::PeginAccepted, 8, 0, vec![]);
+        let mark = len();
+        record(SilentKind::PeginRefunded, 8, 1, vec![]);
+        record(SilentKind::PegoutRequested, 8, 1, vec![]);
+        assert_eq!(len(), 3);
+        truncate(mark);
+        let kept = finish();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].kind, SilentKind::PeginAccepted);
+        truncate(0);
+        assert!(!is_recording(), "taking back records starts no recording");
     }
 
     #[test]

@@ -108,6 +108,11 @@ pub struct ProcessedBlock {
     pub state_root_hash: B256,
     pub receipts_root: B256,
     pub logs_bloom: Bloom,
+    /// The Bridge's decisions this block made that it logs no event for
+    /// (`crate::silent`), which [`BlockProcessor::commit_receipts`] stores
+    /// with it. Empty unless the processor records them
+    /// ([`BlockProcessor::with_legacy_event_store`]).
+    pub unlogged_peg_events: Vec<crate::silent::SilentRecord>,
 }
 
 /// The running gas total for the receipt at `index`.
@@ -221,25 +226,20 @@ impl BlockProcessor {
         self
     }
 
-    /// Share a sender cache with whoever else recovers senders -- the pool,
-    /// above all. Handing the same `Arc` to both is the point: a transaction
-    /// the pool admitted should not be recovered a second time when the
-    /// block carrying it executes.
-    /// Records peg events the Bridge does not emit, into `store`.
-    ///
-    /// Opens the thread-local sink here, because recording is a property of
-    /// the thread that executes and this is the thread that will. Sublists
-    /// running in parallel open their own and the coordinator absorbs them
-    /// (`silent::absorb`), so a parallel block is captured whole.
+    /// Records peg events the Bridge does not emit, into `store`: each block
+    /// this processor runs records its own (see `finish_execute`).
     pub fn with_legacy_event_store(
         mut self,
         store: Arc<rustock_storage::legacy_event_store::LegacyEventStore>,
     ) -> Self {
-        crate::silent::start();
         self.legacy_events = Some(store);
         self
     }
 
+    /// Share a sender cache with whoever else recovers senders -- the pool,
+    /// above all. Handing the same `Arc` to both is the point: a transaction
+    /// the pool admitted should not be recovered a second time when the
+    /// block carrying it executes.
     pub fn with_sender_cache(
         mut self,
         cache: Arc<crate::sender_cache::SenderCache>,
@@ -343,16 +343,25 @@ impl BlockProcessor {
         trie_store: Arc<dyn TrieStore>,
         save_out: Option<&mut std::time::Duration>,
     ) -> Result<ProcessedBlock, ProcessError> {
-        // Recording is thread-local, and the thread that built this processor
-        // need not be the one executing. Opening the sink lazily here makes
-        // that irrelevant: whichever thread arrives, it records. Without it a
-        // node whose import loop runs off the main thread would record
-        // nothing and look exactly like a chain with no Flyover peg-ins.
-        if self.legacy_events.is_some() && !crate::silent::is_recording() {
+        // The Bridge's unlogged decisions are recorded on the thread that
+        // executes (`crate::silent`), so recording is opened here, fresh, and
+        // closed again when the block is done, and what was recorded goes
+        // with the block, to be stored where it is committed, on any thread.
+        // Nothing else the thread runs is recorded -- a local call, a trace,
+        // a block built for the miner -- and a block that fails leaves
+        // nothing behind for the next to store.
+        let recording = self.legacy_events.is_some();
+        if recording {
             crate::silent::start();
         }
         let started = std::time::Instant::now();
-        let out = self.execute_block_inner(block, state_root, trie_store, save_out);
+        let mut out = self.execute_block_inner(block, state_root, trie_store, save_out);
+        if recording {
+            let decisions = crate::silent::finish();
+            if let Ok(processed) = &mut out {
+                processed.unlogged_peg_events = decisions;
+            }
+        }
         // Timed whether or not it succeeded: a block that fails still spent
         // the time, and a measurement that only counts successes reads as a
         // faster node the worse things get.
@@ -584,6 +593,7 @@ impl BlockProcessor {
             state_root_hash,
             receipts_root,
             logs_bloom: block_bloom,
+            unlogged_peg_events: Vec::new(),
         })
     }
 
@@ -1090,10 +1100,9 @@ impl BlockProcessor {
         Ok(result)
     }
 
-    /// The commit half of [`BlockProcessor::process_and_commit`]: store the
-    /// receipts of a processed block and index its transactions and Bridge
-    /// events.
-    /// Records this block's peg events that the Bridge did not emit.
+    /// Records this block's peg events that the Bridge did not emit: the
+    /// decisions `decisions` holds, which are the block's own
+    /// ([`ProcessedBlock::unlogged_peg_events`]).
     ///
     /// Runs beside `index_bridge_events` deliberately: that keeps the index
     /// of what the Bridge *did* log current as blocks arrive, and this keeps
@@ -1111,15 +1120,18 @@ impl BlockProcessor {
     /// Public so it can be driven without `commit_receipts`, which also
     /// writes receipts and so cannot run against a read-only store. The node
     /// reaches it through `commit_receipts`; a test reaches it directly.
-    pub fn record_unlogged_peg_events(&self, block: &Block) -> Result<(), ProcessError> {
+    pub fn record_unlogged_peg_events(
+        &self,
+        block: &Block,
+        decisions: &[crate::silent::SilentRecord],
+    ) -> Result<(), ProcessError> {
         let Some(store) = &self.legacy_events else { return Ok(()) };
-        let decisions = crate::silent::drain();
         if decisions.is_empty() {
             return Ok(());
         }
         let mut rows = Vec::new();
         let mut log_index: u32 = 0;
-        for d in &decisions {
+        for d in decisions {
             // A record that does not say whether the Bridge logged it is
             // refused, not guessed at -- see `legacy_events::reconstructable`.
             if !matches!(crate::bridge::legacy_events::reconstructable(d), Ok(true)) {
@@ -1149,6 +1161,9 @@ impl BlockProcessor {
         Ok(())
     }
 
+    /// The commit half of [`BlockProcessor::process_and_commit`]: store the
+    /// receipts of a processed block, index its transactions and Bridge
+    /// events, and record the peg events it made that the Bridge did not log.
     pub fn commit_receipts(
         &self,
         block: &Block,
@@ -1180,7 +1195,7 @@ impl BlockProcessor {
                 crate::precompiles::BRIDGE_ADDR,
             )
             .map_err(ProcessError::Storage)?;
-        self.record_unlogged_peg_events(block)?;
+        self.record_unlogged_peg_events(block, &result.unlogged_peg_events)?;
         Ok(())
     }
 
@@ -1688,6 +1703,75 @@ mod tests {
         processor
             .execute_block(&block, &root, store)
             .expect("a constructor's Bridge call bars no sublist");
+    }
+
+    /// The Bridge's unlogged decisions are recorded fresh for each block and
+    /// go with it (`ProcessedBlock::unlogged_peg_events`). What the thread
+    /// held before the block -- here a decision as a local call made one on
+    /// a thread an earlier block had left recording -- does not go with it,
+    /// and the thread records nothing once the block is done, so nothing
+    /// else it runs is stored as the chain's.
+    #[test]
+    fn a_block_carries_only_its_own_peg_decisions() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = Arc::new(
+            rustock_storage::legacy_event_store::LegacyEventStore::open(
+                dir.path().to_str().unwrap(),
+            )
+            .unwrap(),
+        );
+        let (block, root, store, block_store) = bridge_calling_block(None, None);
+        let processor = BlockProcessor::new(RskHardforkConfig::testnet(), block_store)
+            .with_legacy_event_store(events);
+        crate::silent::start();
+        crate::silent::record(crate::silent::SilentKind::PeginAccepted, 1, 0, vec![]);
+        let processed = processor
+            .execute_block(&block, &root, store)
+            .expect("block");
+        assert!(
+            processed.unlogged_peg_events.is_empty(),
+            "{:?}",
+            processed.unlogged_peg_events
+        );
+        assert!(
+            !crate::silent::is_recording(),
+            "the thread records once the block is done"
+        );
+    }
+
+    /// What a block carries is what its commit stores, on whatever thread it
+    /// commits: a decision the Bridge logs no event for becomes that event,
+    /// filed under the block.
+    #[test]
+    fn a_commit_stores_the_peg_decisions_its_block_carries() {
+        use crate::silent::{FieldValue, SilentKind, SilentRecord};
+        let dir = tempfile::tempdir().unwrap();
+        let events = Arc::new(
+            rustock_storage::legacy_event_store::LegacyEventStore::open(
+                dir.path().to_str().unwrap(),
+            )
+            .unwrap(),
+        );
+        let (block, root, store, block_store) = bridge_calling_block(None, None);
+        let processor = BlockProcessor::new(RskHardforkConfig::testnet(), block_store)
+            .with_legacy_event_store(events.clone());
+        let mut processed = processor
+            .execute_block(&block, &root, store)
+            .expect("block");
+        let number = block.header.number;
+        processed.unlogged_peg_events = vec![SilentRecord {
+            kind: SilentKind::PegoutRequested,
+            block: number,
+            tx_index: 0,
+            fields: vec![
+                ("rskTxHash", FieldValue::Bytes(vec![1; 32])),
+                ("btcTxHash", FieldValue::Bytes(vec![2; 32])),
+                ("amountSat", FieldValue::U64(5)),
+            ],
+        }];
+        processor.commit_receipts(&block, &processed).unwrap();
+        let topic = crate::bridge::legacy_events::release_requested(&[1; 32], &[2; 32], 5).topic0;
+        assert_eq!(events.topics().unwrap(), vec![(topic, 1, number, number)]);
     }
 
     /// A block whose transactions reach nothing of the sort is unaffected,

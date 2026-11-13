@@ -3,16 +3,15 @@
 //! The offline reconstruction is well covered: `verify_range
 //! --record-legacy-events` drives `events_for` directly and has unit tests
 //! around every branch. The **live** path does not go through any of that.
-//! It runs inside `BlockProcessor::process_block_timed`, where the records
-//! are drained from a thread-local sink that `execute_block` opens and
-//! `commit_receipts` empties.
+//! It runs inside `BlockProcessor::process_block_timed`, which opens a
+//! thread-local sink for the block, closes it when the block is done and
+//! hands what was recorded on with the block (`ProcessedBlock::
+//! unlogged_peg_events`) for `commit_receipts` to store.
 //!
-//! Three things can go wrong there and in no unit test:
+//! Two things can go wrong there and in no unit test:
 //!
-//! - the sink is opened on one thread and drained on another, so nothing is
+//! - the sink is never opened on the thread that executes, so nothing is
 //!   ever recorded and the store looks like a chain with no Flyover peg-ins;
-//! - the drain happens before the events are synthesised, or after something
-//!   else has already emptied it;
 //! - the gate suppresses what it should keep.
 //!
 //! Each failure is silent — an empty store is indistinguishable from a quiet
@@ -82,16 +81,16 @@ fn a_flyover_pegin_is_recorded_through_the_live_commit_path() {
         .with_legacy_event_store(Arc::clone(&events));
 
     // The import loop does these two in sequence (`sync/src/import.rs`):
-    // `process_block_timed` executes and fills the thread-local sink, and
-    // `commit_receipts` empties it. The recording half is called directly
+    // `process_block_timed` executes and records, and `commit_receipts`
+    // stores what the block carries. The recording half is called directly
     // here because the other half of `commit_receipts` writes receipts, and
     // this test runs against the node's real store, opened read-only.
     let mut timings = rustock_execution::ProcessTimings::default();
-    processor
+    let processed = processor
         .process_block_timed(&block, &pre, trie.clone(), &mut timings)
         .expect("block executes");
     processor
-        .record_unlogged_peg_events(&block)
+        .record_unlogged_peg_events(&block, &processed.unlogged_peg_events)
         .expect("records the events the Bridge did not emit");
 
     let topic = rustock_execution::bridge::legacy_events::pegin_btc(

@@ -15387,4 +15387,116 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
             );
         }
     }
+
+    /// The Bridge's unlogged decisions go with the block that made them
+    /// (`ProcessedBlock::unlogged_peg_events`), and only those that stand. In
+    /// `relay` the contract the transaction calls hands the registration to
+    /// the Bridge, which refunds the peg-in: the block carries that, and the
+    /// thread records nothing once the block is done. Where a contract calls
+    /// the relay instead, and the relay's code ends in REVERT, nothing of the
+    /// registration stands and the block carries nothing of it: a frame that
+    /// fails takes back the decisions made under it, as it does its writes.
+    /// Where the relay ends as it does and the contract then calls one that
+    /// reverts, the registration stands, and so does what it decided.
+    #[test]
+    fn a_block_carries_the_peg_decisions_that_stand() {
+        let runs = rskj_runs(include_str!("bridge/testdata/rskj_refunded_pegins.txt"));
+        let run = run_named(&runs, "relay");
+        let relay = Address::repeat_byte(0xa1);
+        let moved = Address::repeat_byte(0xb2);
+        let reverts = Address::repeat_byte(0xc3);
+        // The relay's code, which ends in STOP, and the same ending in REVERT.
+        let relay_code = run
+            .accounts
+            .iter()
+            .find(|account| account.0 == relay)
+            .map(|account| account.3.clone())
+            .unwrap();
+        assert_eq!(relay_code.last(), Some(&0x00));
+        let relay_reverting = [
+            &relay_code[..relay_code.len() - 1],
+            &[0x60, 0x00, 0x60, 0x00, 0xfd],
+        ]
+        .concat();
+        // A CALL of `to` with all the gas, with the call data or none,
+        // popping its flag.
+        let call = |to: &Address, data: bool| {
+            let size: &[u8] = if data { &[0x36] } else { &[0x60, 0x00] };
+            [
+                &[0x60, 0x00, 0x60, 0x00][..],
+                size,
+                &[0x60, 0x00, 0x60, 0x00, 0x73],
+                to.as_slice(),
+                &[0x5a, 0xf1, 0x50],
+            ]
+            .concat()
+        };
+        let copy_call_data = [0x36, 0x60, 0x00, 0x60, 0x00, 0x37];
+        let decisions = |codes: &[(Address, Vec<u8>)]| {
+            let (store, mut root) = state_of_rskj_run(run);
+            for (address, code) in codes {
+                if *address != relay {
+                    root = put_account(&root, store.as_ref(), address, 1, U256::ZERO);
+                }
+                let key = rustock_trie::code_key(address);
+                root = root.put(&TrieKeySlice::from_key(&key), code, store.as_ref());
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let events = Arc::new(
+                rustock_storage::legacy_event_store::LegacyEventStore::open(
+                    dir.path().to_str().unwrap(),
+                )
+                .unwrap(),
+            );
+            let block_store =
+                Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+            let processor = crate::processor::BlockProcessor::new(
+                RskHardforkConfig::rskj_regtest(),
+                block_store,
+            )
+            .with_bridge_constants(crate::bridge::constants::BridgeConstants::rskj_regtest())
+            .with_legacy_event_store(events);
+            let block = rustock_core::Block {
+                header: Header {
+                    difficulty: U256::from(1),
+                    ..dummy_header(10)
+                },
+                transactions: run.transactions.iter().map(|(tx, _)| tx.clone()).collect(),
+                ommers: vec![],
+            };
+            let processed = processor
+                .execute_block(&block, &root, store.clone())
+                .expect("block");
+            assert!(
+                !crate::silent::is_recording(),
+                "the thread records once the block is done"
+            );
+            processed
+                .unlogged_peg_events
+                .iter()
+                .map(|decision| decision.kind)
+                .collect::<Vec<_>>()
+        };
+        let stands = decisions(&[]);
+        assert!(
+            stands.contains(&crate::silent::SilentKind::PeginRefunded),
+            "{stands:?}"
+        );
+        let under =
+            |then: &[u8]| [&copy_call_data[..], &call(&moved, true), then, &[0x00]].concat();
+        assert_eq!(
+            decisions(&[(moved, relay_reverting), (relay, under(&[]))]),
+            Vec::new(),
+            "the relay reverts"
+        );
+        assert_eq!(
+            decisions(&[
+                (moved, relay_code.clone()),
+                (reverts, vec![0x60, 0x00, 0x60, 0x00, 0xfd]),
+                (relay, under(&call(&reverts, false))),
+            ]),
+            stands,
+            "a call after the relay's reverts"
+        );
+    }
 }

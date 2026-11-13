@@ -181,6 +181,10 @@ struct OpenFrame {
     /// (`RskChainExt::debts`), which a frame that fails leaves as it was: the
     /// journal gives back what they held.
     debts: crate::raw_storage::Debts,
+    /// How many of the Bridge's unlogged decisions the thread held as it
+    /// opened (`crate::silent`): those made under a frame that fails stand
+    /// no more than its writes do, and go with them.
+    silent: usize,
     /// It runs the constructor of a CREATE or CREATE2, where the transaction's
     /// own program doesn't: rskj drops what such a program counts as called
     /// (`note_call`).
@@ -1236,14 +1240,16 @@ where
             raw,
             called,
             debts,
+            silent: crate::silent::len(),
             creation,
         });
     }
 
     /// The innermost frame of contract code ends, having `committed` or not.
     /// One that didn't takes back what the precompiles called under it wrote
-    /// outside revm's journal, and what was done under it to what a local
-    /// call's accounts owe (see `frames`).
+    /// outside revm's journal, the Bridge's unlogged decisions made under
+    /// it, and what was done under it to what a local call's accounts owe
+    /// (see `frames`).
     fn close_frame(&mut self, evm: &mut EVM, committed: bool) {
         let Some(frame) = self.frames.pop() else {
             return;
@@ -1252,6 +1258,7 @@ where
             return;
         }
         evm.ctx().chain_mut().raw_storage.revert_frame(frame.raw);
+        crate::silent::truncate(frame.silent);
         evm.ctx().chain_mut().debts = frame.debts;
         if let Some(Ok(mut list)) = self.called_precompiles.as_ref().map(|list| list.lock()) {
             list.truncate(frame.called);
