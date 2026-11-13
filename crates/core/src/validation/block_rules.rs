@@ -445,10 +445,14 @@ pub const TX_EXECUTION_THREADS: usize = 2;
 
 /// Validates the sublist edges against the block's transaction count.
 ///
-/// `edges` is `None` for a version-0 header, and `Some(&[])` means "all
-/// transactions in the sequential sublist" — both are valid and both return
-/// `Ok`. The distinction is preserved because the two encode differently and
-/// therefore hash differently.
+/// `Some(&[])` means "all transactions in the sequential sublist", and is
+/// valid. `edges` is `None` for a header that has none: one from before the
+/// rule, or one whose extension came beside the block's body without them
+/// (rskj `BlockHeaderExtensionV1.fromEncoded`, `BlockHeaderExtensionV2`
+/// alike). rskj's rule reads `edges.length` with no null check, so where it
+/// is active a header without edges makes it throw, and the block is not
+/// imported. The distinction from empty is preserved because the two encode
+/// differently and therefore hash differently.
 pub fn validate_tx_execution_sublists_edges(
     edges: Option<&[i16]>,
     transaction_count: usize,
@@ -457,7 +461,11 @@ pub fn validate_tx_execution_sublists_edges(
     if !active {
         return Ok(());
     }
-    let Some(edges) = edges else { return Ok(()) };
+    let Some(edges) = edges else {
+        return Err(ValidationError::InvalidSublistEdges {
+            reason: "the header has no execution list edges".to_string(),
+        });
+    };
     if edges.is_empty() {
         return Ok(());
     }
@@ -536,12 +544,19 @@ mod sublist_edges_tests {
         assert!(check(Some(&[])).is_ok());
     }
 
-    /// A version-0 header has no edges at all. Distinct from empty, and also
-    /// valid -- the two encode and hash differently, so the distinction is
-    /// carried rather than flattened.
+    /// Not in rskj's suite. A header has no edges at all where its extension
+    /// came without them (`BlockHeaderExtensionV1.fromEncoded` gives null for
+    /// an extension of one element, `V2` for one of two). rskj's rule reads
+    /// `edges.length` with no null check, so it throws and the block is not
+    /// imported. Distinct from empty, which is every transaction in the
+    /// sequential sublist and valid.
     #[test]
-    fn absent_edges_are_valid_and_distinct_from_empty() {
-        assert!(check(None).is_ok());
+    fn absent_edges_are_refused_and_distinct_from_empty() {
+        assert!(matches!(
+            check(None),
+            Err(ValidationError::InvalidSublistEdges { .. })
+        ));
+        assert!(check(Some(&[])).is_ok());
     }
 
     /// rskj `blockWithTooManyEdges`. The bound is rskj's

@@ -1726,10 +1726,12 @@ mod tests {
             testnet.validate_block_body_rules(&block(Some(vec![])), None),
             Ok(())
         );
-        assert_eq!(
+        // A header whose extension came without edges: rskj's rule throws on
+        // the null, and the block is not imported.
+        assert!(matches!(
             testnet.validate_block_body_rules(&block(None), None),
-            Ok(())
-        );
+            Err(ValidationError::InvalidSublistEdges { .. })
+        ));
 
         // With rskip351 moved off reed810, rskj runs the block as one list and
         // never reads its edges.
