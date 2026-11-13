@@ -14,6 +14,7 @@
 #![allow(dead_code)] // Each example uses a different subset.
 
 use anyhow::{Context, Result};
+use rustock_core::config::ActivationHeights;
 use rustock_core::Block;
 use rustock_execution::RskHardforkConfig;
 use rustock_storage::epoch_store::{EpochConfig, EpochTrieStore};
@@ -26,18 +27,28 @@ use std::sync::Arc;
 pub const MAINNET: u64 = 30;
 pub const TESTNET: u64 = 31;
 
-/// The consensus rules to replay under.
+/// The consensus rules to replay under, with the upgrade heights headers are
+/// read by.
 ///
 /// Replaying a testnet block under mainnet rules compares against the wrong
 /// activation heights, REMASC config and bridge constants. That has already
 /// cost one investigation, so the selection is explicit rather than defaulted
 /// inside each tool.
+///
+/// The node installs its network's heights before it reads a header, and so
+/// does this: a header is read, and hashed, by its own network's heights, and
+/// under mainnet's a testnet header from between the two chains' papyrus200,
+/// or from testnet's reed810, does not decode at all. The heights can be
+/// installed once per process, and the first header read installs mainnet's,
+/// so call this before opening the stores.
 pub fn hardfork_for(network_id: u64) -> RskHardforkConfig {
-    match network_id {
-        MAINNET => RskHardforkConfig::mainnet(),
-        TESTNET => RskHardforkConfig::testnet(),
-        _ => RskHardforkConfig::regtest(),
-    }
+    let (heights, rules) = match network_id {
+        MAINNET => (ActivationHeights::mainnet(), RskHardforkConfig::mainnet()),
+        TESTNET => (ActivationHeights::testnet(), RskHardforkConfig::testnet()),
+        _ => (ActivationHeights::regtest(), RskHardforkConfig::regtest()),
+    };
+    heights.install();
+    rules
 }
 
 /// An opened, read-only view of a node's databases, positioned at the

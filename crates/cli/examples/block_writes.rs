@@ -39,11 +39,12 @@ fn main() -> Result<()> {
     let number: u64 = args.next().ok_or_else(|| anyhow::anyhow!(USAGE))?.parse()?;
     let network_id: u64 = args.next().map(|a| a.parse()).transpose()?.unwrap_or(support::MAINNET);
     let trie_dir = args.next();
+    // Before the stores open: headers are read by the network's heights.
+    let hardfork_cfg = support::hardfork_for(network_id);
 
     let replay = Replay::open(&data_dir, trie_dir.as_deref())?;
     replay.ensure_replayable(number)?;
 
-    let hardfork_cfg = support::hardfork_for(network_id);
     eprintln!(
         "replaying #{}..=#{number} on network-id {network_id} (chain_id {})",
         replay.exec_number + 1,

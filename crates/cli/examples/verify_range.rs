@@ -353,6 +353,9 @@ fn main() -> Result<()> {
     let from = *targets.first().expect("non-empty");
     let to = *targets.last().expect("non-empty");
     let network_id: u64 = option(&options, "--network-id", support::TESTNET)?;
+    // Before any header is read or built: headers are read by the network's
+    // heights.
+    let hardfork_cfg = support::hardfork_for(network_id);
     let scratch: Option<String> =
         options.iter().rev().find(|(k, _)| k == "--scratch").map(|(_, v)| v.clone());
     // 0 disables the stop, for a run that is deliberately exhaustive.
@@ -581,7 +584,6 @@ fn main() -> Result<()> {
         carried = Some(genesis);
     }
 
-    let hardfork_cfg = support::hardfork_for(network_id);
     eprintln!(
         "verifying {} block(s) in #{from}..=#{to} on network-id {network_id} (chain_id {})",
         targets.len(),

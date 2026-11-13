@@ -47,12 +47,13 @@ fn main() -> Result<()> {
     let rskj_dir = args.next().ok_or_else(|| anyhow::anyhow!(USAGE))?;
     let network_id: u64 = args.next().map(|a| a.parse()).transpose()?.unwrap_or(support::MAINNET);
     let trie_dir = args.next();
+    // Before the stores open: headers are read by the network's heights.
+    let hardfork_cfg = support::hardfork_for(network_id);
 
     // --- rustock side: replay to <number>, get the computed post-state trie ---
     let replay = Replay::open(&data_dir, trie_dir.as_deref())?;
     replay.ensure_replayable(number)?;
 
-    let hardfork_cfg = support::hardfork_for(network_id);
     eprintln!("replaying on network-id {network_id} (chain_id {})", hardfork_cfg.chain_id);
     let processor = BlockProcessor::new(hardfork_cfg, replay.store.clone());
 
