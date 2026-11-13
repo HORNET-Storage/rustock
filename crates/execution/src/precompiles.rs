@@ -379,14 +379,15 @@ fn secp256k1_mul_run(input: &[u8], gas_limit: u64) -> Result<PrecompileOutput, P
     Ok(PrecompileOutput::new(gas_cost, encode_secp256k1_point(result).into()))
 }
 
-/// Read a 32-byte big-endian word from `data` at `offset`, zero-padding
-/// if the data is shorter than `offset + 32`.
+/// Read a 32-byte big-endian word from `data` at `offset`. rskj's
+/// `ByteUtil.parseWord` pads a word `data` ends inside with zeros on the
+/// right, and reads one past its end as zero.
 fn parse_word(data: &[u8], offset: usize) -> [u8; 32] {
     let mut word = [0u8; 32];
     if offset < data.len() {
         let end = std::cmp::min(offset + 32, data.len());
         let len = end - offset;
-        word[32 - len..].copy_from_slice(&data[offset..end]);
+        word[..len].copy_from_slice(&data[offset..end]);
     }
     word
 }
@@ -2133,6 +2134,26 @@ mod tests {
         let result = secp256k1_mul_run(&input, 10_000).unwrap();
         let expected = build_output(V1BY2X, V1BY2Y);
         assert_eq!(result.bytes.as_ref(), expected.as_slice());
+    }
+
+    /// rskj reads each word with `ByteUtil.parseWord`, which pads a word the
+    /// input ends inside with zeros on the right: the number keeps the bytes
+    /// it has as its high ones. A scalar of the one byte 0x01 multiplies the
+    /// point by 2^248, not by 1.
+    #[test]
+    fn a_word_the_input_ends_inside_is_padded_on_the_right() {
+        let mut input = build_mul_input("1", V1Y, "0");
+        input[64] = 0x01;
+        let by_two_to_the_248 = secp256k1_mul_run(&input, 10_000).unwrap();
+        let cut_after_one_byte = secp256k1_mul_run(&input[..65], 10_000).unwrap();
+        assert_eq!(cut_after_one_byte.bytes, by_two_to_the_248.bytes);
+        assert_ne!(
+            cut_after_one_byte.bytes.as_ref(),
+            build_output("1", V1Y).as_slice()
+        );
+
+        assert_eq!(parse_word(&[0xaa, 0xbb], 0)[..3], [0xaa, 0xbb, 0x00]);
+        assert_eq!(parse_word(&[0xaa; 40], 64), [0; 32]);
     }
 
     #[test]
