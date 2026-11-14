@@ -34,6 +34,7 @@
 use crate::internal_tx::InternalTx;
 use revm::context::result::HaltReason;
 use revm::context::JournalEntry;
+use revm::context_interface::journaled_state::entry::SelfdestructionRevertStatus;
 use revm::context_interface::journaled_state::account::JournaledAccountTr;
 use revm::context_interface::{Cfg, ContextTr, JournalTr};
 use revm::handler::instructions::InstructionProvider;
@@ -1084,9 +1085,21 @@ where
             // futureRefund directly), so this only applies to nested creates
             // (depth > 0). revm propagates the refund unconditionally; drop it here
             // before it merges into the caller (#6,362,186).
+            //
+            // A self-destruct's refund is no part of `futureRefund`: rskj counts it
+            // when the transaction ends, 24,000 for each account in the set of those
+            // destroyed (`TransactionExecutor.refundGas`), a set the constructor does
+            // hand up. So what stays of the refund is the self-destructs' (testnet
+            // #3,088,983). The frame's journal holds an entry for each, its own and
+            // those of the calls and creations it made that did not fail.
             if let FrameResult::Create(outcome) = &mut result {
-                if evm.frame_stack().get().depth > 0 {
-                    outcome.result.gas.set_refund(0);
+                let frame = evm.frame_stack().get();
+                let (depth, ran, journal_i) =
+                    (frame.depth, frame.is_finished(), frame.checkpoint.journal_i);
+                if depth > 0 {
+                    // A creation refused before it ran had no frame of its own.
+                    let kept = if ran { selfdestruct_refunds_since(evm, journal_i) } else { 0 };
+                    outcome.result.gas.set_refund(kept);
                 }
             }
             // RSKIP-144: a frame that fails is about to have its journal
@@ -1397,6 +1410,33 @@ where
     }
     let len = evm.ctx().journal_mut().journal().len();
     crate::collision::forget_entries_above(len);
+}
+
+/// What `rsk_selfdestruct` refunded since the journal's `journal_i`th entry,
+/// in frames that have not failed (a failed frame takes its entries with it):
+/// rskj's `SUICIDE_REFUND` for each account destroyed for the first time in
+/// the transaction, as rskj's set of deleted accounts holds each once.
+fn selfdestruct_refunds_since<EVM>(evm: &mut EVM, journal_i: usize) -> i64
+where
+    EVM: EvmTr<Context: ContextTr<Journal: JournalTr<State = EvmState> + JournalExt>>,
+{
+    let refund = evm.ctx().cfg().gas_params().selfdestruct_refund();
+    let destroyed = evm
+        .ctx()
+        .journal()
+        .journal()
+        .get(journal_i..)
+        .unwrap_or_default()
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry,
+                JournalEntry::AccountDestroyed { destroyed_status, .. }
+                    if *destroyed_status != SelfdestructionRevertStatus::RepeatedSelfdestruction
+            )
+        })
+        .count();
+    refund * destroyed as i64
 }
 
 /// `EvmTr::frame_run` with the create-return path replaced by

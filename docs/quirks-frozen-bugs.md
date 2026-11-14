@@ -616,7 +616,8 @@ from-scratch client that simply propagated the child frame's refund counter (as
 canonical EVM and revm do) would over-refund and fork. The top-level create
 *transaction* is unaffected: `TransactionExecutor.create` reads the constructor
 program's `futureRefund` directly (the constructor IS the tx's program), so its
-refund counts.
+refund counts. A nested constructor's self-destructs are refunded all the
+same, from the set of deleted accounts it does hand up (§96).
 
 mainnet #6,362,186 tx[3]: a contract is CREATE'd (depth 7) whose constructor sets
 storage slot 0 to an address then clears it back to 0 (a reentrancy-guard /
@@ -627,11 +628,12 @@ rskj's `CLEAR_SSTORE` and `RESET_SSTORE` both cost 5000, the misclassification i
 invisible in the per-opcode gas trajectory (the trace stayed in lockstep); only
 the post-execution refund diverged.
 
-**rustock**: `RskHandler::run_exec_loop` (crates/execution/src/rsk_handler.rs), just
-before `frame_return_result` merges a finished frame into its caller, zeroes the
+**rustock**: `RskHandler::exec_loop` (crates/execution/src/rsk_handler.rs), just
+before `frame_return_result` merges a finished frame into its caller, sets the
 gas refund of a `FrameResult::Create` whose frame depth is > 0 (a nested create;
-the top-level create tx is depth 0 and keeps its refund) via
-`outcome.result.gas.set_refund(0)`. Revert/halt creates already discard the
+the top-level create tx is depth 0 and keeps its refund) to what the
+self-destructs in it refunded (`selfdestruct_refunds_since`, §96), dropping the
+rest. Revert/halt creates already discard the
 refund, so only the success path matters. Test:
 `executor::tests::nested_create_constructor_refund_is_dropped_rskj` (a factory whose
 nested-CREATE constructor sets-then-clears a slot must cost MORE than a set-only
@@ -795,4 +797,47 @@ Bridge methods pass on as a throw. Test
 (without the fix the hard-coded script counts 3 and the peg-out builds).
 Verified: testnet #2,237,507 replays to the header's state and receipts
 roots.
+
+---
+
+## §96 A self-destruct in a nested constructor keeps its refund (testnet #3,088,983)
+
+rskj doesn't refund a self-destruct where it happens. `Program.suicide` adds
+the account to the program's set of deleted accounts, and
+`TransactionExecutor.refundGas` adds 24,000 (`SUICIDE_REFUND`) for each
+account in the transaction's set when the transaction ends, before the cap
+at half the gas used. `Program.finalizeContractCreation` hands a
+constructor's set up to its creator, where it drops the constructor's
+`futureRefund` (§65). So the self-destructs of a constructor, and those of
+the calls and creations it made that didn't fail, are refunded, while its
+`SSTORE` clears are not. An account counts once in a transaction however
+often it self-destructs, and a frame that fails takes its accounts with it:
+a constructor that fails, or after RSKIP453 one whose code can't be
+deposited, is rolled back before anything is handed up
+(`Program.createContractImpl`).
+
+**Trigger**: testnet #3,088,983 tx[0] (`0x24b9ae9b…`), a call to
+`0x286b8f4f…` that CREATEs `0x68e88b83…`, whose constructor self-destructs.
+rskj's receipt says 36,388 gas. rustock refunded nothing and used 60,388, so
+the block's gas used came to 182,156 against the header's 158,156.
+
+**Ground truth**: RSKj's release VETIVER-9.0.4: `TransactionExecutor.refundGas`
+is the only use of `SUICIDE_REFUND`, `Program.suicide` the only
+`addDeleteAccount`, and `finalizeContractCreation` passes on
+`deleteAccounts`; and the header of testnet #3,088,983.
+
+**rustock**: revm records the refund as SELFDESTRUCT runs (`rsk_selfdestruct`),
+on the frame's gas, and §65's rule dropped it with the rest of a nested
+constructor's refund. `RskHandler::exec_loop` now sets a nested create's
+refund to `selfdestruct_refunds_since` (crates/execution/src/rsk_handler.rs):
+24,000 for each `AccountDestroyed` entry in the frame's part of the journal
+that isn't a repeat in the transaction
+(`SelfdestructionRevertStatus::RepeatedSelfdestruction`), the same test
+`rsk_selfdestruct` refunds by. A frame that failed has had its entries taken
+out of the journal by then. Test
+`executor::tests::nested_create_constructor_selfdestruct_refund_is_kept_rskj`
+(a nested constructor that self-destructs costs 24,000 less than one that
+returns, after the two endings' own costs, with and without a slot set and
+cleared first; without the fix it fails by 24,000). Verified: testnet
+#3,088,983 replays to the header's state and receipts roots.
 

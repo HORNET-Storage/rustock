@@ -4672,6 +4672,112 @@ mod tests {
         );
     }
 
+    /// Testnet #3,088,983 tx[0] (gas 60,388 against the header's 36,388): a
+    /// contract CREATEs a child whose constructor self-destructs. rskj counts a
+    /// self-destruct's 24,000 refund when the transaction ends, from the set of
+    /// deleted accounts (`TransactionExecutor.refundGas`), and
+    /// `Program.finalizeContractCreation` hands that set up from a constructor;
+    /// what it drops is only the constructor's `futureRefund` (the test above).
+    /// So against a constructor that returns, one that self-destructs costs its
+    /// CALLER and SELFDESTRUCT (5,002) less the 24,000, also where both set and
+    /// clear a slot first, whose 15,000 stays dropped.
+    #[test]
+    fn nested_create_constructor_selfdestruct_refund_is_kept_rskj() {
+        // child init: optionally set then clear slot 0, then SELFDESTRUCT to the
+        // creator or RETURN empty code.
+        let child_init = |clear: bool, destruct: bool| -> Vec<u8> {
+            let mut c = Vec::new();
+            if clear {
+                c.extend_from_slice(&[0x60, 0x01, 0x60, 0x00, 0x55]); // slot0 = 1
+                c.extend_from_slice(&[0x60, 0x00, 0x60, 0x00, 0x55]); // slot0 = 0
+            }
+            if destruct {
+                c.extend_from_slice(&[0x33, 0xff]); // CALLER SELFDESTRUCT
+            } else {
+                c.extend_from_slice(&[0x60, 0x00, 0x60, 0x00, 0xf3]); // RETURN empty
+            }
+            c
+        };
+        // factory runtime: MSTORE the child init (right-aligned), then CREATE it.
+        let factory_runtime = |init: &[u8]| -> Vec<u8> {
+            let n = init.len();
+            assert!((1..=32).contains(&n));
+            let off = (32 - n) as u8;
+            let mut r = vec![0x5f + n as u8]; // PUSH{n}
+            r.extend_from_slice(init);
+            r.extend_from_slice(&[0x60, 0x00, 0x52]); // PUSH1 0 MSTORE
+            r.extend_from_slice(&[0x60, n as u8]); // PUSH1 size
+            r.extend_from_slice(&[0x60, off]); // PUSH1 offset
+            r.extend_from_slice(&[0x60, 0x00, 0xf0, 0x00]); // PUSH1 0 (value) CREATE STOP
+            r
+        };
+        // deploy wrapper: CODECOPY the runtime (after the 12-byte prefix) + RETURN.
+        let deploy_init = |runtime: &[u8]| -> Vec<u8> {
+            let l = runtime.len() as u8;
+            let mut d = vec![
+                0x60, l, 0x60, 0x0c, 0x60, 0x00, 0x39, 0x60, l, 0x60, 0x00, 0xf3,
+            ];
+            d.extend_from_slice(runtime);
+            d
+        };
+
+        // Deploy the factory, call it, and return the call's gas_used.
+        let run = |child: Vec<u8>| -> u64 {
+            let store = Arc::new(MemoryTrieStore::new());
+            let root = TrieNode::empty();
+            let sender = Address::repeat_byte(0xAB);
+            let one_rbtc = U256::from(10u64).pow(U256::from(18));
+            let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
+            let block_store =
+                Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+            let executor = RskExecutor::new(RskHardforkConfig::testnet(), block_store);
+
+            let deploy = rustock_core::Transaction {
+                nonce: 0,
+                gas_price: U256::from(0),
+                gas_limit: U256::from(2_000_000),
+                to: Bytes::new(),
+                value: U256::ZERO,
+                input: Bytes::from(deploy_init(&factory_runtime(&child))),
+                v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
+            };
+            let r1 = executor
+                .execute_block(&dummy_header(3_088_982), &[(deploy, sender)], &root, store.clone())
+                .expect("deploy block");
+            assert!(r1.tx_results[0].success, "factory deploy failed");
+            let factory_addr = sender.create(0);
+            let root2 = crate::state::apply_state_changes(
+                &root, store.as_ref(), &r1.state_changes, &r1.markers,
+            );
+            let call = rustock_core::Transaction {
+                nonce: 1,
+                gas_price: U256::from(0),
+                gas_limit: U256::from(2_000_000),
+                to: Bytes::copy_from_slice(factory_addr.as_slice()),
+                value: U256::ZERO,
+                input: Bytes::new(),
+                v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
+            };
+            let r2 = executor
+                .execute_block(&dummy_header(3_088_983), &[(call, sender)], &root2, store.clone())
+                .expect("call block");
+            assert!(r2.tx_results[0].success, "factory call (CREATE) failed");
+            r2.tx_results[0].gas_used
+        };
+
+        for clear in [false, true] {
+            let returns = run(child_init(clear, false));
+            let destructs = run(child_init(clear, true));
+            // CALLER + SELFDESTRUCT (2 + 5,000) against PUSH1 PUSH1 RETURN
+            // (3 + 3), less the self-destruct's refund.
+            assert_eq!(
+                destructs + 24_000,
+                returns + 5_002 - 6,
+                "a nested constructor's self-destruct keeps its refund (clear: {clear})"
+            );
+        }
+    }
+
     /// Regression for mainnet #3,631,998 tx[1] (gas used 27,540 vs 27,529, +11,
     /// divergent revert branch): rskj `VM.doEXTCODEHASH` (`getCodeHashStandard`)
     /// keys on TRIE EXISTENCE, not EIP-161 emptiness. An account that exists in

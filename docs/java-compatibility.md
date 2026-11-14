@@ -98,6 +98,7 @@ implementation quirk, it is cross-referenced below.
 | 93 | A reverted CREATE/CREATE2 leaves its creator's return data empty | [`quirks-frozen-bugs.md`](./quirks-frozen-bugs.md) |
 | 94 | Before RSKIP284 a Flyover BTC address's version is read as a signed byte | [`quirks-frozen-bugs.md`](./quirks-frozen-bugs.md) |
 | 95 | An input spent with testnet's hard-coded ERP script cannot be sized: the build throws | [`quirks-frozen-bugs.md`](./quirks-frozen-bugs.md) |
+| 96 | A self-destruct in a nested constructor keeps its refund | [`quirks-frozen-bugs.md`](./quirks-frozen-bugs.md) |
 | — | Discovery NodeTable eviction (liveness, non-consensus) | [`wire-protocol.md`](./wire-protocol.md) |
 
 ## Quirks logged with their feature (cross-reference to `consensus-port-log.md`)
