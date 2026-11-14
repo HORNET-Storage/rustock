@@ -455,8 +455,9 @@ pub fn find_bridge_method(selector: &[u8; 4]) -> Option<&'static BridgeMethodInf
 /// `getGasForData` and, when `Bridge.execute` throws (parse failure OR a
 /// method `VMException`/`RuntimeException`), only spends `requiredGas +
 /// basicTxCost` while still flagging the summary as failed: the receipt is
-/// SUCCESS with that spent gas, no logs, no endowment, but the sender is
-/// charged the FULL gas limit. The marker carries `requiredGas` so the
+/// SUCCESS with that spent gas, no endowment, and of the logs those the
+/// method wrote before it threw; but the sender is charged the FULL gas
+/// limit. The marker carries `requiredGas` so the
 /// precompile frame can record exactly that cost (the basic tx cost is
 /// charged separately by revm's intrinsic accounting).
 pub const INVISIBLE_EXCEPTION_MARKER: &str = "rskj invisible exception:";

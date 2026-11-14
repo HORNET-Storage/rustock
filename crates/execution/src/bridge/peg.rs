@@ -816,7 +816,7 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
                     emit_pegin_rejection_release(
                         ctx, &btc_tx, &refund_hash160, refund_is_p2sh, total_value, &fed_redeem,
                         &retiring, &pays_live_federation, rsk_height, config, hardfork_cfg, tx_ctx,
-                    );
+                    )?;
                 }
                 set_btc_tx_processed(ctx, &legacy_txid, rsk_height, hardfork_cfg.has_rskip134(rsk_height));
                 return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
@@ -883,7 +883,7 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
                 emit_pegin_rejection_release(
                     ctx, &btc_tx, &refund_hash160, refund_is_p2sh, total_value, &fed_redeem,
                     &retiring, &pays_live_federation, rsk_height, config, hardfork_cfg, tx_ctx,
-                );
+                )?;
             }
             set_btc_tx_processed(ctx, &legacy_txid, rsk_height, hardfork_cfg.has_rskip134(rsk_height));
             return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
@@ -1102,7 +1102,7 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
         emit_pegin_rejection_release(
             ctx, &btc_tx, &sender_hash160, sender_is_p2sh, total_value, &fed_redeem,
             &retiring, &pays_live_federation, rsk_height, config, hardfork_cfg, tx_ctx,
-        );
+        )?;
         set_btc_tx_processed(ctx, &legacy_txid, rsk_height, hardfork_cfg.has_rskip134(rsk_height));
         return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
     }
@@ -1348,7 +1348,7 @@ fn emit_pegin_rejection_release<CTX: crate::RskContextTr>(
     config: &BridgeConstants,
     hardfork_cfg: &RskHardforkConfig,
     tx_ctx: &BridgeTxContext,
-) {
+) -> Result<(), PrecompileError> {
     // TODO(rustock): a rejected peg-in paying BOTH live federations would
     // need per-input redeem scripts in the refund; none exists on
     // mainnet pre-wasabi. Inputs paying the retiring federation use its
@@ -1397,6 +1397,9 @@ fn emit_pegin_rejection_release<CTX: crate::RskContextTr>(
     } else {
         p2pkh_output_script(refund_hash160)
     };
+    // bitcoinj throws where it cannot size the inputs
+    // (`release_tx::signatures_required`), and so does the peg-in's
+    // registration: nothing of it is kept, and it is not marked processed.
     let built = super::release_tx::build_empty_wallet_to(
         &pegin_utxos,
         &refund_script,
@@ -1404,7 +1407,7 @@ fn emit_pegin_rejection_release<CTX: crate::RskContextTr>(
         fee_per_kb,
         tx_version,
         format >= 4000,
-    );
+    )?;
     tracing::debug!(
         "pegin rejection release: utxos {} fee_per_kb {} built {:?}",
         pegin_utxos.len(),
@@ -1450,6 +1453,7 @@ fn emit_pegin_rejection_release<CTX: crate::RskContextTr>(
             ],
         );
     }
+    Ok(())
 }
 
 /// rskj `BtcLockSender`: what a peg-in's FIRST input says of its sender, as
@@ -2194,7 +2198,7 @@ pub fn register_fast_bridge_btc_transaction<CTX: crate::RskContextTr>(
         emit_flyover_rejection_release(
             ctx, &btc_tx, &refund_hash160, refund_is_p2sh, total_satoshis,
             &flyover_feds, rsk_height, config, hardfork_cfg, tx_ctx,
-        );
+        )?;
         return ok(flyover_code_output(if is_lp {
             flyover_codes::REFUNDED_LP
         } else {
@@ -2595,7 +2599,7 @@ fn emit_flyover_rejection_release<CTX: crate::RskContextTr>(
     config: &BridgeConstants,
     hardfork_cfg: &RskHardforkConfig,
     tx_ctx: &BridgeTxContext,
-) {
+) -> Result<(), PrecompileError> {
     // Gather the spending UTXOs in output order, each with the redeem of the
     // flyover address it pays.
     let mut utxos: Vec<BridgeUtxo> = Vec::new();
@@ -2640,7 +2644,7 @@ fn emit_flyover_rejection_release<CTX: crate::RskContextTr>(
         let single = input_redeems.first().copied().unwrap_or(&[]);
         super::release_tx::build_empty_wallet_to(
             &utxos, &refund_script, single, fee_per_kb, tx_version, is_segwit,
-        )
+        )?
     } else {
         build_flyover_empty_wallet_multi(
             &utxos,
@@ -2649,7 +2653,7 @@ fn emit_flyover_rejection_release<CTX: crate::RskContextTr>(
             fee_per_kb,
             tx_version,
             is_segwit,
-        )
+        )?
     };
     if let Some(built) = built {
         // rskj names a flyover refund by `internalTx.getOriginHash()`, the
@@ -2672,6 +2676,7 @@ fn emit_flyover_rejection_release<CTX: crate::RskContextTr>(
         process_release_transaction_info(ctx, &built, hardfork_cfg, rsk_height);
         store_pegout_confirmation_set(ctx, &waiting, use_tx_hash);
     }
+    Ok(())
 }
 
 /// rskj `ReleaseTransactionBuilder.buildEmptyWalletTo` over a multi-script
@@ -2685,7 +2690,8 @@ fn emit_flyover_rejection_release<CTX: crate::RskContextTr>(
 /// is the empty-scriptSig serialized length plus, per input, `threshold *
 /// SIG_SIZE + redeemScript.len()`, segwit-weighted for a P2SH-P2WSH federation
 /// (`is_segwit`), whose inputs carry their witnesses. The size limit is
-/// `release_tx::fill_inputs`'s.
+/// `release_tx::fill_inputs`'s. It refuses, and throws, where
+/// `release_tx::build_empty_wallet_to` does.
 fn build_flyover_empty_wallet_multi(
     utxos: &[BridgeUtxo],
     input_redeems: &[&[u8]],
@@ -2693,23 +2699,22 @@ fn build_flyover_empty_wallet_multi(
     fee_per_kb: u64,
     version: i32,
     is_segwit: bool,
-) -> Option<super::release_tx::BuiltPegout> {
+) -> Result<Option<super::release_tx::BuiltPegout>, super::release_tx::UncountableSignatures> {
     use bitcoin::{
         absolute::LockTime, transaction::Version, Amount, OutPoint, Sequence, TxIn, TxOut, Witness,
     };
-    // bitcoinj constants (see release_tx.rs): SIG_SIZE=75, min fee 5000 sat/kB.
-    const SIG_SIZE: usize = 75;
+    // bitcoinj's minimum fee (see release_tx.rs): 5000 sat/kB.
     const REFERENCE_DEFAULT_MIN_TX_FEE: u64 = 5000;
 
     if utxos.is_empty() {
-        return None;
+        return Ok(None);
     }
     let thresholds: Vec<usize> = input_redeems
         .iter()
         .map(|r| super::release_tx::redeem_script_threshold(r))
         .collect();
     if thresholds.contains(&0) {
-        return None;
+        return Ok(None);
     }
     let gathered: u64 = utxos.iter().map(|u| u.value_satoshis).sum();
 
@@ -2747,11 +2752,7 @@ fn build_flyover_empty_wallet_multi(
     // each input's own redeem script.
     let base_size =
         bitcoin::consensus::serialize(&tx).len() + if is_segwit { utxos.len() * 36 } else { 0 };
-    let sig_estimate: usize = input_redeems
-        .iter()
-        .zip(&thresholds)
-        .map(|(r, t)| t * SIG_SIZE + r.len())
-        .sum();
+    let sig_estimate = super::release_tx::signing_bytes(input_redeems.iter().copied())?;
     let size = if is_segwit {
         (base_size + sig_estimate + 3 * base_size) / 4
     } else {
@@ -2759,18 +2760,18 @@ fn build_flyover_empty_wallet_multi(
     };
     let fee = (fee_per_kb * size as u64 / 1000).max(REFERENCE_DEFAULT_MIN_TX_FEE);
     if fee >= gathered {
-        return None;
+        return Ok(None);
     }
     let value = gathered - fee;
     if value < super::release_tx::min_non_dust_value(refund_script) {
-        return None;
+        return Ok(None);
     }
     tx.output[0].value = Amount::from_sat(value);
 
     if !super::release_tx::fill_inputs(&mut tx, input_redeems.iter().copied(), is_segwit) {
-        return None;
+        return Ok(None);
     }
-    Some(super::release_tx::BuiltPegout { tx, used_utxos: utxos.to_vec() })
+    Ok(Some(super::release_tx::BuiltPegout { tx, used_utxos: utxos.to_vec() }))
 }
 
 // ---------------------------------------------------------------------------
@@ -3085,7 +3086,7 @@ pub fn update_collections<CTX: crate::RskContextTr>(
     // moves the retiring federation's balance into the active federation
     // with a migration transaction queued like a peg-out.
     // -----------------------------------------------------------------------
-    process_funds_migration(ctx, config, hardfork_cfg, block_number, tx_ctx);
+    process_funds_migration(ctx, config, hardfork_cfg, block_number, tx_ctx)?;
 
     // -----------------------------------------------------------------------
     // Step 1: Process peg-out requests (rskj processPegoutRequests)
@@ -3247,6 +3248,9 @@ pub fn update_collections<CTX: crate::RskContextTr>(
                             script: p2pkh_output_script(&request.btc_dest_hash160),
                             amount_satoshis: request.amount_satoshis,
                         }];
+                        // A build bitcoinj cannot size throws, and so does
+                        // this call, with no request processed (testnet
+                        // #2,237,507).
                         match super::release_tx::complete_pegout_tx(
                             &available,
                             &outputs,
@@ -3255,7 +3259,7 @@ pub fn update_collections<CTX: crate::RskContextTr>(
                             fee_per_kb,
                             tx_version,
                             is_segwit,
-                        ) {
+                        )? {
                             Some(built) => {
                                 settle(
                                     ctx,
@@ -3291,7 +3295,7 @@ pub fn update_collections<CTX: crate::RskContextTr>(
                         fee_per_kb,
                         tx_version,
                         is_segwit,
-                    ) {
+                    )? {
                         let total: u64 = pending.iter().map(|r| r.amount_satoshis).sum();
                         // rskj logBatchPegoutCreated needs the batch BTC tx hash
                         // and the per-request creation RSK tx hashes; capture
@@ -3444,7 +3448,7 @@ pub fn update_collections<CTX: crate::RskContextTr>(
     // Step 4: drive the RSKIP419 Sign Validation Protocol for a proposed
     // federation (rskj updateSvpState).
     // -----------------------------------------------------------------------
-    update_svp_state(ctx, config, hardfork_cfg, block_number, tx_ctx);
+    update_svp_state(ctx, config, hardfork_cfg, block_number, tx_ctx)?;
 
     Ok(PrecompileOutput::new(gas_cost, Bytes::new()))
 }
@@ -3460,19 +3464,19 @@ fn update_svp_state<CTX: crate::RskContextTr>(
     hardfork_cfg: &RskHardforkConfig,
     block_number: u64,
     tx_ctx: &BridgeTxContext,
-) {
+) -> Result<(), PrecompileError> {
     if !hardfork_cfg.has_rskip419(block_number) {
-        return;
+        return Ok(());
     }
     let Some(proposed) = super::federation::load_stored_federation(ctx, PROPOSED_FEDERATION_KEY)
     else {
-        return;
+        return Ok(());
     };
 
     // isSvpOngoing: the proposal is still within its validation window.
     if block_number >= proposed.creation_block + config.validation_period_duration_in_blocks {
         process_svp_failure(ctx, &proposed, config, hardfork_cfg, block_number);
-        return;
+        return Ok(());
     }
 
     // shouldCreateAndProcessSvpFundTransaction: every SVP value must be clear.
@@ -3488,7 +3492,7 @@ fn update_svp_state<CTX: crate::RskContextTr>(
             hardfork_cfg,
             block_number,
             tx_ctx,
-        );
+        )?;
     }
 
     // Once the fund tx change has been registered (svpFundTxSigned set), build
@@ -3505,6 +3509,7 @@ fn update_svp_state<CTX: crate::RskContextTr>(
             tx_ctx,
         );
     }
+    Ok(())
 }
 
 /// rskj `BridgeSupport.processSvpFailure`: the proposed federation did not pass
@@ -3555,12 +3560,12 @@ fn process_svp_fund_transaction_unsigned<CTX: crate::RskContextTr>(
     hardfork_cfg: &RskHardforkConfig,
     block_number: u64,
     tx_ctx: &BridgeTxContext,
-) {
+) -> Result<(), PrecompileError> {
     let svp_fund_tx_outputs_value = config.minimum_pegout_tx_value * 2;
     let Some(built) =
-        build_svp_fund_transaction(ctx, proposed, svp_fund_tx_outputs_value, config, hardfork_cfg, block_number)
+        build_svp_fund_transaction(ctx, proposed, svp_fund_tx_outputs_value, config, hardfork_cfg, block_number)?
     else {
-        return;
+        return Ok(());
     };
 
     // setSvpFundTxHashUnsigned(tx.getHash()) = RLP element of the display-order txid.
@@ -3632,6 +3637,7 @@ fn process_svp_fund_transaction_unsigned<CTX: crate::RskContextTr>(
         super::events::log_pegout_transaction_created(ctx, &fund_hash, &outpoint_values);
         save_release_outpoints_values(ctx, &fund_hash, &outpoint_values, hardfork_cfg, block_number);
     }
+    Ok(())
 }
 
 /// rskj `BridgeSupport.processSvpSpendTransactionUnsigned`: once the SVP fund
@@ -4012,7 +4018,7 @@ fn build_svp_fund_transaction<CTX: crate::RskContextTr>(
     config: &BridgeConstants,
     hardfork_cfg: &RskHardforkConfig,
     block_number: u64,
-) -> Option<super::release_tx::BuiltPegout> {
+) -> Result<Option<super::release_tx::BuiltPegout>, super::release_tx::UncountableSignatures> {
     // Proposed federation redeem + P2SH (its TYPE is keyed on its creation block).
     let proposed_keys = proposed.btc_keys();
     let proposed_redeem = build_committed_federation_redeem_script(
@@ -4182,15 +4188,15 @@ fn process_funds_migration<CTX: crate::RskContextTr>(
     hardfork_cfg: &RskHardforkConfig,
     block_number: u64,
     tx_ctx: &BridgeTxContext,
-) {
+) -> Result<(), PrecompileError> {
     let Some(retiring_keys) =
         retiring_federation_keys(ctx, config, hardfork_cfg, block_number)
     else {
-        return;
+        return Ok(());
     };
     let Some(new_fed) = super::federation::load_stored_federation(ctx, NEW_FEDERATION_KEY)
     else {
-        return;
+        return Ok(());
     };
 
     let age = block_number.saturating_sub(new_fed.creation_block);
@@ -4212,7 +4218,7 @@ fn process_funds_migration<CTX: crate::RskContextTr>(
     let in_migration_age = age > migration_start && age < migration_end;
     let past_migration_age = age >= migration_end;
     if !in_migration_age && !past_migration_age {
-        return;
+        return Ok(());
     }
 
     let mut old_utxos = super::storage::load_old_federation_utxos(ctx);
@@ -4314,7 +4320,7 @@ fn process_funds_migration<CTX: crate::RskContextTr>(
                 fee_per_kb,
                 migration_tx_version,
                 retiring_is_segwit,
-            ) {
+            )? {
                 Some(b) => break Some(b),
                 None => {
                     target /= 2;
@@ -4391,6 +4397,7 @@ fn process_funds_migration<CTX: crate::RskContextTr>(
         }
         bridge_store_bytes_named(ctx, OLD_FEDERATION_KEY, &[]);
     }
+    Ok(())
 }
 
 /// Active federation member keys (rskj FederationSupport.getActiveFederation):
@@ -5559,6 +5566,17 @@ const LEGACY_ERP_TESTNET_REDEEM_SCRIPT: &str = concat!(
     "5368ae",
 );
 
+/// The hard-coded script's bytes. bitcoinj-thin's `RedeemScriptParserFactory`
+/// holds the same script, and an input spent with it cannot be sized
+/// (`release_tx::signatures_required`).
+pub(super) fn legacy_erp_testnet_redeem_script() -> &'static [u8] {
+    static SCRIPT: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    SCRIPT.get_or_init(|| {
+        alloy_primitives::hex::decode(LEGACY_ERP_TESTNET_REDEEM_SCRIPT)
+            .expect("the hard-coded script is hex")
+    })
+}
+
 /// rskj `NonStandardErpRedeemScriptBuilderFactory`: the builder of a
 /// non-standard ERP federation's redeem script, by network and by the block
 /// being run. rskj rebuilds a stored federation with that block's
@@ -5609,8 +5627,7 @@ fn build_erp_redeem_script(
     script: ErpScript,
 ) -> Vec<u8> {
     if script == ErpScript::NonStandardHardcoded {
-        return alloy_primitives::hex::decode(LEGACY_ERP_TESTNET_REDEEM_SCRIPT)
-            .expect("the hard-coded script is hex");
+        return legacy_erp_testnet_redeem_script().to_vec();
     }
     let p2sh = script == ErpScript::P2sh;
     let default_redeem = build_federation_redeem_script(default_keys, default_threshold);
@@ -6111,20 +6128,20 @@ fn estimated_fees_for_next_pegout<CTX: crate::RskContextTr>(
     config: &BridgeConstants,
     hardfork_cfg: &RskHardforkConfig,
     block_number: u64,
-) -> u64 {
+) -> Result<u64, PrecompileError> {
     let queue = load_release_request_queue(ctx, hardfork_cfg.has_rskip146(block_number));
 
     // shouldReturnZeroEstimatedFees (l.2646-2651).
     if !hardfork_cfg.has_rskip385(block_number)
         && (!hardfork_cfg.has_rskip271(block_number) || queue.is_empty())
     {
-        return 0;
+        return Ok(0);
     }
 
     if !hardfork_cfg.has_rskip305(block_number) {
-        return estimated_fees_from_inputs_and_outputs_count(
+        return Ok(estimated_fees_from_inputs_and_outputs_count(
             ctx, config, hardfork_cfg, block_number, queue.len(),
-        );
+        ));
     }
 
     // getEstimatedFeesFromPegoutTransactionSimulation (l.2677-2692): the
@@ -6136,13 +6153,15 @@ fn estimated_fees_for_next_pegout<CTX: crate::RskContextTr>(
         100_000_000
     };
 
-    simulate_pegout_fee(ctx, config, hardfork_cfg, block_number, &queue, estimated_next_amount)
+    // A build bitcoinj cannot size throws past the fallback
+    // (`release_tx::signatures_required`).
+    Ok(simulate_pegout_fee(ctx, config, hardfork_cfg, block_number, &queue, estimated_next_amount)?
         .unwrap_or_else(|| {
             // BridgeIllegalArgumentException -> "fallback to old logic".
             estimated_fees_from_inputs_and_outputs_count(
                 ctx, config, hardfork_cfg, block_number, queue.len(),
             )
-        })
+        }))
 }
 
 /// rskj `BridgeSupport.getEstimatedFeesFromInputsAndOutputsCount`
@@ -6186,7 +6205,8 @@ fn estimated_fees_from_inputs_and_outputs_count<CTX: crate::RskContextTr>(
 /// federation's real UTXO set, and report `inputSum - outputSum`.
 ///
 /// `None` mirrors the `BridgeIllegalArgumentException` rskj throws when the
-/// builder does not return SUCCESS; the caller then falls back.
+/// builder does not return SUCCESS; the caller then falls back. `Err` is a
+/// build bitcoinj cannot size, which throws past that fallback.
 fn simulate_pegout_fee<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     config: &BridgeConstants,
@@ -6194,11 +6214,11 @@ fn simulate_pegout_fee<CTX: crate::RskContextTr>(
     block_number: u64,
     queue: &[ReleaseRequest],
     estimated_next_amount: u64,
-) -> Option<u64> {
+) -> Result<Option<u64>, super::release_tx::UncountableSignatures> {
     let (keys, redeem_script) =
         active_federation_keys_and_redeem(ctx, config, hardfork_cfg, block_number);
     if keys.is_empty() {
-        return None;
+        return Ok(None);
     }
     let format = active_federation_format(ctx, config, hardfork_cfg, block_number);
     let is_segwit = format >= 4000;
@@ -6236,7 +6256,7 @@ fn simulate_pegout_fee<CTX: crate::RskContextTr>(
         amount_satoshis: estimated_next_amount,
     });
 
-    let built = super::release_tx::complete_pegout_tx(
+    let Some(built) = super::release_tx::complete_pegout_tx(
         &available,
         &outputs,
         &change_script,
@@ -6244,11 +6264,14 @@ fn simulate_pegout_fee<CTX: crate::RskContextTr>(
         fee_per_kb,
         tx_version,
         is_segwit,
-    )?;
+    )?
+    else {
+        return Ok(None);
+    };
 
     let input_sum: u64 = built.used_utxos.iter().map(|u| u.value_satoshis).sum();
     let output_sum: u64 = built.tx.output.iter().map(|o| o.value.to_sat()).sum();
-    Some(input_sum.saturating_sub(output_sum))
+    Ok(Some(input_sum.saturating_sub(output_sum)))
 }
 
 /// `getEstimatedFeesForNextPegOutEvent()` → uint256 (satoshis)
@@ -6263,7 +6286,7 @@ pub fn get_estimated_fees_for_next_pegout<CTX: crate::RskContextTr>(
     hardfork_cfg: &RskHardforkConfig,
 ) -> Result<PrecompileOutput, PrecompileError> {
     let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
-    let fee = estimated_fees_for_next_pegout(ctx, config, hardfork_cfg, block_number);
+    let fee = estimated_fees_for_next_pegout(ctx, config, hardfork_cfg, block_number)?;
     let out = U256::from(fee).to_be_bytes::<32>();
     Ok(PrecompileOutput::new(gas_cost, out.to_vec().into()))
 }
@@ -6318,7 +6341,7 @@ pub fn get_estimated_fees_for_pegout_amount<CTX: crate::RskContextTr>(
         PrecompileError::other("getEstimatedFeesForPegOutAmount: cannot simulate peg-out")
     })?;
     let queue = load_release_request_queue(ctx, hardfork_cfg.has_rskip146(block_number));
-    let fee = simulate_pegout_fee(ctx, config, hardfork_cfg, block_number, &queue, amount)
+    let fee = simulate_pegout_fee(ctx, config, hardfork_cfg, block_number, &queue, amount)?
         .ok_or_else(|| {
             PrecompileError::other("getEstimatedFeesForPegOutAmount: cannot simulate peg-out")
         })?;
@@ -8917,10 +8940,12 @@ mod tests {
         let redeems_uniform: Vec<&[u8]> = vec![fly_a.as_slice(), fly_a.as_slice()];
         let multi =
             build_flyover_empty_wallet_multi(&utxos, &redeems_uniform, &refund, 1000, 2, false)
+                .unwrap()
                 .expect("multi build");
         let single = crate::bridge::release_tx::build_empty_wallet_to(
             &utxos, &refund, &fly_a, 1000, 2, false,
         )
+        .unwrap()
         .expect("single build");
         assert_eq!(
             bitcoin::consensus::serialize(&multi.tx),
@@ -8935,6 +8960,7 @@ mod tests {
         let redeems_mixed: Vec<&[u8]> = vec![fly_a.as_slice(), fly_b.as_slice()];
         let mixed =
             build_flyover_empty_wallet_multi(&utxos, &redeems_mixed, &refund, 1000, 2, false)
+                .unwrap()
                 .expect("mixed build");
         assert_eq!(mixed.tx.input.len(), 2);
         assert_eq!(mixed.used_utxos.len(), 2);

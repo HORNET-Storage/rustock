@@ -459,7 +459,12 @@ wraps any method `RuntimeException`/`BridgeIllegalArgumentException` in a
   flagged `markAsFailed()` because `result.getException() != null`, and
   `getFee()` returns `calcCost(gasLimit)` (refund/leftover = 0). REMASC receives
   `gasLimit * gasPrice`.
-- **No logs, no endowment** (the throw aborts before they take effect).
+- **No endowment**, and of the logs only those the method wrote before it
+  threw. The Bridge writes its logs straight into the result's list
+  (`result.getLogInfoList()`), which the receipt takes whole, and its storage
+  only in `save()`, once the method has returned; a parse failure throws
+  before anything is logged. Testnet #2,237,507 (§95): `updateCollections`
+  logs `update_collections`, then throws, and the receipt holds that log.
 
 This is the same "invisible exception" already implemented for a post-RSKIP88
 parse failure (§ for `addLockWhitelistAddress` / #764,123) — a method throw is
@@ -733,4 +738,61 @@ code) and `a_flyover_derivation_hash_reads_the_address_bitcoinj_read`
 (without the fix a 22-byte address misses a registration made under its 21
 bytes). Verified: testnet #2,122,593 replays to the header's state and
 receipts roots.
+
+## §95 An input spent with testnet's hard-coded ERP script cannot be sized: the build throws (testnet #2,237,507)
+
+The federation testnet committed at #2,235,076 is a non-standard ERP one.
+Before RSKIP284 rskj gives every non-standard ERP federation on testnet the
+same hard-coded redeem script (`NonStandardErpRedeemScriptBuilderHardcoded`),
+so its address is that script's, `2Mw6KM642fbkypTzbgFi6DTgTFPRWZUD4BA`.
+bitcoinj-thin's `RedeemScriptParserFactory.get` knows the script by its chunks
+and hands it to `NonStandardErpRedeemScriptParserHardcoded`, whose `getM()` is
+-1. `Script.isSentToMultiSig()` (`getM() > 0`) is then false, and
+`getNumberOfSignaturesRequiredToSpend()` throws `IllegalStateException`
+("Unsupported script type").
+
+`Wallet.completeTx` asks it of every selected input when it sizes the
+transaction (`calculateFee` → `calculateTxSize` → `estimateBytesForSigning`),
+after the dust and money checks. `ReleaseTransactionBuilder` catches only
+`completeTx`'s own failures (insufficient money, dust, could not adjust
+downwards, too big), so the exception leaves the Bridge method: a peg-out
+from that federation throws, and so does a rejected peg-in's refund paid
+from it. A transaction's own call to the Bridge then ends in the invisible
+exception (§50): SUCCESS, `requiredGas` used, the logs written before the
+throw kept, and none of the Bridge's storage, which rskj writes only once a
+method returns. Until RSKIP284 (#2,581,800), an `updateCollections` that gets
+as far as sizing a peg-out throws, and the request stays queued. At RSKIP284
+the federation's script changes and testnet moves its UTXOs to a new key,
+leaving the 128 UTXOs (929.41153208 tBTC) at the hard-coded address under
+the old one, unspent.
+
+The factory compares the chunks with their offsets, so inside a Flyover
+redeem script (`PUSH32 <hash> OP_DROP <script>`) the script is not
+recognized: it is parsed by its structure as a non-standard ERP script, and
+counts 3.
+
+**Trigger**: testnet #2,237,507 tx[1], `updateCollections` with a request
+of 500,000 satoshis queued. rskj's receipt is SUCCESS with the one
+`update_collections` log. rustock built the peg-out (437,200 satoshis to
+`cab5925c…` and the change), logged `release_requested`, took the request
+off the queue and the UTXO off the federation's list, and the state root
+differed.
+
+**Ground truth**: RSKj's release VETIVER-9.0.4, run as the jar.
+`ReleaseTransactionBuilder.buildAmountTo` over the federation's UTXO at
+#2,237,507 throws `IllegalStateException: Unsupported script type` from
+`Script.getNumberOfSignaturesRequiredToSpend`, called by
+`Wallet.estimateBytesForSigning`; nothing on the way catches it. The
+hard-coded script alone throws the same, and behind a Flyover prefix counts
+3.
+
+**rustock**: `release_tx::signatures_required`
+(crates/execution/src/bridge/release_tx.rs) answers
+`Err(UncountableSignatures)` for the hard-coded script. Every builder sizes
+its inputs through it (`signing_bytes`) and returns the error, which the
+Bridge methods pass on as a throw. Test
+`bridge::release_tx::tests::an_input_spent_with_the_hardcoded_testnet_erp_script_cannot_be_sized`
+(without the fix the hard-coded script counts 3 and the peg-out builds).
+Verified: testnet #2,237,507 replays to the header's state and receipts
+roots.
 

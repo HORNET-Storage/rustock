@@ -23,7 +23,9 @@
 //!   `threshold * SIG_SIZE(75) + redeemScript.len()` per input; the tx must
 //!   not exceed `MAX_STANDARD_TX_SIZE` (100k) where `completeTx` checks it,
 //!   which is with its placeholders for a legacy federation and with its
-//!   inputs still empty for a P2SH-P2WSH one (`fill_inputs`).
+//!   inputs still empty for a P2SH-P2WSH one (`fill_inputs`). An input
+//!   spent with testnet's hard-coded ERP redeem script cannot be sized, and
+//!   the build throws (`signatures_required`).
 
 use bitcoin::absolute::LockTime;
 use bitcoin::transaction::Version;
@@ -195,6 +197,49 @@ pub fn redeem_script_threshold(redeem_script: &[u8]) -> usize {
         .unwrap_or(0)
 }
 
+/// bitcoinj-thin threw while it sized an input. `Wallet.completeTx` refuses a
+/// build with failures of its own, which `ReleaseTransactionBuilder` catches;
+/// this one nothing catches, and the Bridge method that asked for the build
+/// throws. rskj writes the Bridge's storage only once a method returns, so
+/// none of what the method changed is kept; what it logged stays logged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UncountableSignatures;
+
+impl From<UncountableSignatures> for revm::precompile::PrecompileError {
+    fn from(_: UncountableSignatures) -> Self {
+        Self::other("Unsupported script type")
+    }
+}
+
+/// bitcoinj-thin `Script.getNumberOfSignaturesRequiredToSpend` on a P2SH
+/// input's redeem script, as `Wallet.estimateBytesForSigning` asks it: the
+/// threshold of the multisig the script's parser finds (`getM()`), which is
+/// `redeem_script_threshold`. rskj gives every non-standard ERP federation on
+/// testnet, before RSKIP284, a hard-coded redeem script. Its parser is
+/// `NonStandardErpRedeemScriptParserHardcoded`, whose `getM()` is -1, so
+/// bitcoinj takes the script for no multisig and throws "Unsupported script
+/// type". `RedeemScriptParserFactory` knows that script by its chunks and
+/// their offsets, so only as a whole redeem script: inside a Flyover redeem
+/// script it is parsed by its structure, and counts 3.
+pub fn signatures_required(redeem_script: &[u8]) -> Result<usize, UncountableSignatures> {
+    if redeem_script == super::peg::legacy_erp_testnet_redeem_script() {
+        return Err(UncountableSignatures);
+    }
+    Ok(redeem_script_threshold(redeem_script))
+}
+
+/// bitcoinj `Wallet.estimateBytesForSigning` over P2SH inputs, each spent with
+/// its own redeem script: `signatures * SIG_SIZE + redeemScript.len()` apiece.
+/// It throws at the first input it cannot count.
+pub fn signing_bytes<'r>(
+    redeem_scripts: impl IntoIterator<Item = &'r [u8]>,
+) -> Result<usize, UncountableSignatures> {
+    redeem_scripts
+        .into_iter()
+        .map(|redeem| Ok(signatures_required(redeem)? * SIG_SIZE + redeem.len()))
+        .sum()
+}
+
 /// Replica of `Wallet.completeTx` for the bridge peg-out path
 /// (`recipientsPayFees = true`, `shuffleOutputs = false`, legacy P2SH
 /// multisig federation, `ensureMinRequiredFee = true`).
@@ -205,8 +250,10 @@ pub fn redeem_script_threshold(redeem_script: &[u8]) -> usize {
 /// flyover UTXO this is the `PUSH32 <derivationHash> OP_DROP <fedRedeem>`
 /// wrapper (34 bytes longer than the plain fed redeem), which changes both the
 /// USE_OP_ZERO placeholder scriptSig and the per-input fee-sizing estimate.
-/// Returns `None` on any of bitcoinj's build failures (dusty send, insufficient
-/// money, could not adjust downwards, exceeded max size).
+/// Returns `Ok(None)` on any of bitcoinj's build failures (dusty send,
+/// insufficient money, could not adjust downwards, exceeded max size), and
+/// `Err` where bitcoinj throws instead, unable to size a selected input
+/// (`signatures_required`).
 pub fn complete_pegout_tx<'r, F>(
     available_utxos: &[BridgeUtxo],
     outputs: &[PegoutOutput],
@@ -215,18 +262,18 @@ pub fn complete_pegout_tx<'r, F>(
     fee_per_kb: u64,
     version: i32,
     is_segwit: bool,
-) -> Option<BuiltPegout>
+) -> Result<Option<BuiltPegout>, UncountableSignatures>
 where
     F: Fn(&BridgeUtxo) -> &'r [u8],
 {
     if outputs.is_empty() {
-        return None;
+        return Ok(None);
     }
 
     // completeTx: dusty sends are rejected up front (DustySendRequested).
     for output in outputs {
         if output.amount_satoshis < min_non_dust_value(&output.script) {
-            return None;
+            return Ok(None);
         }
     }
 
@@ -237,7 +284,7 @@ where
         available_utxos.iter().map(|u| (u, redeem_for(u))).collect();
     candidates.sort_by(|a, b| a.0.tx_hash.cmp(&b.0.tx_hash).then(a.0.vout.cmp(&b.0.vout)));
     if candidates.iter().any(|(_, r)| redeem_script_threshold(r) == 0) {
-        return None;
+        return Ok(None);
     }
 
     let value: u64 = outputs.iter().map(|o| o.amount_satoshis).sum();
@@ -258,7 +305,7 @@ where
                 v -= (fee % n_outputs) as i128;
             }
             if v < min_non_dust_value(&output.script) as i128 {
-                return None;
+                return Ok(None);
             }
             out_values.push(v as u64);
         }
@@ -275,7 +322,7 @@ where
             gathered += utxo.value_satoshis;
         }
         if gathered < value {
-            return None;
+            return Ok(None);
         }
 
         let mut tx_outputs: Vec<TxOut> = outputs
@@ -296,7 +343,7 @@ where
                 let missing = min_change - change;
                 let first = tx_outputs[0].value.to_sat() as i128 - missing as i128;
                 if first < 0 || (first as u64) < min_non_dust_value(&outputs[0].script) {
-                    return None;
+                    return Ok(None);
                 }
                 tx_outputs[0].value = Amount::from_sat(first as u64);
                 change = min_change;
@@ -334,10 +381,7 @@ where
         // vsize = (baseSize + signing + 3*baseSize) / 4.
         let base_size = bitcoin::consensus::serialize(&tx).len()
             + if is_segwit { selected.len() * 36 } else { 0 };
-        let signing: usize = selected
-            .iter()
-            .map(|(_, r)| redeem_script_threshold(r) * SIG_SIZE + r.len())
-            .sum();
+        let signing = signing_bytes(selected.iter().map(|(_, r)| *r))?;
         let size = if is_segwit {
             (base_size + signing + 3 * base_size) / 4
         } else {
@@ -357,10 +401,10 @@ where
                 selected.iter().map(|(_, redeem)| *redeem),
                 is_segwit,
             ) {
-                return None;
+                return Ok(None);
             }
             let used_utxos = selected.into_iter().map(|(u, _)| u.clone()).collect();
-            return Some(BuiltPegout { tx, used_utxos });
+            return Ok(Some(BuiltPegout { tx, used_utxos }));
         }
         fee = fee_needed;
     }
@@ -371,7 +415,8 @@ where
 /// outputs are FIXED and the change output to `change_script` (the active
 /// federation) absorbs the size-based fee. Selection target is `value + fee`;
 /// the fee grows until it covers the tx size. A dusty change output is dropped
-/// into the fee (no change output) — bitcoinj `Wallet.completeTx`.
+/// into the fee (no change output) — bitcoinj `Wallet.completeTx`. It refuses
+/// a build, and throws, where `complete_pegout_tx` does.
 pub fn complete_recipients_dont_pay_fees_tx<'r, F>(
     available_utxos: &[BridgeUtxo],
     outputs: &[PegoutOutput],
@@ -380,17 +425,17 @@ pub fn complete_recipients_dont_pay_fees_tx<'r, F>(
     fee_per_kb: u64,
     version: i32,
     is_segwit: bool,
-) -> Option<BuiltPegout>
+) -> Result<Option<BuiltPegout>, UncountableSignatures>
 where
     F: Fn(&BridgeUtxo) -> &'r [u8],
 {
     if outputs.is_empty() {
-        return None;
+        return Ok(None);
     }
     // completeTx: dusty sends are rejected up front (DustySendRequested).
     for output in outputs {
         if output.amount_satoshis < min_non_dust_value(&output.script) {
-            return None;
+            return Ok(None);
         }
     }
 
@@ -399,7 +444,7 @@ where
         available_utxos.iter().map(|u| (u, redeem_for(u))).collect();
     candidates.sort_by(|a, b| a.0.tx_hash.cmp(&b.0.tx_hash).then(a.0.vout.cmp(&b.0.vout)));
     if candidates.iter().any(|(_, r)| redeem_script_threshold(r) == 0) {
-        return None;
+        return Ok(None);
     }
 
     let value: u64 = outputs.iter().map(|o| o.amount_satoshis).sum();
@@ -417,7 +462,7 @@ where
             gathered += utxo.value_satoshis;
         }
         if gathered < target {
-            return None;
+            return Ok(None);
         }
 
         // Recipient outputs are unchanged; the change output absorbs the fee.
@@ -463,10 +508,7 @@ where
         // `(baseSize + signing + 3*baseSize) / 4`.
         let base_size = bitcoin::consensus::serialize(&tx).len()
             + if is_segwit { selected.len() * 36 } else { 0 };
-        let signing: usize = selected
-            .iter()
-            .map(|(_, r)| redeem_script_threshold(r) * SIG_SIZE + r.len())
-            .sum();
+        let signing = signing_bytes(selected.iter().map(|(_, r)| *r))?;
         let size = if is_segwit {
             (base_size + signing + 3 * base_size) / 4
         } else {
@@ -482,10 +524,10 @@ where
                 selected.iter().map(|(_, redeem)| *redeem),
                 is_segwit,
             ) {
-                return None;
+                return Ok(None);
             }
             let used_utxos = selected.into_iter().map(|(u, _)| u.clone()).collect();
-            return Some(BuiltPegout { tx, used_utxos });
+            return Ok(Some(BuiltPegout { tx, used_utxos }));
         }
         fee = fee_needed;
     }
@@ -502,6 +544,10 @@ where
 /// federation whatever it builds: the fee is then taken over the virtual size,
 /// and each input carries the witness program in its scriptSig and the
 /// unsigned witness (`signSegwitTxInputs`), as a pegout's does.
+///
+/// Returns `Ok(None)` where bitcoinj refuses the refund, and `Err` where it
+/// throws, unable to size the inputs (`signatures_required`), which it asks
+/// before whether the refund is dust.
 pub fn build_empty_wallet_to(
     utxos: &[BridgeUtxo],
     refund_script: &ScriptBuf,
@@ -509,13 +555,13 @@ pub fn build_empty_wallet_to(
     fee_per_kb: u64,
     version: i32,
     is_segwit: bool,
-) -> Option<BuiltPegout> {
+) -> Result<Option<BuiltPegout>, UncountableSignatures> {
     if utxos.is_empty() {
-        return None;
+        return Ok(None);
     }
     let threshold = redeem_script_threshold(redeem_script);
     if threshold == 0 {
-        return None;
+        return Ok(None);
     }
 
     let gathered: u64 = utxos.iter().map(|u| u.value_satoshis).sum();
@@ -550,7 +596,7 @@ pub fn build_empty_wallet_to(
     // output must stay above dust.
     let base_size =
         bitcoin::consensus::serialize(&tx).len() + if is_segwit { utxos.len() * 36 } else { 0 };
-    let signing = utxos.len() * (threshold * SIG_SIZE + redeem_script.len());
+    let signing = signing_bytes(utxos.iter().map(|_| redeem_script))?;
     let size = if is_segwit {
         (base_size + signing + 3 * base_size) / 4
     } else {
@@ -558,18 +604,18 @@ pub fn build_empty_wallet_to(
     };
     let fee = (fee_per_kb * size as u64 / 1000).max(REFERENCE_DEFAULT_MIN_TX_FEE);
     if fee >= gathered {
-        return None;
+        return Ok(None);
     }
     let value = gathered - fee;
     if value < min_non_dust_value(refund_script) {
-        return None;
+        return Ok(None);
     }
     tx.output[0].value = Amount::from_sat(value);
 
     if !fill_inputs(&mut tx, std::iter::repeat(redeem_script), is_segwit) {
-        return None;
+        return Ok(None);
     }
-    Some(BuiltPegout { tx, used_utxos: utxos.to_vec() })
+    Ok(Some(BuiltPegout { tx, used_utxos: utxos.to_vec() }))
 }
 
 /// Convert a stored UTXO hash (bitcoinj display/stored byte order) into a
@@ -1254,6 +1300,7 @@ mod tests {
             1,
             false,
         )
+        .unwrap()
         .expect("build");
         // Selection order: hash 01 vout 0, hash 01 vout 1 (covers 100k > 60k).
         assert_eq!(built.used_utxos.len(), 2);
@@ -1286,6 +1333,7 @@ mod tests {
                 2,
                 segwit,
             )
+            .unwrap()
             .expect("build")
         };
         let seg = build(true);
@@ -1317,6 +1365,7 @@ mod tests {
             1,
             false,
         )
+        .unwrap()
         .expect("build");
         let tx = &built.tx;
         assert_eq!(tx.output.len(), 2);
@@ -1364,6 +1413,7 @@ mod tests {
             2,
             false,
         )
+        .unwrap()
         .expect("build");
         let tx = &built.tx;
         assert_eq!(tx.version.0, 2);
@@ -1404,6 +1454,7 @@ mod tests {
             complete_recipients_dont_pay_fees_tx(
                 &utxos, &outputs, &p2sh(8), |_| redeem.as_slice(), 5000, 2, seg,
             )
+            .unwrap()
             .expect("build")
         };
         let legacy = build(false);
@@ -1434,6 +1485,7 @@ mod tests {
             1,
             false,
         )
+        .unwrap()
         .is_none());
     }
 
@@ -1450,6 +1502,7 @@ mod tests {
             1,
             false,
         )
+        .unwrap()
         .is_none());
     }
 
@@ -1476,6 +1529,7 @@ mod tests {
         let pegout = |segwit| {
             let redeem_for = |_: &BridgeUtxo| redeem.as_slice();
             complete_pegout_tx(&utxos, &to(p2pkh(7)), &p2sh(8), redeem_for, 5000, 2, segwit)
+                .unwrap()
         };
         assert!(pegout(false).is_none());
         let built = pegout(true).expect("a segwit pegout");
@@ -1494,6 +1548,7 @@ mod tests {
                 2,
                 segwit,
             )
+            .unwrap()
         };
         assert!(fund(false).is_none());
         let built = fund(true).expect("a segwit release");
@@ -1501,8 +1556,9 @@ mod tests {
         assert!(filled(&built) > MAX_STANDARD_TX_SIZE);
 
         // A refund, which empties what it is given.
-        let refund =
-            |segwit| build_empty_wallet_to(&utxos[..700], &p2pkh(7), &redeem, 5000, 2, segwit);
+        let refund = |segwit| {
+            build_empty_wallet_to(&utxos[..700], &p2pkh(7), &redeem, 5000, 2, segwit).unwrap()
+        };
         assert!(refund(false).is_none());
         let built = refund(true).expect("a segwit refund");
         assert_eq!(built.tx.input.len(), 700);
@@ -1525,6 +1581,7 @@ mod tests {
             1,
             false,
         )
+        .unwrap()
         .expect("build");
         let tx = &built.tx;
         assert_eq!(tx.output.len(), 2);
@@ -1566,6 +1623,7 @@ mod tests {
             1,
             false,
         )
+        .unwrap()
         .expect("build");
         let tx = &built.tx;
         assert_eq!(tx.input.len(), 2);
@@ -1593,6 +1651,50 @@ mod tests {
                 + (2 * SIG_SIZE + flyover_redeem.len())
         };
         assert_eq!(fee, 5000 * size as u64 / 1000);
+    }
+
+    /// Testnet #2,237,507: the federation committed at #2,235,076 is a
+    /// non-standard ERP one, and before RSKIP284 rskj gives it testnet's
+    /// hard-coded redeem script. bitcoinj-thin counts no signatures for that
+    /// script and throws while it sizes the federation's input, so rskj's
+    /// updateCollections threw where rustock built the peg-out. Inside a
+    /// Flyover redeem script the same script counts its threshold, and a build
+    /// refused before the inputs are sized is still refused.
+    #[test]
+    fn an_input_spent_with_the_hardcoded_testnet_erp_script_cannot_be_sized() {
+        let hardcoded = crate::bridge::peg::legacy_erp_testnet_redeem_script();
+        assert_eq!(signatures_required(hardcoded), Err(UncountableSignatures));
+        let mut flyover = vec![32u8];
+        flyover.extend_from_slice(&[7u8; 32]);
+        flyover.push(0x75);
+        flyover.extend_from_slice(hardcoded);
+        assert_eq!(signatures_required(&flyover), Ok(3));
+
+        // The block's request: 500,000 satoshis from the federation's one
+        // UTXO, at 100,000 satoshis per kB.
+        let utxos = vec![utxo(1, 0, 92_345_185_965)];
+        let to = |amount_satoshis| [PegoutOutput { script: p2pkh(7), amount_satoshis }];
+        let pegout = |redeem: &[u8], amount| {
+            complete_pegout_tx(&utxos, &to(amount), &p2sh(8), |_| redeem, 100_000, 2, false)
+        };
+        assert_eq!(pegout(hardcoded, 500_000).err(), Some(UncountableSignatures));
+        assert!(pegout(&flyover, 500_000).expect("sized").is_some());
+        // Refused before it is sized: more than the federation holds, and dust.
+        assert!(pegout(hardcoded, 100_000_000_000).expect("refused").is_none());
+        assert!(pegout(hardcoded, 2_729).expect("refused").is_none());
+
+        let fund = complete_recipients_dont_pay_fees_tx(
+            &utxos,
+            &to(500_000),
+            &p2sh(8),
+            |_| hardcoded,
+            100_000,
+            2,
+            false,
+        );
+        assert_eq!(fund.err(), Some(UncountableSignatures));
+        let refund = build_empty_wallet_to(&utxos, &p2pkh(7), hardcoded, 100_000, 2, false);
+        assert_eq!(refund.err(), Some(UncountableSignatures));
     }
 
     #[test]
@@ -1674,6 +1776,7 @@ mod tests {
             1,
             false,
         )
+        .unwrap()
         .expect("rejection release builds");
         let mut rid = *built.tx.compute_txid().to_raw_hash().as_byte_array();
         rid.reverse();
@@ -1756,6 +1859,7 @@ mod tests {
             1,       // pre-RSKIP201
             false,
         )
+        .unwrap()
         .expect("rejection release builds");
 
         // Fee: 500000 sat/kB over 1198 bytes (598 serialized + 8*75+598
